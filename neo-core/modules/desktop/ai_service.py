@@ -925,6 +925,72 @@ class AIService:
         return "unknown"
 
     @staticmethod
+    def _find_app_from_diagnostic(program: str, diagnostic_output: str) -> str | None:
+        """Parse diagnostic output deterministically to find a working launch command.
+
+        This is the "roteiro" (playbook) for app-not-found recovery — no LLM needed.
+        Tries in priority order: flatpak → snap → flatpak exports bin → find results.
+
+        Returns the ready-to-run shell command, or None if the app is not found anywhere.
+        """
+        if not diagnostic_output:
+            return None
+
+        prog_lower = program.lower()
+
+        # Split the diagnostic output into named sections (=== section ===)
+        sections: dict[str, list[str]] = {}
+        current = "preamble"
+        for line in diagnostic_output.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("===") and stripped.endswith("==="):
+                current = stripped.strip("= ").strip().lower()
+                sections[current] = []
+            else:
+                sections.setdefault(current, []).append(stripped)
+
+        def non_empty(lines: list[str]) -> list[str]:
+            return [l for l in lines if l and "nenhum" not in l.lower() and "nao encontrado" not in l.lower() and "not found" not in l.lower()]
+
+        # 1. Flatpak app list — "org.blender.Blender  Blender  ..."
+        for line in non_empty(sections.get("flatpak", [])):
+            if prog_lower in line.lower():
+                parts = line.split()
+                app_id = parts[0] if parts else ""
+                if "." in app_id:  # looks like a real flatpak ID
+                    logger.info(f"[Diagnostic] Found via flatpak: {app_id}")
+                    return f"flatpak run {app_id}"
+
+        # 2. Snap list — "blender  3.6  ..."
+        for line in non_empty(sections.get("snap", [])):
+            if prog_lower in line.lower():
+                snap_name = line.split()[0] if line.split() else ""
+                if snap_name:
+                    logger.info(f"[Diagnostic] Found via snap: {snap_name}")
+                    return f"snap run {snap_name}"
+
+        # 3. Flatpak exports bin — direct binary symlinks
+        for line in non_empty(sections.get("flatpak exports bin", [])):
+            if prog_lower in line.lower():
+                bin_name = line.strip()
+                if bin_name and "/" not in bin_name:
+                    path = f"/var/lib/flatpak/exports/bin/{bin_name}"
+                    logger.info(f"[Diagnostic] Found in flatpak exports bin: {path}")
+                    return path
+
+        # 4. find results — full paths
+        for line in non_empty(sections.get("find", [])):
+            path = line.strip()
+            if (prog_lower in path.lower()
+                    and path.startswith("/")
+                    and not path.endswith(".desktop")
+                    and ("/bin/" in path or "/usr/" in path or "/opt/" in path)):
+                logger.info(f"[Diagnostic] Found via find: {path}")
+                return path
+
+        return None
+
+    @staticmethod
     def _build_diagnostic_command(program: str, error_type: str) -> str | None:
         """Build a diagnostic shell command that gathers real system data.
 
@@ -1087,6 +1153,23 @@ class AIService:
                     "requires_approval": False,
                     "_is_diagnostic": True,
                 }
+
+        # ── STEP 1.5: Deterministic recovery from diagnostic output ──
+        # Parse the diagnostic output ourselves before asking the LLM.
+        # This eliminates LLM variability for the common "app found via flatpak/snap" case.
+        if diagnostic_output and error_type == "command_not_found":
+            program = self._extract_program_name(command, error, tool_arguments)
+            launch_cmd = self._find_app_from_diagnostic(program, diagnostic_output)
+            if launch_cmd:
+                launcher = launch_cmd.split()[0]  # flatpak, snap, or absolute path
+                return {
+                    "action": "retry",
+                    "tool_name": "run_command",
+                    "tool_arguments": {"command": launch_cmd, "is_background": True},
+                    "explanation": f"Encontrei {program} via {launcher}! Abrindo em segundo plano...",
+                    "requires_approval": False,
+                }
+            logger.info(f"[Diagnostic] {program} not found in diagnostic output — escalating to LLM")
 
         # ── STEP 2: Build an informed prompt with real data ──
         system_msg = (
