@@ -1,0 +1,166 @@
+"""Tipos e modelos base compartilhados."""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class MessageRole(str, Enum):
+    """Roles de mensagens no chat."""
+
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class IntentType(str, Enum):
+    """Tipo de intenção classificada pelo router."""
+
+    DIRECT_RESPONSE = "direct_response"
+    SERVER_TOOL = "server_tool"
+    CLIENT_TOOL = "client_tool"
+
+
+class SessionStatus(str, Enum):
+    """Status de uma sessão de conversa."""
+
+    ACTIVE = "active"
+    CLOSED = "closed"
+    EXPIRED = "expired"
+
+
+class ExecutionStatus(str, Enum):
+    """Status de uma execução."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+
+class StreamEventType(str, Enum):
+    """Tipos de eventos no streaming LLM."""
+
+    TOKEN = "token"
+    TOOL_CALL_START = "tool_call_start"
+    TOOL_CALL_ARGS = "tool_call_args"
+    TOOL_CALL_END = "tool_call_end"
+    DONE = "done"
+    ERROR = "error"
+
+
+# ---------------------------------------------------------------------------
+# Message / Chat
+# ---------------------------------------------------------------------------
+
+class Message(BaseModel):
+    """Mensagem no histórico de conversação."""
+
+    role: MessageRole
+    content: str
+    name: str | None = None
+    tool_call_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Tool types
+# ---------------------------------------------------------------------------
+
+class ToolParameter(BaseModel):
+    """Parâmetro de uma tool."""
+
+    type: str
+    description: str
+    enum: list[str] | None = None
+    required: bool = False
+
+
+class ToolSchema(BaseModel):
+    """Schema completo de uma tool."""
+
+    name: str
+    description: str
+    parameters: dict[str, ToolParameter]
+    module: str
+    execution: Literal["client-side", "server-side"] = "client-side"
+    timeout: int = 30
+
+
+class ToolCall(BaseModel):
+    """Chamada de tool solicitada pelo LLM."""
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    arguments: dict[str, Any]
+
+
+class ToolResult(BaseModel):
+    """Resultado da execução de uma tool."""
+
+    tool_call_id: str
+    name: str
+    result: Any
+    error: str | None = None
+    execution_time: float
+
+
+# ---------------------------------------------------------------------------
+# Agent execution
+# ---------------------------------------------------------------------------
+
+class AgentStep(BaseModel):
+    """Um passo na execução do agente."""
+
+    step_number: int
+    thought: str | None = None
+    tool_calls: list[ToolCall]
+    tool_results: list[ToolResult] = []
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+# ---------------------------------------------------------------------------
+# Router / Intent
+# ---------------------------------------------------------------------------
+
+class RoutingDecision(BaseModel):
+    """Decisão do IntentRouter sobre como processar uma mensagem.
+
+    Extended with optional classifier metadata so the caller can persist the
+    full classifier payload/response for debugging/observability.
+    """
+
+    intent: IntentType
+    confidence: float = Field(ge=0.0, le=1.0, default=1.0)
+    tool_name: str | None = None
+    tool_arguments: dict[str, Any] | None = None
+    explanation: str | None = None
+    requires_approval: bool = False
+    raw_command: str | None = None  # para CLIENT_TOOL (comando shell)
+
+    # --- classifier observability (optional) ---
+    classifier_raw: str | None = None  # raw LLM/text response from classifier
+    classifier_payload: dict[str, Any] | None = None  # messages/prompt sent to classifier
+
+
+# ---------------------------------------------------------------------------
+# LLM Streaming
+# ---------------------------------------------------------------------------
+
+class StreamChunk(BaseModel):
+    """Chunk individual de streaming LLM."""
+
+    event: StreamEventType
+    content: str | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    tool_arguments_delta: str | None = None
+    finish_reason: str | None = None

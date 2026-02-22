@@ -1,0 +1,81 @@
+"""Request/Response schemas para a API."""
+
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class ExecuteTaskRequest(BaseModel):
+    """Request para executar uma task."""
+
+    task: str = Field(..., description="Descrição da task a executar")
+    session_id: UUID | None = Field(None, description="ID da sessão (opcional)")
+    provider: Literal["openai", "anthropic", "ollama"] | None = Field(
+        None, description="Provider LLM a usar"
+    )
+    model: str | None = Field(None, description="Modelo específico")
+
+
+class ToolResultSchema(BaseModel):
+    """Schema de resultado de tool."""
+
+    tool_call_id: str
+    name: str
+    result: Any
+    error: str | None = None
+    execution_time: float
+
+
+class AgentStepSchema(BaseModel):
+    """Schema de um step do agente."""
+
+    step_number: int
+    thought: str | None = None
+    tool_calls: list[dict[str, Any]]
+    tool_results: list[ToolResultSchema]
+
+
+class ExecuteTaskResponse(BaseModel):
+    """Response da execução de task."""
+
+    status: str
+    final_response: str | None
+    steps: list[AgentStepSchema]
+    iterations: int
+    session_id: str | None
+
+
+class ToolInfoSchema(BaseModel):
+    """Schema de informações de uma tool."""
+
+    name: str
+    description: str
+    module: str
+    execution: str
+    parameters: dict[str, Any]
+
+
+class ListToolsResponse(BaseModel):
+    """Response da listagem de tools."""
+
+    tools: list[ToolInfoSchema]
+    count: int
+
+
+class SessionHistoryResponse(BaseModel):
+    """Response do histórico de sessão."""
+
+    session_id: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    step_count: int
+    messages: list[dict[str, str]]
+
+
+class ErrorResponse(BaseModel):
+    """Response de erro."""
+
+    error: str
+    details: dict[str, Any] | None = None
