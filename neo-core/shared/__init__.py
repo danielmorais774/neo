@@ -3,7 +3,9 @@
 from shared.config import Settings, get_settings
 from shared.exceptions import (
     AgentIterationLimitError,
+    AgentLoopDetectedError,
     AgentTimeoutError,
+    ContextOverflowError,
     LLMProviderError,
     NeoError,
     ToolExecutionError,
@@ -12,8 +14,11 @@ from shared.exceptions import (
 )
 from shared.types import (
     AgentStep,
+    CompactionResult,
     ExecutionStatus,
     IntentType,
+    LoopType,
+    MemorySearchResult,
     Message,
     MessageRole,
     RoutingDecision,
@@ -40,10 +45,13 @@ __all__ = [
     "AgentStep",
     "ExecutionStatus",
     "IntentType",
+    "LoopType",
     "RoutingDecision",
     "SessionStatus",
     "StreamChunk",
     "StreamEventType",
+    "MemorySearchResult",
+    "CompactionResult",
     # Exceptions
     "NeoError",
     "LLMProviderError",
@@ -52,4 +60,6 @@ __all__ = [
     "ToolValidationError",
     "AgentIterationLimitError",
     "AgentTimeoutError",
+    "AgentLoopDetectedError",
+    "ContextOverflowError",
 ]

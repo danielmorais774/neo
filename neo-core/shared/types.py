@@ -58,6 +58,15 @@ class StreamEventType(str, Enum):
     ERROR = "error"
 
 
+class LoopType(str, Enum):
+    """Tipos de loop detectados no agente."""
+
+    GENERIC_REPEAT = "generic_repeat"
+    PING_PONG = "ping_pong"
+    NO_PROGRESS = "no_progress"
+    CIRCUIT_BREAKER = "circuit_breaker"
+
+
 # ---------------------------------------------------------------------------
 # Message / Chat
 # ---------------------------------------------------------------------------
@@ -69,6 +78,7 @@ class Message(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list["ToolCall"] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +155,7 @@ class RoutingDecision(BaseModel):
     explanation: str | None = None
     requires_approval: bool = False
     raw_command: str | None = None  # para CLIENT_TOOL (comando shell)
+    needs_memory: bool = True  # whether cross-session memory recovery is useful
 
     # --- classifier observability (optional) ---
     classifier_raw: str | None = None  # raw LLM/text response from classifier
@@ -164,3 +175,34 @@ class StreamChunk(BaseModel):
     tool_name: str | None = None
     tool_arguments_delta: str | None = None
     finish_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Memory Search
+# ---------------------------------------------------------------------------
+
+class MemorySearchResult(BaseModel):
+    """Resultado de uma busca na memória híbrida."""
+
+    content: str
+    source: Literal["session", "message"] = "message"
+    similarity: float = 0.0
+    fts_score: float = 0.0
+    temporal_score: float = 0.0
+    final_score: float = 0.0
+    session_id: UUID | None = None
+    message_id: UUID | None = None
+    created_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Context Compaction
+# ---------------------------------------------------------------------------
+
+class CompactionResult(BaseModel):
+    """Resultado de uma compactação de contexto."""
+
+    summary: str
+    preserved_identifiers: list[str] = []
+    original_token_count: int = 0
+    compacted_token_count: int = 0

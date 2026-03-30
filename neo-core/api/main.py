@@ -1,19 +1,35 @@
 """Main FastAPI application for Neo Core 2."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+
+# Configure logging early so all loggers (including modules) respect LOG_LEVEL
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level, logging.INFO),
+    format="%(levelname)s:     %(name)s - %(message)s",
+    force=True,
+)
+# Silence noisy third-party loggers
+for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import desktop, health, debug
+from api.routes import desktop, health, debug, session_logs
 from core import (
     AgentExecutor,
+    ContextCompactor,
     EmbeddingService,
+    HybridMemorySearch,
     IntentRouter,
     LLMRouter,
     PersistentSessionManager,
+    PreferenceExtractor,
+    TokenCounter,
     ToolExecutor,
     ToolRegistry,
 )
@@ -44,7 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _session_manager, _desktop_service, _ai_service, _db
 
     settings = get_settings()
-    print(f"🚀 Initializing Neo Core 2 v2.0.0...")
+    print(f"🚀 Initializing Neo Core 2 v2.1.0...")
 
     # ── Database (async) ──────────────────────────────────────────
     _db = AsyncPostgresClient(settings.database_url)
@@ -55,16 +71,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await obs.connect()  # gracefully no-ops if mongo unavailable
     set_obs(obs)
 
+    # ── Intelligence layer ────────────────────────────────────────
+    token_counter = TokenCounter()
+    context_compactor = ContextCompactor(llm_router=None, token_counter=token_counter)  # wired below after LLMRouter
+
     # ── Core components ───────────────────────────────────────────
     _tool_registry = ToolRegistry()
     _tool_executor = ToolExecutor(_tool_registry)
     _llm_router = LLMRouter()
     _session_manager = SessionManager()  # legacy in-memory (used by DesktopService)
 
+    # Wire LLM into compactor after LLMRouter is ready
+    context_compactor.llm_router = _llm_router
+
     _agent_executor = AgentExecutor(
         llm_router=_llm_router,
         tool_registry=_tool_registry,
         tool_executor=_tool_executor,
+        token_counter=token_counter,
+        compactor=context_compactor,
     )
 
     # ── Register tools ────────────────────────────────────────────
@@ -77,8 +102,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
-    persistent_session = PersistentSessionManager(db=_db, embedding_service=embedding_service)
+    hybrid_search = HybridMemorySearch(db=_db, embedding_service=embedding_service, settings=settings)
+    persistent_session = PersistentSessionManager(
+        db=_db,
+        embedding_service=embedding_service,
+        hybrid_search=hybrid_search,
+        token_counter=token_counter,
+    )
     intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry)
+    preference_extractor = PreferenceExtractor(llm_router=_llm_router, db=_db)
 
     _ai_service = AIService(
         llm_router=_llm_router,
@@ -88,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tool_executor=_tool_executor,
         agent_executor=_agent_executor,
         db=_db,
+        preference_extractor=preference_extractor,
     )
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
@@ -145,7 +178,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 # Create FastAPI app
 app = FastAPI(
     title="Neo Core 2 API",
-    version="2.0.0",
+    version="2.1.0",
     description="Neo Core — AI-powered orchestrator with IntentRouter, streaming LLM, persistent sessions",
     lifespan=lifespan,
 )
@@ -163,3 +196,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(desktop.router, prefix="/api/v1")
 app.include_router(debug.router, prefix="/api/v1")
+app.include_router(session_logs.router, prefix="/api/v1")

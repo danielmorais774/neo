@@ -5,11 +5,13 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy import text
 from sqlmodel import select
 
 from db.models.user import User
 from db.models.user_message import UserMessage
 from db.models.conversation import ConversationSession, ConversationMessage
+from db.models.user_preference import UserPreference
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -122,14 +124,14 @@ class AsyncPostgresClient:
 
                 query = text(f"""
                     SELECT id, topic_summary, 
-                           1 - (topic_embedding <=> :embedding::vector) as similarity
+                           1 - (topic_embedding <=> CAST(:embedding AS vector)) as similarity
                     FROM conversation_session
                     WHERE status = 'closed'
                       AND topic_embedding IS NOT NULL
                       AND service = :service
                       {user_filter}
-                      AND 1 - (topic_embedding <=> :embedding::vector) > :min_sim
-                    ORDER BY topic_embedding <=> :embedding::vector
+                      AND 1 - (topic_embedding <=> CAST(:embedding AS vector)) > :min_sim
+                    ORDER BY topic_embedding <=> CAST(:embedding AS vector)
                     LIMIT :limit
                 """)
                 result = await db.execute(query, params)
@@ -147,6 +149,124 @@ class AsyncPostgresClient:
                 return []
 
     # ---------------------------------------------------------------
+    # Vector Search — Messages (pgvector)
+    # ---------------------------------------------------------------
+
+    async def find_similar_messages(
+        self,
+        embedding: list[float],
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+        limit: int = 20,
+        min_similarity: float = 0.4,
+    ) -> list[tuple[ConversationMessage, float]]:
+        """Busca mensagens individuais por similaridade de embedding."""
+        async with self.get_session() as db:
+            try:
+                params: dict[str, Any] = {
+                    "embedding": str(embedding),
+                    "service": service,
+                    "limit": limit,
+                    "min_sim": min_similarity,
+                }
+                user_filter = ""
+                if user_id:
+                    user_filter = "AND cs.user_id = :user_id"
+                    params["user_id"] = str(user_id)
+
+                query = text(f"""
+                    SELECT cm.id,
+                           1 - (cm.embedding <=> CAST(:embedding AS vector)) AS similarity
+                    FROM conversation_message cm
+                    JOIN conversation_session cs ON cs.id = cm.session_id
+                    WHERE cm.embedding IS NOT NULL
+                      AND cs.service = :service
+                      {user_filter}
+                      AND 1 - (cm.embedding <=> CAST(:embedding AS vector)) > :min_sim
+                    ORDER BY cm.embedding <=> CAST(:embedding AS vector)
+                    LIMIT :limit
+                """)
+                result = await db.execute(query, params)
+                rows = result.fetchall()
+
+                messages = []
+                for row in rows:
+                    msg = await db.get(ConversationMessage, row[0])
+                    if msg:
+                        messages.append((msg, float(row[1])))
+                return messages
+            except Exception as e:
+                logger.warning(f"pgvector message search failed: {e}")
+                return []
+
+    # ---------------------------------------------------------------
+    # Full-Text Search — Messages (PostgreSQL FTS)
+    # ---------------------------------------------------------------
+
+    async def search_messages_fts(
+        self,
+        query_text: str,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+        limit: int = 20,
+    ) -> list[tuple[ConversationMessage, float]]:
+        """Busca mensagens por Full-Text Search (FTS) no PostgreSQL.
+
+        Usa tsquery com fallback de idioma: português → inglês.
+        """
+        async with self.get_session() as db:
+            try:
+                params: dict[str, Any] = {
+                    "query": query_text,
+                    "service": service,
+                    "limit": limit,
+                }
+                user_filter = ""
+                if user_id:
+                    user_filter = "AND cs.user_id = :user_id"
+                    params["user_id"] = str(user_id)
+
+                query = text(f"""
+                    WITH fts AS (
+                        SELECT cm.id,
+                               ts_rank_cd(cm.content_tsv, query) AS rank
+                        FROM conversation_message cm
+                        JOIN conversation_session cs ON cs.id = cm.session_id,
+                             plainto_tsquery('portuguese', :query) query
+                        WHERE cm.content_tsv @@ query
+                          AND cs.service = :service
+                          {user_filter}
+
+                        UNION ALL
+
+                        SELECT cm.id,
+                               ts_rank_cd(cm.content_tsv, query) AS rank
+                        FROM conversation_message cm
+                        JOIN conversation_session cs ON cs.id = cm.session_id,
+                             plainto_tsquery('english', :query) query
+                        WHERE cm.content_tsv @@ query
+                          AND cs.service = :service
+                          {user_filter}
+                    )
+                    SELECT DISTINCT ON (id) id, rank
+                    FROM fts
+                    ORDER BY id, rank DESC
+                    LIMIT :limit
+                """)
+                result = await db.execute(query, params)
+                rows = result.fetchall()
+
+                messages = []
+                for row in rows:
+                    msg = await db.get(ConversationMessage, row[0])
+                    if msg:
+                        messages.append((msg, float(row[1])))
+                return messages
+            except Exception as e:
+                logger.warning(f"FTS search failed: {e}")
+                return []
+
+    # ---------------------------------------------------------------
     # ConversationMessage CRUD
     # ---------------------------------------------------------------
 
@@ -159,6 +279,7 @@ class AsyncPostgresClient:
         tool_name: str | None = None,
         tool_call_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        token_count: int | None = None,
     ) -> ConversationMessage:
         """Save a message to a conversation session."""
         msg = ConversationMessage(
@@ -168,6 +289,7 @@ class AsyncPostgresClient:
             embedding=embedding,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
+            token_count=token_count,
             extra_metadata=metadata,
         )
         async with self.get_session() as db:
@@ -245,3 +367,104 @@ class AsyncPostgresClient:
             stmt = select(User).where(User.username == username)
             result = await db.execute(stmt)
             return result.scalars().first()
+
+    # ---------------------------------------------------------------
+    # User Preferences CRUD
+    # ---------------------------------------------------------------
+
+    async def upsert_preference(
+        self,
+        category: str,
+        key: str,
+        value: str,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+        source_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> UserPreference:
+        """Create or update a user preference (upsert by user+service+category+key)."""
+        from datetime import datetime
+        async with self.get_session() as db:
+            stmt = select(UserPreference).where(
+                UserPreference.service == service,
+                UserPreference.category == category,
+                UserPreference.key == key,
+            )
+            if user_id:
+                stmt = stmt.where(UserPreference.user_id == user_id)
+            else:
+                stmt = stmt.where(UserPreference.user_id.is_(None))
+
+            result = await db.execute(stmt)
+            existing = result.scalars().first()
+
+            if existing:
+                existing.value = value
+                existing.updated_at = datetime.utcnow()
+                if source_message:
+                    existing.source_message = source_message
+                if metadata:
+                    existing.extra_metadata = {**(existing.extra_metadata or {}), **metadata}
+                db.add(existing)
+                await db.commit()
+                await db.refresh(existing)
+                return existing
+
+            pref = UserPreference(
+                user_id=user_id,
+                service=service,
+                category=category,
+                key=key,
+                value=value,
+                source_message=source_message,
+                extra_metadata=metadata,
+            )
+            db.add(pref)
+            await db.commit()
+            await db.refresh(pref)
+            return pref
+
+    async def get_preferences(
+        self,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+        category: str | None = None,
+    ) -> list[UserPreference]:
+        """Get all preferences for a user/service, optionally filtered by category."""
+        async with self.get_session() as db:
+            stmt = select(UserPreference).where(UserPreference.service == service)
+            if user_id:
+                stmt = stmt.where(UserPreference.user_id == user_id)
+            else:
+                stmt = stmt.where(UserPreference.user_id.is_(None))
+            if category:
+                stmt = stmt.where(UserPreference.category == category)
+            stmt = stmt.order_by(UserPreference.category, UserPreference.key)
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
+    async def delete_preference(
+        self,
+        category: str,
+        key: str,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+    ) -> bool:
+        """Delete a specific preference. Returns True if found and deleted."""
+        async with self.get_session() as db:
+            stmt = select(UserPreference).where(
+                UserPreference.service == service,
+                UserPreference.category == category,
+                UserPreference.key == key,
+            )
+            if user_id:
+                stmt = stmt.where(UserPreference.user_id == user_id)
+            else:
+                stmt = stmt.where(UserPreference.user_id.is_(None))
+            result = await db.execute(stmt)
+            pref = result.scalars().first()
+            if pref:
+                await db.delete(pref)
+                await db.commit()
+                return True
+            return False

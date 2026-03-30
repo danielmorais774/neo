@@ -43,6 +43,8 @@ class MessageTrace:
         self.user_message = user_message
         self.started_at = datetime.now(timezone.utc)
         self.intent_routing: dict[str, Any] = {}
+        self.topic_rotation: dict[str, Any] | None = None
+        self.context_recovery: list[dict[str, Any]] = []
         self.llm_calls: list[dict[str, Any]] = []
         self.tool_calls: list[dict[str, Any]] = []
         self.final_response: str | None = None
@@ -57,6 +59,7 @@ class MessageTrace:
         tool_name: str | None = None,
         raw_payload: dict | None = None,
         duration_ms: float = 0,
+        needs_memory: bool = True,
     ) -> None:
         self.intent_routing = {
             "intent": intent,
@@ -65,7 +68,35 @@ class MessageTrace:
             "tool_name": tool_name,
             "classifier_payload": raw_payload,
             "duration_ms": duration_ms,
+            "needs_memory": needs_memory,
         }
+
+    def set_topic_rotation(
+        self,
+        rotation_result: dict[str, Any],
+    ) -> None:
+        """Record the topic rotation check data for debugging."""
+        self.topic_rotation = rotation_result
+
+    def set_context_recovery(
+        self,
+        results: list[Any],
+    ) -> None:
+        """Record recovered cross-session memories for debugging."""
+        self.context_recovery = []
+        for ctx in (results or []):
+            entry: dict[str, Any] = {
+                "content": getattr(ctx, "content", str(ctx))[:300],
+                "score": round(getattr(ctx, "final_score", 0), 4),
+                "source": getattr(ctx, "source", "?"),
+            }
+            sid = getattr(ctx, "session_id", None)
+            if sid:
+                entry["session_id"] = str(sid)[:8]
+            created = getattr(ctx, "created_at", None)
+            if created:
+                entry["created_at"] = created.strftime("%Y-%m-%d %H:%M") if hasattr(created, "strftime") else str(created)[:16]
+            self.context_recovery.append(entry)
 
     def add_llm_call(
         self,
@@ -77,10 +108,14 @@ class MessageTrace:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         error: str | None = None,
+        temperature: float | None = None,
+        stage: str | None = None,
     ) -> None:
         self.llm_calls.append({
             "provider": provider,
             "model": model,
+            "stage": stage,
+            "temperature": temperature,
             "messages_sent": messages_sent,
             "response_text": response_text,
             "duration_ms": duration_ms,
@@ -117,7 +152,7 @@ class MessageTrace:
 
     def to_document(self) -> dict[str, Any]:
         elapsed = (datetime.now(timezone.utc) - self.started_at).total_seconds() * 1000
-        return {
+        doc: dict[str, Any] = {
             "_id": self.trace_id,
             "session_id": self.session_id,
             "user_message": self.user_message,
@@ -129,6 +164,11 @@ class MessageTrace:
             "final_response": self.final_response,
             "error": self.error,
         }
+        if self.topic_rotation is not None:
+            doc["topic_rotation"] = self.topic_rotation
+        if self.context_recovery:
+            doc["context_recovery"] = self.context_recovery
+        return doc
 
 
 class ObservabilityLogger:

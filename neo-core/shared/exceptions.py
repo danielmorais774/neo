@@ -1,5 +1,12 @@
 """Exceções customizadas do Neo Core."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared.types import LoopType
+
 
 class NeoError(Exception):
     """Base exception para erros do Neo."""
@@ -42,5 +49,19 @@ class AgentIterationLimitError(NeoError):
 
 class AgentTimeoutError(NeoError):
     """Timeout na execução do agente."""
+
+    pass
+
+
+class AgentLoopDetectedError(NeoError):
+    """Loop detectado durante execução do agente."""
+
+    def __init__(self, message: str, loop_type: LoopType, details: dict | None = None) -> None:
+        super().__init__(message, details)
+        self.loop_type = loop_type
+
+
+class ContextOverflowError(NeoError):
+    """Contexto excede o limite mesmo após compactação."""
 
     pass

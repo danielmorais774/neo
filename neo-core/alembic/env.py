@@ -10,6 +10,7 @@ from alembic import context
 from db.models.user import User  # noqa: F401
 from db.models.user_message import UserMessage  # noqa: F401
 from db.models.conversation import ConversationSession, ConversationMessage  # noqa: F401
+from db.models.user_preference import UserPreference  # noqa: F401
 
 config = context.config
 

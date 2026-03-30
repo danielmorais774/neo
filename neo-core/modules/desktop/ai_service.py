@@ -18,10 +18,12 @@ from core.agent.agent_executor import AgentExecutor
 from core.llm.router import LLMRouter
 from core.router.intent_router import IntentRouter
 from core.session.session_manager import PersistentSessionManager
+from core.session.preference_extractor import PreferenceExtractor
 from core.tools.executor import ToolExecutor
 from core.tools.registry import ToolRegistry
 from db.async_client import AsyncPostgresClient
 from observability.logger import get_obs, MessageTrace
+from observability.session_file_logger import get_session_logger
 from shared import (
     IntentType,
     Message,
@@ -71,6 +73,7 @@ class AIService:
         tool_executor: ToolExecutor,
         agent_executor: AgentExecutor,
         db: AsyncPostgresClient,
+        preference_extractor: PreferenceExtractor | None = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -79,6 +82,7 @@ class AIService:
         self.tool_executor = tool_executor
         self.agent = agent_executor
         self.db = db
+        self.preferences = preference_extractor
         self.settings = get_settings()
         self._pending_traces: dict[str, MessageTrace] = {}
 
@@ -110,16 +114,41 @@ class AIService:
             AIServiceResponse with thinking, tool requests, or final response.
         """
         # 1. Get or create session (with topic rotation check)
+        logger.info(f"[HISTORY-DEBUG] Input session_id from desktop: {session_id}")
         session = await self.sessions.get_or_create_session(
             session_id=session_id,
             user_id=user_id,
             service=service,
         )
         sid = session.id
+        slog = get_session_logger(sid)
+        slog.new_interaction(user_message, desktop_session_id=str(session_id) if session_id else None, metadata=metadata)
+        logger.info(f"[HISTORY-DEBUG] Resolved DB session: {sid} (message_count={session.message_count})")
 
         # Check if topic changed → rotate session
+        old_sid = sid
+        rotated = False
+        _rotation_result: dict | None = None
         if session.message_count > 0:
-            should_rotate = await self.sessions.should_rotate_session(session, user_message)
+            rotation_result = await self.sessions.should_rotate_session(session, user_message)
+            _rotation_result = rotation_result
+            should_rotate = rotation_result.get("should_rotate", False)
+
+            # Log the full topic rotation check
+            slog.log_topic_check(
+                similarity=rotation_result.get("similarity"),
+                threshold=rotation_result.get("threshold", 0),
+                rotated=should_rotate,
+                reason=rotation_result.get("reason", ""),
+                message_count=rotation_result.get("message_count", 0),
+                min_required=rotation_result.get("min_required", 0),
+                cooldown_minutes=rotation_result.get("cooldown_minutes", 0),
+                elapsed_minutes=rotation_result.get("elapsed_minutes"),
+                new_message=user_message,
+                context_text=rotation_result.get("context_text", ""),
+                duration_ms=rotation_result.get("duration_ms", 0),
+            )
+
             if should_rotate:
                 logger.info(f"Topic change detected, rotating session {sid}")
                 await self.sessions.close_session(sid, reason="topic_change")
@@ -127,6 +156,17 @@ class AIService:
                     user_id=user_id, service=service
                 )
                 sid = session.id
+                rotated = True
+                # Switch to the new session's logger
+                slog = get_session_logger(sid)
+                slog.new_interaction(user_message, desktop_session_id=str(session_id) if session_id else None, metadata=metadata)
+
+        slog.log_session_resolution(
+            db_session_id=str(sid),
+            message_count=session.message_count,
+            is_new=(session.message_count == 0),
+            rotated_from=str(old_sid) if rotated else None,
+        )
 
         # 2. Save user message to session
         await self.sessions.add_message(
@@ -136,6 +176,7 @@ class AIService:
             generate_embedding=True,
             metadata=metadata,
         )
+        slog.log_message_saved("user", user_message, str(sid))
 
         # 3. Yield thinking status
         yield AIServiceResponse(
@@ -148,6 +189,19 @@ class AIService:
         # 4. Get conversation history for context
         history = await self.sessions.get_history(sid, limit=20)
 
+        # If session was rotated, carry some context from the previous session
+        # so the classifier and LLM have continuity.
+        if rotated and old_sid:
+            old_history = await self.sessions.get_history(old_sid, limit=10)
+            if old_history:
+                logger.info(f"[HISTORY-DEBUG] Carrying {len(old_history)} messages from rotated session {old_sid}")
+                history = old_history + history
+
+        logger.info(f"[HISTORY-DEBUG] get_history returned {len(history)} messages for session {sid}")
+        for i, msg in enumerate(history):
+            logger.info(f"[HISTORY-DEBUG]   [{i}] {msg['role']}: {msg['content'][:100]}")
+        slog.log_history(history)
+
         # Start observability trace (fire-and-forget, never blocks)
         obs = get_obs()
         trace = obs.start_trace(
@@ -155,6 +209,10 @@ class AIService:
             user_message=user_message,
             service=service,
         )
+
+        # Record topic rotation check in the trace (if it was performed)
+        if _rotation_result is not None:
+            trace.set_topic_rotation(_rotation_result)
 
         # 5. Classify intent — pass system context from metadata so router can use it
         sys_context = self._build_system_context(metadata)
@@ -165,9 +223,21 @@ class AIService:
             system_context=sys_context,
         )
         intent_ms = (time.monotonic() - t0) * 1000
-        logger.info(f"Intent: {decision.intent.value} (confidence={decision.confidence:.2f})")
+        logger.info(f"Intent: {decision.intent.value} (confidence={decision.confidence:.2f}, needs_memory={decision.needs_memory})")
 
         classifier_payload = getattr(decision, "classifier_payload", None)
+        classifier_raw = getattr(decision, "classifier_raw", None)
+        slog.log_intent_classification(
+            intent=decision.intent.value,
+            confidence=decision.confidence,
+            explanation=decision.explanation,
+            tool_name=decision.tool_name,
+            duration_ms=intent_ms,
+            payload=classifier_payload,
+            raw_response=classifier_raw,
+            needs_memory=decision.needs_memory,
+        )
+
         trace.set_intent(
             intent=decision.intent.value,
             confidence=decision.confidence,
@@ -175,6 +245,7 @@ class AIService:
             tool_name=decision.tool_name,
             raw_payload=classifier_payload,
             duration_ms=round(intent_ms, 2),
+            needs_memory=decision.needs_memory,
         )
 
         # Log the classifier as an LLM call so it appears in the debug panel's "LLM Calls" section
@@ -183,8 +254,10 @@ class AIService:
                 provider="router",
                 model="intent-classifier",
                 messages_sent=classifier_payload.get("messages", []),
-                response_text=getattr(decision, "classifier_raw", None) or "",
+                response_text=classifier_raw or "",
                 duration_ms=round(intent_ms, 2),
+                temperature=0.1,
+                stage="intent_classification",
             )
 
         # 6. Dispatch based on intent
@@ -192,27 +265,29 @@ class AIService:
         dispatch_error: str | None = None
         try:
             if decision.intent == IntentType.DIRECT_RESPONSE:
-                async for resp in self._handle_direct_response(sid, user_message, history, decision, trace, sys_context):
+                async for resp in self._handle_direct_response(sid, user_message, history, decision, trace, sys_context, slog=slog):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
 
             elif decision.intent == IntentType.SERVER_TOOL:
-                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace):
+                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
 
             elif decision.intent == IntentType.CLIENT_TOOL:
-                async for resp in self._handle_client_tool(sid, user_message, decision, trace):
+                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog):
                     yield resp
         except Exception as e:
             dispatch_error = str(e)
+            slog.log_event("Erro no Dispatch", f"```\n{dispatch_error}\n```")
             raise
         finally:
             if decision.intent == IntentType.CLIENT_TOOL and not dispatch_error:
                 # Keep trace alive — continuation in process_tool_result / process_command_approval
-                self._pending_traces[str(sid)] = trace
+                # Must key by the desktop gRPC session_id (not the DB sid) so process_tool_result can find it
+                self._pending_traces[str(session_id or sid)] = trace
             else:
                 obs.finish_trace(trace, response=final_response, error=dispatch_error)
 
@@ -228,15 +303,29 @@ class AIService:
         decision: RoutingDecision,
         trace: MessageTrace | None = None,
         system_context: str | None = None,
+        slog: "SessionFileLogger | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM."""
 
-        # Check if we need context from previous sessions
-        recovered_context = await self.sessions.recover_context(user_message)
+        # The intent classifier already decided whether cross-session memory is useful.
+        # Skip recovery when needs_memory=False (greetings, acks, phatic expressions).
+        if not decision.needs_memory:
+            recovered_context = []
+            logger.info("[HISTORY-DEBUG] Skipping recover_context (needs_memory=False from classifier)")
+            if slog:
+                slog.log_event(
+                    "Recuperação de Contexto",
+                    "Pulada: o classificador indicou needs_memory=false (mensagem sem conteúdo semântico relevante).",
+                )
+        else:
+            recovered_context = await self.sessions.recover_context(user_message)
 
         # Build messages
         system_prompt = (
             "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
+            "Você foi criado por Daniel Morais. "
+            "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
+            "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
             "Suas regras:\n"
             "1. SEMPRE responda em português brasileiro.\n"
             "2. NUNCA diga que não pode ajudar, que é uma IA com limitações, ou frases genéricas de recusa — sempre tente responder de forma útil.\n"
@@ -254,30 +343,70 @@ class AIService:
         if system_context:
             system_prompt += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
 
+        # Inject persistent user preferences
+        if self.preferences:
+            try:
+                prefs_text = await self.preferences.get_preferences_text(service=service or "neo-desktop")
+                if prefs_text:
+                    system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as sempre:{prefs_text}"
+                    logger.info(f"[PREF] Injected user preferences into system prompt")
+                    if slog:
+                        slog.log_event("Preferências Injetadas", f"```\n{prefs_text}\n```")
+            except Exception as e:
+                logger.warning(f"[PREF] Failed to load preferences: {e}")
+
+        logger.info(f"[HISTORY-DEBUG] recover_context returned {len(recovered_context) if recovered_context else 0} results")
+        # Filter out very short memories (game moves, numbers, etc.)
+        # if recovered_context:
+        #     before_count = len(recovered_context)
+        #     recovered_context = [ctx for ctx in recovered_context if len(ctx.content.strip()) >= 15]
+        #     filtered = before_count - len(recovered_context)
+        #     if filtered:
+        #         logger.info(f"[HISTORY-DEBUG] Filtered out {filtered} short memories (<15 chars)")
+        if slog:
+            slog.log_context_recovery(recovered_context or [])
+        # Record recovered memories in the trace for the debug panel
+        if trace:
+            trace.set_context_recovery(recovered_context or [])
         if recovered_context:
-            context_text = "\n\n--- Contexto de conversas anteriores ---\n"
-            for ctx in recovered_context[:2]:
-                context_text += f"\nSessão anterior ({ctx.get('topic_summary', 'sem resumo')}):\n"
-                for msg in ctx.get("messages", [])[-3:]:
-                    context_text += f"  {msg['role']}: {msg['content'][:200]}\n"
+            context_text = "\n\n--- Contexto de conversas anteriores relevantes ---\n"
+            for ctx in recovered_context[:3]:
+                logger.info(f"[HISTORY-DEBUG]   memory: {ctx.content[:100]} (score={ctx.final_score:.3f})")
+                context_text += f"\n[memória] {ctx.content[:300]}\n"
             system_prompt += context_text
 
         messages: list[Message] = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
         ]
 
-        # Add conversation history
+        # Add conversation history (already includes current user message since
+        # add_message is called before get_history)
         for msg in history:
             role = MessageRole(msg["role"]) if msg["role"] in ("user", "assistant") else MessageRole.USER
             messages.append(Message(role=role, content=msg["content"]))
 
-        messages.append(Message(role=MessageRole.USER, content=user_message))
+        # Only append current message if it wasn't already the last in history
+        # (it will be there because add_message runs before get_history)
+        last_in_history = history[-1] if history else None
+        if not last_in_history or last_in_history.get("content") != user_message or last_in_history.get("role") != "user":
+            messages.append(Message(role=MessageRole.USER, content=user_message))
+
+        # Log the exact conversation payload being sent to the LLM
+        history_count = len(messages) - 1  # subtract system message
+        logger.info(f"[HISTORY-DEBUG] Total messages in LLM payload: {len(messages)} (1 system + {history_count} conversation)")
+        for i, m in enumerate(messages):
+            role_val = m.role.value if hasattr(m.role, "value") else str(m.role)
+            logger.info(f"[HISTORY-DEBUG]   LLM[{i}] {role_val}: {(m.content or '')[:120]}")
 
         # Stream response
         try:
             provider = self.llm.get_provider()
             provider_name = type(provider).__name__.replace("Provider", "").lower()
             model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+
+            if slog:
+                slog.log_llm_request("DIRECT_RESPONSE", messages, model=model_name, provider=provider_name, temperature=0.9)
+
             full_response = ""
             t0 = time.monotonic()
 
@@ -291,6 +420,9 @@ class AIService:
             llm_ms = (time.monotonic() - t0) * 1000
             if not full_response:
                 full_response = "Desculpe, não consegui gerar uma resposta."
+
+            if slog:
+                slog.log_llm_response("DIRECT_RESPONSE", full_response, duration_ms=llm_ms, model=model_name)
 
             # Log to observability (fire-and-forget)
             if trace:
@@ -310,11 +442,15 @@ class AIService:
                     messages_sent=messages_payload,
                     response_text=(full_response or '')[:1000],
                     duration_ms=round(llm_ms, 2),
+                    temperature=0.9,
+                    stage="direct_response",
                 )
 
         except Exception as e:
             logger.exception("Direct response LLM call failed")
             full_response = f"Erro ao processar: {str(e)}"
+            if slog:
+                slog.log_event("Erro LLM", f"```\n{str(e)}\n```")
 
         # Save assistant response
         await self.sessions.add_message(
@@ -323,6 +459,25 @@ class AIService:
             content=full_response,
             generate_embedding=False,
         )
+        if slog:
+            slog.log_message_saved("assistant", full_response, str(session_id))
+            slog.log_final_response(full_response, "DIRECT_RESPONSE", iterations=1)
+
+        # Fire-and-forget: extract user preferences from this turn
+        if self.preferences:
+            try:
+                extracted = await self.preferences.extract_and_save(
+                    user_message=user_message,
+                    assistant_response=full_response,
+                )
+                if extracted and slog:
+                    import json as _json
+                    slog.log_event(
+                        "Preferências Extraídas",
+                        f"```json\n{_json.dumps(extracted, ensure_ascii=False, indent=2)}\n```",
+                    )
+            except Exception as e:
+                logger.warning(f"[PREF] Post-response extraction failed: {e}")
 
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
@@ -343,8 +498,12 @@ class AIService:
         history: list[dict[str, str]],
         decision: RoutingDecision,
         trace: MessageTrace | None = None,
+        slog: "SessionFileLogger | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle server-side tool execution using AgentExecutor."""
+
+        if slog:
+            slog.log_tool_request(decision.tool_name or "agent", arguments=decision.tool_arguments)
 
         yield AIServiceResponse(
             intent=IntentType.SERVER_TOOL,
@@ -353,6 +512,7 @@ class AIService:
             is_final=False,
         )
 
+        t0 = time.monotonic()
         try:
             # Use AgentExecutor for multi-step tool execution
             result = await self.agent.execute(
@@ -362,11 +522,17 @@ class AIService:
 
             final_text = result.get("final_response", "Tarefa concluída.")
             iterations = result.get("iterations", 1)
+            tool_ms = (time.monotonic() - t0) * 1000
+            if slog:
+                slog.log_tool_result(decision.tool_name or "agent", success=True, result=final_text, duration_ms=tool_ms)
 
         except Exception as e:
             logger.exception("Server tool execution failed")
             final_text = f"Erro na execução: {str(e)}"
             iterations = 1
+            tool_ms = (time.monotonic() - t0) * 1000
+            if slog:
+                slog.log_tool_result(decision.tool_name or "agent", success=False, error=str(e), duration_ms=tool_ms)
 
         # Save response
         await self.sessions.add_message(
@@ -376,6 +542,9 @@ class AIService:
             tool_name=decision.tool_name,
             generate_embedding=False,
         )
+        if slog:
+            slog.log_message_saved("assistant", final_text, str(session_id))
+            slog.log_final_response(final_text, "SERVER_TOOL", iterations=iterations)
 
         yield AIServiceResponse(
             intent=IntentType.SERVER_TOOL,
@@ -395,6 +564,7 @@ class AIService:
         user_message: str,
         decision: RoutingDecision,
         trace: MessageTrace | None = None,
+        slog: "SessionFileLogger | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle client-side tool — sends request to desktop for execution.
 
@@ -406,6 +576,9 @@ class AIService:
         tool_call_id = str(uuid4())
 
         if decision.raw_command:
+            if slog:
+                slog.log_tool_request("raw_command", command=decision.raw_command, requires_approval=True)
+
             # Shell command needs approval
             yield AIServiceResponse(
                 intent=IntentType.CLIENT_TOOL,
@@ -437,6 +610,8 @@ class AIService:
             arguments = decision.tool_arguments or {}
             
             logger.info(f"[DEBUG] _handle_client_tool: tool_name='{tool_name}', arguments={arguments}")
+            if slog:
+                slog.log_tool_request(tool_name, arguments=arguments, requires_approval=decision.requires_approval)
 
             yield AIServiceResponse(
                 intent=IntentType.CLIENT_TOOL,
@@ -484,16 +659,11 @@ class AIService:
         _retry_count: int = 0,
         _is_diagnostic: bool = False,
     ) -> AsyncIterator[AIServiceResponse]:
-        """Process tool execution result from desktop and format response.
-
-        When a tool fails, the system:
-        1. Runs diagnostic commands automatically to gather real system data
-        2. Feeds the diagnostic results to the LLM
-        3. LLM decides with actual information (not guessing)
-
-        The flow supports up to MAX_TOOL_RETRIES iterations.
-        """
+        """Process tool execution result from desktop and format response."""
         MAX_TOOL_RETRIES = 4
+
+        # Get session file logger
+        slog = get_session_logger(session_id)
 
         # Retrieve the trace kept alive from _handle_client_tool, or create a new one
         obs = get_obs()
@@ -506,6 +676,7 @@ class AIService:
             )
 
         t0_tool = time.monotonic()
+        slog.log_tool_result(tool_name, success=success, result=result, error=error, duration_ms=0)
 
         # ── DIAGNOSTIC RESULT: this was an auto-diagnostic command ──
         if _is_diagnostic:
@@ -538,6 +709,12 @@ class AIService:
                 retry_count=_retry_count,
                 trace=trace,
                 diagnostic_output=diagnostic_output,
+            )
+            slog.log_error_recovery(
+                attempt=_retry_count + 1,
+                error_type="diagnostic_recovery",
+                action=recovery.get("action", "?") if recovery else "none",
+                details=recovery,
             )
 
             if recovery and recovery.get("action") == "retry":
@@ -702,6 +879,12 @@ class AIService:
                     retry_count=_retry_count,
                     trace=trace,
                 )
+                slog.log_error_recovery(
+                    attempt=_retry_count + 1,
+                    error_type=self._detect_error_type(error or "", command=command, tool_arguments=tool_arguments),
+                    action=recovery.get("action", "?") if recovery else "none",
+                    details=recovery,
+                )
 
                 if recovery and recovery.get("action") == "retry":
                     new_tool = recovery.get("tool_name", "run_command")
@@ -791,6 +974,8 @@ class AIService:
             tool_name=tool_name,
             tool_call_id=tool_call_id,
         )
+        slog.log_message_saved("assistant", final_text, str(actual_sid))
+        slog.log_final_response(final_text, "CLIENT_TOOL", iterations=2 + _retry_count)
 
         # Finalize the trace with the complete flow
         obs.finish_trace(trace, response=final_text)
@@ -812,6 +997,12 @@ class AIService:
         user_message: str = "",
     ) -> AsyncIterator[AIServiceResponse]:
         """Process command approval/rejection from desktop."""
+
+        slog = get_session_logger(session_id)
+        slog.log_event(
+            "Aprovação de Comando",
+            f"- **Comando:** `{command}`\n- **Aprovado:** {'Sim' if approved else 'Não'}\n",
+        )
 
         # Retrieve pending trace or create a new one
         obs = get_obs()

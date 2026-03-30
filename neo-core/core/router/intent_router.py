@@ -24,12 +24,13 @@ logger = logging.getLogger(__name__)
 ROUTER_SYSTEM_PROMPT = """\
 You are an intent classifier for a desktop AI assistant called Neo.
 
-Your job: given a user message, classify which execution path to take.
+Your job: given a user message AND the conversation history, classify which execution path to take.
 
 ## Paths
 
 1. **DIRECT_RESPONSE** — The user is greeting, making small talk, asking general knowledge,
-   requesting translations, jokes, explanations, or anything that can be answered with text only.
+   requesting translations, jokes, explanations, playing games, doing quizzes,
+   or anything that can be answered with text only.
    No tools or commands are needed.
 
 2. **SERVER_TOOL** — The user needs information that requires calling an API or service
@@ -40,7 +41,6 @@ Your job: given a user message, classify which execution path to take.
    **You have full access to the user's terminal via `run_command`.**
    Use this for ANYTHING that requires: shell commands, system info, file operations,
    running scripts, installing packages, checking processes, managing services, etc.
-   When in doubt whether to answer directly or use a tool — use `run_command`.
 
 ## Available Server Tools
 {server_tools}
@@ -64,14 +64,32 @@ Use `list_directory` when the user explicitly wants to browse a folder.
 Use `read_file` / `write_file` for reading or writing specific file content.
 Use `get_system_info` for detailed OS/hardware information.
 
+## CRITICAL: Conversation Context Rules
+- **ALWAYS check the conversation history** before classifying.
+- If the history shows an **ongoing interactive activity** (game, quiz, roleplay, creative writing,
+  storytelling, brainstorming), the user's message is almost certainly a continuation → **DIRECT_RESPONSE**.
+- If the user **references something the AI previously said** ("está errado", "refaz", "tenta de novo",
+  "melhora isso", "remontar"), it's about the conversation → **DIRECT_RESPONSE**.
+- Words like "tabuleiro", "jogo", "placar", "turno", "rodada" in conversational context → **DIRECT_RESPONSE**.
+- Only use CLIENT_TOOL when the user **explicitly** wants something done on their machine
+  (run command, install, list files, check system, etc.).
+
 ## Rules
 - If the message is a greeting, small talk, or general question → DIRECT_RESPONSE
 - If it requires real-time data from an external API → SERVER_TOOL
-- If it requires the user's local machine in any way → CLIENT_TOOL
-- **Prefer CLIENT_TOOL + run_command over DIRECT_RESPONSE when the answer requires knowing local state**
+- If it **explicitly** requires the user's local machine → CLIENT_TOOL
+- **When in doubt and there is conversation history, prefer DIRECT_RESPONSE**
+- **When in doubt and there is NO conversation history, prefer DIRECT_RESPONSE**
 - Set requires_approval=true for destructive operations (delete, format, kill processes)
 - Set requires_approval=false for read-only commands (ls, df, ps, cat, env, version checks)
-- Be conservative: if unsure between DIRECT and CLIENT, check if a command could give a better answer
+
+## Memory Recovery Rule
+- Set `needs_memory` to **true** when the user's message has real semantic content that
+  could benefit from recalling previous conversations (questions, tasks, topics, references).
+- Set `needs_memory` to **false** when the message is a simple greeting, acknowledgment,
+  or phatic expression with no substantive topic (e.g. "oi", "olá", "bom dia", "ok", "tudo bem",
+  "valeu", "obrigado", "hello", "hey"). In these cases, recovering old memories would only
+  inject irrelevant context.
 
 ## Output Format
 Respond ONLY with valid JSON (no markdown fences):
@@ -82,7 +100,8 @@ Respond ONLY with valid JSON (no markdown fences):
   "tool_arguments": {{}},
   "raw_command": "shell command (only if no registered tool fits)",
   "explanation": "brief explanation in Portuguese",
-  "requires_approval": true/false
+  "requires_approval": true/false,
+  "needs_memory": true/false
 }}
 """
 
@@ -140,7 +159,10 @@ class IntentRouter:
                 role = MessageRole(msg["role"]) if msg["role"] in ("user", "assistant") else MessageRole.USER
                 messages.append(Message(role=role, content=msg["content"]))
 
-        messages.append(Message(role=MessageRole.USER, content=user_message))
+        # Only append current message if not already the last in history
+        last_hist = conversation_history[-1] if conversation_history else None
+        if not last_hist or last_hist.get("content") != user_message or last_hist.get("role") != "user":
+            messages.append(Message(role=MessageRole.USER, content=user_message))
 
         try:
             provider = self.llm_router.get_provider()
@@ -218,6 +240,7 @@ class IntentRouter:
             explanation=data.get("explanation"),
             requires_approval=data.get("requires_approval", intent == IntentType.CLIENT_TOOL),
             raw_command=data.get("raw_command"),
+            needs_memory=data.get("needs_memory", True),
         )
 
     def _fallback_classify(self, message: str) -> RoutingDecision:

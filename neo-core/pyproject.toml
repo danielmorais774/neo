@@ -21,6 +21,8 @@ dependencies = [
     "pgvector>=0.3.0",
     "alembic>=1.13.0",
     "motor>=3.3.0",
+    "tiktoken>=0.7.0",
+    "numpy>=1.26.0",
 ]
 
 [build-system]

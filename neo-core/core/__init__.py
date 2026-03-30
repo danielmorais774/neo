@@ -1,17 +1,28 @@
 """Core module - Agent engine."""
 
-from core.agent import AgentExecutor, ContextManager, PromptBuilder
+from core.agent import (
+    AgentExecutor,
+    ContextCompactor,
+    ContextManager,
+    LoopDetector,
+    PromptBuilder,
+    TokenCounter,
+)
 from core.llm import ClaudeProvider, LLMProvider, LLMRouter, OpenAIProvider
 from core.memory import ConversationMemory, SessionManager
+from core.memory.hybrid_search import HybridMemorySearch
 from core.router import IntentRouter
-from core.session import EmbeddingService, PersistentSessionManager
+from core.session import EmbeddingService, PersistentSessionManager, PreferenceExtractor
 from core.tools import ToolExecutor, ToolRegistry, ToolValidator
 
 __all__ = [
     # Agent
     "AgentExecutor",
-    "PromptBuilder",
+    "ContextCompactor",
     "ContextManager",
+    "LoopDetector",
+    "PromptBuilder",
+    "TokenCounter",
     # LLM
     "LLMProvider",
     "LLMRouter",
@@ -22,11 +33,14 @@ __all__ = [
     # Session
     "PersistentSessionManager",
     "EmbeddingService",
+    "PreferenceExtractor",
+    # Memory
+    "HybridMemorySearch",
+    # Memory (legacy)
+    "ConversationMemory",
+    "SessionManager",
     # Tools
     "ToolRegistry",
     "ToolValidator",
     "ToolExecutor",
-    # Memory (legacy)
-    "ConversationMemory",
-    "SessionManager",
 ]
