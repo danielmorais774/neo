@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from datetime import date
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -22,6 +23,8 @@ from core.session.preference_extractor import PreferenceExtractor
 from core.tools.executor import ToolExecutor
 from core.tools.registry import ToolRegistry
 from db.async_client import AsyncPostgresClient
+from modules.context.knowledge_retriever import KnowledgeRetriever
+from modules.context.knowledge_writer import KnowledgeGraphWriter
 from observability.logger import get_obs, MessageTrace
 from observability.session_file_logger import get_session_logger
 from shared import (
@@ -74,6 +77,8 @@ class AIService:
         agent_executor: AgentExecutor,
         db: AsyncPostgresClient,
         preference_extractor: PreferenceExtractor | None = None,
+        knowledge_retriever: KnowledgeRetriever | None = None,
+        knowledge_writer: KnowledgeGraphWriter | None = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -83,6 +88,8 @@ class AIService:
         self.agent = agent_executor
         self.db = db
         self.preferences = preference_extractor
+        self.knowledge_retriever = knowledge_retriever
+        self.knowledge_writer = knowledge_writer
         self.settings = get_settings()
         self._pending_traces: dict[str, MessageTrace] = {}
 
@@ -153,7 +160,7 @@ class AIService:
                 logger.info(f"Topic change detected, rotating session {sid}")
                 await self.sessions.close_session(sid, reason="topic_change")
                 session = await self.sessions.get_or_create_session(
-                    user_id=user_id, service=service
+                    session_id=None, user_id=user_id, service=service
                 )
                 sid = session.id
                 rotated = True
@@ -169,13 +176,16 @@ class AIService:
         )
 
         # 2. Save user message to session
-        await self.sessions.add_message(
+        saved_msg = await self.sessions.add_message(
             session_id=sid,
             role="user",
             content=user_message,
             generate_embedding=True,
             metadata=metadata,
+            user_id=user_id,
         )
+        # Keep the embedding for semantic history filtering (Layer 3)
+        current_embedding = saved_msg.embedding if saved_msg else None
         slog.log_message_saved("user", user_message, str(sid))
 
         # 3. Yield thinking status
@@ -186,13 +196,16 @@ class AIService:
             is_final=False,
         )
 
-        # 4. Get conversation history for context
-        history = await self.sessions.get_history(sid, limit=20)
+        # 4. Get conversation history for context (filtered + token-budgeted)
+        history = await self.sessions.get_history(
+            sid, limit=20, max_tokens_budget=3000,
+            current_embedding=current_embedding,
+        )
 
         # If session was rotated, carry some context from the previous session
         # so the classifier and LLM have continuity.
         if rotated and old_sid:
-            old_history = await self.sessions.get_history(old_sid, limit=10)
+            old_history = await self.sessions.get_history(old_sid, limit=10, max_tokens_budget=1500)
             if old_history:
                 logger.info(f"[HISTORY-DEBUG] Carrying {len(old_history)} messages from rotated session {old_sid}")
                 history = old_history + history
@@ -236,6 +249,7 @@ class AIService:
             payload=classifier_payload,
             raw_response=classifier_raw,
             needs_memory=decision.needs_memory,
+            knowledge_keywords=decision.knowledge_keywords,
         )
 
         trace.set_intent(
@@ -265,19 +279,19 @@ class AIService:
         dispatch_error: str | None = None
         try:
             if decision.intent == IntentType.DIRECT_RESPONSE:
-                async for resp in self._handle_direct_response(sid, user_message, history, decision, trace, sys_context, slog=slog):
+                async for resp in self._handle_direct_response(sid, user_message, history, decision, trace, sys_context, slog=slog, user_id=user_id, metadata=metadata):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
 
             elif decision.intent == IntentType.SERVER_TOOL:
-                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog):
+                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
 
             elif decision.intent == IntentType.CLIENT_TOOL:
-                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog):
+                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id):
                     yield resp
         except Exception as e:
             dispatch_error = str(e)
@@ -304,6 +318,8 @@ class AIService:
         trace: MessageTrace | None = None,
         system_context: str | None = None,
         slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
+        metadata: dict | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM."""
 
@@ -318,20 +334,53 @@ class AIService:
                     "Pulada: o classificador indicou needs_memory=false (mensagem sem conteúdo semântico relevante).",
                 )
         else:
-            recovered_context = await self.sessions.recover_context(user_message)
+            recovered_context = await self.sessions.recover_context(user_message, user_id=user_id)
 
         # Build messages
+        today = date.today()
+        weekday_names = [
+            "segunda-feira",
+            "terça-feira",
+            "quarta-feira",
+            "quinta-feira",
+            "sexta-feira",
+            "sábado",
+            "domingo",
+        ]
+        month_names = [
+            "janeiro",
+            "fevereiro",
+            "março",
+            "abril",
+            "maio",
+            "junho",
+            "julho",
+            "agosto",
+            "setembro",
+            "outubro",
+            "novembro",
+            "dezembro",
+        ]
+        formatted_date = (
+            f"{weekday_names[today.weekday()]}, "
+            f"{today.day} de {month_names[today.month - 1]} de {today.year}"
+        )
+
         system_prompt = (
             "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
-            "Você foi criado por Daniel Morais. "
+            "Você foi criado por Daniel Morais (seu desenvolvedor). "
             "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
             "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
+            "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora. "
+            "O nome e perfil do usuário atual estão na seção 'Usuário Atual' do contexto — use essas informações para saber com quem você está falando. "
+            f"A data de hoje é {formatted_date}. "
             "Suas regras:\n"
             "1. SEMPRE responda em português brasileiro.\n"
             "2. NUNCA diga que não pode ajudar, que é uma IA com limitações, ou frases genéricas de recusa — sempre tente responder de forma útil.\n"
             "3. Se a pergunta for ambígua, interprete da forma mais útil possível e responda diretamente.\n"
             "4. Seja direto, claro e conciso. Evite disclaimers, avisos desnecessários e textos de rodeio.\n"
-            "5. Use o histórico da conversa para manter contexto entre mensagens.\n"
+            "5. Use o histórico da conversa para manter contexto entre mensagens. "
+            "O histórico pode conter mensagens de momentos diferentes — priorize as mais recentes para coerência.\n"
             "6. Para perguntas técnicas, de programação ou conhecimento geral, responda com profundidade e exemplos práticos.\n"
             "7. Para tarefas de automação ou desktop, explique o que está fazendo e por quê.\n"
             "8. Você tem acesso ao terminal do usuário via ferramenta 'run_command'. "
@@ -346,7 +395,7 @@ class AIService:
         # Inject persistent user preferences
         if self.preferences:
             try:
-                prefs_text = await self.preferences.get_preferences_text(service=service or "neo-desktop")
+                prefs_text = await self.preferences.get_preferences_text(service="neo-desktop")
                 if prefs_text:
                     system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as sempre:{prefs_text}"
                     logger.info(f"[PREF] Injected user preferences into system prompt")
@@ -354,6 +403,37 @@ class AIService:
                         slog.log_event("Preferências Injetadas", f"```\n{prefs_text}\n```")
             except Exception as e:
                 logger.warning(f"[PREF] Failed to load preferences: {e}")
+
+        # Inject knowledge graph context
+        if self.knowledge_retriever and user_id:
+            try:
+                kg_result = await self.knowledge_retriever.retrieve(
+                    user_id=user_id,
+                    user_input=user_message,
+                    keywords=decision.knowledge_keywords or None,
+                )
+                kg_context = self._format_knowledge_context(kg_result)
+                if kg_context:
+                    system_prompt += f"\n\n## Usuário Atual (com quem você está conversando agora)\n{kg_context}"
+                    logger.info(
+                        f"[KG] Injected knowledge context: "
+                        f"{kg_result['metadata']['contexts_matched']} contexts, "
+                        f"{kg_result['metadata']['global_nodes']} globals, "
+                        f"keywords={kg_result['metadata']['keywords_extracted']}"
+                    )
+                    if slog:
+                        kw_source = "intent" if decision.knowledge_keywords else "llm"
+                        slog.log_event(
+                            "Contexto do Grafo Injetado",
+                            f"- **Keywords** (via {kw_source}): `{kg_result['metadata']['keywords_extracted']}`\n"
+                            f"- **Contextos:** {kg_result['metadata']['contexts_matched']} "
+                            f"| **Globais:** {kg_result['metadata']['global_nodes']}\n\n"
+                            f"```\n{kg_context}\n```",
+                        )
+            except Exception as e:
+                logger.warning(f"[KG] Failed to retrieve knowledge context: {e}")
+        else:
+            logger.warning(f"[KG] Skipped: retriever={'yes' if self.knowledge_retriever else 'no'}, user_id={user_id}")
 
         logger.info(f"[HISTORY-DEBUG] recover_context returned {len(recovered_context) if recovered_context else 0} results")
         # Filter out very short memories (game moves, numbers, etc.)
@@ -400,9 +480,10 @@ class AIService:
 
         # Stream response
         try:
-            provider = self.llm.get_provider()
+            _req_model = (metadata or {}).get("model")
+            provider = self.llm.get_provider_for_model(_req_model)
             provider_name = type(provider).__name__.replace("Provider", "").lower()
-            model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+            model_name = _req_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
 
             if slog:
                 slog.log_llm_request("DIRECT_RESPONSE", messages, model=model_name, provider=provider_name, temperature=0.9)
@@ -410,7 +491,10 @@ class AIService:
             full_response = ""
             t0 = time.monotonic()
 
-            async for chunk in provider.stream_complete(messages=messages):
+            async for chunk in provider.stream_complete(
+                messages=messages,
+                max_tokens=self.settings.default_max_tokens,
+            ):
                 if chunk.event == StreamEventType.TOKEN and chunk.content:
                     full_response += chunk.content
                 elif chunk.event == StreamEventType.ERROR:
@@ -458,6 +542,7 @@ class AIService:
             role="assistant",
             content=full_response,
             generate_embedding=False,
+            user_id=user_id,
         )
         if slog:
             slog.log_message_saved("assistant", full_response, str(session_id))
@@ -479,6 +564,45 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PREF] Post-response extraction failed: {e}")
 
+        # Fire-and-forget: update knowledge graph from this turn
+        # Run writer even without knowledge_keywords — the writer itself decides if there's
+        # anything worth saving (device info, problems, etc. wouldn't get keywords otherwise)
+        if self.knowledge_writer and user_id and full_response:
+            try:
+                kg_context_for_writer = ""
+                if self.knowledge_retriever:
+                    kg_raw = await self.knowledge_retriever.retrieve(
+                        user_id=user_id,
+                        user_input=user_message,
+                        keywords=decision.knowledge_keywords,
+                    )
+                    kg_context_for_writer = self._format_knowledge_context(kg_raw)
+
+                # Build recent history context for the writer (last 6 messages before current turn)
+                recent_history_lines = []
+                for msg in history[-(6 + 1):-1] if len(history) > 1 else []:
+                    role_label = "Usuário" if msg.get("role") == "user" else "Assistente"
+                    content_preview = (msg.get("content") or "")[:500]
+                    recent_history_lines.append(f"[{role_label}]: {content_preview}")
+                recent_history_str = "\n".join(recent_history_lines)
+
+                applied = await self.knowledge_writer.extract_and_apply(
+                    user_id=user_id,
+                    user_message=user_message,
+                    assistant_response=full_response,
+                    kg_context=kg_context_for_writer,
+                    keywords=decision.knowledge_keywords,
+                    recent_history=recent_history_str,
+                )
+                if applied and slog:
+                    import json as _json
+                    slog.log_event(
+                        "Grafo Atualizado",
+                        f"```json\n{_json.dumps(applied, ensure_ascii=False, indent=2)}\n```",
+                    )
+            except Exception as e:
+                logger.warning(f"[KGW] Post-response write failed: {e}")
+
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
@@ -499,6 +623,7 @@ class AIService:
         decision: RoutingDecision,
         trace: MessageTrace | None = None,
         slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle server-side tool execution using AgentExecutor."""
 
@@ -541,6 +666,7 @@ class AIService:
             content=final_text,
             tool_name=decision.tool_name,
             generate_embedding=False,
+            user_id=user_id,
         )
         if slog:
             slog.log_message_saved("assistant", final_text, str(session_id))
@@ -565,6 +691,7 @@ class AIService:
         decision: RoutingDecision,
         trace: MessageTrace | None = None,
         slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle client-side tool — sends request to desktop for execution.
 
@@ -658,9 +785,11 @@ class AIService:
         tool_arguments: dict | None = None,
         _retry_count: int = 0,
         _is_diagnostic: bool = False,
+        _followup_count: int = 0,
     ) -> AsyncIterator[AIServiceResponse]:
         """Process tool execution result from desktop and format response."""
         MAX_TOOL_RETRIES = 4
+        MAX_FOLLOWUP_STEPS = 3
 
         # Get session file logger
         slog = get_session_logger(session_id)
@@ -790,7 +919,8 @@ class AIService:
             actual_sid = session.id
             await self.sessions.add_message(
                 session_id=actual_sid, role="assistant", content=final_text,
-                tool_name=tool_name, tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                user_id=session.user_id,
             )
             obs.finish_trace(trace, response=final_text)
 
@@ -841,6 +971,65 @@ class AIService:
             final_text = await self._format_tool_result(
                 user_message, command or tool_name, raw_output, trace=trace,
             )
+
+            # ── MULTI-STEP FOLLOW-UP: check if user's request needs more commands ──
+            if _followup_count < MAX_FOLLOWUP_STEPS:
+                followup = await self._check_followup_needed(
+                    user_message=user_message,
+                    command_ran=command or tool_name,
+                    command_output=raw_output,
+                    trace=trace,
+                )
+                if followup and followup.get("needed"):
+                    followup_cmd = followup.get("command", "")
+                    followup_explanation = followup.get("explanation", "Executando próximo passo...")
+                    if followup_cmd:
+                        logger.info(
+                            f"[FOLLOWUP] Step {_followup_count + 1}: {followup_cmd}"
+                        )
+                        slog.log_event(
+                            "Follow-up detectado",
+                            f"- **Passo:** {_followup_count + 1}/{MAX_FOLLOWUP_STEPS}\n"
+                            f"- **Comando:** `{followup_cmd}`\n"
+                            f"- **Razão:** {followup_explanation}\n",
+                        )
+
+                        new_tool_call_id = str(uuid4())
+
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            message=followup_explanation,
+                            is_final=False,
+                        )
+
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            tool_request={
+                                "tool_call_id": new_tool_call_id,
+                                "tool_name": "run_command",
+                                "arguments": json.dumps(
+                                    {"command": followup_cmd, "working_dir": (tool_arguments or {}).get("working_dir", "")},
+                                    ensure_ascii=False,
+                                ),
+                                "requires_approval": False,
+                            },
+                            is_final=False,
+                            metadata={
+                                "flow": "client_tool",
+                                "tool_call_id": new_tool_call_id,
+                                "tool_name": "run_command",
+                                "user_message": user_message,
+                                "tool_arguments": {"command": followup_cmd, "working_dir": (tool_arguments or {}).get("working_dir", "")},
+                                "command": followup_cmd,
+                                "_retry_count": 0,
+                                "_followup_count": _followup_count + 1,
+                            },
+                        )
+
+                        self._pending_traces[str(session_id)] = trace
+                        return  # Flow continues when desktop sends next tool_result
         else:
             tool_ms = round((time.monotonic() - t0_tool) * 1000, 2)
 
@@ -966,13 +1155,13 @@ class AIService:
         )
         actual_sid = session.id
 
-        # Save to session
+        # Save to session (no tool_call_id so it appears in conversation history)
         await self.sessions.add_message(
             session_id=actual_sid,
             role="assistant",
             content=final_text,
             tool_name=tool_name,
-            tool_call_id=tool_call_id,
+            user_id=session.user_id,
         )
         slog.log_message_saved("assistant", final_text, str(actual_sid))
         slog.log_final_response(final_text, "CLIENT_TOOL", iterations=2 + _retry_count)
@@ -1028,7 +1217,8 @@ class AIService:
                 obs.finish_trace(trace, response=msg)
 
             await self.sessions.add_message(
-                session_id=actual_sid, role="assistant", content=msg
+                session_id=actual_sid, role="assistant", content=msg,
+                user_id=session.user_id,
             )
             yield AIServiceResponse(
                 intent=IntentType.CLIENT_TOOL,
@@ -1471,6 +1661,29 @@ class AIService:
     # ---------------------------------------------------------------
 
     @staticmethod
+    def _format_knowledge_context(kg_result: dict) -> str:
+        """Formata o resultado do grafo de conhecimento em texto para o system prompt."""
+        lines: list[str] = []
+
+        for ctx_tree in kg_result.get("contexts_found", []):
+            ctx = ctx_tree["context"]
+            lines.append(f"### {ctx['name']}")
+            for child in ctx_tree.get("children", []):
+                props = child.get("properties") or {}
+                props_str = ", ".join(f"{k}: {v}" for k, v in props.items() if v is not None)
+                lines.append(f"- [{child['type']}] {child['name']}" + (f" — {props_str}" if props_str else ""))
+
+        globals_ = kg_result.get("global", [])
+        if globals_:
+            lines.append("\n### Perfil Global")
+            for g in globals_:
+                props = g.get("properties") or {}
+                props_str = ", ".join(f"{k}: {v}" for k, v in props.items() if v is not None)
+                lines.append(f"- [{g['type']}] {g['name']}" + (f" — {props_str}" if props_str else ""))
+
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_system_context(metadata: dict[str, Any] | None) -> str | None:
         """Build a compact system context string from metadata sent by the desktop client.
 
@@ -1495,10 +1708,15 @@ class AIService:
         return (
             f"Sistema operacional do usuário: {os_name} {release} ({arch}).\n"
             f"Diretório home: {home}\n"
-            f"Pastas principais: Downloads={downloads}, Documents={documents}, Desktop={desktop_dir}\n"
+            f"Diretório de documentos do usuário: {documents}\n"
+            f"Diretório de downloads do usuário: {downloads}\n"
+            f"Diretório desktop do usuário: {desktop_dir}\n"
             f"Shell padrão: {'bash/zsh' if platform in ('linux', 'darwin') else 'PowerShell/cmd'}.\n"
-            f"Use caminhos absolutos ao manipular arquivos. "
-            f"Prefira paths relativos ao home ({home}) em comandos quando possível."
+            f"IMPORTANTE: Quando o usuário mencionar 'pasta de documentos', 'meus documentos' ou similar, "
+            f"use SEMPRE o caminho '{documents}' como working_dir. "
+            f"Quando mencionar 'downloads', use '{downloads}'. "
+            f"Quando mencionar 'desktop' ou 'área de trabalho', use '{desktop_dir}'.\n"
+            f"Use caminhos absolutos ao manipular arquivos."
         )
 
     async def _format_tool_result(
@@ -1566,6 +1784,87 @@ class AIService:
                     error=str(e),
                 )
             return f"Resultado de `{command}`:\n```\n{output}\n```"
+
+    async def _check_followup_needed(
+        self,
+        user_message: str,
+        command_ran: str,
+        command_output: str,
+        trace: MessageTrace | None = None,
+    ) -> dict[str, Any] | None:
+        """Ask LLM whether the user's original request requires an additional command.
+
+        Returns None or {"needed": False} when the task is complete, or
+        {"needed": True, "command": "...", "explanation": "..."} when a follow-up
+        command should be executed to fully satisfy the user's request.
+        """
+        prompt = (
+            f'O pedido original do usuário foi: "{user_message}"\n'
+            f"O comando executado foi: `{command_ran}`\n"
+            f"Saída obtida:\n```\n{command_output[:2000]}\n```\n\n"
+            "Analise se o pedido do usuário foi COMPLETAMENTE atendido pela saída acima.\n"
+            "Exemplos de quando NÃO está completo:\n"
+            '- Usuário pediu "encontre o arquivo X e mostre o conteúdo" mas o comando apenas encontrou/listou o arquivo.\n'
+            '- Usuário pediu "ache os CSVs e diga quantas linhas tem" mas o comando apenas listou os CSVs.\n'
+            '- Usuário pediu "crie o arquivo e coloque tal conteúdo" mas o comando apenas criou o arquivo vazio.\n\n'
+            "Exemplos de quando ESTÁ completo:\n"
+            '- Usuário pediu "liste os arquivos" e o comando listou.\n'
+            '- Usuário pediu "mostre o conteúdo do arquivo" e o comando já mostrou o conteúdo.\n'
+            '- Usuário pediu "qual meu IP" e o comando retornou o IP.\n\n'
+            "Responda APENAS com JSON válido (sem markdown fences):\n"
+            '{"needed": false} se o pedido já foi completamente atendido.\n'
+            '{"needed": true, "command": "comando_shell_para_completar", "explanation": "explicação curta em português"}\n'
+            "se um comando adicional é necessário para completar o pedido.\n"
+            "IMPORTANTE: O comando deve usar caminhos absolutos baseados na saída obtida."
+        )
+
+        system_msg = (
+            "Você é um planejador de tarefas para um assistente de desktop. "
+            "Decida se o pedido do usuário precisa de mais um passo para ser concluído. "
+            "Seja conservador: só retorne needed=true quando claramente falta algo. "
+            "Responda APENAS com JSON."
+        )
+
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=system_msg),
+            Message(role=MessageRole.USER, content=prompt),
+        ]
+
+        try:
+            provider = self.llm.get_provider()
+            provider_name = type(provider).__name__.replace("Provider", "").lower()
+            model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+            t0 = time.monotonic()
+            response = await provider.complete(
+                messages=messages,
+                temperature=0.1,
+                max_tokens=200,
+            )
+            llm_ms = (time.monotonic() - t0) * 1000
+            raw = response.get_content() or ""
+
+            if trace:
+                trace.add_llm_call(
+                    provider=provider_name,
+                    model=model_name,
+                    messages_sent=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt[:3000]},
+                    ],
+                    response_text=raw[:500],
+                    duration_ms=round(llm_ms, 2),
+                    stage="followup_check",
+                )
+
+            # Parse JSON from response
+            clean = raw.strip()
+            if clean.startswith("```"):
+                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(clean)
+            return parsed
+        except Exception as e:
+            logger.warning(f"Failed to check followup needed: {e}")
+            return None
 
     @staticmethod
     def _truncate_output(value: str, max_lines: int = 60) -> str:

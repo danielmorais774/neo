@@ -156,6 +156,7 @@ class RoutingDecision(BaseModel):
     requires_approval: bool = False
     raw_command: str | None = None  # para CLIENT_TOOL (comando shell)
     needs_memory: bool = True  # whether cross-session memory recovery is useful
+    knowledge_keywords: list[str] | None = None  # keywords for KG retrieval (classified by intent LLM)
 
     # --- classifier observability (optional) ---
     classifier_raw: str | None = None  # raw LLM/text response from classifier

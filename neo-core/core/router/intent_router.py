@@ -64,6 +64,16 @@ Use `list_directory` when the user explicitly wants to browse a folder.
 Use `read_file` / `write_file` for reading or writing specific file content.
 Use `get_system_info` for detailed OS/hardware information.
 
+## CRITICAL: Path Resolution
+- When the user mentions "pasta de documentos", "meus documentos", "documents" → use the Documents
+  path from "Contexto do Sistema do Usuário" as `working_dir` (e.g. `/home/user/Documents`).
+- When the user mentions "downloads" → use the Downloads path.
+- When the user mentions "desktop", "área de trabalho" → use the Desktop path.
+- **NEVER** default to the home directory when the user explicitly mentions a known folder.
+- If a task requires multiple steps (e.g. "find CSV files and show their content"), combine them
+  into a single shell command using `&&`, `|`, `$()`, or `xargs`.
+  Example: `find ~/Documents -name '*.csv' -exec head -20 {{}} +`
+
 ## CRITICAL: Conversation Context Rules
 - **ALWAYS check the conversation history** before classifying.
 - If the history shows an **ongoing interactive activity** (game, quiz, roleplay, creative writing,
@@ -73,6 +83,17 @@ Use `get_system_info` for detailed OS/hardware information.
 - Words like "tabuleiro", "jogo", "placar", "turno", "rodada" in conversational context → **DIRECT_RESPONSE**.
 - Only use CLIENT_TOOL when the user **explicitly** wants something done on their machine
   (run command, install, list files, check system, etc.).
+
+## CRITICAL: Personal Knowledge Graph Rule
+The system has a **Knowledge Graph** that stores the user's personal data: workout plans, exercises,
+diet, supplements, routines, health info, and preferences. This data is automatically injected into
+the AI's context — **no file search or tool is needed to access it**.
+- When the user asks about **their own personal information** (e.g. "meu treino", "meu plano",
+  "minha dieta", "meus exercícios", "minha rotina", "meus suplementos"), this is **ALWAYS DIRECT_RESPONSE**.
+- **NEVER** use `search_files`, `list_directory`, or `read_file` to look for personal data —
+  it lives in the Knowledge Graph, not in files.
+- Only use file tools when the user **explicitly** mentions a file, path, folder, or document
+  (e.g. "abre o arquivo X", "lê o documento Y", "lista a pasta Z").
 
 ## Rules
 - If the message is a greeting, small talk, or general question → DIRECT_RESPONSE
@@ -91,6 +112,18 @@ Use `get_system_info` for detailed OS/hardware information.
   "valeu", "obrigado", "hello", "hey"). In these cases, recovering old memories would only
   inject irrelevant context.
 
+## Knowledge Keywords Rule
+- Extract `knowledge_keywords`: lowercase Portuguese nouns/activities from the user message that
+  could match personal context categories (food, exercise, work, health, routines, supplements,
+  devices, software, problems, vehicles, finances, people, pets, etc.).
+- Always use **singular** form (e.g. "treinos" → "treino", "refeições" → "refeição", "notebooks" → "notebook").
+- Include hardware/device names when the user mentions something they OWN or USE
+  (e.g. "notebook", "celular", "monitor", "acer predator", "iphone", "carro").
+- Include problem/defect keywords when the user reports an issue with a device or software
+  (e.g. "coil whine", "superaquecimento", "tela piscando", "travando").
+- Maximum 6 keywords. Return empty array `[]` for greetings or messages with no personal context topic.
+- These keywords are used to search the user's personal knowledge graph.
+
 ## Output Format
 Respond ONLY with valid JSON (no markdown fences):
 {{
@@ -101,7 +134,8 @@ Respond ONLY with valid JSON (no markdown fences):
   "raw_command": "shell command (only if no registered tool fits)",
   "explanation": "brief explanation in Portuguese",
   "requires_approval": true/false,
-  "needs_memory": true/false
+  "needs_memory": true/false,
+  "knowledge_keywords": ["keyword1", "keyword2"]
 }}
 """
 
@@ -232,6 +266,11 @@ class IntentRouter:
         }
         intent = intent_map.get(intent_str, IntentType.DIRECT_RESPONSE)
 
+        raw_keywords = data.get("knowledge_keywords")
+        knowledge_keywords: list[str] | None = None
+        if isinstance(raw_keywords, list):
+            knowledge_keywords = [str(k).lower().strip() for k in raw_keywords if k] or None
+
         return RoutingDecision(
             intent=intent,
             confidence=float(data.get("confidence", 0.8)),
@@ -241,6 +280,7 @@ class IntentRouter:
             requires_approval=data.get("requires_approval", intent == IntentType.CLIENT_TOOL),
             raw_command=data.get("raw_command"),
             needs_memory=data.get("needs_memory", True),
+            knowledge_keywords=knowledge_keywords,
         )
 
     def _fallback_classify(self, message: str) -> RoutingDecision:

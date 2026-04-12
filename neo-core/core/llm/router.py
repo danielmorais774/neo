@@ -4,11 +4,37 @@ from typing import Literal
 
 from core.llm.claude_provider import ClaudeProvider
 from core.llm.deepseek_provider import DeepSeekProvider
+from core.llm.ollama_provider import OllamaProvider
 from core.llm.openai_provider import OpenAIProvider
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, get_settings
 
 ProviderType = Literal["openai", "anthropic", "ollama", "deepseek"]
+
+# Mapeamento de nome de modelo → provider
+_MODEL_TO_PROVIDER: dict[str, str] = {
+    # OpenAI
+    "gpt-4o": "openai",
+    "gpt-4o-mini": "openai",
+    "gpt-4-turbo": "openai",
+    "gpt-4-turbo-preview": "openai",
+    "gpt-3.5-turbo": "openai",
+    # Anthropic
+    "claude-3-opus-20240229": "anthropic",
+    "claude-3-sonnet-20240229": "anthropic",
+    "claude-3-haiku-20240307": "anthropic",
+    # DeepSeek
+    "deepseek-chat": "deepseek",
+    "deepseek-reasoner": "deepseek",
+    # Ollama (modelos locais)
+    "gemma4:e2b": "ollama",
+    "gemma4:12b": "ollama",
+    "llama3": "ollama",
+    "llama3:8b": "ollama",
+    "llama3:70b": "ollama",
+    "mistral": "ollama",
+    "phi4": "ollama",
+}
 
 
 class LLMRouter:
@@ -40,11 +66,10 @@ class LLMRouter:
                 api_key=self.settings.deepseek_api_key
             )
 
-        # Ollama (futuro)
-        # if self.settings.ollama_base_url:
-        #     self._providers["ollama"] = OllamaProvider(
-        #         base_url=self.settings.ollama_base_url
-        #     )
+        # Ollama — sempre disponível (não requer API key)
+        self._providers["ollama"] = OllamaProvider(
+            base_url=self.settings.ollama_base_url,
+        )
 
     def get_provider(self, provider_name: ProviderType | None = None) -> LLMProvider:
         """
@@ -73,6 +98,18 @@ class LLMRouter:
         """Lista providers disponíveis."""
         return list(self._providers.keys())
 
+    def get_provider_for_model(self, model_name: str | None) -> LLMProvider:
+        """Retorna o provider correto para um nome de modelo.
+
+        Usa o mapeamento _MODEL_TO_PROVIDER para inferir o provider.
+        Fallback para o provider default se o modelo não for reconhecido.
+        """
+        if model_name:
+            provider_name = _MODEL_TO_PROVIDER.get(model_name)
+            if provider_name and provider_name in self._providers:
+                return self._providers[provider_name]
+        return self.get_provider()
+
     def get_default_model(self, provider_name: ProviderType | None = None) -> str:
         """
         Retorna o modelo padrão para um provider.
@@ -89,7 +126,8 @@ class LLMRouter:
         defaults = {
             "openai": "gpt-4-turbo-preview",
             "anthropic": "claude-3-opus-20240229",
-            "ollama": "llama2",
+            "ollama": "gemma4:e2b",
+            "deepseek": "deepseek-chat",
         }
 
         return defaults.get(name, self.settings.default_model)

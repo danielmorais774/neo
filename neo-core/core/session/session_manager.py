@@ -58,9 +58,28 @@ class PersistentSessionManager:
 
         if session_id:
             session = await self.db.get_conversation_session(session_id)
+            if session:
+                # Found session — reactivate if it was closed
+                if session.status != "active":
+                    logger.info(f"Reativando sessão {session.id} (status={session.status})")
+                    session.status = "active"
+                    session.ended_at = None
+                    session.last_activity_at = datetime.utcnow()
+                    await self.db.update_session(session)
+                return session
+            else:
+                # Desktop sent a new session_id (e.g. after "Novo chat") — create with that id
+                logger.info(f"Session {session_id} not in DB, creating new session with given session_id")
+                session = await self.db.create_conversation_session(
+                    session_id=session_id,
+                    user_id=user_id,
+                    service=service,
+                )
+                logger.info(f"Nova sessão criada: {session.id}")
+                return session
 
-        if not session:
-            session = await self.db.get_active_session(user_id=user_id, service=service)
+        # No session_id provided — fallback to active session
+        session = await self.db.get_active_session(user_id=user_id, service=service)
 
         if session and self._is_expired(session):
             logger.info(f"Sessão {session.id} expirada por inatividade")
@@ -109,6 +128,7 @@ class PersistentSessionManager:
         tool_call_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         generate_embedding: bool = False,
+        user_id: UUID | None = None,
     ) -> ConversationMessage:
         """Adiciona mensagem com contagem de tokens e embedding opcional."""
         embedding = None
@@ -132,11 +152,80 @@ class PersistentSessionManager:
             tool_call_id=tool_call_id,
             metadata=metadata,
             token_count=token_count,
+            user_id=user_id,
         )
 
-    async def get_history(self, session_id: UUID, limit: int = 20) -> list[dict[str, str]]:
-        """Obtém histórico de conversação para o LLM."""
-        return await self.db.fetch_session_history(session_id, limit=limit)
+    async def get_history(
+        self,
+        session_id: UUID,
+        limit: int = 20,
+        max_tokens_budget: int = 3000,
+        current_embedding: list[float] | None = None,
+    ) -> list[dict[str, str]]:
+        """Obtém histórico filtrado e com orçamento de tokens para o LLM.
+
+        1. Busca as últimas `limit` mensagens (user/assistant, sem tool calls, >5 chars).
+        2. Aplica orçamento de tokens: mantém mensagens mais recentes até atingir o limite.
+        3. Se a sessão tem >30 mensagens e um embedding está disponível,
+           busca top-K mensagens similares e mescla para dar contexto relevante.
+
+        Retorna lista de {role, content} (sem token_count — limpo para o LLM).
+        """
+        raw_history = await self.db.fetch_session_history(session_id, limit=limit)
+
+        if not raw_history:
+            return []
+
+        # --- Token budget: keep most recent messages within budget ---
+        budgeted: list[dict[str, str]] = []
+        remaining = max_tokens_budget
+        # Walk backwards (most recent first) and accumulate
+        for msg in reversed(raw_history):
+            tc = msg.get("token_count", 0) or 0
+            # Estimate if no token_count was saved
+            if tc == 0 and self.token_counter:
+                tc = self.token_counter.count(msg["content"])
+            if remaining - tc < 0 and budgeted:
+                # Budget exhausted — stop adding older messages
+                break
+            remaining -= tc
+            budgeted.append(msg)
+        # Restore chronological order
+        budgeted.reverse()
+
+        # --- Embedding relevance: merge top-K similar for long sessions ---
+        if current_embedding is not None and self.embeddings.available:
+            try:
+                session = await self.db.get_conversation_session(session_id)
+                msg_count = session.message_count if session else 0
+            except Exception:
+                msg_count = 0
+
+            if msg_count > 30:
+                try:
+                    similar = await self.db.fetch_similar_session_messages(
+                        session_id=session_id,
+                        embedding=current_embedding,
+                        limit=5,
+                        min_similarity=0.55,
+                    )
+                    # Deduplicate: don't add messages already in budgeted
+                    existing_contents = {m["content"] for m in budgeted}
+                    new_relevant = [
+                        s for s in similar if s["content"] not in existing_contents
+                    ]
+                    if new_relevant:
+                        # Prepend relevant old context before the recent history
+                        logger.info(
+                            f"[HISTORY] Merged {len(new_relevant)} relevant older messages "
+                            f"into context for session {session_id}"
+                        )
+                        budgeted = new_relevant + budgeted
+                except Exception as e:
+                    logger.warning(f"[HISTORY] Embedding relevance merge failed: {e}")
+
+        # Strip token_count before returning — LLM doesn't need it
+        return [{"role": m["role"], "content": m["content"]} for m in budgeted]
 
     # ---------------------------------------------------------------
     # Topic change detection

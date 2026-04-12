@@ -44,12 +44,16 @@ class AsyncPostgresClient:
 
     async def create_conversation_session(
         self,
+        session_id: UUID | None = None,
         user_id: UUID | None = None,
         service: str = "neo-desktop",
         metadata: dict[str, Any] | None = None,
     ) -> ConversationSession:
         """Create a new conversation session."""
+        if user_id is not None:
+            await self.ensure_user_exists(user_id)
         session = ConversationSession(
+            id=session_id if session_id else None,
             user_id=user_id,
             service=service,
             extra_metadata=metadata,
@@ -171,7 +175,7 @@ class AsyncPostgresClient:
                 }
                 user_filter = ""
                 if user_id:
-                    user_filter = "AND cs.user_id = :user_id"
+                    user_filter = "AND cm.user_id = :user_id"
                     params["user_id"] = str(user_id)
 
                 query = text(f"""
@@ -223,7 +227,7 @@ class AsyncPostgresClient:
                 }
                 user_filter = ""
                 if user_id:
-                    user_filter = "AND cs.user_id = :user_id"
+                    user_filter = "AND cm.user_id = :user_id"
                     params["user_id"] = str(user_id)
 
                 query = text(f"""
@@ -280,6 +284,7 @@ class AsyncPostgresClient:
         tool_call_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         token_count: int | None = None,
+        user_id: UUID | None = None,
     ) -> ConversationMessage:
         """Save a message to a conversation session."""
         msg = ConversationMessage(
@@ -291,6 +296,7 @@ class AsyncPostgresClient:
             tool_call_id=tool_call_id,
             token_count=token_count,
             extra_metadata=metadata,
+            user_id=user_id,
         )
         async with self.get_session() as db:
             db.add(msg)
@@ -310,16 +316,46 @@ class AsyncPostgresClient:
         self,
         session_id: UUID,
         limit: int = 50,
+        roles: list[str] | None = None,
+        exclude_tool_calls: bool = False,
+        min_content_length: int = 0,
     ) -> list[ConversationMessage]:
-        """Fetch messages for a session, ordered by creation time."""
+        """Fetch the *last* N messages for a session, ordered chronologically.
+
+        Uses a subquery with DESC to pick the most recent rows, then
+        re-orders ASC so the conversation flows naturally.
+        """
+        from sqlalchemy import func
+
         async with self.get_session() as db:
             stmt = (
                 select(ConversationMessage)
                 .where(ConversationMessage.session_id == session_id)
-                .order_by(ConversationMessage.created_at.asc())
-                .limit(limit)
             )
-            result = await db.execute(stmt)
+
+            # Filter by allowed roles (e.g. ['user', 'assistant'])
+            if roles:
+                stmt = stmt.where(ConversationMessage.role.in_(roles))
+
+            # Exclude intermediate tool-call result messages
+            if exclude_tool_calls:
+                stmt = stmt.where(ConversationMessage.tool_call_id.is_(None))
+
+            # Exclude very short messages (game moves, "ok", numbers)
+            if min_content_length > 0:
+                stmt = stmt.where(
+                    func.length(ConversationMessage.content) > min_content_length
+                )
+
+            # Pick the LAST N rows: order DESC + limit, then wrap to re-order ASC
+            stmt = stmt.order_by(ConversationMessage.created_at.desc()).limit(limit)
+            subq = stmt.subquery()
+            final_stmt = (
+                select(ConversationMessage)
+                .join(subq, ConversationMessage.id == subq.c.id)
+                .order_by(ConversationMessage.created_at.asc())
+            )
+            result = await db.execute(final_stmt)
             return list(result.scalars().all())
 
     async def fetch_session_history(
@@ -327,9 +363,55 @@ class AsyncPostgresClient:
         session_id: UUID,
         limit: int = 20,
     ) -> list[dict[str, str]]:
-        """Fetch session messages as [{role, content}] for LLM context."""
-        messages = await self.fetch_session_messages(session_id, limit=limit)
-        return [{"role": m.role, "content": m.content} for m in messages]
+        """Fetch the last N user/assistant messages as [{role, content, token_count}] for LLM context."""
+        messages = await self.fetch_session_messages(
+            session_id,
+            limit=limit,
+            roles=["user", "assistant"],
+            exclude_tool_calls=True,
+            min_content_length=5,
+        )
+        return [
+            {"role": m.role, "content": m.content, "token_count": m.token_count or 0}
+            for m in messages
+        ]
+
+    async def fetch_similar_session_messages(
+        self,
+        session_id: UUID,
+        embedding: list[float],
+        limit: int = 5,
+        min_similarity: float = 0.5,
+    ) -> list[dict[str, str]]:
+        """Fetch top-K semantically similar messages within a session via pgvector."""
+        async with self.get_session() as db:
+            try:
+                query = text("""
+                    SELECT cm.id, cm.role, cm.content, cm.token_count,
+                           1 - (cm.embedding <=> CAST(:embedding AS vector)) AS similarity
+                    FROM conversation_message cm
+                    WHERE cm.session_id = :session_id
+                      AND cm.embedding IS NOT NULL
+                      AND cm.role IN ('user', 'assistant')
+                      AND cm.tool_call_id IS NULL
+                      AND 1 - (cm.embedding <=> CAST(:embedding AS vector)) > :min_sim
+                    ORDER BY cm.embedding <=> CAST(:embedding AS vector)
+                    LIMIT :limit
+                """)
+                result = await db.execute(query, {
+                    "session_id": str(session_id),
+                    "embedding": str(embedding),
+                    "min_sim": min_similarity,
+                    "limit": limit,
+                })
+                rows = result.fetchall()
+                return [
+                    {"role": r[1], "content": r[2], "token_count": r[3] or 0}
+                    for r in rows
+                ]
+            except Exception as e:
+                logger.warning(f"pgvector session similarity search failed: {e}")
+                return []
 
     # ---------------------------------------------------------------
     # Legacy compatibility — UserMessage methods
@@ -367,6 +449,15 @@ class AsyncPostgresClient:
             stmt = select(User).where(User.username == username)
             result = await db.execute(stmt)
             return result.scalars().first()
+
+    async def ensure_user_exists(self, user_id: UUID) -> None:
+        """Create user record with given ID if it doesn't exist yet."""
+        async with self.get_session() as db:
+            existing = await db.get(User, user_id)
+            if existing is None:
+                db.add(User(id=user_id))
+                await db.commit()
+                logger.info(f"[DB] Auto-created user {user_id}")
 
     # ---------------------------------------------------------------
     # User Preferences CRUD

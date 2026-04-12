@@ -19,7 +19,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import desktop, health, debug, session_logs
+from api.routes import context, desktop, health, debug, session_logs, knowledge_graph
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -112,6 +112,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry)
     preference_extractor = PreferenceExtractor(llm_router=_llm_router, db=_db)
 
+    # ── Knowledge Graph routes ────────────────────────────────────
+    knowledge_graph.set_db(_db)
+
+    # ── Knowledge Retriever (context routes) ────────────────────
+    from modules.context.knowledge_retriever import KnowledgeRetriever
+    from modules.context.knowledge_writer import KnowledgeGraphWriter
+    _knowledge_retriever = KnowledgeRetriever(
+        session_factory=_db.session_factory,
+        llm_router=_llm_router,
+    )
+    _knowledge_writer = KnowledgeGraphWriter(llm_router=_llm_router, db=_db)
+    context.set_knowledge_retriever(_knowledge_retriever)
+    print(f"✅ Knowledge retriever ready")
+
     _ai_service = AIService(
         llm_router=_llm_router,
         intent_router=intent_router,
@@ -121,6 +135,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         agent_executor=_agent_executor,
         db=_db,
         preference_extractor=preference_extractor,
+        knowledge_retriever=_knowledge_retriever,
+        knowledge_writer=_knowledge_writer,
     )
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
@@ -197,3 +213,5 @@ app.include_router(health.router)
 app.include_router(desktop.router, prefix="/api/v1")
 app.include_router(debug.router, prefix="/api/v1")
 app.include_router(session_logs.router, prefix="/api/v1")
+app.include_router(context.router, prefix="/api/v1")
+app.include_router(knowledge_graph.router, prefix="/api/v1")

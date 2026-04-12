@@ -82,6 +82,10 @@ class ConversationMessage(SQLModel, table=True):
             nullable=False, index=True,
         ),
     )
+    user_id: Optional[UUID] = Field(
+        default=None,
+        sa_column=Column("user_id", SAUuid, ForeignKey("user.id"), nullable=True, index=True),
+    )
     role: str = Field(
         sa_column=Column("role", String(16), nullable=False),
     )

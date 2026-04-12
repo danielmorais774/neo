@@ -126,8 +126,7 @@ class SessionFileLogger:
         if reason:
             self._write(f"- **Razão:** {reason}\n")
         if context_text:
-            display = context_text if len(context_text) <= 500 else context_text[:500] + "..."
-            self._write(f"\n<details>\n<summary>Contexto usado para embedding (últimas 5 msgs)</summary>\n\n```\n{display}\n```\n\n</details>\n\n")
+            self._write(f"\n<details>\n<summary>Contexto usado para embedding (últimas 5 msgs)</summary>\n\n```\n{context_text}\n```\n\n</details>\n\n")
         self._write("\n")
 
     def log_history(self, history: list[dict[str, str]]) -> None:
@@ -138,9 +137,7 @@ class SessionFileLogger:
         for i, msg in enumerate(history):
             role = msg.get("role", "?")
             content = msg.get("content", "")
-            # Truncate long messages for readability but keep full content
-            display = content if len(content) <= 500 else content[:500] + "... [truncado]"
-            self._write(f"**[{i}] {role}:**\n```\n{display}\n```\n\n")
+            self._write(f"**[{i}] {role}:**\n```\n{content}\n```\n\n")
 
     def log_intent_classification(
         self,
@@ -152,12 +149,15 @@ class SessionFileLogger:
         payload: dict | None = None,
         raw_response: str | None = None,
         needs_memory: bool = True,
+        knowledge_keywords: list[str] | None = None,
     ) -> None:
         self._write(f"### 4. Classificação de Intent\n\n")
         self._write(f"- **Intent:** `{intent}`\n")
         self._write(f"- **Confiança:** {confidence:.2f}\n")
         self._write(f"- **Duração:** {duration_ms:.1f}ms\n")
         self._write(f"- **Needs Memory:** `{needs_memory}`\n")
+        if knowledge_keywords:
+            self._write(f"- **Knowledge Keywords:** `{knowledge_keywords}`\n")
         if tool_name:
             self._write(f"- **Tool:** `{tool_name}`\n")
         if explanation:
@@ -185,14 +185,13 @@ class SessionFileLogger:
             source = getattr(ctx, "source", "?")
             session_id = getattr(ctx, "session_id", None)
             created_at = getattr(ctx, "created_at", None)
-            display = content if len(content) <= 300 else content[:300] + "..."
             meta_parts = [f"source=`{source}`", f"score={score:.3f}"]
             if session_id:
                 meta_parts.append(f"session=`{str(session_id)[:8]}…`")
             if created_at:
-                meta_parts.append(f"criado={created_at.strftime('%Y-%m-%d %H:%M') if hasattr(created_at, 'strftime') else str(created_at)[:16]}")
+                meta_parts.append(f"criado={created_at.strftime('%Y-%m-%d %H:%M') if hasattr(created_at, 'strftime') else str(created_at)}")
             meta = ", ".join(meta_parts)
-            self._write(f"**[{i}]** ({meta})\n```\n{display}\n```\n\n")
+            self._write(f"**[{i}]** ({meta})\n```\n{content}\n```\n\n")
 
     def log_llm_request(
         self,
@@ -288,8 +287,7 @@ class SessionFileLogger:
         if error:
             self._write(f"- **Erro:** {error}\n")
         if result:
-            display = result if len(result) <= 2000 else result[:2000] + "\n... [truncado]"
-            self._write(f"\n```\n{display}\n```\n\n")
+            self._write(f"\n```\n{result}\n```\n\n")
         self._write("\n")
 
     def log_error_recovery(
@@ -318,8 +316,7 @@ class SessionFileLogger:
         self._write(f"### Mensagem salva no DB\n\n")
         self._write(f"- **Role:** `{role}`\n")
         self._write(f"- **Sessão:** `{session_id}`\n")
-        preview = content_preview if len(content_preview) <= 200 else content_preview[:200] + "..."
-        self._write(f"- **Preview:** {preview}\n\n")
+        self._write(f"- **Conteúdo:** {content_preview}\n\n")
 
     def log_event(self, title: str, details: str = "") -> None:
         """Log a generic event."""

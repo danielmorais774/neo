@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, description="Anthropic API key")
     deepseek_api_key: str | None = Field(default=None, description="DeepSeek API key")
     ollama_base_url: str = Field(
-        default="http://localhost:11434", description="Ollama base URL"
+        default="http://neo-ollama:11434", description="Ollama base URL"
     )
 
     # Default LLM Settings
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     )
     default_model: str = Field(default="gpt-4-turbo-preview", description="Default model")
     default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    default_max_tokens: int = Field(default=4096, ge=1)
+    default_max_tokens: int = Field(default=8192, ge=1)
 
     # Agent Settings
     max_iterations: int = Field(default=32, ge=1, le=100, description="Max agent iterations")

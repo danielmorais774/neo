@@ -47,14 +47,23 @@ class NeoDesktopServicer:
                 session_id = desktop_msg.session_id
                 sid_uuid = UUID(session_id) if session_id else None
 
+                # Extract user_id from DesktopMessage (optional)
+                uid_uuid: UUID | None = None
+                if desktop_msg.user_id:
+                    try:
+                        uid_uuid = UUID(desktop_msg.user_id)
+                    except ValueError:
+                        logger.warning(f"[gRPC] Invalid user_id: {desktop_msg.user_id}")
+
                 if desktop_msg.HasField("user_input"):
                     msg = desktop_msg.user_input.message
                     metadata = dict(desktop_msg.user_input.metadata) if desktop_msg.user_input.metadata else {}
-                    logger.info(f"[gRPC] USER_INPUT session={session_id}: {msg[:80]}")
+                    logger.info(f"[gRPC] USER_INPUT session={session_id} user={uid_uuid}: {msg[:80]}")
 
                     async for resp in self.ai_service.process_user_input(
                         user_message=msg,
                         session_id=sid_uuid,
+                        user_id=uid_uuid,
                         service=metadata.get("client", "neo-desktop"),
                         metadata=metadata,
                     ):
@@ -82,6 +91,7 @@ class NeoDesktopServicer:
                         tool_arguments=pending.get("tool_arguments"),
                         _retry_count=pending.get("_retry_count", 0),
                         _is_diagnostic=pending.get("_is_diagnostic", False),
+                        _followup_count=pending.get("_followup_count", 0),
                     ):
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
