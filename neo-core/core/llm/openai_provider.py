@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 
@@ -48,7 +49,16 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, api_key: str | None = None, **kwargs: Any) -> None:
         super().__init__(api_key, **kwargs)
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            http_client=httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10,
+                    keepalive_expiry=60,
+                ),
+            ),
+        )
 
     async def complete(
         self,

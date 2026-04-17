@@ -28,12 +28,15 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(default=None, description="OpenAI API key")
     anthropic_api_key: str | None = Field(default=None, description="Anthropic API key")
     deepseek_api_key: str | None = Field(default=None, description="DeepSeek API key")
+    gemini_api_key: str | None = Field(default=None, description="Google Gemini API key")
+    grok_api_key: str | None = Field(default=None, description="xAI Grok API key")
+    groq_api_key: str | None = Field(default=None, description="Groq API key (groq.com)")
     ollama_base_url: str = Field(
         default="http://neo-ollama:11434", description="Ollama base URL"
     )
 
     # Default LLM Settings
-    default_provider: Literal["openai", "anthropic", "ollama", "deepseek"] = Field(
+    default_provider: Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"] = Field(
         default="openai", description="Default LLM provider"
     )
     default_model: str = Field(default="gpt-4-turbo-preview", description="Default model")

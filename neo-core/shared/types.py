@@ -158,6 +158,10 @@ class RoutingDecision(BaseModel):
     needs_memory: bool = True  # whether cross-session memory recovery is useful
     knowledge_keywords: list[str] | None = None  # keywords for KG retrieval (classified by intent LLM)
 
+    # --- complexity assessment (avoids separate should_create_plan LLM call) ---
+    needs_plan: bool = False  # True when 2+ steps with dependencies are needed
+    tipo_tarefa: str = "simples"  # simples | multi_etapas | analitica | criacao
+
     # --- classifier observability (optional) ---
     classifier_raw: str | None = None  # raw LLM/text response from classifier
     classifier_payload: dict[str, Any] | None = None  # messages/prompt sent to classifier

@@ -141,32 +141,32 @@ class SessionFileLogger:
 
     def log_intent_classification(
         self,
-        intent: str,
-        confidence: float,
-        explanation: str | None = None,
-        tool_name: str | None = None,
+        decision_data: dict,
         duration_ms: float = 0,
-        payload: dict | None = None,
-        raw_response: str | None = None,
-        needs_memory: bool = True,
-        knowledge_keywords: list[str] | None = None,
+        embed_ms: float = 0,
+        hist_ms: float = 0,
     ) -> None:
+        """Dump the full RoutingDecision as JSON — no cherry-picking, new fields appear automatically."""
         self._write(f"### 4. Classificação de Intent\n\n")
-        self._write(f"- **Intent:** `{intent}`\n")
-        self._write(f"- **Confiança:** {confidence:.2f}\n")
-        self._write(f"- **Duração:** {duration_ms:.1f}ms\n")
-        self._write(f"- **Needs Memory:** `{needs_memory}`\n")
-        if knowledge_keywords:
-            self._write(f"- **Knowledge Keywords:** `{knowledge_keywords}`\n")
-        if tool_name:
-            self._write(f"- **Tool:** `{tool_name}`\n")
-        if explanation:
-            self._write(f"- **Explicação:** {explanation}\n")
+        self._write(f"- **Duração classify:** {duration_ms:.1f}ms\n")
+        if embed_ms:
+            self._write(f"- **Duração embedding:** {embed_ms:.1f}ms\n")
+        if hist_ms:
+            self._write(f"- **Duração histórico:** {hist_ms:.1f}ms\n")
+        # Separate large blobs so the main block stays readable
+        raw_response = decision_data.pop("classifier_raw", None)
+        classifier_payload = decision_data.pop("classifier_payload", None)
+        # Show LLM provider/model prominently before the JSON block
+        if classifier_payload:
+            llm_provider = classifier_payload.get("provider", "?")
+            llm_model = classifier_payload.get("model", "?")
+            self._write(f"- **LLM:** `{llm_provider}` / `{llm_model}`\n")
         self._write("\n")
-        if payload:
+        self._write(f"```json\n{_safe_json(decision_data)}\n```\n\n")
+        if classifier_payload:
             self._write(
-                f"<details>\n<summary>Payload completo do classificador</summary>\n\n"
-                f"```json\n{_safe_json(payload)}\n```\n\n</details>\n\n"
+                f"<details>\n<summary>Payload do classificador (prompt)</summary>\n\n"
+                f"```json\n{_safe_json(classifier_payload)}\n```\n\n</details>\n\n"
             )
         if raw_response:
             self._write(

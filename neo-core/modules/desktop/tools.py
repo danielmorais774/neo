@@ -6,7 +6,7 @@ from shared import ToolParameter, ToolSchema
 DESKTOP_TOOLS: list[ToolSchema] = [
     ToolSchema(
         name="list_directory",
-        description="Lista conteúdo de um diretório",
+        description="Lista conteúdo de um diretório. USE SEMPRE esta ferramenta em vez de 'ls' via run_command. Retorna nome, tipo, tamanho e data de cada item.",
         module="desktop",
         execution="client-side",
         parameters={
@@ -24,7 +24,7 @@ DESKTOP_TOOLS: list[ToolSchema] = [
     ),
     ToolSchema(
         name="read_file",
-        description="Lê conteúdo de um arquivo",
+        description="Lê conteúdo de um arquivo. USE SEMPRE esta ferramenta em vez de 'cat' via run_command. Retorna o conteúdo completo do arquivo. Possui tratamento de erros embutido.",
         module="desktop",
         execution="client-side",
         parameters={
@@ -42,7 +42,7 @@ DESKTOP_TOOLS: list[ToolSchema] = [
     ),
     ToolSchema(
         name="write_file",
-        description="Escreve conteúdo em um arquivo",
+        description="Escreve conteúdo em um arquivo. USE SEMPRE esta ferramenta em vez de 'echo >' ou 'tee' via run_command. Cria diretórios pais automaticamente se não existirem.",
         module="desktop",
         execution="client-side",
         parameters={
@@ -132,7 +132,7 @@ DESKTOP_TOOLS: list[ToolSchema] = [
     ),
     ToolSchema(
         name="search_files",
-        description="Busca arquivos por padrão",
+        description="Busca arquivos por padrão (nome). USE SEMPRE esta ferramenta em vez de 'find' via run_command para encontrar arquivos.",
         module="desktop",
         execution="client-side",
         parameters={

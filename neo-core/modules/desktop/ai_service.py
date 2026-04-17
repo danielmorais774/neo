@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 from core.agent.agent_executor import AgentExecutor
 from core.llm.router import LLMRouter
+from core.planning.plan_manager import ExecutionPlan, PlanManager, PlanStep
 from core.router.intent_router import IntentRouter
 from core.session.session_manager import PersistentSessionManager
 from core.session.preference_extractor import PreferenceExtractor
@@ -92,6 +93,7 @@ class AIService:
         self.knowledge_writer = knowledge_writer
         self.settings = get_settings()
         self._pending_traces: dict[str, MessageTrace] = {}
+        self.planner = PlanManager(llm_router)
 
     # ---------------------------------------------------------------
     # Main entry point — called by gRPC controller
@@ -176,6 +178,7 @@ class AIService:
         )
 
         # 2. Save user message to session
+        t0_embed = time.monotonic()
         saved_msg = await self.sessions.add_message(
             session_id=sid,
             role="user",
@@ -184,6 +187,7 @@ class AIService:
             metadata=metadata,
             user_id=user_id,
         )
+        embed_ms = round((time.monotonic() - t0_embed) * 1000, 1)
         # Keep the embedding for semantic history filtering (Layer 3)
         current_embedding = saved_msg.embedding if saved_msg else None
         slog.log_message_saved("user", user_message, str(sid))
@@ -197,10 +201,12 @@ class AIService:
         )
 
         # 4. Get conversation history for context (filtered + token-budgeted)
+        t0_hist = time.monotonic()
         history = await self.sessions.get_history(
             sid, limit=20, max_tokens_budget=3000,
             current_embedding=current_embedding,
         )
+        hist_ms = round((time.monotonic() - t0_hist) * 1000, 1)
 
         # If session was rotated, carry some context from the previous session
         # so the classifier and LLM have continuity.
@@ -236,20 +242,17 @@ class AIService:
             system_context=sys_context,
         )
         intent_ms = (time.monotonic() - t0) * 1000
+        logger.info(f"[TIMING] embed={embed_ms}ms hist={hist_ms}ms intent={intent_ms:.0f}ms")
         logger.info(f"Intent: {decision.intent.value} (confidence={decision.confidence:.2f}, needs_memory={decision.needs_memory})")
 
-        classifier_payload = getattr(decision, "classifier_payload", None)
-        classifier_raw = getattr(decision, "classifier_raw", None)
+        classifier_payload = decision.classifier_payload
+        classifier_raw = decision.classifier_raw
+
         slog.log_intent_classification(
-            intent=decision.intent.value,
-            confidence=decision.confidence,
-            explanation=decision.explanation,
-            tool_name=decision.tool_name,
+            decision_data=decision.model_dump(),
             duration_ms=intent_ms,
-            payload=classifier_payload,
-            raw_response=classifier_raw,
-            needs_memory=decision.needs_memory,
-            knowledge_keywords=decision.knowledge_keywords,
+            embed_ms=embed_ms,
+            hist_ms=hist_ms,
         )
 
         trace.set_intent(
@@ -265,8 +268,8 @@ class AIService:
         # Log the classifier as an LLM call so it appears in the debug panel's "LLM Calls" section
         if trace and classifier_payload:
             trace.add_llm_call(
-                provider="router",
-                model="intent-classifier",
+                provider=classifier_payload.get("provider", "router"),
+                model=classifier_payload.get("model", "intent-classifier"),
                 messages_sent=classifier_payload.get("messages", []),
                 response_text=classifier_raw or "",
                 duration_ms=round(intent_ms, 2),
@@ -291,7 +294,7 @@ class AIService:
                     yield resp
 
             elif decision.intent == IntentType.CLIENT_TOOL:
-                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id):
+                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id, metadata=metadata):
                     yield resp
         except Exception as e:
             dispatch_error = str(e)
@@ -481,7 +484,11 @@ class AIService:
         # Stream response
         try:
             _req_model = (metadata or {}).get("model")
-            provider = self.llm.get_provider_for_model(_req_model)
+            _req_provider = (metadata or {}).get("provider")
+            if _req_provider:
+                provider = self.llm.get_provider(_req_provider)
+            else:
+                provider = self.llm.get_provider_for_model(_req_model)
             provider_name = type(provider).__name__.replace("Provider", "").lower()
             model_name = _req_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
 
@@ -493,6 +500,7 @@ class AIService:
 
             async for chunk in provider.stream_complete(
                 messages=messages,
+                model=_req_model or None,
                 max_tokens=self.settings.default_max_tokens,
             ):
                 if chunk.event == StreamEventType.TOKEN and chunk.content:
@@ -692,16 +700,85 @@ class AIService:
         trace: MessageTrace | None = None,
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle client-side tool — sends request to desktop for execution.
 
         This yields a non-final response containing a command_request or tool_request
         that the gRPC controller sends to the desktop client.
         The desktop executes and sends back a tool_result which continues the flow.
+
+        For complex multi-step tasks, creates an ExecutionPlan and sends steps one by one.
         """
         command_id = str(uuid4())
         tool_call_id = str(uuid4())
 
+        # ── PLAN CHECK: use classifier's needs_plan (no extra LLM call) ──
+        sys_context = self._build_system_context(metadata)
+        needs_plan = decision.needs_plan
+
+        if needs_plan:
+            plan = await self.planner.generate_plan(
+                user_message=user_message,
+                system_context=sys_context,
+            )
+
+            if plan and plan.steps:
+                sid_str = str(session_id)
+                self.planner.store_plan(sid_str, plan)
+
+                if slog:
+                    slog.log_event(
+                        "Plano Criado",
+                        f"**Objetivo:** {plan.goal}\n"
+                        f"**Passos:** {len(plan.steps)}\n\n"
+                        + "\n".join(f"{i+1}. {s.description}" for i, s in enumerate(plan.steps)),
+                    )
+
+                # Send plan summary to user
+                yield AIServiceResponse(
+                    intent=IntentType.CLIENT_TOOL,
+                    session_id=session_id,
+                    message=plan.to_summary(),
+                    is_final=False,
+                )
+
+                # Send first step
+                first_step = plan.get_current_step()
+                if first_step:
+                    first_step.status = "running"
+                    step_tool_call_id = str(uuid4())
+
+                    yield AIServiceResponse(
+                        intent=IntentType.CLIENT_TOOL,
+                        session_id=session_id,
+                        message=f"{plan.progress_text}: {first_step.description}",
+                        is_final=False,
+                    )
+
+                    yield AIServiceResponse(
+                        intent=IntentType.CLIENT_TOOL,
+                        session_id=session_id,
+                        tool_request={
+                            "tool_call_id": step_tool_call_id,
+                            "tool_name": first_step.tool_name,
+                            "arguments": json.dumps(first_step.tool_arguments, ensure_ascii=False),
+                            "requires_approval": first_step.requires_approval,
+                        },
+                        is_final=False,
+                        metadata={
+                            "flow": "client_tool",
+                            "tool_call_id": step_tool_call_id,
+                            "tool_name": first_step.tool_name,
+                            "user_message": user_message,
+                            "tool_arguments": first_step.tool_arguments,
+                            "command": first_step.raw_command or first_step.tool_arguments.get("command", first_step.tool_name),
+                            "_has_plan": True,
+                        },
+                    )
+                    return  # Flow continues in process_tool_result
+
+        # ── No plan needed — existing single-step flow ──
         if decision.raw_command:
             if slog:
                 slog.log_tool_request("raw_command", command=decision.raw_command, requires_approval=True)
@@ -786,6 +863,7 @@ class AIService:
         _retry_count: int = 0,
         _is_diagnostic: bool = False,
         _followup_count: int = 0,
+        _has_plan: bool = False,
     ) -> AsyncIterator[AIServiceResponse]:
         """Process tool execution result from desktop and format response."""
         MAX_TOOL_RETRIES = 4
@@ -879,6 +957,7 @@ class AIService:
                             "tool_arguments": tool_arguments,  # preserve original tool_arguments
                             "user_message": user_message,
                             "_retry_count": _retry_count + 1,
+                            "_has_plan": _has_plan,
                         },
                     )
                 else:
@@ -900,6 +979,7 @@ class AIService:
                             "tool_arguments": tool_arguments,  # preserve original, NOT new_args
                             "command": command,  # preserve original command through retries
                             "_retry_count": _retry_count + 1,
+                            "_has_plan": _has_plan,
                         },
                     )
 
@@ -967,13 +1047,206 @@ class AIService:
                 is_final=False,
             )
 
-            # Format with AI (trace is passed so the LLM call gets logged)
-            final_text = await self._format_tool_result(
-                user_message, command or tool_name, raw_output, trace=trace,
-            )
+            # ── PLAN-BASED EXECUTION: advance plan and send next step ──
+            sid_str = str(session_id)
+            active_plan = self.planner.get_active_plan(sid_str) if _has_plan else None
 
-            # ── MULTI-STEP FOLLOW-UP: check if user's request needs more commands ──
-            if _followup_count < MAX_FOLLOWUP_STEPS:
+            if active_plan:
+                # Advance the plan with the result
+                next_step = active_plan.advance(step_result=raw_output)
+                completed_step_idx = active_plan.current_step_index - 1 if active_plan.current_step_index > 0 else 0
+
+                if slog:
+                    current_done = active_plan.steps[completed_step_idx] if completed_step_idx < len(active_plan.steps) else None
+                    slog.log_event(
+                        "Plano - Passo Concluído",
+                        f"**Passo:** {(current_done.index + 1) if current_done else '?'}/{len(active_plan.steps)}\n"
+                        f"**Status:** {'Próximo passo' if next_step else 'Plano concluído'}\n",
+                    )
+
+                # Check if completed sub-plan needs to return to parent
+                if active_plan.is_complete and active_plan.parent_plan_id:
+                    parent_plan = self.planner.pop_completed_subplan(sid_str)
+                    if parent_plan:
+                        # Sub-plan done → get next step from parent
+                        subplan_summary = active_plan.get_completed_context()
+                        next_step = parent_plan.advance(step_result=f"Sub-plano concluído:\n{subplan_summary}")
+                        active_plan = parent_plan
+
+                        if slog:
+                            slog.log_event("Sub-plano Concluído", f"Retornando ao plano principal. Próximo passo: {next_step.description if next_step else 'nenhum'}")
+
+                if next_step:
+                    # --- Heuristic: try to skip LLM call ---
+                    skip = self.planner.should_skip_llm(
+                        plan=active_plan,
+                        step_index=completed_step_idx,
+                        raw_output=raw_output,
+                        next_step=next_step,
+                    )
+
+                    if skip:
+                        # No LLM needed — continue with existing step or finish
+                        if skip["decision"] == "finish":
+                            final_text = await self.planner.build_final_response(active_plan, user_message)
+                            self.planner.clear_plans(sid_str)
+                            if slog:
+                                slog.log_event("Plano Concluído (skip)", f"**Status:** {active_plan.status}")
+                        else:
+                            # Send next step directly
+                            next_step.status = "running"
+                            step_tool_call_id = str(uuid4())
+
+                            # Emit plan update
+                            plan_update = self.planner.build_plan_update(active_plan)
+                            yield AIServiceResponse(
+                                intent=IntentType.CLIENT_TOOL,
+                                session_id=session_id,
+                                message=f"{active_plan.progress_text}: {next_step.description}",
+                                is_final=False,
+                                metadata={"plan_update": plan_update},
+                            )
+
+                            yield AIServiceResponse(
+                                intent=IntentType.CLIENT_TOOL,
+                                session_id=session_id,
+                                tool_request={
+                                    "tool_call_id": step_tool_call_id,
+                                    "tool_name": next_step.tool_name,
+                                    "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
+                                    "requires_approval": next_step.requires_approval,
+                                },
+                                is_final=False,
+                                metadata={
+                                    "flow": "client_tool",
+                                    "tool_call_id": step_tool_call_id,
+                                    "tool_name": next_step.tool_name,
+                                    "user_message": user_message,
+                                    "tool_arguments": next_step.tool_arguments,
+                                    "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
+                                    "_has_plan": True,
+                                },
+                            )
+
+                            self._pending_traces[str(session_id)] = trace
+                            return  # Flow continues when desktop sends next tool_result
+                    else:
+                        # --- Call unified advance_and_refine (single LLM call) ---
+                        sys_context = self._build_system_context(tool_arguments)
+                        ar_result = await self.planner.advance_and_refine(
+                            plan=active_plan,
+                            step_index=completed_step_idx,
+                            raw_output=raw_output,
+                            system_context=sys_context,
+                        )
+
+                        decision = ar_result["decision"]
+
+                        if decision == "finish":
+                            final_text = await self.planner.build_final_response(active_plan, user_message)
+                            self.planner.clear_plans(sid_str)
+                            if slog:
+                                slog.log_event("Plano Concluído (LLM)", f"**Razão:** {ar_result.get('reason', '')}")
+
+                        elif decision == "subplan":
+                            subplan_steps = ar_result.get("subplan_steps") or []
+                            remaining = [s for s in active_plan.steps if s.status == "pending"]
+                            if subplan_steps and self.planner.subplan_is_valid(subplan_steps, remaining):
+                                # Create the subplan via generate_plan with the steps from LLM
+                                sub_goal = ar_result.get("reason", active_plan.goal)
+                                subplan = await self.planner.create_subplan(
+                                    parent_plan=active_plan,
+                                    parent_step=active_plan.steps[completed_step_idx],
+                                    step_result=raw_output,
+                                    system_context=sys_context,
+                                    session_id=sid_str,
+                                )
+                                if subplan and subplan.steps:
+                                    self.planner.store_plan(sid_str, subplan)
+                                    active_plan = subplan
+                                    next_step = subplan.get_current_step()
+
+                                    yield AIServiceResponse(
+                                        intent=IntentType.CLIENT_TOOL,
+                                        session_id=session_id,
+                                        message=f"📋 Sub-plano: {subplan.goal}\n" + subplan.to_summary(),
+                                        is_final=False,
+                                    )
+                            # If subplan rejected, fall through to continue with next_step
+
+                        elif decision == "retry":
+                            # Use refined_step from LLM response
+                            refined = ar_result.get("refined_step")
+                            if refined:
+                                next_step.tool_name = refined.get("tool_name", next_step.tool_name)
+                                next_step.tool_arguments = refined.get("tool_arguments", next_step.tool_arguments)
+                                next_step.raw_command = next_step.tool_arguments.get("command", next_step.raw_command)
+                                next_step.requires_approval = refined.get("requires_approval", next_step.requires_approval)
+
+                        else:  # "continue"
+                            # Apply refined_step if provided (for dependent steps)
+                            refined = ar_result.get("refined_step")
+                            if refined:
+                                next_step.tool_name = refined.get("tool_name", next_step.tool_name)
+                                next_step.tool_arguments = refined.get("tool_arguments", next_step.tool_arguments)
+                                next_step.raw_command = next_step.tool_arguments.get("command", next_step.raw_command)
+                                next_step.requires_approval = refined.get("requires_approval", next_step.requires_approval)
+
+                        # If decision was continue/retry/subplan and we have a next step, send it
+                        if decision in ("continue", "retry", "subplan") and next_step:
+                            next_step.status = "running"
+                            step_tool_call_id = str(uuid4())
+
+                            plan_update = self.planner.build_plan_update(active_plan)
+                            yield AIServiceResponse(
+                                intent=IntentType.CLIENT_TOOL,
+                                session_id=session_id,
+                                message=f"{active_plan.progress_text}: {next_step.description}",
+                                is_final=False,
+                                metadata={"plan_update": plan_update},
+                            )
+
+                            yield AIServiceResponse(
+                                intent=IntentType.CLIENT_TOOL,
+                                session_id=session_id,
+                                tool_request={
+                                    "tool_call_id": step_tool_call_id,
+                                    "tool_name": next_step.tool_name,
+                                    "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
+                                    "requires_approval": next_step.requires_approval,
+                                },
+                                is_final=False,
+                                metadata={
+                                    "flow": "client_tool",
+                                    "tool_call_id": step_tool_call_id,
+                                    "tool_name": next_step.tool_name,
+                                    "user_message": user_message,
+                                    "tool_arguments": next_step.tool_arguments,
+                                    "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
+                                    "_has_plan": True,
+                                },
+                            )
+
+                            self._pending_traces[str(session_id)] = trace
+                            return  # Flow continues when desktop sends next tool_result
+
+                # Plan complete — format final unified response
+                if not active_plan.is_complete:
+                    active_plan.status = "completed"
+                final_text = await self.planner.build_final_response(active_plan, user_message)
+                self.planner.clear_plans(sid_str)
+
+                if slog:
+                    slog.log_event("Plano Concluído", f"**Status:** {active_plan.status}\n**Resultado:**\n{final_text[:500]}")
+
+            else:
+                # Format with AI (trace is passed so the LLM call gets logged)
+                final_text = await self._format_tool_result(
+                    user_message, command or tool_name, raw_output, trace=trace,
+                )
+
+            # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
+            if not active_plan and _followup_count < MAX_FOLLOWUP_STEPS:
                 followup = await self._check_followup_needed(
                     user_message=user_message,
                     command_ran=command or tool_name,
@@ -983,7 +1256,7 @@ class AIService:
                 if followup and followup.get("needed"):
                     followup_cmd = followup.get("command", "")
                     followup_explanation = followup.get("explanation", "Executando próximo passo...")
-                    if followup_cmd:
+                    if followup_cmd and not self._is_blocking_command(followup_cmd):
                         logger.info(
                             f"[FOLLOWUP] Step {_followup_count + 1}: {followup_cmd}"
                         )
@@ -1042,8 +1315,77 @@ class AIService:
                 error=error or "desconhecido",
             )
 
+            # ── PLAN-AWARE ERROR: mark step as failed, try to continue ──
+            sid_str = str(session_id)
+            active_plan = self.planner.get_active_plan(sid_str) if _has_plan else None
+
+            if active_plan:
+                # Mark the current step as failed and try next
+                next_step = active_plan.advance(step_error=error or "desconhecido")
+
+                if slog:
+                    slog.log_event(
+                        "Plano - Passo Falhou",
+                        f"**Erro:** {error or 'desconhecido'}\n"
+                        f"**Ação:** {'Tentando próximo passo' if next_step else 'Plano abortado'}\n",
+                    )
+
+                if next_step:
+                    # For error recovery: refine the next step if dependent
+                    if next_step.depends_on_previous:
+                        sys_context = self._build_system_context(tool_arguments)
+                        ar_result = await self.planner.advance_and_refine(
+                            plan=active_plan,
+                            step_index=active_plan.current_step_index - 1 if active_plan.current_step_index > 0 else 0,
+                            raw_output=f"ERRO: {error or 'desconhecido'}",
+                            system_context=sys_context,
+                        )
+                        refined = ar_result.get("refined_step")
+                        if refined:
+                            next_step.tool_name = refined.get("tool_name", next_step.tool_name)
+                            next_step.tool_arguments = refined.get("tool_arguments", next_step.tool_arguments)
+                            next_step.raw_command = next_step.tool_arguments.get("command", next_step.raw_command)
+
+                    next_step.status = "running"
+                    step_tool_call_id = str(uuid4())
+
+                    yield AIServiceResponse(
+                        intent=IntentType.CLIENT_TOOL,
+                        session_id=session_id,
+                        message=f"⚠️ Passo anterior falhou. {active_plan.progress_text}: {next_step.description}",
+                        is_final=False,
+                    )
+
+                    yield AIServiceResponse(
+                        intent=IntentType.CLIENT_TOOL,
+                        session_id=session_id,
+                        tool_request={
+                            "tool_call_id": step_tool_call_id,
+                            "tool_name": next_step.tool_name,
+                            "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
+                            "requires_approval": next_step.requires_approval,
+                        },
+                        is_final=False,
+                        metadata={
+                            "flow": "client_tool",
+                            "tool_call_id": step_tool_call_id,
+                            "tool_name": next_step.tool_name,
+                            "user_message": user_message,
+                            "tool_arguments": next_step.tool_arguments,
+                            "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
+                            "_has_plan": True,
+                        },
+                    )
+
+                    self._pending_traces[str(session_id)] = trace
+                    return
+
+                # All steps done or failed — format whatever we have
+                final_text = await self.planner.build_final_response(active_plan, user_message)
+                self.planner.clear_plans(sid_str)
+
             # ── ERROR RECOVERY: auto-diagnose then ask LLM ──────────
-            if _retry_count < MAX_TOOL_RETRIES:
+            elif _retry_count < MAX_TOOL_RETRIES:
                 logger.info(
                     f"Tool '{tool_name}' failed (attempt {_retry_count + 1}/{MAX_TOOL_RETRIES}). "
                     f"Starting recovery: {error}"
@@ -1110,6 +1452,7 @@ class AIService:
                                 "user_message": user_message,
                                 "_retry_count": _retry_count + 1,
                                 "_is_diagnostic": is_diag,
+                                "_has_plan": _has_plan,
                             },
                         )
                     else:
@@ -1132,6 +1475,7 @@ class AIService:
                                 "command": command,  # preserve original command through retries
                                 "_retry_count": _retry_count + 1,
                                 "_is_diagnostic": is_diag,
+                                "_has_plan": _has_plan,
                             },
                         )
 
@@ -1404,7 +1748,23 @@ class AIService:
                 f"echo $PATH"
             )
         if error_type == "permission_denied":
+            # For permission denied, check if the path/directory actually exists
+            # Extract the path from the command or tool_arguments
+            target_path = ""
+            if tool_arguments:
+                target_path = tool_arguments.get("path", "") or tool_arguments.get("command", "")
+            if not target_path:
+                target_path = command or ""
+            # Try to extract a file path from shell redirect (e.g. "> /path/to/file")
+            import re as _re_diag
+            redirect_match = _re_diag.search(r'>\s*(/[^\s;|&]+)', target_path)
+            file_path = redirect_match.group(1) if redirect_match else target_path
+
             return (
+                f"echo '=== path check ==='; "
+                f"test -e '{file_path}' && echo 'path exists' || echo 'path does NOT exist'; "
+                f"echo '=== parent dir ==='; "
+                f"dirname '{file_path}' | xargs -I{{}} sh -c 'test -d \"{{}}\" && echo \"dir exists: {{}}\" || echo \"dir does NOT exist: {{}}\"'; "
                 f"echo '=== file info ==='; "
                 f"ls -la $(which {program} 2>/dev/null || echo /usr/bin/{program}) 2>&1; "
                 f"echo '=== user ==='; "
@@ -1551,6 +1911,32 @@ class AIService:
                     "requires_approval": False,
                 }
             logger.info(f"[Diagnostic] {program} not found in diagnostic output — escalating to LLM")
+
+        # ── STEP 1.5b: Deterministic recovery for permission_denied ──
+        # If the diagnostic shows the path/directory doesn't exist, switch to write_file tool
+        if diagnostic_output and error_type == "permission_denied":
+            if "dir does NOT exist" in diagnostic_output or "path does NOT exist" in diagnostic_output:
+                # The real problem is the path doesn't exist, not permissions
+                # Suggest using write_file tool which auto-creates parent directories
+                target_path = ""
+                if tool_arguments:
+                    target_path = tool_arguments.get("path", "")
+                if not target_path:
+                    import re as _re_path
+                    redirect_match = _re_path.search(r'>\s*(/[^\s;|&]+)', command or "")
+                    if redirect_match:
+                        target_path = redirect_match.group(1)
+
+                if target_path:
+                    logger.info(f"[Diagnostic] permission_denied but path doesn't exist: {target_path}. Switching to write_file tool.")
+                    return {
+                        "action": "retry",
+                        "tool_name": "write_file",
+                        "tool_arguments": {"path": target_path, "content": "", "mode": "write"},
+                        "explanation": f"O diretório não existe. Criando o arquivo {target_path} usando write_file (cria diretórios automaticamente)...",
+                        "requires_approval": False,
+                    }
+                logger.info(f"[Diagnostic] permission_denied + path doesn't exist but couldn't extract target path")
 
         # ── STEP 2: Build an informed prompt with real data ──
         system_msg = (
@@ -1815,7 +2201,9 @@ class AIService:
             '{"needed": false} se o pedido já foi completamente atendido.\n'
             '{"needed": true, "command": "comando_shell_para_completar", "explanation": "explicação curta em português"}\n'
             "se um comando adicional é necessário para completar o pedido.\n"
-            "IMPORTANTE: O comando deve usar caminhos absolutos baseados na saída obtida."
+            "IMPORTANTE: O comando deve usar caminhos absolutos baseados na saída obtida.\n"
+            "NUNCA sugira comandos que bloqueiam o terminal indefinidamente (tail -f, watch, less, vim, nano, top, htop, journalctl -f).\n"
+            "Se o comando anterior já abriu um app gráfico com sucesso (exit code 0), retorne needed=false."
         )
 
         system_msg = (
@@ -1865,6 +2253,36 @@ class AIService:
         except Exception as e:
             logger.warning(f"Failed to check followup needed: {e}")
             return None
+
+    # Patterns that match commands which block forever (never return)
+    _BLOCKING_COMMAND_PATTERNS = [
+        "tail -f", "tail --follow",
+        "watch ",
+        "less ", "more ",
+        "vim ", "vi ", "nano ", "emacs ",
+        "top", "htop", "btop",
+        "journalctl -f", "journalctl --follow",
+        "dmesg -w", "dmesg --follow",
+        "python -m http.server", "python3 -m http.server",
+        "npm start", "npm run dev", "npm run serve",
+        "nc -l", "netcat -l",
+    ]
+
+    @staticmethod
+    def _is_blocking_command(cmd: str) -> bool:
+        """Check if a command is known to block forever (never return).
+
+        These commands should never be used as auto-followup steps because
+        they hang the session indefinitely.
+        """
+        import re
+        cmd_stripped = cmd.strip()
+        for pattern in AIService._BLOCKING_COMMAND_PATTERNS:
+            # Match at the start of the command or after a pipe/semicolon
+            if re.search(r'(?:^|[|;&]\s*)' + re.escape(pattern), cmd_stripped):
+                logger.warning(f"[FOLLOWUP] Blocked dangerous command: {cmd_stripped}")
+                return True
+        return False
 
     @staticmethod
     def _truncate_output(value: str, max_lines: int = 60) -> str:

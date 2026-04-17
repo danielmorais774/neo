@@ -92,6 +92,7 @@ class NeoDesktopServicer:
                         _retry_count=pending.get("_retry_count", 0),
                         _is_diagnostic=pending.get("_is_diagnostic", False),
                         _followup_count=pending.get("_followup_count", 0),
+                        _has_plan=pending.get("_has_plan", False),
                     ):
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
@@ -142,6 +143,39 @@ class NeoDesktopServicer:
         # Prefer the DB-assigned session_id from the response over the raw desktop string.
         # This ensures the desktop always echoes back a valid DB UUID on subsequent messages.
         sid = str(resp.session_id) if resp.session_id else session_id
+
+        # Plan update (from metadata)
+        plan_update_data = resp.metadata.get("plan_update") if resp.metadata else None
+        if plan_update_data:
+            steps = [
+                neo_desktop_pb2.PlanStepInfo(
+                    id=s.get("id", ""),
+                    index=s.get("index", 0),
+                    description=s.get("description", ""),
+                    tool_name=s.get("tool_name", ""),
+                    status=s.get("status", "pending"),
+                    result_summary=s.get("result_summary", ""),
+                    error=s.get("error", ""),
+                )
+                for s in plan_update_data.get("steps", [])
+            ]
+            plan_msg = neo_desktop_pb2.CoreMessage(
+                session_id=sid,
+                plan_update=neo_desktop_pb2.PlanUpdate(
+                    plan_id=plan_update_data.get("plan_id", ""),
+                    goal=plan_update_data.get("goal", ""),
+                    steps=steps,
+                    current_step=plan_update_data.get("current_step", 0),
+                    status=plan_update_data.get("status", "active"),
+                    parent_plan_id=plan_update_data.get("parent_plan_id", ""),
+                ),
+            )
+            # If there's also a message, we need to send plan_update first, then the message
+            # Since proto oneof only allows one, handle the plan_update priority
+            if not resp.message:
+                return plan_msg
+            # If there's also a message, send plan_update (message will be sent as thinking in next yield)
+            return plan_msg
 
         # Command request
         if resp.command_request:

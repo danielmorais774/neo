@@ -4,12 +4,15 @@ from typing import Literal
 
 from core.llm.claude_provider import ClaudeProvider
 from core.llm.deepseek_provider import DeepSeekProvider
+from core.llm.gemini_provider import GeminiProvider
+from core.llm.grok_provider import GrokProvider
+from core.llm.groq_provider import GroqProvider
 from core.llm.ollama_provider import OllamaProvider
 from core.llm.openai_provider import OpenAIProvider
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, get_settings
 
-ProviderType = Literal["openai", "anthropic", "ollama", "deepseek"]
+ProviderType = Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"]
 
 # Mapeamento de nome de modelo → provider
 _MODEL_TO_PROVIDER: dict[str, str] = {
@@ -26,6 +29,12 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     # DeepSeek
     "deepseek-chat": "deepseek",
     "deepseek-reasoner": "deepseek",
+    # Gemini
+    "gemini-2.5-pro-preview-03-25": "gemini",
+    "gemini-2.0-flash": "gemini",
+    "gemini-2.0-flash-lite": "gemini",
+    "gemini-1.5-pro": "gemini",
+    "gemini-1.5-flash": "gemini",
     # Ollama (modelos locais)
     "gemma4:e2b": "ollama",
     "gemma4:12b": "ollama",
@@ -34,6 +43,19 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "llama3:70b": "ollama",
     "mistral": "ollama",
     "phi4": "ollama",
+    # Grok (xAI) — free plan
+    "grok-3-mini": "grok",
+    "grok-3-mini-fast": "grok",
+    "grok-2-1212": "grok",
+    # Grok (xAI) — paid
+    "grok-3": "grok",
+    "grok-3-fast": "grok",
+    # Groq (groq.com) — ultra-fast LPU inference
+    "llama-3.3-70b-versatile": "groq",
+    "llama-3.1-8b-instant": "groq",
+    "llama3-70b-8192": "groq",
+    "mixtral-8x7b-32768": "groq",
+    "gemma2-9b-it": "groq",
 }
 
 
@@ -64,6 +86,24 @@ class LLMRouter:
         if self.settings.deepseek_api_key:
             self._providers["deepseek"] = DeepSeekProvider(
                 api_key=self.settings.deepseek_api_key
+            )
+
+        # Gemini
+        if self.settings.gemini_api_key:
+            self._providers["gemini"] = GeminiProvider(
+                api_key=self.settings.gemini_api_key
+            )
+
+        # Grok (xAI)
+        if self.settings.grok_api_key:
+            self._providers["grok"] = GrokProvider(
+                api_key=self.settings.grok_api_key
+            )
+
+        # Groq (groq.com) — ultra-fast LPU
+        if self.settings.groq_api_key:
+            self._providers["groq"] = GroqProvider(
+                api_key=self.settings.groq_api_key
             )
 
         # Ollama — sempre disponível (não requer API key)
@@ -128,6 +168,7 @@ class LLMRouter:
             "anthropic": "claude-3-opus-20240229",
             "ollama": "gemma4:e2b",
             "deepseek": "deepseek-chat",
+            "gemini": "gemini-2.0-flash",
         }
 
         return defaults.get(name, self.settings.default_model)
