@@ -23,6 +23,7 @@ dependencies = [
     "motor>=3.3.0",
     "tiktoken>=0.7.0",
     "numpy>=1.26.0",
+    "sentence-transformers>=3.0",
 ]
 
 [build-system]

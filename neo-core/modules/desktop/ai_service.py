@@ -7,6 +7,7 @@ It uses IntentRouter to classify messages and dispatches to the correct handler:
   - handle_client_tool: tools running on the user's desktop (via gRPC tool_request)
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -123,12 +124,15 @@ class AIService:
             AIServiceResponse with thinking, tool requests, or final response.
         """
         # 1. Get or create session (with topic rotation check)
+        t0_total = time.monotonic()
         logger.info(f"[HISTORY-DEBUG] Input session_id from desktop: {session_id}")
+        t0_session = time.monotonic()
         session = await self.sessions.get_or_create_session(
             session_id=session_id,
             user_id=user_id,
             service=service,
         )
+        session_ms = round((time.monotonic() - t0_session) * 1000, 1)
         sid = session.id
         slog = get_session_logger(sid)
         slog.new_interaction(user_message, desktop_session_id=str(session_id) if session_id else None, metadata=metadata)
@@ -177,22 +181,7 @@ class AIService:
             rotated_from=str(old_sid) if rotated else None,
         )
 
-        # 2. Save user message to session
-        t0_embed = time.monotonic()
-        saved_msg = await self.sessions.add_message(
-            session_id=sid,
-            role="user",
-            content=user_message,
-            generate_embedding=True,
-            metadata=metadata,
-            user_id=user_id,
-        )
-        embed_ms = round((time.monotonic() - t0_embed) * 1000, 1)
-        # Keep the embedding for semantic history filtering (Layer 3)
-        current_embedding = saved_msg.embedding if saved_msg else None
-        slog.log_message_saved("user", user_message, str(sid))
-
-        # 3. Yield thinking status
+        # 3. Yield thinking status cedo — usuário vê feedback enquanto processamos
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=sid,
@@ -200,13 +189,30 @@ class AIService:
             is_final=False,
         )
 
-        # 4. Get conversation history for context (filtered + token-budgeted)
-        t0_hist = time.monotonic()
-        history = await self.sessions.get_history(
-            sid, limit=20, max_tokens_budget=3000,
-            current_embedding=current_embedding,
+        # 2+4. Salvar mensagem (com embedding) E buscar histórico EM PARALELO
+        # get_history roda sem current_embedding (re-rank semântico ignorado para msgs novas;
+        # só afeta sessões com >30 msgs). O classify recebe o histórico diretamente.
+        sys_context = self._build_system_context(metadata)
+        t0_parallel = time.monotonic()
+        saved_msg, history = await asyncio.gather(
+            self.sessions.add_message(
+                session_id=sid,
+                role="user",
+                content=user_message,
+                generate_embedding=True,
+                metadata=metadata,
+                user_id=user_id,
+            ),
+            self.sessions.get_history(
+                sid, limit=20, max_tokens_budget=3000,
+                current_embedding=None,  # ainda não disponível; sem re-rank semântico
+            ),
         )
-        hist_ms = round((time.monotonic() - t0_hist) * 1000, 1)
+        parallel_ms = round((time.monotonic() - t0_parallel) * 1000, 1)
+        embed_ms = parallel_ms  # ambas as ops rodaram em paralelo
+        hist_ms = 0.0           # sobrepostos — não contados separadamente
+        current_embedding = saved_msg.embedding if saved_msg else None
+        slog.log_message_saved("user", user_message, str(sid))
 
         # If session was rotated, carry some context from the previous session
         # so the classifier and LLM have continuity.
@@ -233,17 +239,39 @@ class AIService:
         if _rotation_result is not None:
             trace.set_topic_rotation(_rotation_result)
 
-        # 5. Classify intent — pass system context from metadata so router can use it
-        sys_context = self._build_system_context(metadata)
+        # 5. Classify intent — history já disponível do gather acima
+        # Bypass: metadata["force_intent"] = "CLIENT_TOOL"|"DIRECT_RESPONSE"|"SERVER_TOOL"
+        # útil para testes sem precisar aguardar o classificador.
+        _force_intent = (metadata or {}).get("force_intent", "").upper()
         t0 = time.monotonic()
-        decision = await self.router.classify(
-            user_message,
-            conversation_history=history,
-            system_context=sys_context,
-        )
+        if _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "SERVER_TOOL"):
+            from shared.types import RoutingDecision as _RD
+            _intent_map = {
+                "CLIENT_TOOL": IntentType.CLIENT_TOOL,
+                "DIRECT_RESPONSE": IntentType.DIRECT_RESPONSE,
+                "SERVER_TOOL": IntentType.SERVER_TOOL,
+            }
+            decision = _RD(
+                intent=_intent_map[_force_intent],
+                confidence=1.0,
+                tool_name=(metadata or {}).get("force_tool_name") or None,
+                needs_plan=True,
+                requires_approval=False,
+                explanation=f"[forced via metadata] {_force_intent}",
+            )
+            logger.info(f"[INTENT-OVERRIDE] force_intent={_force_intent}")
+        else:
+            decision = await self.router.classify(
+                user_message,
+                conversation_history=history,
+                system_context=sys_context,
+            )
         intent_ms = (time.monotonic() - t0) * 1000
-        logger.info(f"[TIMING] embed={embed_ms}ms hist={hist_ms}ms intent={intent_ms:.0f}ms")
+        logger.info(f"[TIMING] session={session_ms}ms embed+hist={embed_ms}ms intent={intent_ms:.0f}ms")
         logger.info(f"Intent: {decision.intent.value} (confidence={decision.confidence:.2f}, needs_memory={decision.needs_memory})")
+        slog.record_step_timing("Sessão (get/create)", session_ms)
+        slog.record_step_timing("Embed + Histórico (parallel)", embed_ms)
+        slog.record_step_timing("Classificação de Intent", round(intent_ms, 1))
 
         classifier_payload = decision.classifier_payload
         classifier_raw = decision.classifier_raw
@@ -301,6 +329,9 @@ class AIService:
             slog.log_event("Erro no Dispatch", f"```\n{dispatch_error}\n```")
             raise
         finally:
+            total_ms = round((time.monotonic() - t0_total) * 1000, 1)
+            logger.info(f"[TIMING-TOTAL] neo-core total={total_ms}ms")
+            slog.log_timing_summary(total_ms)
             if decision.intent == IntentType.CLIENT_TOOL and not dispatch_error:
                 # Keep trace alive — continuation in process_tool_result / process_command_approval
                 # Must key by the desktop gRPC session_id (not the DB sid) so process_tool_result can find it
@@ -330,6 +361,7 @@ class AIService:
         # Skip recovery when needs_memory=False (greetings, acks, phatic expressions).
         if not decision.needs_memory:
             recovered_context = []
+            recover_ms = 0.0
             logger.info("[HISTORY-DEBUG] Skipping recover_context (needs_memory=False from classifier)")
             if slog:
                 slog.log_event(
@@ -337,7 +369,9 @@ class AIService:
                     "Pulada: o classificador indicou needs_memory=false (mensagem sem conteúdo semântico relevante).",
                 )
         else:
+            t0_recover = time.monotonic()
             recovered_context = await self.sessions.recover_context(user_message, user_id=user_id)
+            recover_ms = round((time.monotonic() - t0_recover) * 1000, 1)
 
         # Build messages
         today = date.today()
@@ -374,7 +408,7 @@ class AIService:
             "Você foi criado por Daniel Morais (seu desenvolvedor). "
             "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
             "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
-            "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora. "
+            "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora, e também só deve mencionar isso em um contexto relevante. "
             "O nome e perfil do usuário atual estão na seção 'Usuário Atual' do contexto — use essas informações para saber com quem você está falando. "
             f"A data de hoje é {formatted_date}. "
             "Suas regras:\n"
@@ -396,9 +430,12 @@ class AIService:
             system_prompt += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
 
         # Inject persistent user preferences
+        prefs_ms = 0.0
         if self.preferences:
             try:
+                t0_prefs = time.monotonic()
                 prefs_text = await self.preferences.get_preferences_text(service="neo-desktop")
+                prefs_ms = round((time.monotonic() - t0_prefs) * 1000, 1)
                 if prefs_text:
                     system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as sempre:{prefs_text}"
                     logger.info(f"[PREF] Injected user preferences into system prompt")
@@ -408,13 +445,16 @@ class AIService:
                 logger.warning(f"[PREF] Failed to load preferences: {e}")
 
         # Inject knowledge graph context
+        kg_ms = 0.0
         if self.knowledge_retriever and user_id:
             try:
+                t0_kg = time.monotonic()
                 kg_result = await self.knowledge_retriever.retrieve(
                     user_id=user_id,
                     user_input=user_message,
                     keywords=decision.knowledge_keywords or None,
                 )
+                kg_ms = round((time.monotonic() - t0_kg) * 1000, 1)
                 kg_context = self._format_knowledge_context(kg_result)
                 if kg_context:
                     system_prompt += f"\n\n## Usuário Atual (com quem você está conversando agora)\n{kg_context}"
@@ -545,6 +585,7 @@ class AIService:
                 slog.log_event("Erro LLM", f"```\n{str(e)}\n```")
 
         # Save assistant response
+        t0_save = time.monotonic()
         await self.sessions.add_message(
             session_id=session_id,
             role="assistant",
@@ -552,12 +593,30 @@ class AIService:
             generate_embedding=False,
             user_id=user_id,
         )
+        save_ms = round((time.monotonic() - t0_save) * 1000, 1)
+        logger.info(f"[TIMING-DIRECT] recover={recover_ms}ms prefs={prefs_ms}ms kg={kg_ms}ms llm={llm_ms:.0f}ms save_assistant={save_ms}ms")
         if slog:
+            slog.record_step_timing("Recuperação de Contexto", recover_ms)
+            slog.record_step_timing("Preferências do Usuário", prefs_ms)
+            slog.record_step_timing("Grafo de Conhecimento", kg_ms)
+            slog.record_step_timing("LLM (resposta)", round(llm_ms, 1))
+            slog.record_step_timing("Salvar resposta (DB)", save_ms)
             slog.log_message_saved("assistant", full_response, str(session_id))
             slog.log_final_response(full_response, "DIRECT_RESPONSE", iterations=1)
 
-        # Fire-and-forget: extract user preferences from this turn
-        if self.preferences:
+        # Yield final response FIRST — background tasks must never block the user-facing round-trip
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE,
+            session_id=session_id,
+            message=full_response,
+            is_final=True,
+            iterations=1,
+        )
+
+        # True fire-and-forget: schedule as background tasks AFTER yielding the response
+        async def _bg_prefs() -> None:
+            if not self.preferences:
+                return
             try:
                 extracted = await self.preferences.extract_and_save(
                     user_message=user_message,
@@ -572,10 +631,9 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PREF] Post-response extraction failed: {e}")
 
-        # Fire-and-forget: update knowledge graph from this turn
-        # Run writer even without knowledge_keywords — the writer itself decides if there's
-        # anything worth saving (device info, problems, etc. wouldn't get keywords otherwise)
-        if self.knowledge_writer and user_id and full_response:
+        async def _bg_kg() -> None:
+            if not (self.knowledge_writer and user_id and full_response):
+                return
             try:
                 kg_context_for_writer = ""
                 if self.knowledge_retriever:
@@ -586,7 +644,6 @@ class AIService:
                     )
                     kg_context_for_writer = self._format_knowledge_context(kg_raw)
 
-                # Build recent history context for the writer (last 6 messages before current turn)
                 recent_history_lines = []
                 for msg in history[-(6 + 1):-1] if len(history) > 1 else []:
                     role_label = "Usuário" if msg.get("role") == "user" else "Assistente"
@@ -611,13 +668,8 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[KGW] Post-response write failed: {e}")
 
-        yield AIServiceResponse(
-            intent=IntentType.DIRECT_RESPONSE,
-            session_id=session_id,
-            message=full_response,
-            is_final=True,
-            iterations=1,
-        )
+        asyncio.create_task(_bg_prefs())
+        asyncio.create_task(_bg_kg())
 
     # ---------------------------------------------------------------
     # Handler: SERVER_TOOL — tools running on neo-core host
@@ -636,7 +688,7 @@ class AIService:
         """Handle server-side tool execution using AgentExecutor."""
 
         if slog:
-            slog.log_tool_request(decision.tool_name or "agent", arguments=decision.tool_arguments)
+            slog.log_tool_request(decision.tool_name or "agent", arguments=decision.tool_arguments, execution="server-side")
 
         yield AIServiceResponse(
             intent=IntentType.SERVER_TOOL,
@@ -657,7 +709,7 @@ class AIService:
             iterations = result.get("iterations", 1)
             tool_ms = (time.monotonic() - t0) * 1000
             if slog:
-                slog.log_tool_result(decision.tool_name or "agent", success=True, result=final_text, duration_ms=tool_ms)
+                slog.log_tool_result(decision.tool_name or "agent", success=True, result=final_text, duration_ms=tool_ms, execution="server-side")
 
         except Exception as e:
             logger.exception("Server tool execution failed")
@@ -665,7 +717,7 @@ class AIService:
             iterations = 1
             tool_ms = (time.monotonic() - t0) * 1000
             if slog:
-                slog.log_tool_result(decision.tool_name or "agent", success=False, error=str(e), duration_ms=tool_ms)
+                slog.log_tool_result(decision.tool_name or "agent", success=False, error=str(e), duration_ms=tool_ms, execution="server-side")
 
         # Save response
         await self.sessions.add_message(
@@ -781,7 +833,7 @@ class AIService:
         # ── No plan needed — existing single-step flow ──
         if decision.raw_command:
             if slog:
-                slog.log_tool_request("raw_command", command=decision.raw_command, requires_approval=True)
+                slog.log_tool_request("raw_command", command=decision.raw_command, requires_approval=True, execution="client-side")
 
             # Shell command needs approval
             yield AIServiceResponse(
@@ -815,7 +867,7 @@ class AIService:
             
             logger.info(f"[DEBUG] _handle_client_tool: tool_name='{tool_name}', arguments={arguments}")
             if slog:
-                slog.log_tool_request(tool_name, arguments=arguments, requires_approval=decision.requires_approval)
+                slog.log_tool_request(tool_name, arguments=arguments, requires_approval=decision.requires_approval, execution="client-side")
 
             yield AIServiceResponse(
                 intent=IntentType.CLIENT_TOOL,
@@ -883,7 +935,7 @@ class AIService:
             )
 
         t0_tool = time.monotonic()
-        slog.log_tool_result(tool_name, success=success, result=result, error=error, duration_ms=0)
+        slog.log_tool_result(tool_name, success=success, result=result, error=error, duration_ms=0, execution="client-side")
 
         # ── DIAGNOSTIC RESULT: this was an auto-diagnostic command ──
         if _is_diagnostic:

@@ -43,7 +43,7 @@ class ConversationSession(SQLModel, table=True):
         default=None,
         sa_column=Column(
             "topic_embedding",
-            Vector(1536) if HAS_PGVECTOR else JSON,
+            Vector(384) if HAS_PGVECTOR else JSON,
             nullable=True,
         ),
     )
@@ -96,7 +96,7 @@ class ConversationMessage(SQLModel, table=True):
         default=None,
         sa_column=Column(
             "embedding",
-            Vector(1536) if HAS_PGVECTOR else JSON,
+            Vector(384) if HAS_PGVECTOR else JSON,
             nullable=True,
         ),
     )

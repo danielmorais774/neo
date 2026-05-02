@@ -62,11 +62,19 @@ class Settings(BaseSettings):
     )
 
     # Embeddings
+    embedding_provider: Literal["local", "openai"] = Field(
+        default="local",
+        description="Provider de embeddings: 'local' (sentence-transformers) ou 'openai' (API remota)",
+    )
+    embedding_local_model: str = Field(
+        default="all-MiniLM-L6-v2",
+        description="Modelo local sentence-transformers (usado quando embedding_provider=local)",
+    )
     embedding_model: str = Field(
         default="text-embedding-3-small",
-        description="OpenAI embedding model",
+        description="OpenAI embedding model (usado quando embedding_provider=openai)",
     )
-    embedding_dimensions: int = Field(default=1536, description="Embedding vector size")
+    embedding_dimensions: int = Field(default=384, description="Embedding vector size (384 para all-MiniLM-L6-v2 local, 1536 para OpenAI)")
 
     # Session lifecycle
     session_inactivity_minutes: int = Field(

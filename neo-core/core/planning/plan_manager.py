@@ -81,8 +81,16 @@ class ExecutionPlan(BaseModel):
         return "\n".join(lines)
 
     def advance(self, step_result: str | None = None, step_error: str | None = None) -> PlanStep | None:
-        """Mark current step as completed/failed and return the next pending step."""
-        current = self.get_current_step()
+        """Mark current running step as completed/failed and return the next pending step."""
+        # Find the "running" step first (it was set to running when dispatched).
+        # Fallback to first pending only if nothing is running (edge case).
+        current = None
+        for step in self.steps:
+            if step.status == "running":
+                current = step
+                break
+        if current is None:
+            current = self.get_current_step()
         if not current:
             self.status = "completed"
             return None
@@ -264,7 +272,13 @@ class PlanManager:
             "   - list_directory: para listar conteúdo de diretórios\n"
             "7. Para o primeiro passo e passos independentes, escreva o comando COMPLETO\n"
             "8. Para passos dependentes, descreva o que precisa ser feito — o sistema\n"
-            "   vai gerar o comando exato quando o passo anterior completar\n\n"
+            "   vai gerar o comando exato quando o passo anterior completar\n"
+            "9. CRÍTICO para tarefas de leitura de múltiplos arquivos + escrita de resumo:\n"
+            "   - Crie um step read_file SEPARADO para CADA arquivo, com o path absoluto correto\n"
+            "   - Cada read_file tem depends_on_previous=false (são independentes entre si)\n"
+            "   - O step write_file final DEVE ter depends_on_previous=true\n"
+            "   - No write_file, use content='[SERÁ GERADO COM BASE NOS ARQUIVOS LIDOS]' como placeholder\n"
+            "     O conteúdo real será construído após todos os reads serem completados\n\n"
             "## Formato de Resposta\n"
             "Responda APENAS com JSON válido (sem markdown fences):\n"
             "{\n"
@@ -665,7 +679,7 @@ class PlanManager:
             icon = {"pending": " ", "running": "→", "completed": "✓", "failed": "✗", "skipped": "⏭"}[s.status]
             result_snip = ""
             if s.result:
-                result_snip = f" → {s.result[:300]}"
+                result_snip = f" → {s.result[:1500]}"
             elif s.error:
                 result_snip = f" → ERRO: {s.error[:200]}"
             steps_view.append(f"  [{icon}] {s.index + 1}. {s.description}{result_snip}")
@@ -712,11 +726,18 @@ class PlanManager:
             "- refined_step: {tool_name, tool_arguments, requires_approval} | null\n"
             "  (obrigatório se decision=continue e próximo step depende do anterior)\n"
             "- subplan_steps: [{description, tool_name, tool_arguments, requires_approval}] | null\n\n"
-            "## Regras\n"
+            "## Regras CRÍTICAS\n"
+            "- NUNCA pule steps do plano. Execute SEMPRE o próximo step pendente na ordem exata.\n"
+            "- decision=continue significa executar o próximo step pendente — não altere a ordem sem razão técnica.\n"
+            "- decision=finish SÓ se TODOS os steps estão com status ✓ e o goal foi atingido. NUNCA finalize com steps pendentes.\n"
             "- decision=subplan SÓ se o resultado revela N items que os steps restantes não cobrem\n"
             "- decision=retry SÓ se retry_classification ≠ \"fatal\"\n"
-            "- decision=finish SÓ se todos os steps estão ✓ e o goal foi atingido\n"
-            "- subplan_steps tem MAX 5 steps\n\n"
+            "- subplan_steps tem MAX 5 steps\n"
+            "- CRÍTICO para write_file com depends_on_previous=true:\n"
+            "  Você DEVE retornar refined_step com 'content' REAL e COMPLETO construído a partir dos\n"
+            "  resultados dos steps de leitura anteriores (visíveis no estado do plano como '→ conteúdo').\n"
+            "  NUNCA use placeholder como '[conteúdo baseado no arquivo]' ou '[SERÁ GERADO]'.\n"
+            "  Se algum arquivo ainda não foi lido (step pendente), retorne decision=continue para ler esse arquivo primeiro.\n\n"
             "Responda APENAS com JSON válido."
         )
 
@@ -733,7 +754,7 @@ class PlanManager:
             response = await provider.complete(
                 messages=messages,
                 temperature=0.1,
-                max_tokens=600,
+                max_tokens=2000,
             )
             raw = (response.get_content() or "").strip()
             if raw.startswith("```"):

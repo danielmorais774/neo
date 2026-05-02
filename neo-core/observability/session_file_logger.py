@@ -77,9 +77,12 @@ class SessionFileLogger:
 
     def new_interaction(self, user_message: str, desktop_session_id: str | None = None, metadata: dict | None = None) -> None:
         self._interaction += 1
+        self._interaction_start = datetime.now(timezone.utc)
+        self._step_timings: list[tuple[str, float]] = []
         self._write(
             f"## Interação {self._interaction}\n\n"
-            f"**Timestamp:** {_ts()}\n\n"
+            f"**⏱ Request recebida:** `{self._interaction_start.strftime('%H:%M:%S.%f')[:-3]} UTC`  "
+            f"({self._interaction_start.strftime('%Y-%m-%d')})\n\n"
         )
         if desktop_session_id:
             self._write(f"**Desktop session_id:** `{desktop_session_id}`\n\n")
@@ -261,9 +264,13 @@ class SessionFileLogger:
         arguments: dict | None = None,
         requires_approval: bool = False,
         command: str | None = None,
+        execution: str | None = None,
     ) -> None:
         self._write(f"### Tool Request\n\n")
         self._write(f"- **Tool:** `{tool_name}`\n")
+        if execution:
+            label = {"client-side": "🖥 neo-desktop (client)", "server-side": "☁️ neo-core (server)"}.get(execution, execution)
+            self._write(f"- **Executado em:** {label}\n")
         if command:
             self._write(f"- **Comando:** `{command}`\n")
         self._write(f"- **Requer aprovação:** {'Sim' if requires_approval else 'Não'}\n")
@@ -278,10 +285,14 @@ class SessionFileLogger:
         result: str | None = None,
         error: str | None = None,
         duration_ms: float = 0,
+        execution: str | None = None,
     ) -> None:
         status = "Sucesso" if success else "Falha"
         self._write(f"### Tool Result\n\n")
         self._write(f"- **Tool:** `{tool_name}`\n")
+        if execution:
+            label = {"client-side": "🖥 neo-desktop (client)", "server-side": "☁️ neo-core (server)"}.get(execution, execution)
+            self._write(f"- **Executado em:** {label}\n")
         self._write(f"- **Status:** {status}\n")
         self._write(f"- **Duração:** {duration_ms:.1f}ms\n")
         if error:
@@ -310,6 +321,26 @@ class SessionFileLogger:
         self._write(f"- **Iterações:** {iterations}\n")
         self._write(f"- **Tamanho:** {len(response)} chars\n\n")
         self._write(f"```\n{response}\n```\n\n")
+
+    def record_step_timing(self, step: str, ms: float) -> None:
+        """Accumulate a timing entry for the end-of-interaction summary table."""
+        if not hasattr(self, "_step_timings"):
+            self._step_timings = []
+        self._step_timings.append((step, ms))
+
+    def log_timing_summary(self, total_ms: float) -> None:
+        """Write response timestamp and a markdown timing table at the end of the interaction."""
+        now = datetime.now(timezone.utc)
+        self._write(f"### ⏱ Resumo de Tempo\n\n")
+        self._write(f"**Resposta enviada:** `{now.strftime('%H:%M:%S.%f')[:-3]} UTC`\n\n")
+        timings = getattr(self, "_step_timings", [])
+        if timings:
+            self._write("| Etapa | Tempo |\n")
+            self._write("|-------|------:|\n")
+            for step, ms in timings:
+                self._write(f"| {step} | `{ms:.0f}ms` |\n")
+            self._write(f"| **Total (neo-core)** | **`{total_ms:.0f}ms`** |\n")
+            self._write("\n")
         self._write("---\n\n")
 
     def log_message_saved(self, role: str, content_preview: str, session_id: str) -> None:

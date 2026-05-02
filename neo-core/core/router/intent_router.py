@@ -127,9 +127,9 @@ class IntentRouter:
             messages.append(Message(role=MessageRole.USER, content=user_message))
 
         try:
-            # Use groq llama-3.3-70b-versatile: ultra-fast Groq LPU inference
-            provider_name = "groq"
-            model_name = "llama-3.3-70b-versatile"
+            # Use OpenAI model for intent classification as requested.
+            provider_name = "openai"
+            model_name = "meta-llama/llama-4-scout-17b-16e-instruct"
             provider = self.llm_router.get_provider(provider_name)
             response = await provider.complete(
                 messages=messages,
@@ -189,8 +189,19 @@ class IntentRouter:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            logger.warning(f"Failed to parse router response: {text[:200]}")
-            return RoutingDecision(intent=IntentType.DIRECT_RESPONSE, confidence=0.5)
+            # LLM returned prose instead of JSON — try to extract embedded JSON object
+            import re as _re
+            json_match = _re.search(r'\{[^{}]*"intent"[^{}]*\}', text, _re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group())
+                    logger.warning("Router: extracted JSON from prose response")
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse router response (bad embedded JSON): {text[:200]}")
+                    return self._fallback_classify(raw_text)
+            else:
+                logger.warning(f"Failed to parse router response (no JSON found): {text[:200]}")
+                return self._fallback_classify(raw_text)
 
         intent_str = data.get("intent", "DIRECT_RESPONSE").upper()
         intent_map = {
@@ -238,6 +249,19 @@ class IntentRouter:
             "tamanho", "size", "processos", "processes", "versao", "version",
             "conteudo", "listar", "lista", "mostra", "terminal", "comando",
         ]
+        # Multi-step file task: "leia ... e crie" or "ler ... escrever"
+        file_read_write = (
+            ("leia" in text or "ler" in text or "leia" in text or "read" in text)
+            and ("crie" in text or "escreva" in text or "criar" in text or "write" in text or "salve" in text)
+        )
+        if file_read_write:
+            return RoutingDecision(
+                intent=IntentType.CLIENT_TOOL,
+                confidence=0.7,
+                explanation="Fallback: leitura + escrita de arquivos detectada",
+                requires_approval=False,
+                needs_plan=True,
+            )
         if sum(1 for t in client_tokens if t in text) >= 2:
             return RoutingDecision(
                 intent=IntentType.CLIENT_TOOL,

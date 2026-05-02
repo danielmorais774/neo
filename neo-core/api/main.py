@@ -19,7 +19,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, session_logs, knowledge_graph
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -102,6 +102,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
+    # Pre-warm embedding model so the first user request doesn't pay the cold-start cost (~8s)
+    try:
+        import asyncio as _asyncio
+        import time as _time
+        _t0_warmup = _time.monotonic()
+        await embedding_service.embed("warmup")
+        print(f"✅ Embedding model warm ({((_time.monotonic() - _t0_warmup) * 1000):.0f}ms)")
+    except Exception as _e:
+        print(f"⚠️  Embedding warm-up failed (will load on first request): {_e}")
     hybrid_search = HybridMemorySearch(db=_db, embedding_service=embedding_service, settings=settings)
     persistent_session = PersistentSessionManager(
         db=_db,
@@ -215,3 +224,4 @@ app.include_router(debug.router, prefix="/api/v1")
 app.include_router(session_logs.router, prefix="/api/v1")
 app.include_router(context.router, prefix="/api/v1")
 app.include_router(knowledge_graph.router, prefix="/api/v1")
+app.include_router(quick_help.router, prefix="/api/v1")

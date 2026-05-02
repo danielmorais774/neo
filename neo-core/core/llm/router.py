@@ -22,6 +22,7 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "gpt-4-turbo": "openai",
     "gpt-4-turbo-preview": "openai",
     "gpt-3.5-turbo": "openai",
+    "meta-llama/llama-4-scout-17b-16e-instruct": "openai",
     # Anthropic
     "claude-3-opus-20240229": "anthropic",
     "claude-3-sonnet-20240229": "anthropic",
