@@ -5,6 +5,8 @@ import NeoFrameAnalyzer from './NeoFrameAnalyzer';
 import NeoVisionPanel from './NeoVisionPanel';
 import SessionLogsPanel from './SessionLogsPanel';
 import KnowledgeGraphPanel from './KnowledgeGraphPanel';
+import WhatsAppPanel from './WhatsAppPanel';
+import WhatsAppStatusPanel from './WhatsAppStatusPanel';
 
 const dataProvider = {
   getList: async (resource: string, _params: any) => {
@@ -94,7 +96,7 @@ const TAB_STYLE = (active: boolean): React.CSSProperties => ({
 })
 
 function App() {
-  const [tab, setTab] = useState<'logs' | 'debug' | 'vision' | 'frame' | 'session-logs' | 'knowledge-graph'>('debug')
+  const [tab, setTab] = useState<'logs' | 'debug' | 'vision' | 'frame' | 'session-logs' | 'knowledge-graph' | 'whatsapp' | 'whatsapp-status'>('whatsapp-status')
 
   return (
     <div style={{ background: '#0f1117', height: '100vh', display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden' }}>
@@ -113,10 +115,14 @@ function App() {
         <button style={TAB_STYLE(tab === 'vision')} onClick={() => setTab('vision')}>🎬 Vision</button>
         <button style={TAB_STYLE(tab === 'frame')} onClick={() => setTab('frame')}>🔍 Frame</button>
         <button style={TAB_STYLE(tab === 'knowledge-graph')} onClick={() => setTab('knowledge-graph')}>🕸️ Knowledge Graph</button>
+        <button style={TAB_STYLE(tab === 'whatsapp')} onClick={() => setTab('whatsapp')}>📱 WhatsApp</button>
+        <button style={TAB_STYLE(tab === 'whatsapp-status')} onClick={() => setTab('whatsapp-status')}>🔑 WhatsApp Status</button>
         <button style={TAB_STYLE(tab === 'logs')} onClick={() => setTab('logs')}>📋 Logs (legado)</button>
       </div>
 
       {tab === 'knowledge-graph' && <KnowledgeGraphPanel />}
+      {tab === 'whatsapp' && <WhatsAppPanel />}
+      {tab === 'whatsapp-status' && <WhatsAppStatusPanel />}
       {tab === 'debug' && <DebugPanel />}
       {tab === 'session-logs' && <SessionLogsPanel />}
       {tab === 'vision' && <NeoVisionPanel />}
