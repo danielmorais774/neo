@@ -12,6 +12,8 @@ interface Message {
   id: string
   from: string
   body: string
+  caption?: string | null
+  mediaType?: string | null
   timestamp: number
   fromMe: boolean
 }
@@ -87,13 +89,17 @@ export default function WhatsAppPanel() {
   const [selected, setSelected] = useState<Chat | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [msgsLoading, setMsgsLoading] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const msgListRef = useRef<HTMLDivElement>(null)
+  const atTopRef = useRef(false)
   const [connOk, setConnOk] = useState<boolean | null>(null)
   const [search, setSearch] = useState('')
   const [composerText, setComposerText] = useState('')
   const [sending, setSending] = useState(false)
   const [statusMsg, setStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const msgListRef = useRef<HTMLDivElement | null>(null)
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [mediaUrls, setMediaUrls] = useState<Record<string, string>>({})
 
   const showStatus = useCallback((type: 'success' | 'error', text: string) => {
     setStatusMsg({ type, text })
@@ -123,17 +129,29 @@ export default function WhatsAppPanel() {
     finally { setChatsLoading(false) }
   }, [])
 
-  const loadMessages = useCallback(async (jid: string) => {
-    setMsgsLoading(true)
+  const loadMessages = useCallback(async (jid: string, prepend = false) => {
+    if (prepend) {
+      setLoadingMore(true)
+    } else {
+      setMsgsLoading(true)
+      setHasMore(false)
+    }
     try {
-      const res = await fetch(`${API}/chats/${encodeURIComponent(jid)}/messages`)
+      const url = prepend && messages.length > 0
+        ? `${API}/chats/${encodeURIComponent(jid)}/messages?before=${encodeURIComponent(messages[0].id)}`
+        : `${API}/chats/${encodeURIComponent(jid)}/messages`
+      const res = await fetch(url)
       if (res.ok) {
         const data = await res.json()
-        setMessages(data.messages ?? [])
+        setMessages(prev => prepend ? [...data.messages, ...prev] : (data.messages ?? []))
+        setHasMore(data.messages?.length >= 100)
       }
     } catch { /* silent */ }
-    finally { setMsgsLoading(false) }
-  }, [])
+    finally {
+      setMsgsLoading(false)
+      setLoadingMore(false)
+    }
+  }, [messages])
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -151,18 +169,48 @@ export default function WhatsAppPanel() {
     return () => { clearInterval(connInterval); clearInterval(chatInterval) }
   }, [checkConn, loadChats])
 
-  // Auto-refresh messages when a chat is open
+  // Auto-refresh: prepend new messages instead of replacing
   useEffect(() => {
     if (!selected) return
-    const interval = setInterval(() => loadMessages(selected.jid), 10000)
+    const interval = setInterval(async () => {
+      if (messages.length === 0) { loadMessages(selected.jid); return }
+      try {
+        const res = await fetch(`${API}/chats/${encodeURIComponent(selected.jid)}/messages?limit=20`)
+        if (res.ok) {
+          const data = await res.json()
+          const newest = data.messages?.[data.messages.length - 1]
+          if (newest && messages[messages.length - 1]?.id !== newest.id) {
+            setMessages(prev => [...prev, ...data.messages.slice(prev.length ? data.messages.indexOf(prev[prev.length-1]) + 1 : 0)])
+          }
+        }
+      } catch {}
+    }, 8000)
     return () => clearInterval(interval)
-  }, [selected, loadMessages])
+  }, [selected, messages])
+
+  const handleScrollTop = useCallback(() => {
+    if (!hasMore || loadingMore || !selected) return
+    atTopRef.current = true
+    loadMessages(selected.jid, true).then(() => { atTopRef.current = false })
+  }, [hasMore, loadingMore, selected, loadMessages])
+
+  const loadMedia = useCallback(async (jid: string, msgId: string) => {
+    if (mediaUrls[msgId]) return
+    try {
+      const res = await fetch(`${API}/chats/${encodeURIComponent(jid)}/media/${encodeURIComponent(msgId)}`)
+      if (res.ok) {
+        const data = await res.json()
+        if (data.url) setMediaUrls(prev => ({ ...prev, [msgId]: data.url }))
+      }
+    } catch {}
+  }, [mediaUrls])
 
   const handleSelectChat = useCallback((chat: Chat) => {
     setSelected(chat)
     setMessages([])
     setComposerText('')
     setStatusMsg(null)
+    setMediaUrls({})
     loadMessages(chat.jid)
   }, [loadMessages])
 
@@ -278,7 +326,19 @@ export default function WhatsAppPanel() {
               </div>
 
               {/* Messages */}
-              <div ref={msgListRef} style={s.msgList}>
+              <div
+                ref={msgListRef}
+                style={{ ...s.msgList, overflowY: 'auto' } as React.CSSProperties}
+                onScroll={e => {
+                  const el = e.currentTarget
+                  if (el.scrollTop < 50 && hasMore && !loadingMore) handleScrollTop()
+                }}
+              >
+                {loadingMore && (
+                  <div style={{ textAlign: 'center', color: '#475569', fontSize: 12, padding: '8px 0' }}>
+                    Carregando mensagens mais antigas…
+                  </div>
+                )}
                 {msgsLoading && messages.length === 0 && (
                   <div style={{ color: '#475569', fontSize: 13, textAlign: 'center', margin: 'auto' }}>
                     Carregando mensagens…
@@ -292,7 +352,40 @@ export default function WhatsAppPanel() {
                 {messages.map(m => (
                   <div key={m.id} style={{ display: 'flex', flexDirection: 'column', alignItems: m.fromMe ? 'flex-end' : 'flex-start' }}>
                     <div style={s.bubble(m.fromMe)}>
-                      {m.body}
+                      {m.mediaType === 'image' ? (
+                        <div>
+                          {mediaUrls[m.id] ? (
+                            <img
+                              src={mediaUrls[m.id]}
+                              alt={m.caption || 'image'}
+                              style={{ maxWidth: '100%', borderRadius: 6, display: 'block', cursor: 'pointer' }}
+                              onClick={() => window.open(mediaUrls[m.id], '_blank')}
+                            />
+                          ) : (
+                            <div
+                              style={{ width: 200, height: 150, background: '#1a1a2e', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#475569', fontSize: 12 }}
+                              onClick={() => selected && loadMedia(selected.jid, m.id)}
+                            >
+                              {msgsLoading ? 'carregando…' : 'clique para carregar imagem'}
+                            </div>
+                          )}
+                          {m.caption && <div style={{ marginTop: 4, fontSize: 13 }}>{m.caption}</div>}
+                        </div>
+                      ) : m.mediaType === 'video' ? (
+                        <div style={{ color: '#64748b', fontSize: 12 }}>
+                          🎥 Vídeo — clique para carregar
+                        </div>
+                      ) : m.mediaType === 'audio' ? (
+                        <div style={{ color: '#64748b', fontSize: 12 }}>
+                          🎵 Áudio
+                        </div>
+                      ) : m.mediaType === 'document' ? (
+                        <div style={{ color: '#64748b', fontSize: 12 }}>
+                          📎 Documento
+                        </div>
+                      ) : (
+                        <span>{m.body}</span>
+                      )}
                       <div style={s.bubbleTime}>{m.timestamp ? fmtTime(m.timestamp) : ''}</div>
                     </div>
                   </div>
