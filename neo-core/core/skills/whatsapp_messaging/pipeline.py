@@ -139,6 +139,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         if any(w in msg_lower for w in CONFIRM_WORDS):
             active = await self.db.find_active_confirmation_mission(user_id)
             if active:
+                logger.info(f"Implicit approval: mission={active.id} found for user={user_id}")
                 return await self._handle_approval(active, {"approved": True}, slog)
 
         tool_args = extra.get("tool_arguments") or {}
@@ -430,6 +431,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
     ) -> SkillResult:
         approved = extra.get("approved", False)
         edited_text = extra.get("edited_text")
+        logger.info(f"_handle_approval: mission={mission.id} approved={approved} edited_text={edited_text}")
 
         if not approved:
             await self.db.update_mission_status(mission.id, status="cancelled")
