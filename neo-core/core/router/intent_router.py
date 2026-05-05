@@ -27,12 +27,20 @@ ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI ass
 - **DIRECT_RESPONSE**: conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **Default when in doubt.**
 - **SERVER_TOOL**: needs real-time external data (weather, web search, stock prices). Pick tool from server list.
 - **CLIENT_TOOL**: explicitly needs the user's local machine (shell, files, system info, installs). Pick tool from client list.
+- **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário. Inclui:
+  - mensagens pessoais ("avisa minha mãe que vou chegar tarde", "manda um oi para Ana")
+  - pedidos comerciais (pizza, delivery, farmácia, mercado, encomendas)
+  - mensagens para JID/telefone direto ("manda 'oi' para 5511988217222").
+  Sempre extraia em `tool_arguments` os campos `text` (texto da mensagem) e `recipient` (JID, telefone OU apelido como "minha mãe", "pai", "Ana"). NÃO interprete o apelido — passe-o cru, o pipeline resolve buscando na agenda.
 
 ## Server Tools
 {server_tools}
 
 ## Client Tools
 {client_tools}
+
+## Skills
+{skills}
 
 ## Tool Priority (CLIENT_TOOL)
 Prefer specific tools over `run_command`:
@@ -49,11 +57,11 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 - `requires_approval=true` for destructive ops (delete, kill, format); `false` for read-only
 - `needs_memory=false` for greetings/acks ("oi", "ok", "valeu"); `true` for substantive topics
 - `knowledge_keywords`: up to 6 singular PT nouns from user message (devices, health, food, finance, etc.); `[]` for greetings
-- `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL
+- `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL/WHATSAPP_MESSAGING
 
 ## Output — valid JSON only, no markdown:
 {{
-  "intent": "DIRECT_RESPONSE"|"SERVER_TOOL"|"CLIENT_TOOL",
+  "intent": "DIRECT_RESPONSE"|"SERVER_TOOL"|"CLIENT_TOOL"|"WHATSAPP_MESSAGING",
   "confidence": 0.0-1.0,
   "tool_name": "tool name or null",
   "tool_arguments": {{}},
@@ -63,8 +71,23 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "needs_memory": true,
   "knowledge_keywords": [],
   "needs_plan": false,
-  "tipo_tarefa": "simples|multi_etapas|analitica|criacao"
+  "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
+  "skill_name": "whatsapp_messaging or null"
 }}
+
+## WHATSAPP_MESSAGING — exemplos de extração
+
+User: "manda uma mensagem para minha mãe que vou chegar mais tarde"
+→ tool_arguments: {{"text": "vou chegar mais tarde", "recipient": "minha mãe"}}
+
+User: "avisa o pai que cheguei"
+→ tool_arguments: {{"text": "cheguei", "recipient": "pai"}}
+
+User: "manda whatsapp pro 5511988217222: oi tudo bem?"
+→ tool_arguments: {{"text": "oi tudo bem?", "recipient": "5511988217222"}}
+
+User: "pede uma pizza no Domino's"
+→ tool_arguments: {{"text": "Olá, gostaria de fazer um pedido", "recipient": "Domino's"}}
 """
 
 
@@ -98,10 +121,12 @@ class IntentRouter:
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
         client_tools_desc = self._format_tools("client-side")
+        skills_desc = self._format_skills()
 
         base_prompt = ROUTER_SYSTEM_PROMPT.format(
             server_tools=server_tools_desc or "(none registered yet)",
             client_tools=client_tools_desc or "(none registered yet)",
+            skills=skills_desc or "(none registered yet)",
         )
 
         # Inject system context (OS, paths) when provided by the client
@@ -127,9 +152,9 @@ class IntentRouter:
             messages.append(Message(role=MessageRole.USER, content=user_message))
 
         try:
-            # Use OpenAI model for intent classification as requested.
-            provider_name = "openai"
-            model_name = "meta-llama/llama-4-scout-17b-16e-instruct"
+            # Use groq for intent classification (fast inference)
+            provider_name = "groq"
+            model_name = "llama-3.3-70b-versatile"
             provider = self.llm_router.get_provider(provider_name)
             response = await provider.complete(
                 messages=messages,
@@ -179,6 +204,17 @@ class IntentRouter:
             lines.append(f"- {t.name}: {t.description} ({params_desc})")
         return "\n".join(lines)
 
+    def _format_skills(self) -> str:
+        """Format registered skills for the system prompt."""
+        from core.skills.manifest import SkillManifest
+        skills = SkillManifest.all()
+        if not skills:
+            return ""
+        lines = []
+        for name, manifest in skills.items():
+            lines.append(f"- {name}: {manifest.description} (keywords: {', '.join(manifest.keywords)})")
+        return "\n".join(lines)
+
     def _parse_classification(self, raw_text: str) -> RoutingDecision:
         """Parse LLM JSON response into RoutingDecision."""
         text = raw_text.strip()
@@ -208,6 +244,8 @@ class IntentRouter:
             "DIRECT_RESPONSE": IntentType.DIRECT_RESPONSE,
             "SERVER_TOOL": IntentType.SERVER_TOOL,
             "CLIENT_TOOL": IntentType.CLIENT_TOOL,
+            "WHATSAPP_MESSAGING": IntentType.WHATSAPP_MESSAGING,
+            "WHATSAPP_ORDER": IntentType.WHATSAPP_MESSAGING,
         }
         intent = intent_map.get(intent_str, IntentType.DIRECT_RESPONSE)
 
@@ -228,6 +266,7 @@ class IntentRouter:
             knowledge_keywords=knowledge_keywords,
             needs_plan=data.get("needs_plan", False),
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
+            skill_name=data.get("skill_name"),
         )
 
     def _fallback_classify(self, message: str) -> RoutingDecision:
@@ -281,6 +320,20 @@ class IntentRouter:
                 intent=IntentType.SERVER_TOOL,
                 confidence=0.5,
                 explanation="Fallback: detectado pedido de dados externos",
+            )
+
+        # WhatsApp indicators
+        whatsapp_tokens = [
+            "whatsapp", "wpp", "zap", "mensagem", "mensagens",
+            "manda", "mandar", "envia", "enviar", "texto",
+            "contato", "telefone", "celular",
+        ]
+        if sum(1 for t in whatsapp_tokens if t in text) >= 1:
+            return RoutingDecision(
+                intent=IntentType.WHATSAPP_MESSAGING,
+                confidence=0.7,
+                skill_name="whatsapp_messaging",
+                explanation="Fallback: detectado pedido via WhatsApp",
             )
 
         return RoutingDecision(

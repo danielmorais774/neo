@@ -5,13 +5,16 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlmodel import select
 
 from db.models.user import User
 from db.models.user_message import UserMessage
 from db.models.conversation import ConversationSession, ConversationMessage
 from db.models.user_preference import UserPreference
+from db.models.mission import Mission
+from db.models.whatsapp_contact import WhatsAppContact
+from db.models.user_notification import UserNotification
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -559,3 +562,304 @@ class AsyncPostgresClient:
                 await db.commit()
                 return True
             return False
+
+    # ---------------------------------------------------------------
+    # Mission CRUD
+    # ---------------------------------------------------------------
+
+    async def create_mission(
+        self,
+        user_id: UUID,
+        session_id: UUID,
+        parent_session_id: UUID | None,
+        title: str,
+        goal: str,
+        contact_jid: str,
+        channel: str = "whatsapp",
+    ) -> Mission:
+        """Create a new mission record."""
+        mission = Mission(
+            user_id=user_id,
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            title=title,
+            goal=goal,
+            contact_jid=contact_jid,
+            channel=channel,
+        )
+        async with self.get_session() as db:
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
+    async def get_mission(self, mission_id: UUID) -> Mission | None:
+        """Get a mission by ID."""
+        async with self.get_session() as db:
+            return await db.get(Mission, mission_id)
+
+    async def find_active_mission_by_contact(self, contact_jid: str) -> Mission | None:
+        """Find the active mission for a contact (awaiting_reply or awaiting_confirmation)."""
+        async with self.get_session() as db:
+            stmt = (
+                select(Mission)
+                .where(Mission.contact_jid == contact_jid)
+                .where(Mission.status.in_(["awaiting_reply", "awaiting_confirmation"]))
+                .order_by(Mission.last_activity_at.desc())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def find_active_confirmation_mission(self, user_id: UUID) -> Mission | None:
+        """Find the most recent awaiting_confirmation mission for a user."""
+        async with self.get_session() as db:
+            stmt = (
+                select(Mission)
+                .where(Mission.user_id == user_id)
+                .where(Mission.status == "awaiting_confirmation")
+                .order_by(Mission.last_activity_at.desc())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def lock_mission_for_update(self, mission_id: UUID) -> Mission | None:
+        """Lock a mission row for update to prevent concurrent agent runs."""
+        async with self.get_session() as db:
+            stmt = (
+                select(Mission)
+                .where(Mission.id == mission_id)
+                .with_for_update()
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def update_mission_status(
+        self,
+        mission_id: UUID,
+        status: str,
+        last_inbound_message_id: str | None = None,
+        result_summary: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> Mission | None:
+        """Update mission status and related fields."""
+        async with self.get_session() as db:
+            mission = await db.get(Mission, mission_id)
+            if not mission:
+                return None
+            from datetime import datetime
+            mission.status = status
+            mission.last_activity_at = datetime.utcnow()
+            if last_inbound_message_id is not None:
+                mission.last_inbound_message_id = last_inbound_message_id
+            if result_summary is not None:
+                mission.result_summary = result_summary
+            if extra_metadata is not None:
+                mission.extra_metadata = {**mission.extra_metadata, **extra_metadata}
+            if status in ("completed", "failed", "cancelled"):
+                mission.completed_at = datetime.utcnow()
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
+    # ---------------------------------------------------------------
+    # WhatsAppContact CRUD
+    # ---------------------------------------------------------------
+
+    async def upsert_whatsapp_contact(
+        self,
+        user_id: UUID,
+        jid: str,
+        label: str,
+        phone_e164: str,
+        notes: str | None = None,
+    ) -> WhatsAppContact:
+        """Upsert a WhatsApp contact by user_id + jid."""
+        async with self.get_session() as db:
+            stmt = select(WhatsAppContact).where(
+                WhatsAppContact.user_id == user_id,
+                WhatsAppContact.jid == jid,
+            )
+            result = await db.execute(stmt)
+            existing = result.scalars().first()
+            from datetime import datetime
+            if existing:
+                existing.label = label
+                existing.phone_e164 = phone_e164
+                if notes is not None:
+                    existing.notes = notes
+                existing.last_used_at = datetime.utcnow()
+                db.add(existing)
+                await db.commit()
+                await db.refresh(existing)
+                return existing
+            contact = WhatsAppContact(
+                user_id=user_id,
+                jid=jid,
+                label=label,
+                phone_e164=phone_e164,
+                notes=notes,
+                last_used_at=datetime.utcnow(),
+            )
+            db.add(contact)
+            await db.commit()
+            await db.refresh(contact)
+            return contact
+
+    async def get_whatsapp_contact_by_label(
+        self,
+        user_id: UUID,
+        label: str,
+    ) -> WhatsAppContact | None:
+        """Find a WhatsApp contact by label (case-insensitive exact match)."""
+        async with self.get_session() as db:
+            stmt = (
+                select(WhatsAppContact)
+                .where(WhatsAppContact.user_id == user_id)
+                .where(func.lower(WhatsAppContact.label) == label.lower())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def get_whatsapp_contact_by_jid(self, jid: str) -> WhatsAppContact | None:
+        """Find any WhatsApp contact (across users) matching this JID.
+
+        Used by inbound webhook to notify the contact's owner when there is
+        no active mission. Returns the most recently used contact when the
+        same JID is saved by multiple users.
+        """
+        async with self.get_session() as db:
+            stmt = (
+                select(WhatsAppContact)
+                .where(WhatsAppContact.jid == jid)
+                .order_by(WhatsAppContact.last_used_at.desc())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def search_whatsapp_contact(
+        self,
+        user_id: UUID,
+        query: str,
+    ) -> WhatsAppContact | None:
+        """Fuzzy search a WhatsApp contact by label, phone_e164, or JID.
+
+        Matches beginning of label (case-insensitive), full phone_e164,
+        or JID prefix. Returns the best match ordered by last_used_at desc.
+        """
+        q = query.strip()
+        if not q:
+            return None
+        async with self.get_session() as db:
+            # Try exact JID first
+            stmt = (
+                select(WhatsAppContact)
+                .where(WhatsAppContact.user_id == user_id)
+                .where(WhatsAppContact.jid == q)
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            contact = result.scalars().first()
+            if contact:
+                return contact
+
+            # Try phone (digits only)
+            digits = "".join(filter(str.isdigit, q))
+            if digits:
+                stmt = (
+                    select(WhatsAppContact)
+                    .where(WhatsAppContact.user_id == user_id)
+                    .where(func.replace(func.replace(WhatsAppContact.phone_e164, " ", ""), "-", "") == digits)
+                    .order_by(WhatsAppContact.last_used_at.desc())
+                    .limit(1)
+                )
+                result = await db.execute(stmt)
+                contact = result.scalars().first()
+                if contact:
+                    return contact
+
+            # Fuzzy label match (case-insensitive, starts-with)
+            stmt = (
+                select(WhatsAppContact)
+                .where(WhatsAppContact.user_id == user_id)
+                .where(func.lower(WhatsAppContact.label).like(f"{q.lower()}%"))
+                .order_by(WhatsAppContact.last_used_at.desc())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def list_whatsapp_contacts(self, user_id: UUID) -> list[WhatsAppContact]:
+        """List all WhatsApp contacts for a user, ordered by last_used_at desc."""
+        async with self.get_session() as db:
+            stmt = (
+                select(WhatsAppContact)
+                .where(WhatsAppContact.user_id == user_id)
+                .order_by(WhatsAppContact.last_used_at.desc())
+            )
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
+    # ---------------------------------------------------------------
+    # UserNotification CRUD
+    # ---------------------------------------------------------------
+
+    async def create_notification(
+        self,
+        user_id: UUID,
+        mission_id: UUID | None,
+        kind: str,
+        title: str,
+        body: str,
+        payload: dict | None = None,
+    ) -> UserNotification:
+        """Create a new notification."""
+        notif = UserNotification(
+            user_id=user_id,
+            mission_id=mission_id,
+            kind=kind,
+            title=title,
+            body=body,
+            payload=payload or {},
+        )
+        async with self.get_session() as db:
+            db.add(notif)
+            await db.commit()
+            await db.refresh(notif)
+        return notif
+
+    async def get_pending_notifications(self, user_id: UUID) -> list[UserNotification]:
+        """Get all undelivered notifications for a user."""
+        async with self.get_session() as db:
+            stmt = (
+                select(UserNotification)
+                .where(UserNotification.user_id == user_id)
+                .where(UserNotification.delivered_at.is_(None))
+                .order_by(UserNotification.created_at.asc())
+            )
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
+    async def mark_notification_delivered(self, notification_id: UUID) -> None:
+        """Mark a notification as delivered."""
+        async with self.get_session() as db:
+            notif = await db.get(UserNotification, notification_id)
+            if notif:
+                from datetime import datetime
+                notif.delivered_at = datetime.utcnow()
+                db.add(notif)
+                await db.commit()
+
+    async def mark_notification_acked(self, notification_id: UUID) -> None:
+        """Mark a notification as acked by the desktop client."""
+        async with self.get_session() as db:
+            notif = await db.get(UserNotification, notification_id)
+            if notif:
+                from datetime import datetime
+                notif.acked_at = datetime.utcnow()
+                db.add(notif)
+                await db.commit()

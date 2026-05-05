@@ -94,6 +94,7 @@ class AIService:
         self.knowledge_writer = knowledge_writer
         self.settings = get_settings()
         self._pending_traces: dict[str, MessageTrace] = {}
+        self._skill_executor: "SkillExecutor | None" = None
         self.planner = PlanManager(llm_router)
 
     # ---------------------------------------------------------------
@@ -323,6 +324,12 @@ class AIService:
 
             elif decision.intent == IntentType.CLIENT_TOOL:
                 async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id, metadata=metadata):
+                    yield resp
+
+            elif decision.intent == IntentType.WHATSAPP_MESSAGING:
+                async for resp in self._handle_whatsapp_messaging(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, metadata=metadata):
+                    if resp.is_final:
+                        final_response = resp.message
                     yield resp
         except Exception as e:
             dispatch_error = str(e)
@@ -738,6 +745,93 @@ class AIService:
             message=final_text,
             is_final=True,
             iterations=iterations,
+        )
+
+    # ---------------------------------------------------------------
+    # Handler: WHATSAPP_MESSAGING — skill-based WhatsApp mission
+    # ---------------------------------------------------------------
+
+    async def _handle_whatsapp_messaging(
+        self,
+        session_id: UUID,
+        user_message: str,
+        history: list[dict[str, str]],
+        decision: RoutingDecision,
+        trace: MessageTrace | None = None,
+        slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Handle WhatsApp messaging intent — delegates to SkillExecutor."""
+
+        skill_name = decision.skill_name or "whatsapp_messaging"
+
+        if slog:
+            slog.log_event(
+                "WhatsApp Messaging",
+                f"Skill: {skill_name} | Mensagem: {user_message[:80]}",
+            )
+
+        yield AIServiceResponse(
+            intent=IntentType.WHATSAPP_MESSAGING,
+            session_id=session_id,
+            message=f"Iniciando missão WhatsApp...",
+            is_final=False,
+        )
+
+        try:
+            skill_executor = self._skill_executor
+            if not skill_executor:
+                from core.skills.skill_executor import SkillExecutor
+                from core.notifications import NotificationBroker
+                broker = NotificationBroker()
+                skill_executor = SkillExecutor(
+                    agent_executor=self.agent,
+                    db=self.db,
+                    notification_broker=broker,
+                )
+                self._skill_executor = skill_executor
+
+            extra: dict[str, Any] = dict(metadata or {})
+            if decision.tool_arguments:
+                extra["tool_arguments"] = decision.tool_arguments
+            if decision.tool_name:
+                extra["router_tool_name"] = decision.tool_name
+
+            result = await skill_executor.execute(
+                skill_name=skill_name,
+                session_id=session_id,
+                user_message=user_message,
+                conversation_history=history,
+                user_id=user_id,
+                extra=extra,
+            )
+
+            if result.ok:
+                final_text = result.message
+            else:
+                final_text = f"Erro na missão: {result.message}"
+
+        except Exception as e:
+            logger.exception("WhatsApp messaging execution failed")
+            final_text = f"Erro ao processar missão WhatsApp: {str(e)}"
+
+        await self.sessions.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=final_text,
+            generate_embedding=False,
+            user_id=user_id,
+        )
+        if slog:
+            slog.log_final_response(final_text, "WHATSAPP_MESSAGING", iterations=1)
+
+        yield AIServiceResponse(
+            intent=IntentType.WHATSAPP_MESSAGING,
+            session_id=session_id,
+            message=final_text,
+            is_final=True,
+            iterations=1,
         )
 
     # ---------------------------------------------------------------

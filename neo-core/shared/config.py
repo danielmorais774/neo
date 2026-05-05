@@ -147,6 +147,30 @@ class Settings(BaseSettings):
     algorithm: str = Field(default="HS256", description="JWT algorithm")
     access_token_expire_minutes: int = Field(default=30, ge=1)
 
+    # WhatsApp Gateway
+    whatsapp_gateway_url: str = Field(
+        default="http://localhost:3030",
+        description="neo-whatsapp HTTP gateway URL",
+    )
+    whatsapp_webhook_secret: str = Field(
+        default="dev-secret",
+        description="HMAC secret for inbound webhook validation",
+    )
+    whatsapp_webhook_path: str = Field(
+        default="/api/v1/whatsapp/webhook",
+        description="Webhook path for inbound WhatsApp messages",
+    )
+
+    # Mission Settings
+    mission_default_timeout_hours: int = Field(
+        default=24, ge=1,
+        description="Default timeout for a mission before it's marked failed",
+    )
+    mission_max_concurrent: int = Field(
+        default=8, ge=1,
+        description="Maximum concurrent missions across all users",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

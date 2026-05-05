@@ -19,7 +19,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -34,6 +34,8 @@ from core import (
     ToolRegistry,
 )
 from core.memory import SessionManager
+from core.skills.skill_executor import SkillExecutor
+from core.notifications import NotificationBroker
 from db import AsyncPostgresClient
 from modules.desktop import AIService, DesktopService, DESKTOP_TOOLS
 from modules.weather import WEATHER_TOOLS, WeatherExecutor
@@ -51,6 +53,8 @@ _session_manager: SessionManager | None = None
 _desktop_service: DesktopService | None = None
 _ai_service: AIService | None = None
 _db: AsyncPostgresClient | None = None
+_notification_broker: NotificationBroker | None = None
+_skill_executor: SkillExecutor | None = None
 
 
 @asynccontextmanager
@@ -58,6 +62,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifecycle manager - inicializa e limpa recursos."""
     global _tool_registry, _tool_executor, _llm_router, _agent_executor
     global _session_manager, _desktop_service, _ai_service, _db
+    global _notification_broker, _skill_executor
 
     settings = get_settings()
     print(f"🚀 Initializing Neo Core 2 v2.1.0...")
@@ -99,6 +104,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Register server-side module executors
     weather_executor = WeatherExecutor()
     _tool_executor.register_module_executor("weather", weather_executor)
+
+    # Register whatsapp_messaging tools in the global registry (for discovery / routing)
+    from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
+    _tool_registry.register_many(WHATSAPP_MESSAGING_TOOLS)
+
+    # Import skill manifests to register them in SkillManifest registry
+    from core.skills.whatsapp_messaging import whatsapp_messaging_manifest  # noqa: F401
 
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
@@ -148,6 +160,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         knowledge_writer=_knowledge_writer,
     )
 
+    # ── Skills + Notifications ─────────────────────────────────────
+    _notification_broker = NotificationBroker()
+    _skill_executor = SkillExecutor(
+        agent_executor=_agent_executor,
+        db=_db,
+        notification_broker=_notification_broker,
+    )
+
+    # Wire skill executor into webhook route
+    from api.routes.whatsapp import set_dependencies as set_whatsapp_deps
+    set_whatsapp_deps(_db, _skill_executor)
+
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
         agent_executor=_agent_executor,
@@ -161,6 +185,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     print(f"✅ Registered tools: {_tool_registry.count()}")
     print(f"   ├─ Desktop (client-side): {len(DESKTOP_TOOLS)}")
     print(f"   └─ Weather (server-side): {len(WEATHER_TOOLS)}")
+    print(f"   └─ WhatsApp Messaging (server-side): {len(WHATSAPP_MESSAGING_TOOLS)}")
     print(f"🌐 API ready on port {settings.api_port}")
 
     # ── Start gRPC server ─────────────────────────────────────────
@@ -169,7 +194,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from grpc_server import serve as serve_grpc
 
-        grpc_server = await serve_grpc(ai_service=_ai_service, port=settings.grpc_port)
+        grpc_server = await serve_grpc(
+        ai_service=_ai_service,
+        port=settings.grpc_port,
+        notification_broker=_notification_broker,
+        skill_executor=_skill_executor,
+    )
         app.state.grpc_server = grpc_server
         print(f"✅ gRPC server started on port {settings.grpc_port}")
     except Exception as e:
@@ -225,3 +255,4 @@ app.include_router(session_logs.router, prefix="/api/v1")
 app.include_router(context.router, prefix="/api/v1")
 app.include_router(knowledge_graph.router, prefix="/api/v1")
 app.include_router(quick_help.router, prefix="/api/v1")
+app.include_router(whatsapp.router)

@@ -27,6 +27,30 @@ class IntentType(str, Enum):
     DIRECT_RESPONSE = "direct_response"
     SERVER_TOOL = "server_tool"
     CLIENT_TOOL = "client_tool"
+    WHATSAPP_MESSAGING = "whatsapp_messaging"
+
+
+class MissionStatus(str, Enum):
+    """Status de uma missão WhatsApp."""
+
+    PENDING = "pending"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    AWAITING_REPLY = "awaiting_reply"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NotificationKind(str, Enum):
+    """Tipo de notificação push."""
+
+    MISSION_STARTED = "mission_started"
+    MISSION_UPDATE = "mission_update"
+    MISSION_COMPLETED = "mission_completed"
+    MISSION_FAILED = "mission_failed"
+    APPROVAL_REQUIRED = "approval_required"
+    UNSOLICITED_MESSAGE = "unsolicited_message"
 
 
 class SessionStatus(str, Enum):
@@ -157,6 +181,7 @@ class RoutingDecision(BaseModel):
     raw_command: str | None = None  # para CLIENT_TOOL (comando shell)
     needs_memory: bool = True  # whether cross-session memory recovery is useful
     knowledge_keywords: list[str] | None = None  # keywords for KG retrieval (classified by intent LLM)
+    skill_name: str | None = None  # qual skill dispara (quando intent é uma skill)
 
     # --- complexity assessment (avoids separate should_create_plan LLM call) ---
     needs_plan: bool = False  # True when 2+ steps with dependencies are needed

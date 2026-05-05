@@ -7,6 +7,9 @@ Responsibilities:
   - Delegate to AIService
   - Convert AIServiceResponse → CoreMessage protobuf
   - Send back to desktop
+
+NOTE: After editing proto/neo_desktop.proto, regenerate with:
+  protoc --python_out=. --grpc_python_out=. proto/neo_desktop.proto
 """
 
 import json
@@ -25,11 +28,18 @@ from shared import IntentType
 logger = logging.getLogger(__name__)
 
 
-class NeoDesktopServicer:
+class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
     """gRPC Servicer — thin controller that delegates to AIService."""
 
-    def __init__(self, ai_service: AIService) -> None:
+    def __init__(
+        self,
+        ai_service: AIService,
+        notification_broker=None,
+        skill_executor=None,
+    ) -> None:
         self.ai_service = ai_service
+        self.notification_broker = notification_broker
+        self.skill_executor = skill_executor
         # Track pending client-tool flows per session for approval/result routing
         self._pending: dict[str, dict] = {}
 
@@ -238,8 +248,92 @@ class NeoDesktopServicer:
             status={"core": "ok", "ai": "ok"},
         )
 
+    # ---------------------------------------------------------------
+    # Notifications — server streaming
+    # ---------------------------------------------------------------
 
-async def serve(ai_service: AIService, port: int = 50051) -> grpc.aio.Server:
+    async def SubscribeNotifications(self, request, context):
+        """Server-streaming RPC: pushes notifications to desktop as they arrive."""
+        user_id_str = request.user_id
+        try:
+            user_id = UUID(user_id_str)
+        except ValueError:
+            logger.warning(f"[gRPC] Invalid user_id for notifications: {user_id_str}")
+            return
+
+        logger.info(f"[gRPC] SubscribeNotifications user={user_id}")
+
+        if self.notification_broker:
+            async for notif in self.notification_broker.subscribe(user_id):
+                # Convert dict to protobuf Notification
+                pb_notif = neo_desktop_pb2.Notification(
+                    id=notif.get("id", ""),
+                    user_id=notif.get("user_id", user_id_str),
+                    mission_id=notif.get("mission_id", ""),
+                    kind=notif.get("kind", ""),
+                    title=notif.get("title", ""),
+                    body=notif.get("body", ""),
+                    payload_json=json.dumps(notif.get("payload", {})),
+                    created_at_unix=notif.get("created_at_unix", 0),
+                )
+                yield pb_notif
+
+    async def AckNotification(self, request, context):
+        """Mark a notification as acked."""
+        if self.ai_service and self.ai_service.db:
+            from uuid import UUID as _UUID
+            try:
+                notif_id = _UUID(request.notification_id)
+                await self.ai_service.db.mark_notification_acked(notif_id)
+                logger.info(f"[gRPC] AckNotification {notif_id}")
+            except Exception as e:
+                logger.error(f"[gRPC] AckNotification failed: {e}")
+        return neo_desktop_pb2.AckResponse()
+
+    async def RespondToMissionPrompt(self, request, context):
+        """Handle Daniel's approval/denial of a pending mission draft."""
+        if not self.skill_executor:
+            return neo_desktop_pb2.MissionPromptAck(ok=False, message="SkillExecutor not available")
+
+        try:
+            mission_id = UUID(request.mission_id)
+        except ValueError:
+            return neo_desktop_pb2.MissionPromptAck(ok=False, message="Invalid mission_id")
+
+        logger.info(f"[gRPC] RespondToMissionPrompt mission={mission_id} approved={request.approved}")
+
+        try:
+            from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
+            pipeline = WhatsAppMessagingPipeline(
+                agent_executor=self.skill_executor.agent_executor,
+                db=self.skill_executor.db,
+                broker=self.skill_executor.broker,
+            )
+            result = await pipeline.run(
+                session_id=mission_id,
+                user_message="",
+                history=[],
+                mission_id=mission_id,
+                extra={
+                    "approved": request.approved,
+                    "edited_text": request.edited_text or None,
+                },
+            )
+            return neo_desktop_pb2.MissionPromptAck(
+                ok=result.ok,
+                message=result.message,
+            )
+        except Exception as e:
+            logger.exception(f"[gRPC] RespondToMissionPrompt failed: {e}")
+            return neo_desktop_pb2.MissionPromptAck(ok=False, message=str(e))
+
+
+async def serve(
+    ai_service: AIService,
+    port: int = 50051,
+    notification_broker=None,
+    skill_executor=None,
+) -> grpc.aio.Server:
     """Start gRPC server with injected AIService.
 
     Args:
@@ -251,7 +345,7 @@ async def serve(ai_service: AIService, port: int = 50051) -> grpc.aio.Server:
     """
     server = grpc.aio.server()
     neo_desktop_pb2_grpc.add_NeoDesktopServiceServicer_to_server(
-        NeoDesktopServicer(ai_service), server
+        NeoDesktopServicer(ai_service, notification_broker, skill_executor), server
     )
     server.add_insecure_port(f"[::]:{port}")
     logger.info(f"Starting gRPC server on port {port}")
