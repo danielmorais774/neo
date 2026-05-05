@@ -19,7 +19,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -35,6 +35,7 @@ from core import (
 )
 from core.memory import SessionManager
 from core.skills.skill_executor import SkillExecutor
+from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
 from core.notifications import NotificationBroker
 from db import AsyncPostgresClient
 from modules.desktop import AIService, DesktopService, DESKTOP_TOOLS
@@ -172,6 +173,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from api.routes.whatsapp import set_dependencies as set_whatsapp_deps
     set_whatsapp_deps(_db, _skill_executor)
 
+    # Wire missions route
+    missions.set_db(_db)
+    missions.set_pipeline_factory(lambda: WhatsAppMessagingPipeline(
+        agent_executor=_agent_executor,
+        db=_db,
+        broker=_notification_broker,
+    ))
+
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
         agent_executor=_agent_executor,
@@ -256,3 +265,4 @@ app.include_router(context.router, prefix="/api/v1")
 app.include_router(knowledge_graph.router, prefix="/api/v1")
 app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
+app.include_router(missions.router)

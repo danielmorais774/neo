@@ -635,6 +635,23 @@ class AsyncPostgresClient:
             result = await db.execute(stmt)
             return result.scalars().first()
 
+    async def list_missions(
+        self,
+        user_id: UUID | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[Mission]:
+        """List missions optionally filtered by user_id and/or status."""
+        async with self.get_session() as db:
+            stmt = select(Mission)
+            if user_id:
+                stmt = stmt.where(Mission.user_id == user_id)
+            if status:
+                stmt = stmt.where(Mission.status == status)
+            stmt = stmt.order_by(Mission.last_activity_at.desc()).limit(limit)
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
     async def update_mission_status(
         self,
         mission_id: UUID,
