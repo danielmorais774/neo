@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import QRCode from 'qrcode'
 
-const API = 'http://localhost:8000/api/v1/whatsapp'
+const WS_URL = 'ws://localhost:8000/api/v1/whatsapp/ws/qr-status'
+const REST_URL = 'http://localhost:8000/api/v1/whatsapp'
 
 interface QrStatus {
   qr: string | null
@@ -15,24 +16,50 @@ export default function WhatsAppStatus() {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [clearing, setClearing] = useState(false)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const wsConnectedRef = useRef(false)
 
-  const fetchQr = useCallback(async () => {
-    try {
-      const res = await fetch(`${API}/qr-status`)
-      const data: QrStatus = await res.json()
-      setQrStatus(data)
-    } catch {
-      setQrStatus({ qr: null, state: 'unreachable' })
+  // Connect to WebSocket for real-time updates
+  useEffect(() => {
+    const connect = () => {
+      const ws = new WebSocket(WS_URL)
+
+      ws.onopen = () => {
+        wsConnectedRef.current = true
+        console.log('[WS] QR status connected')
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data: QrStatus = JSON.parse(event.data)
+          setQrStatus(data)
+        } catch {
+          // ignore parse errors
+        }
+      }
+
+      ws.onclose = () => {
+        wsConnectedRef.current = false
+        console.log('[WS] QR status disconnected, reconnecting in 3s')
+        setTimeout(connect, 3000)
+      }
+
+      ws.onerror = () => {
+        ws.close()
+      }
+
+      wsRef.current = ws
+    }
+
+    connect()
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.onclose = null // prevent reconnect on intentional unmount
+        wsRef.current.close()
+      }
     }
   }, [])
-
-  // Poll every 3 seconds
-  useEffect(() => {
-    fetchQr()
-    pollRef.current = setInterval(fetchQr, 3000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [fetchQr])
 
   // Render QR code as data URL when we have one
   useEffect(() => {
@@ -57,8 +84,9 @@ export default function WhatsAppStatus() {
     setRefreshing(true)
     setQrDataUrl(null)
     try {
-      await fetch(`${API}/qr-refresh`, { method: 'POST' })
-      // polling will pick up the new QR
+      // POST to qr-refresh triggers broadcast to all WS subscribers
+      await fetch(`${REST_URL}/qr-refresh`, { method: 'POST' })
+      // WS will deliver the updated status
     } catch { /* ignore */ }
     setRefreshing(false)
   }, [])
@@ -67,8 +95,7 @@ export default function WhatsAppStatus() {
     if (!confirm('Isso vai remover a sessão do WhatsApp e gerar um novo QR code. Continuar?')) return
     setClearing(true)
     try {
-      // Force logout via refresh endpoint
-      await fetch(`${API}/qr-refresh`, { method: 'POST' })
+      await fetch(`${REST_URL}/qr-refresh`, { method: 'POST' })
     } catch { /* ignore */ }
     setClearing(false)
   }, [])
