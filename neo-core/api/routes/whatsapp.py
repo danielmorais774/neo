@@ -1,15 +1,18 @@
 """WhatsApp webhook endpoint — receives inbound messages from neo-whatsapp."""
 
+import asyncio
 import logging
 import hmac
 import hashlib
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from core.skills.skill_executor import SkillExecutor
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
 from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
+from core.notifications.qr_broadcaster import get_qr_broadcaster
 from db.async_client import AsyncPostgresClient
 from shared.config import get_settings
 
@@ -103,20 +106,38 @@ async def _notify_unsolicited(jid: str, text: str, message_id: str) -> None:
             logger.info({"jid": jid}, "Inbound from unknown contact (no user); not notifying")
             return
 
-        await _db.create_notification(
+        payload = {
+            "contact_label": label,
+            "contact_jid": jid,
+            "contact_phone_e164": phone,
+            "inbound_text": text,
+            "message_id": message_id,
+        }
+        notif = await _db.create_notification(
             user_id=user_id,
             mission_id=None,
             kind="unsolicited_message",
             title=f"{label} te mandou mensagem",
             body=text[:500],
-            payload={
-                "contact_label": label,
-                "contact_jid": jid,
-                "contact_phone_e164": phone,
-                "inbound_text": text,
-                "message_id": message_id,
-            },
+            payload=payload,
         )
+        if _skill_executor and _skill_executor.broker:
+            try:
+                await _skill_executor.broker.publish(
+                    user_id,
+                    {
+                        "id": str(notif.id),
+                        "user_id": str(user_id),
+                        "mission_id": "",
+                        "kind": "unsolicited_message",
+                        "title": f"{label} te mandou mensagem",
+                        "body": text[:500],
+                        "payload": payload,
+                        "created_at_unix": int(notif.created_at.timestamp()) if notif.created_at else 0,
+                    },
+                )
+            except Exception as e:
+                logger.warning({"err": str(e)}, "Broker publish failed (unsolicited)")
     except Exception as e:
         logger.warning({"err": str(e), "jid": jid}, "Unsolicited notify failed")
 
@@ -163,6 +184,17 @@ async def _process_inbound(
             status="failed",
             result_summary=f"Inbound error: {e}",
         )
+        return
+
+    # Update last_inbound_message_id to prevent duplicate processing
+    try:
+        await _db.update_mission_status(
+            mission.id,
+            status=mission.status,
+            last_inbound_message_id=message_id,
+        )
+    except Exception as e:
+        logger.warning({mission.id, e}, "Failed to update last_inbound_message_id")
 
 
 # ── Panel-facing endpoints ────────────────────────────────────────────────
@@ -231,18 +263,45 @@ async def connection_status() -> dict:
         await gateway.close()
 
 
+@router.websocket("/ws/qr-status")
+async def ws_qr_status(websocket: WebSocket) -> None:
+    """WebSocket endpoint for real-time QR status updates.
+
+    Clients connect once and receive push updates whenever QR state changes.
+    Eliminates polling /qr-status every 3 seconds.
+    """
+    await websocket.accept()
+    broadcaster = get_qr_broadcaster()
+    try:
+        async for status in broadcaster.subscribe():
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json(status)
+    except WebSocketDisconnect:
+        pass
+
+
 @router.get("/qr-status")
 async def qr_status() -> dict:
-    """Get current QR code and connection state from neo-whatsapp."""
+    """Get current QR code and connection state from neo-whatsapp.
+
+    Also pushes update to all WebSocket subscribers.
+    """
+    broadcaster = get_qr_broadcaster()
     gateway = WhatsAppGatewayClient()
     try:
         client = await gateway._get_client()
         resp = await client.get("/qr")
         if resp.status_code == 200:
-            return resp.json()
-        return {"qr": None, "state": "unknown", "error": f"HTTP {resp.status_code}"}
+            status = resp.json()
+            asyncio.create_task(broadcaster.broadcast(status))
+            return status
+        status = {"qr": None, "state": "unknown", "error": f"HTTP {resp.status_code}"}
+        asyncio.create_task(broadcaster.broadcast(status))
+        return status
     except Exception as e:
-        return {"qr": None, "state": "unreachable", "error": str(e)}
+        status = {"qr": None, "state": "unreachable", "error": str(e)}
+        asyncio.create_task(broadcaster.broadcast(status))
+        return status
     finally:
         await gateway.close()
 
@@ -291,12 +350,17 @@ async def get_chat_media(jid: str, msg_id: str) -> dict:
 @router.post("/qr-refresh")
 async def qr_refresh() -> dict:
     """Force neo-whatsapp to generate a new QR code."""
+    broadcaster = get_qr_broadcaster()
     gateway = WhatsAppGatewayClient()
     try:
         client = await gateway._get_client()
         resp = await client.post("/qr/refresh", json={})
-        return resp.json()
+        result = resp.json()
+        asyncio.create_task(broadcaster.broadcast(result))
+        return result
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        status = {"ok": False, "error": str(e)}
+        asyncio.create_task(broadcaster.broadcast(status))
+        return status
     finally:
         await gateway.close()

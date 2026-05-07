@@ -861,6 +861,17 @@ class AsyncPostgresClient:
             result = await db.execute(stmt)
             return list(result.scalars().all())
 
+    async def list_notifications_for_mission(self, mission_id: UUID) -> list[UserNotification]:
+        """All notifications tied to a mission, oldest first."""
+        async with self.get_session() as db:
+            stmt = (
+                select(UserNotification)
+                .where(UserNotification.mission_id == mission_id)
+                .order_by(UserNotification.created_at.asc())
+            )
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
     async def mark_notification_delivered(self, notification_id: UUID) -> None:
         """Mark a notification as delivered."""
         async with self.get_session() as db:
