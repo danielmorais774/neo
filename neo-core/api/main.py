@@ -19,7 +19,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -266,3 +266,4 @@ app.include_router(knowledge_graph.router, prefix="/api/v1")
 app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
 app.include_router(missions.router)
+app.include_router(devices.router, prefix="/api/v1")

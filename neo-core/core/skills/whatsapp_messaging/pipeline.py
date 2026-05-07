@@ -81,6 +81,41 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         self.gateway = WhatsAppGatewayClient()
         self.executor = WhatsAppMessagingExecutor(db, self.gateway)
 
+    async def _notify(
+        self,
+        user_id: UUID,
+        mission_id: UUID | None,
+        kind: str,
+        title: str,
+        body: str,
+        payload: dict | None = None,
+    ) -> None:
+        """Persist notification and push it to the user's live broker queue."""
+        notif = await self.db.create_notification(
+            user_id=user_id,
+            mission_id=mission_id,
+            kind=kind,
+            title=title,
+            body=body,
+            payload=payload or {},
+        )
+        try:
+            await self.broker.publish(
+                user_id,
+                {
+                    "id": str(notif.id),
+                    "user_id": str(user_id),
+                    "mission_id": str(mission_id) if mission_id else "",
+                    "kind": kind,
+                    "title": title,
+                    "body": body,
+                    "payload": payload or {},
+                    "created_at_unix": int(notif.created_at.timestamp()) if notif.created_at else 0,
+                },
+            )
+        except Exception as e:
+            logger.warning("Broker publish failed kind=%s err=%s", kind, e)
+
     async def run(
         self,
         session_id: UUID,
@@ -258,7 +293,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             f"\n“{draft_text}”\n\n"
             f"Aprovar?"
         )
-        await self.db.create_notification(
+        await self._notify(
             user_id=user_id,
             mission_id=mission_id,
             kind="approval_required",
@@ -279,12 +314,23 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             f"mission={mission_id} contact={contact_label} phone={phone_label}",
         )
 
+        import json as _json
+        _mission_marker = _json.dumps({
+            "missionId": str(mission_id),
+            "contactLabel": contact_label,
+            "contactJid": contact_jid,
+            "contactPhone": contact_phone or phone_label,
+            "draftText": draft_text,
+        }, ensure_ascii=False)
         return SkillResult(
             ok=True,
-            message=f"Pronto para enviar para {contact_label} ({phone_label}). Aguardando sua aprovação.",
+            message=f"[MISSION:{_mission_marker}]Pronto para enviar para {contact_label} ({phone_label}). Aguardando sua aprovação.",
             mission_id=mission_id,
             draft_text=draft_text,
             notification_kind="approval_required",
+            mission_contact_label=contact_label,
+            mission_contact_jid=contact_jid,
+            mission_contact_phone=contact_phone or phone_label,
         )
 
     async def _kickoff_commercial(
@@ -324,7 +370,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 extra_metadata={"draft_text": draft_text},
             )
             phone_label = contact_phone or _phone_from_jid(contact_jid) or contact_jid
-            await self.db.create_notification(
+            await self._notify(
                 user_id=user_id,
                 mission_id=mission_id,
                 kind="approval_required",
@@ -380,7 +426,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
 
         if mode == "personal":
-            await self.db.create_notification(
+            summary = f"{contact_label} respondeu: {inbound_text[:300]}"
+            await self._notify(
                 user_id=mission.user_id,
                 mission_id=mission.id,
                 kind="mission_update",
@@ -393,10 +440,14 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     "inbound_text": inbound_text,
                 },
             )
-            await self.db.update_mission_status(mission.id, status="awaiting_reply")
+            await self.db.update_mission_status(
+                mission.id,
+                status="completed",
+                result_summary=summary,
+            )
             return SkillResult(
                 ok=True,
-                message=f"{contact_label} respondeu — Daniel notificado.",
+                message=f"{contact_label} respondeu — missão concluída.",
                 mission_id=mission.id,
             )
 
@@ -431,13 +482,13 @@ class WhatsAppMessagingPipeline(SkillPipeline):
     ) -> SkillResult:
         approved = extra.get("approved", False)
         edited_text = extra.get("edited_text")
-        logger.info(f"_handle_approval: mission={mission.id} approved={approved} edited_text={edited_text}")
 
         if not approved:
             await self.db.update_mission_status(mission.id, status="cancelled")
             return SkillResult(ok=False, message="Missão cancelada.", mission_id=mission.id)
 
         text_to_send = edited_text or (mission.extra_metadata or {}).get("draft_text", "")
+        logger.info(f"_handle_approval: mission={mission.id} approved={approved} text_to_send={text_to_send[:50] if text_to_send else 'EMPTY'}")
         if not text_to_send:
             return SkillResult(
                 ok=False, message="Nenhum texto para enviar.", mission_id=mission.id
@@ -470,9 +521,17 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             extra_metadata={"last_outbound_id": message_id},
         )
 
+        import json as _json
+        _mission_marker = _json.dumps({
+            "missionId": str(mission.id),
+            "contactLabel": mission.title,
+            "contactJid": mission.contact_jid,
+            "contactPhone": (mission.extra_metadata or {}).get("contact_phone_e164") or _phone_from_jid(mission.contact_jid) or mission.contact_jid,
+            "draftText": text_to_send,
+        }, ensure_ascii=False)
         return SkillResult(
             ok=True,
-            message=f"Mensagem enviada para {mission.title}.",
+            message=f"[MISSION:{_mission_marker}]Mensagem enviada para {mission.title}.",
             mission_id=mission.id,
         )
 
@@ -542,7 +601,14 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 ok=False, error=f"Nenhum contato '{label}' encontrado."
             )
 
+        # Prefer .c.us JID variant when same contact appears as both @lid and @c.us
+        # (@lid entries often have the raw digits as phone without country code)
         top = results[0]
+        if len(results) > 1 and top.get("jid", "").endswith("@lid"):
+            c_us = next((r for r in results[1:] if r.get("jid", "").endswith("@c.us") and r.get("name") == top.get("name")), None)
+            if c_us:
+                top = c_us
+
         if len(results) == 1 or _strong_match(top, label):
             return _ResolvedRecipient(
                 ok=True,

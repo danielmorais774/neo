@@ -14,6 +14,8 @@ NOTE: After editing proto/neo_desktop.proto, regenerate with:
 
 import json
 import logging
+import threading
+import time
 from collections.abc import AsyncIterator
 from uuid import UUID
 
@@ -26,6 +28,43 @@ from modules.desktop.ai_service import AIService, AIServiceResponse
 from shared import IntentType
 
 logger = logging.getLogger(__name__)
+
+
+class ConnectedDevicesRegistry:
+    """Thread-safe registry of devices connected via gRPC."""
+
+    def __init__(self):
+        self._devices: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def register(self, device_id: str, info: dict) -> None:
+        with self._lock:
+            info["connected_at_unix"] = int(time.time())
+            self._devices[device_id] = info
+            logger.info(f"[Devices] Registered: {device_id} ({info.get('device_type', 'unknown')})")
+
+    def unregister(self, device_id: str) -> None:
+        with self._lock:
+            if device_id in self._devices:
+                del self._devices[device_id]
+                logger.info(f"[Devices] Unregistered: {device_id}")
+
+    def update(self, device_id: str, updates: dict) -> None:
+        with self._lock:
+            if device_id in self._devices:
+                self._devices[device_id].update(updates)
+
+    def list_all(self) -> list[dict]:
+        with self._lock:
+            return list(self._devices.values())
+
+    def get(self, device_id: str) -> dict | None:
+        with self._lock:
+            return self._devices.get(device_id)
+
+
+# Global registry instance
+_connected_devices = ConnectedDevicesRegistry()
 
 
 class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
@@ -51,6 +90,9 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         """Bidirectional streaming — routes desktop messages to AIService."""
         logger.info("[gRPC] ExecuteTask stream started")
         session_id: str | None = None
+        device_id: str | None = None
+        device_info: dict = {}
+        _connected_devices_local = _connected_devices  # local ref for finally block
 
         try:
             async for desktop_msg in request_iterator:
@@ -69,6 +111,22 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     msg = desktop_msg.user_input.message
                     metadata = dict(desktop_msg.user_input.metadata) if desktop_msg.user_input.metadata else {}
                     logger.info(f"[gRPC] USER_INPUT session={session_id} user={uid_uuid}: {msg[:80]}")
+
+                    # Register device on first user_input
+                    if device_id is None:
+                        device_id = session_id or str(sid_uuid) if sid_uuid else None
+                        device_info = {
+                            "device_id": device_id,
+                            "device_type": metadata.get("client", "neo-desktop"),
+                            "model": metadata.get("model", "unknown"),
+                            "os_platform": metadata.get("os_platform", "unknown"),
+                            "os_version": metadata.get("os_release", "unknown"),
+                            "client_version": metadata.get("client_version", "unknown"),
+                            "ip_address": metadata.get("ip_address", ""),
+                            "user_id": desktop_msg.user_id or "",
+                        }
+                        if device_id:
+                            _connected_devices.register(device_id, device_info)
 
                     async for resp in self.ai_service.process_user_input(
                         user_message=msg,
@@ -142,6 +200,9 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         finally:
             if session_id:
                 self._pending.pop(session_id, None)
+            # Note: device_id is NOT unregistered here because the desktop might
+            # just be idle. On next message it will update its info. Only unregister
+            # when the AIService signals connection close (handled separately).
 
     # ---------------------------------------------------------------
     # AIServiceResponse → CoreMessage conversion
@@ -253,7 +314,12 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
     # ---------------------------------------------------------------
 
     async def SubscribeNotifications(self, request, context):
-        """Server-streaming RPC: pushes notifications to desktop as they arrive."""
+        """Server-streaming RPC: pushes notifications to desktop as they arrive.
+
+        On connect, replays any undelivered notifications from the DB so the
+        desktop catches up on anything it missed while offline. Then keeps the
+        stream open and yields each new broker publication.
+        """
         user_id_str = request.user_id
         try:
             user_id = UUID(user_id_str)
@@ -263,9 +329,27 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
 
         logger.info(f"[gRPC] SubscribeNotifications user={user_id}")
 
+        # Replay undelivered notifications from DB
+        if self.ai_service and self.ai_service.db:
+            try:
+                pending = await self.ai_service.db.get_pending_notifications(user_id)
+                logger.info(f"[gRPC] Replaying {len(pending)} pending notifications")
+                for notif in pending:
+                    yield neo_desktop_pb2.Notification(
+                        id=str(notif.id),
+                        user_id=user_id_str,
+                        mission_id=str(notif.mission_id) if notif.mission_id else "",
+                        kind=notif.kind or "",
+                        title=notif.title or "",
+                        body=notif.body or "",
+                        payload_json=json.dumps(notif.payload or {}),
+                        created_at_unix=int(notif.created_at.timestamp()) if notif.created_at else 0,
+                    )
+            except Exception as e:
+                logger.error(f"[gRPC] Pending replay failed: {e}")
+
         if self.notification_broker:
             async for notif in self.notification_broker.subscribe(user_id):
-                # Convert dict to protobuf Notification
                 pb_notif = neo_desktop_pb2.Notification(
                     id=notif.get("id", ""),
                     user_id=notif.get("user_id", user_id_str),
@@ -326,6 +410,57 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         except Exception as e:
             logger.exception(f"[gRPC] RespondToMissionPrompt failed: {e}")
             return neo_desktop_pb2.MissionPromptAck(ok=False, message=str(e))
+
+    async def ListConnectedDevices(self, request, context):
+        """Return list of devices currently connected via gRPC."""
+        user_id = request.user_id
+        logger.info(f"[gRPC] ListConnectedDevices user={user_id}")
+
+        all_devices = _connected_devices.list_all()
+        # Filter by user_id if provided
+        if user_id:
+            all_devices = [d for d in all_devices if d.get("user_id") == user_id]
+
+        proto_devices = [
+            neo_desktop_pb2.DeviceInfo(
+                device_id=d.get("device_id", ""),
+                device_type=d.get("device_type", "unknown"),
+                model=d.get("model", "unknown"),
+                os_platform=d.get("os_platform", "unknown"),
+                os_version=d.get("os_version", "unknown"),
+                client_version=d.get("client_version", ""),
+                ip_address=d.get("ip_address", ""),
+                connected_at_unix=d.get("connected_at_unix", 0),
+                is_current_device=d.get("is_current_device", False),
+            )
+            for d in all_devices
+        ]
+
+        return neo_desktop_pb2.ListConnectedDevicesResponse(devices=proto_devices)
+
+    async def RegisterDevice(self, request, context):
+        """Register a device proactively (called by desktop on startup)."""
+        device_id = request.device_id or f"device-{id(request)}"
+        device_info = {
+            "device_id": device_id,
+            "device_type": request.device_type or "neo-desktop",
+            "model": request.model or "unknown",
+            "os_platform": request.os_platform or "unknown",
+            "os_version": request.os_version or "unknown",
+            "client_version": request.client_version or "",
+            "ip_address": request.ip_address or "",
+            "user_id": request.user_id or "",
+        }
+        _connected_devices.register(device_id, device_info)
+        logger.info(f"[gRPC] RegisterDevice: {device_id}")
+        return neo_desktop_pb2.RegisterDeviceResponse(ok=True)
+
+    async def UnregisterDevice(self, request, context):
+        """Unregister a device (called by desktop on shutdown)."""
+        device_id = request.device_id
+        _connected_devices.unregister(device_id)
+        logger.info(f"[gRPC] UnregisterDevice: {device_id}")
+        return neo_desktop_pb2.UnregisterDeviceResponse(ok=True)
 
 
 async def serve(

@@ -103,7 +103,7 @@ async def _notify_unsolicited(jid: str, text: str, message_id: str) -> None:
         phone = (contact.phone_e164 if contact else None) or _phone_from_jid(jid) or jid
 
         if not user_id:
-            logger.info({"jid": jid}, "Inbound from unknown contact (no user); not notifying")
+            logger.info("Inbound from unknown contact (no user); not notifying jid=%s", jid)
             return
 
         payload = {
@@ -188,11 +188,7 @@ async def _process_inbound(
 
     # Update last_inbound_message_id to prevent duplicate processing
     try:
-        await _db.update_mission_status(
-            mission.id,
-            status=mission.status,
-            last_inbound_message_id=message_id,
-        )
+        await _db.update_mission_last_inbound_message_id(mission.id, message_id)
     except Exception as e:
         logger.warning({mission.id, e}, "Failed to update last_inbound_message_id")
 

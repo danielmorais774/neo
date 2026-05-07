@@ -20,6 +20,45 @@ from shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _digits_from_whatsapp_jid(jid: str | None) -> str:
+    """Return phone digits for phone-backed WhatsApp JIDs."""
+    if not jid:
+        return ""
+    local = jid.split("@", 1)[0]
+    return local if local.isdigit() else ""
+
+
+def _whatsapp_jid_candidates(jid: str) -> list[str]:
+    """Equivalent JID variants for a phone-backed WhatsApp contact."""
+    candidates = {jid}
+    digits = _digits_from_whatsapp_jid(jid)
+    if digits:
+        candidates.add(f"{digits}@c.us")
+        candidates.add(f"{digits}@s.whatsapp.net")
+    return list(candidates)
+
+
+def _mission_matches_whatsapp_contact(mission: Mission, contact_jid: str) -> bool:
+    """Return whether a mission can be associated with an inbound WhatsApp JID."""
+    inbound_candidates = set(_whatsapp_jid_candidates(contact_jid))
+    if mission.contact_jid in inbound_candidates:
+        return True
+
+    phone_digits = _digits_from_whatsapp_jid(contact_jid)
+    candidate_digits = _digits_from_whatsapp_jid(mission.contact_jid)
+    meta = mission.extra_metadata or {}
+    meta_phone = meta.get("contact_phone_e164", "")
+    meta_digits = "".join(filter(str.isdigit, meta_phone or ""))
+    if phone_digits and phone_digits in {candidate_digits, meta_digits}:
+        return True
+
+    # WPPConnect sometimes emits inbound messages as @lid while the mission
+    # contact was resolved as @c.us. The outbound message id carries that @lid:
+    # true_234020537397350@lid_3EB0...
+    last_outbound_id = str(meta.get("last_outbound_id") or "")
+    return bool(contact_jid and contact_jid in last_outbound_id)
+
+
 class AsyncPostgresClient:
     """Async PostgreSQL client using SQLAlchemy async engine + SQLModel models."""
 
@@ -599,17 +638,37 @@ class AsyncPostgresClient:
             return await db.get(Mission, mission_id)
 
     async def find_active_mission_by_contact(self, contact_jid: str) -> Mission | None:
-        """Find the active mission for a contact (awaiting_reply or awaiting_confirmation)."""
+        """Find the active mission for a contact (awaiting_reply or awaiting_confirmation).
+
+        WhatsApp gateways may report the same 1:1 contact as @c.us or
+        @s.whatsapp.net depending on the API path. Match by equivalent phone
+        JID variants first, then fall back to a small active-mission scan.
+        """
+        jid_candidates = _whatsapp_jid_candidates(contact_jid)
         async with self.get_session() as db:
             stmt = (
                 select(Mission)
-                .where(Mission.contact_jid == contact_jid)
+                .where(Mission.contact_jid.in_(jid_candidates))
                 .where(Mission.status.in_(["awaiting_reply", "awaiting_confirmation"]))
                 .order_by(Mission.last_activity_at.desc())
                 .limit(1)
             )
             result = await db.execute(stmt)
-            return result.scalars().first()
+            mission = result.scalars().first()
+            if mission:
+                return mission
+
+            fallback_stmt = (
+                select(Mission)
+                .where(Mission.status.in_(["awaiting_reply", "awaiting_confirmation"]))
+                .order_by(Mission.last_activity_at.desc())
+                .limit(50)
+            )
+            fallback_result = await db.execute(fallback_stmt)
+            for candidate in fallback_result.scalars().all():
+                if _mission_matches_whatsapp_contact(candidate, contact_jid):
+                    return candidate
+            return None
 
     async def find_active_confirmation_mission(self, user_id: UUID) -> Mission | None:
         """Find the most recent awaiting_confirmation mission for a user."""
@@ -676,6 +735,24 @@ class AsyncPostgresClient:
                 mission.extra_metadata = {**mission.extra_metadata, **extra_metadata}
             if status in ("completed", "failed", "cancelled"):
                 mission.completed_at = datetime.utcnow()
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
+    async def update_mission_last_inbound_message_id(
+        self,
+        mission_id: UUID,
+        message_id: str,
+    ) -> Mission | None:
+        """Update inbound idempotency marker without changing mission status."""
+        async with self.get_session() as db:
+            mission = await db.get(Mission, mission_id)
+            if not mission:
+                return None
+            from datetime import datetime
+            mission.last_inbound_message_id = message_id
+            mission.last_activity_at = datetime.utcnow()
             db.add(mission)
             await db.commit()
             await db.refresh(mission)

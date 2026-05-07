@@ -77,9 +77,23 @@ class AgentExecutor:
         memory: ConversationMemory | None = None,
         provider: str | None = None,
         model: str | None = None,
+        system_prompt_override: str | None = None,
+        tool_subset: list["ToolSchema"] | None = None,
+        tool_executor: Any = None,
+        available_tools: list["ToolSchema"] | None = None,
     ) -> dict[str, Any]:
         """Executa uma task com resiliência (double-loop).
 
+        Args:
+            task: o prompt / task description
+            session_id: session ID opcional
+            memory: ConversationMemory opcional
+            provider: override de provider LLM
+            model: override de model
+            system_prompt_override: usa esse system prompt em vez do padrão
+            tool_subset: lista de ToolSchema — substitui tools padrão
+            tool_executor: executor custom para as tools da skill
+            available_tools: tools visíveis ao LLM (mutually exclusive with tool_subset)
         Returns:
             Dict com status, final_response, steps, iterations, metadata.
         """
@@ -91,6 +105,10 @@ class AgentExecutor:
                 result = await asyncio.wait_for(
                     self._inner_loop(
                         task, session_id, memory, provider, model, loop_hints_injected,
+                        system_prompt_override=system_prompt_override,
+                        tool_subset=tool_subset,
+                        tool_executor=tool_executor,
+                        available_tools=available_tools,
                     ),
                     timeout=self.settings.agent_global_timeout,
                 )
@@ -169,6 +187,10 @@ class AgentExecutor:
         provider: str | None,
         model: str | None,
         loop_hints: set[LoopType],
+        system_prompt_override: str | None = None,
+        tool_subset: list["ToolSchema"] | None = None,
+        tool_executor: Any = None,
+        available_tools: list["ToolSchema"] | None = None,
     ) -> dict[str, Any]:
         """Loop interno: LLM → Tools → LLM com detecção de loops."""
         steps: list[AgentStep] = []
@@ -186,8 +208,8 @@ class AgentExecutor:
         loop_detector = LoopDetector(self.settings)
         loop_detector.reset()
 
-        prompt_builder = PromptBuilder()
-        available_tools = self.tool_registry.get_all()
+        prompt_builder = PromptBuilder(system_prompt=system_prompt_override)
+        available_tools = tool_subset or available_tools or self.tool_registry.get_all()
 
         # Construir mensagens iniciais
         initial_messages = prompt_builder.build_initial_messages(task, available_tools)
@@ -254,7 +276,7 @@ class AgentExecutor:
                     thought=content,
                     tool_calls=tool_calls,
                 )
-                step.tool_results = await self._execute_tools(tool_calls)
+                step.tool_results = await self._execute_tools(tool_calls, executor=tool_executor)
                 steps.append(step)
 
                 # 6. Registrar no loop detector
@@ -315,9 +337,14 @@ class AgentExecutor:
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _execute_tools(self, tool_calls: list[ToolCall]) -> list[Any]:
+    async def _execute_tools(
+        self,
+        tool_calls: list[ToolCall],
+        executor: Any = None,
+    ) -> list[Any]:
         """Executa tool calls em paralelo."""
-        tasks = [self.tool_executor.execute_tool_call(tc) for tc in tool_calls]
+        ex = executor or self.tool_executor
+        tasks = [ex.execute_tool_call(tc) for tc in tool_calls]
         return await asyncio.gather(*tasks)
 
     @staticmethod

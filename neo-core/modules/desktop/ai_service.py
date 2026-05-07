@@ -808,9 +808,21 @@ class AIService:
             )
 
             if result.ok:
-                final_text = result.message
+                _raw_text = result.message
+                final_text = _raw_text  # keep [MISSION:...] marker in gRPC response so desktop can parse it
+                _mission_meta = None
+                if result.mission_id:
+                    import json as _json
+                    _mission_meta = _json.dumps({
+                        "missionId": str(result.mission_id),
+                        "contactLabel": result.mission_contact_label or "",
+                        "contactJid": result.mission_contact_jid or "",
+                        "contactPhone": result.mission_contact_phone or "",
+                        "draftText": result.draft_text or "",
+                    }, ensure_ascii=False)
             else:
                 final_text = f"Erro na missão: {result.message}"
+                _mission_meta = None
 
         except Exception as e:
             logger.exception("WhatsApp messaging execution failed")
@@ -822,6 +834,7 @@ class AIService:
             content=final_text,
             generate_embedding=False,
             user_id=user_id,
+            metadata=(_mission_meta and {"mission": _mission_meta}) or None,
         )
         if slog:
             slog.log_final_response(final_text, "WHATSAPP_MESSAGING", iterations=1)

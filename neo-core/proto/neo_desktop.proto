@@ -1,0 +1,226 @@
+syntax = "proto3";
+
+package neo.desktop;
+
+// Serviço principal de comunicação Desktop <-> Core
+service NeoDesktopService {
+  // Stream bidirecional para execução de tarefas
+  rpc ExecuteTask(stream DesktopMessage) returns (stream CoreMessage);
+
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Notificações push em tempo real (server-streaming)
+  rpc SubscribeNotifications(SubscribeRequest) returns (stream Notification);
+
+  // Acknowledge de uma notificação
+  rpc AckNotification(AckRequest) returns (AckResponse);
+
+  // Responder a um pedido de aprovação de missão
+  rpc RespondToMissionPrompt(MissionPromptResponse) returns (MissionPromptAck);
+
+  // Lista dispositivos conectados ao neo-core via gRPC
+  rpc ListConnectedDevices(ListConnectedDevicesRequest) returns (ListConnectedDevicesResponse);
+
+  // Registra um dispositivo (chamado pelo desktop na inicialização)
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+
+  // Desregistra um dispositivo (chamado pelo desktop ao fechar)
+  rpc UnregisterDevice(UnregisterDeviceRequest) returns (UnregisterDeviceResponse);
+}
+
+// Subscribe request — desktop subscreve às notificações de um user_id
+message SubscribeRequest {
+  string user_id = 1;
+}
+
+// Notificação push
+message Notification {
+  string id = 1;
+  string user_id = 2;
+  string mission_id = 3;
+  string kind = 4;       // mission_started | mission_completed | approval_required | ...
+  string title = 5;
+  string body = 6;
+  string payload_json = 7;
+  int64 created_at_unix = 8;
+}
+
+// Ack de notificação
+message AckRequest {
+  string notification_id = 1;
+  bool acked = 2;
+}
+
+message AckResponse {}
+
+// Resposta do Daniel a um pedido de aprovação
+message MissionPromptResponse {
+  string mission_id = 1;
+  string user_answer = 2;   // texto livre (não usado no momento)
+  bool approved = 3;        // sim/não
+  string edited_text = 4;   // se daniel editou a 1ª mensagem
+}
+
+message MissionPromptAck {
+  bool ok = 1;
+  string message = 2;
+}
+
+// Mensagens do Desktop para o Core
+message DesktopMessage {
+  string session_id = 1;
+  string user_id = 6;  // UUID do usuário autenticado no desktop
+  
+  oneof content {
+    UserInput user_input = 2;
+    ToolResult tool_result = 3;
+    CommandApproval command_approval = 4;
+    KeepAlive keep_alive = 5;
+  }
+}
+
+message UserInput {
+  string message = 1;
+  map<string, string> metadata = 2;
+}
+
+message ToolResult {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bool success = 3;
+  string result = 4;
+  string error = 5;
+}
+
+message CommandApproval {
+  string command_id = 1;
+  bool approved = 2;
+}
+
+message KeepAlive {
+  int64 timestamp = 1;
+}
+
+// Mensagens do Core para o Desktop
+message CoreMessage {
+  string session_id = 1;
+  
+  oneof content {
+    AgentThinking thinking = 2;
+    ToolRequest tool_request = 3;
+    CommandRequest command_request = 4;
+    AgentResponse response = 5;
+    ErrorMessage error = 6;
+    IterationUpdate iteration = 7;
+    PlanUpdate plan_update = 8;
+  }
+}
+
+message AgentThinking {
+  string message = 1;
+  int32 iteration = 2;
+}
+
+message ToolRequest {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string arguments = 3; // JSON string
+  bool requires_approval = 4;
+}
+
+message CommandRequest {
+  string command_id = 1;
+  string command = 2;
+  string explanation = 3;
+  bool is_background = 4;
+}
+
+message AgentResponse {
+  string message = 1;
+  bool is_final = 2;
+  int32 total_iterations = 3;
+}
+
+message ErrorMessage {
+  string error = 1;
+  string details = 2;
+}
+
+message IterationUpdate {
+  int32 current = 1;
+  int32 max = 2;
+}
+
+message PlanUpdate {
+  string plan_id = 1;
+  string goal = 2;
+  repeated PlanStepInfo steps = 3;
+  int32 current_step = 4;
+  string status = 5;
+  string parent_plan_id = 6;
+}
+
+message PlanStepInfo {
+  string id = 1;
+  int32 index = 2;
+  string description = 3;
+  string tool_name = 4;
+  string status = 5;
+  string result_summary = 6;
+  string error = 7;
+}
+
+// Health check
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  map<string, string> status = 3;
+}
+
+// Device info for connected devices list
+message DeviceInfo {
+  string device_id = 1;
+  string device_type = 2;  // neo-desktop | neo-mobile
+  string model = 3;
+  string os_platform = 4;
+  string os_version = 5;
+  string client_version = 6;
+  string ip_address = 7;
+  int64 connected_at_unix = 8;
+  bool is_current_device = 9;
+}
+
+// List connected devices request
+message ListConnectedDevicesRequest {
+  string user_id = 1;
+}
+
+message ListConnectedDevicesResponse {
+  repeated DeviceInfo devices = 1;
+}
+
+message RegisterDeviceRequest {
+  string device_id = 1;
+  string device_type = 2;
+  string model = 3;
+  string os_platform = 4;
+  string os_version = 5;
+  string client_version = 6;
+  string ip_address = 7;
+  string user_id = 8;
+}
+
+message RegisterDeviceResponse {
+  bool ok = 1;
+}
+
+message UnregisterDeviceRequest {
+  string device_id = 1;
+}
+
+message UnregisterDeviceResponse {
+  bool ok = 1;
+}

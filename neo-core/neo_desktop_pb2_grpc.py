@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import neo_desktop_pb2 as neo__desktop__pb2
+from proto import neo_desktop_pb2 as proto_dot_neo__desktop__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in neo_desktop_pb2_grpc.py depends on'
+        + ' but the generated code in proto/neo_desktop_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -37,13 +37,33 @@ class NeoDesktopServiceStub(object):
         """
         self.ExecuteTask = channel.stream_stream(
                 '/neo.desktop.NeoDesktopService/ExecuteTask',
-                request_serializer=neo__desktop__pb2.DesktopMessage.SerializeToString,
-                response_deserializer=neo__desktop__pb2.CoreMessage.FromString,
+                request_serializer=proto_dot_neo__desktop__pb2.DesktopMessage.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.CoreMessage.FromString,
                 _registered_method=True)
         self.HealthCheck = channel.unary_unary(
                 '/neo.desktop.NeoDesktopService/HealthCheck',
-                request_serializer=neo__desktop__pb2.HealthCheckRequest.SerializeToString,
-                response_deserializer=neo__desktop__pb2.HealthCheckResponse.FromString,
+                request_serializer=proto_dot_neo__desktop__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.HealthCheckResponse.FromString,
+                _registered_method=True)
+        self.SubscribeNotifications = channel.unary_stream(
+                '/neo.desktop.NeoDesktopService/SubscribeNotifications',
+                request_serializer=proto_dot_neo__desktop__pb2.SubscribeRequest.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.Notification.FromString,
+                _registered_method=True)
+        self.AckNotification = channel.unary_unary(
+                '/neo.desktop.NeoDesktopService/AckNotification',
+                request_serializer=proto_dot_neo__desktop__pb2.AckRequest.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.AckResponse.FromString,
+                _registered_method=True)
+        self.RespondToMissionPrompt = channel.unary_unary(
+                '/neo.desktop.NeoDesktopService/RespondToMissionPrompt',
+                request_serializer=proto_dot_neo__desktop__pb2.MissionPromptResponse.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.MissionPromptAck.FromString,
+                _registered_method=True)
+        self.ListConnectedDevices = channel.unary_unary(
+                '/neo.desktop.NeoDesktopService/ListConnectedDevices',
+                request_serializer=proto_dot_neo__desktop__pb2.ListConnectedDevicesRequest.SerializeToString,
+                response_deserializer=proto_dot_neo__desktop__pb2.ListConnectedDevicesResponse.FromString,
                 _registered_method=True)
 
 
@@ -65,18 +85,66 @@ class NeoDesktopServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubscribeNotifications(self, request, context):
+        """Notificações push em tempo real (server-streaming)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AckNotification(self, request, context):
+        """Acknowledge de uma notificação
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RespondToMissionPrompt(self, request, context):
+        """Responder a um pedido de aprovação de missão
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListConnectedDevices(self, request, context):
+        """Lista dispositivos conectados ao neo-core via gRPC
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NeoDesktopServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'ExecuteTask': grpc.stream_stream_rpc_method_handler(
                     servicer.ExecuteTask,
-                    request_deserializer=neo__desktop__pb2.DesktopMessage.FromString,
-                    response_serializer=neo__desktop__pb2.CoreMessage.SerializeToString,
+                    request_deserializer=proto_dot_neo__desktop__pb2.DesktopMessage.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.CoreMessage.SerializeToString,
             ),
             'HealthCheck': grpc.unary_unary_rpc_method_handler(
                     servicer.HealthCheck,
-                    request_deserializer=neo__desktop__pb2.HealthCheckRequest.FromString,
-                    response_serializer=neo__desktop__pb2.HealthCheckResponse.SerializeToString,
+                    request_deserializer=proto_dot_neo__desktop__pb2.HealthCheckRequest.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'SubscribeNotifications': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubscribeNotifications,
+                    request_deserializer=proto_dot_neo__desktop__pb2.SubscribeRequest.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.Notification.SerializeToString,
+            ),
+            'AckNotification': grpc.unary_unary_rpc_method_handler(
+                    servicer.AckNotification,
+                    request_deserializer=proto_dot_neo__desktop__pb2.AckRequest.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.AckResponse.SerializeToString,
+            ),
+            'RespondToMissionPrompt': grpc.unary_unary_rpc_method_handler(
+                    servicer.RespondToMissionPrompt,
+                    request_deserializer=proto_dot_neo__desktop__pb2.MissionPromptResponse.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.MissionPromptAck.SerializeToString,
+            ),
+            'ListConnectedDevices': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListConnectedDevices,
+                    request_deserializer=proto_dot_neo__desktop__pb2.ListConnectedDevicesRequest.FromString,
+                    response_serializer=proto_dot_neo__desktop__pb2.ListConnectedDevicesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -105,8 +173,8 @@ class NeoDesktopService(object):
             request_iterator,
             target,
             '/neo.desktop.NeoDesktopService/ExecuteTask',
-            neo__desktop__pb2.DesktopMessage.SerializeToString,
-            neo__desktop__pb2.CoreMessage.FromString,
+            proto_dot_neo__desktop__pb2.DesktopMessage.SerializeToString,
+            proto_dot_neo__desktop__pb2.CoreMessage.FromString,
             options,
             channel_credentials,
             insecure,
@@ -132,8 +200,116 @@ class NeoDesktopService(object):
             request,
             target,
             '/neo.desktop.NeoDesktopService/HealthCheck',
-            neo__desktop__pb2.HealthCheckRequest.SerializeToString,
-            neo__desktop__pb2.HealthCheckResponse.FromString,
+            proto_dot_neo__desktop__pb2.HealthCheckRequest.SerializeToString,
+            proto_dot_neo__desktop__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubscribeNotifications(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/neo.desktop.NeoDesktopService/SubscribeNotifications',
+            proto_dot_neo__desktop__pb2.SubscribeRequest.SerializeToString,
+            proto_dot_neo__desktop__pb2.Notification.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AckNotification(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neo.desktop.NeoDesktopService/AckNotification',
+            proto_dot_neo__desktop__pb2.AckRequest.SerializeToString,
+            proto_dot_neo__desktop__pb2.AckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RespondToMissionPrompt(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neo.desktop.NeoDesktopService/RespondToMissionPrompt',
+            proto_dot_neo__desktop__pb2.MissionPromptResponse.SerializeToString,
+            proto_dot_neo__desktop__pb2.MissionPromptAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListConnectedDevices(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neo.desktop.NeoDesktopService/ListConnectedDevices',
+            proto_dot_neo__desktop__pb2.ListConnectedDevicesRequest.SerializeToString,
+            proto_dot_neo__desktop__pb2.ListConnectedDevicesResponse.FromString,
             options,
             channel_credentials,
             insecure,
