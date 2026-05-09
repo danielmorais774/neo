@@ -1,19 +1,22 @@
 mod commands;
 mod grpc_gen;
 mod services;
+mod websocket;
 
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     Manager,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use log::info;
+use crate::websocket::DeviceWsManager;
 
 pub struct AppState {
     pub device_id: String,
     pub user_id: String,
     pub session_id: Mutex<String>,
+    pub ws_manager: Mutex<Option<Arc<DeviceWsManager>>>,
 }
 
 fn get_or_create_device_id() -> String {
@@ -58,6 +61,7 @@ pub fn run() {
             device_id,
             user_id,
             session_id: Mutex::new(session_id),
+            ws_manager: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
@@ -141,6 +145,27 @@ pub fn run() {
                 .build(app)?;
 
             info!("[Neo] Tray created successfully");
+
+            // Start WebSocket connections for device online status and notifications
+            let app_handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            let device_id = state.device_id.clone();
+            
+            // Create and start WebSocket manager
+            let ws_manager = Arc::new(DeviceWsManager::new(device_id, app_handle.clone()));
+            
+            // Store in state for later cleanup
+            if let Ok(mut guard) = state.ws_manager.lock() {
+                *guard = Some(ws_manager.clone());
+            }
+            
+            // Connect WebSockets
+            let ws_manager_clone = ws_manager.clone();
+            tauri::async_runtime::spawn(async move {
+                ws_manager_clone.connect().await;
+            });
+
+            info!("[Neo] WebSocket connections initiated");
             Ok(())
         })
         .run(tauri::generate_context!())

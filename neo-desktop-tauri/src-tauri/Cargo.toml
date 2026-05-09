@@ -37,3 +37,7 @@ tonic = "0.12"
 prost = "0.13"
 tokio-stream = "0.1"
 tower = "0.4"
+tungstenite = "0.24"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+urlencoding = "2.1"
