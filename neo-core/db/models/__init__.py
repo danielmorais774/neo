@@ -7,6 +7,7 @@ from .knowledge_graph import KnowledgeEntity, KnowledgeRelation
 from .mission import Mission
 from .whatsapp_contact import WhatsAppContact
 from .user_notification import UserNotification
+from .connected_device import ConnectedDevice
 
 __all__ = [
     "User",
@@ -19,4 +20,5 @@ __all__ = [
     "Mission",
     "WhatsAppContact",
     "UserNotification",
+    "ConnectedDevice",
 ]

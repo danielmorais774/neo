@@ -181,6 +181,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         broker=_notification_broker,
     ))
 
+    # Wire devices route
+    devices.set_db(_db)
+
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
         agent_executor=_agent_executor,

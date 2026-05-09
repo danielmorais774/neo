@@ -12,6 +12,7 @@ NOTE: After editing proto/neo_desktop.proto, regenerate with:
   protoc --python_out=. --grpc_python_out=. proto/neo_desktop.proto
 """
 
+import asyncio
 import json
 import logging
 import threading
@@ -40,13 +41,15 @@ class ConnectedDevicesRegistry:
     def register(self, device_id: str, info: dict) -> None:
         with self._lock:
             info["connected_at_unix"] = int(time.time())
+            info["last_heartbeat_unix"] = int(time.time())
+            info["is_online"] = True
             self._devices[device_id] = info
             logger.info(f"[Devices] Registered: {device_id} ({info.get('device_type', 'unknown')})")
 
     def unregister(self, device_id: str) -> None:
         with self._lock:
             if device_id in self._devices:
-                del self._devices[device_id]
+                self._devices[device_id]["is_online"] = False
                 logger.info(f"[Devices] Unregistered: {device_id}")
 
     def update(self, device_id: str, updates: dict) -> None:
@@ -63,8 +66,48 @@ class ConnectedDevicesRegistry:
             return self._devices.get(device_id)
 
 
-# Global registry instance
+class DevicesWSRegistry:
+    """Async registry of devices connected via WebSocket (online/offline signal)."""
+
+    def __init__(self):
+        self._online: set[str] = set()
+        self._connection_ids: dict[str, str] = {}
+        self._lock = asyncio.Lock()
+        self._db = None
+
+    def set_db(self, db) -> None:
+        self._db = db
+
+    async def register(self, device_id: str, ws_connection_id: str | None = None) -> None:
+        conn_id = ws_connection_id or str(id(self))  # fallback to instance id if no ws id
+        async with self._lock:
+            self._online.add(device_id)
+            self._connection_ids[device_id] = conn_id
+            logger.info(f"[WS] Device online: {device_id} conn={conn_id}")
+        # Sync to DB (async, non-blocking)
+        if self._db:
+            asyncio.create_task(self._db.set_device_ws_connection(device_id, conn_id))
+
+    async def unregister(self, device_id: str) -> None:
+        async with self._lock:
+            self._online.discard(device_id)
+            self._connection_ids.pop(device_id, None)
+            logger.info(f"[WS] Device offline: {device_id}")
+        # Sync to DB (async, non-blocking)
+        if self._db:
+            asyncio.create_task(self._db.clear_device_ws_connection(device_id))
+
+    async def is_online(self, device_id: str) -> bool:
+        return device_id in self._online
+
+    async def list_online(self) -> list[str]:
+        async with self._lock:
+            return list(self._online)
+
+
+# Global registry instances
 _connected_devices = ConnectedDevicesRegistry()
+_devices_ws_registry = DevicesWSRegistry()
 
 
 class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
@@ -112,9 +155,10 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     metadata = dict(desktop_msg.user_input.metadata) if desktop_msg.user_input.metadata else {}
                     logger.info(f"[gRPC] USER_INPUT session={session_id} user={uid_uuid}: {msg[:80]}")
 
-                    # Register device on first user_input
+                    # Register device on first user_input — use device_id from metadata if present,
+                    # otherwise fall back to session_id (for backwards compat)
                     if device_id is None:
-                        device_id = session_id or str(sid_uuid) if sid_uuid else None
+                        device_id = metadata.get("device_id") or session_id or (str(sid_uuid) if sid_uuid else None)
                         device_info = {
                             "device_id": device_id,
                             "device_type": metadata.get("client", "neo-desktop"),
@@ -127,6 +171,22 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         }
                         if device_id:
                             _connected_devices.register(device_id, device_info)
+                            # Sync to DB (async, non-blocking)
+                            if self.ai_service and self.ai_service.db and uid_uuid:
+                                asyncio.create_task(
+                                    self.ai_service.db.upsert_connected_device(
+                                        user_id=uid_uuid,
+                                        device_id=device_id,
+                                        device_type=metadata.get("client", "neo-desktop") or "neo-desktop",
+                                        model=metadata.get("model", "unknown"),
+                                        os_platform=metadata.get("os_platform", "unknown"),
+                                        os_version=metadata.get("os_release", "unknown"),
+                                        client_version=metadata.get("client_version", "unknown"),
+                                        ip_address=metadata.get("ip_address", ""),
+                                        last_heartbeat_unix=int(time.time()),
+                                        is_online=True,
+                                    )
+                                )
 
                     async for resp in self.ai_service.process_user_input(
                         user_message=msg,
@@ -188,9 +248,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         if resp.metadata and resp.tool_request:
                             self._pending[session_id] = {**pending, **resp.metadata}
 
-                elif desktop_msg.HasField("keep_alive"):
-                    logger.debug(f"[gRPC] keep_alive session={session_id}")
-
+                
         except Exception as e:
             logger.error(f"[gRPC] Error in ExecuteTask: {e}", exc_info=True)
             yield neo_desktop_pb2.CoreMessage(
@@ -200,9 +258,15 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         finally:
             if session_id:
                 self._pending.pop(session_id, None)
-            # Note: device_id is NOT unregistered here because the desktop might
-            # just be idle. On next message it will update its info. Only unregister
-            # when the AIService signals connection close (handled separately).
+            # Mark device offline when stream ends — this fires on graceful disconnect
+            # AND when the connection drops (gRPC detects broken pipe/stream complete)
+            if device_id:
+                _connected_devices.update(device_id, {"is_online": False})
+                if self.ai_service and self.ai_service.db:
+                    asyncio.create_task(
+                        self.ai_service.db.mark_device_offline(device_id)
+                    )
+                logger.info(f"[Devices] Stream ended, marked offline: {device_id}")
 
     # ---------------------------------------------------------------
     # AIServiceResponse → CoreMessage conversion
@@ -432,6 +496,8 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                 ip_address=d.get("ip_address", ""),
                 connected_at_unix=d.get("connected_at_unix", 0),
                 is_current_device=d.get("is_current_device", False),
+                is_online=d.get("is_online", False),
+                last_heartbeat_unix=d.get("last_heartbeat_unix", 0),
             )
             for d in all_devices
         ]
@@ -441,6 +507,12 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
     async def RegisterDevice(self, request, context):
         """Register a device proactively (called by desktop on startup)."""
         device_id = request.device_id or f"device-{id(request)}"
+        user_id_str = request.user_id or ""
+        try:
+            uid_uuid = UUID(user_id_str) if user_id_str else None
+        except ValueError:
+            uid_uuid = None
+
         device_info = {
             "device_id": device_id,
             "device_type": request.device_type or "neo-desktop",
@@ -449,9 +521,27 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
             "os_version": request.os_version or "unknown",
             "client_version": request.client_version or "",
             "ip_address": request.ip_address or "",
-            "user_id": request.user_id or "",
+            "user_id": user_id_str,
         }
         _connected_devices.register(device_id, device_info)
+
+        # Sync to DB (async, non-blocking)
+        if self.ai_service and self.ai_service.db and uid_uuid:
+            asyncio.create_task(
+                self.ai_service.db.upsert_connected_device(
+                    user_id=uid_uuid,
+                    device_id=device_id,
+                    device_type=request.device_type or "neo-desktop",
+                    model=request.model or "unknown",
+                    os_platform=request.os_platform or "unknown",
+                    os_version=request.os_version or "unknown",
+                    client_version=request.client_version or "",
+                    ip_address=request.ip_address or "",
+                    last_heartbeat_unix=int(time.time()),
+                    is_online=True,
+                )
+            )
+
         logger.info(f"[gRPC] RegisterDevice: {device_id}")
         return neo_desktop_pb2.RegisterDeviceResponse(ok=True)
 
@@ -459,6 +549,13 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         """Unregister a device (called by desktop on shutdown)."""
         device_id = request.device_id
         _connected_devices.unregister(device_id)
+
+        # Mark offline in DB (async, non-blocking)
+        if self.ai_service and self.ai_service.db:
+            asyncio.create_task(
+                self.ai_service.db.mark_device_offline(device_id)
+            )
+
         logger.info(f"[gRPC] UnregisterDevice: {device_id}")
         return neo_desktop_pb2.UnregisterDeviceResponse(ok=True)
 
@@ -483,6 +580,22 @@ async def serve(
         NeoDesktopServicer(ai_service, notification_broker, skill_executor), server
     )
     server.add_insecure_port(f"[::]:{port}")
+
+    # Set DB on WS registry so it can sync online/offline to DB
+    _devices_ws_registry.set_db(ai_service.db if ai_service else None)
+
     logger.info(f"Starting gRPC server on port {port}")
     await server.start()
     return server
+
+
+async def _offline_checker(db: "AsyncPostgresClient", interval_seconds: int = 30, threshold_seconds: int = 60) -> None:
+    """Background task: periodically marks devices with stale heartbeats as offline."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            count = await db.mark_stale_devices_offline(threshold_seconds)
+            if count > 0:
+                logger.info(f"[Devices] Marked {count} stale device(s) offline")
+        except Exception as e:
+            logger.warning(f"[Devices] Offline checker error: {e}")

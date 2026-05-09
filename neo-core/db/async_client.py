@@ -15,6 +15,7 @@ from db.models.user_preference import UserPreference
 from db.models.mission import Mission
 from db.models.whatsapp_contact import WhatsAppContact
 from db.models.user_notification import UserNotification
+from db.models.connected_device import ConnectedDevice
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -968,3 +969,151 @@ class AsyncPostgresClient:
                 notif.acked_at = datetime.utcnow()
                 db.add(notif)
                 await db.commit()
+
+    # ---------------------------------------------------------------
+    # ConnectedDevice CRUD
+    # ---------------------------------------------------------------
+
+    async def upsert_connected_device(
+        self,
+        user_id: UUID,
+        device_id: str,
+        device_type: str,
+        model: str,
+        os_platform: str,
+        os_version: str,
+        client_version: str = "",
+        ip_address: str = "",
+        last_heartbeat_unix: int = 0,
+        is_online: bool = True,
+    ) -> None:
+        """Insert or update a connected device record."""
+        import time as _time
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            existing = result.scalars().first()
+
+            now_unix = int(_time.time())
+
+            if existing:
+                existing.user_id = user_id
+                existing.device_type = device_type
+                existing.model = model
+                existing.os_platform = os_platform
+                existing.os_version = os_version
+                existing.client_version = client_version
+                existing.ip_address = ip_address
+                existing.last_heartbeat_unix = last_heartbeat_unix or now_unix
+                existing.is_online = is_online
+                db.add(existing)
+            else:
+                device = ConnectedDevice(
+                    user_id=user_id,
+                    device_id=device_id,
+                    device_type=device_type,
+                    model=model,
+                    os_platform=os_platform,
+                    os_version=os_version,
+                    client_version=client_version,
+                    ip_address=ip_address,
+                    last_heartbeat_unix=last_heartbeat_unix or now_unix,
+                    is_online=is_online,
+                )
+                db.add(device)
+            await db.commit()
+
+    async def get_connected_devices(self, user_id: UUID | None = None) -> list[ConnectedDevice]:
+        """List all connected devices, optionally filtered by user_id."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice)
+            if user_id:
+                stmt = stmt.where(ConnectedDevice.user_id == user_id)
+            stmt = stmt.order_by(ConnectedDevice.created_at.desc())
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
+    async def update_device_heartbeat(self, device_id: str, timestamp_unix: int) -> None:
+        """Update last_heartbeat_unix and set is_online=True for a device."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.last_heartbeat_unix = timestamp_unix
+                device.is_online = True
+                db.add(device)
+                await db.commit()
+
+    async def mark_device_offline(self, device_id: str) -> None:
+        """Mark a device as offline."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.is_online = False
+                db.add(device)
+                await db.commit()
+
+    async def get_device_by_id(self, device_id: str) -> ConnectedDevice | None:
+        """Get a device by its device_id."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def mark_device_online(self, device_id: str) -> None:
+        """Mark a device as online (used by WS registry)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.is_online = True
+                device.last_heartbeat_unix = int(time.time())
+                db.add(device)
+                await db.commit()
+
+    async def set_device_ws_connection(self, device_id: str, ws_connection_id: str) -> None:
+        """Set the WS connection ID for a device (connection open)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.ws_connection_id = ws_connection_id
+                device.is_online = True
+                db.add(device)
+                await db.commit()
+
+    async def clear_device_ws_connection(self, device_id: str) -> None:
+        """Clear the WS connection ID for a device (connection closed)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.ws_connection_id = None
+                device.is_online = False
+                db.add(device)
+                await db.commit()
+
+    async def mark_stale_devices_offline(self, threshold_seconds: int = 60) -> int:
+        """Mark all devices with last_heartbeat older than threshold as offline. Returns count."""
+        import time as _time
+        cutoff = int(_time.time()) - threshold_seconds
+        async with self.get_session() as db:
+            stmt = (
+                select(ConnectedDevice)
+                .where(ConnectedDevice.last_heartbeat_unix > 0)
+                .where(ConnectedDevice.last_heartbeat_unix < cutoff)
+                .where(ConnectedDevice.is_online == True)
+            )
+            result = await db.execute(stmt)
+            stale = list(result.scalars().all())
+            for device in stale:
+                device.is_online = False
+                db.add(device)
+            await db.commit()
+            return len(stale)

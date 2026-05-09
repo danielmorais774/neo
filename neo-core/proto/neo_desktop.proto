@@ -191,6 +191,8 @@ message DeviceInfo {
   string ip_address = 7;
   int64 connected_at_unix = 8;
   bool is_current_device = 9;
+  bool is_online = 10;
+  int64 last_heartbeat_unix = 11;
 }
 
 // List connected devices request
