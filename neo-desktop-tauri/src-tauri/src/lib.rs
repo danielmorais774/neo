@@ -87,6 +87,13 @@ pub fn run() {
                 let _ = window.set_focus();
             }
 
+            // Force the notification webview to render with a transparent
+            // background. Without this, macOS WKWebView defaults to white,
+            // which leaks through the rounded corners of the notification body.
+            if let Some(notif_window) = app.get_webview_window("notification") {
+                let _ = notif_window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
+            }
+
             // Get icon path
             let icon_path = app.path().resource_dir()
                 .unwrap_or_default()
