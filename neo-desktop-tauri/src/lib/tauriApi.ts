@@ -23,15 +23,42 @@ export interface DeviceInfo {
   is_current_device: boolean;
 }
 
+export interface NotificationAction {
+  action_type: string;
+  label: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface NotificationField {
+  label: string;
+  value: string;
+}
+
+export interface NotificationConfig {
+  duration_ms?: number;
+  position?: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' | 'center';
+  persistent?: boolean;
+  play_sound?: boolean;
+}
+
 export interface NeoNotification {
   id: string;
   userId: string;
   missionId: string | null;
   kind: string;
   title: string;
-  body: string;
+  description: string;
+  fields?: NotificationField[];
+  actions?: NotificationAction[];
   payload: Record<string, unknown>;
   createdAtUnix: number;
+  config?: NotificationConfig;
+}
+
+export interface NotificationActionEvent {
+  notification_id: string;
+  action_type: string;
+  action_payload?: Record<string, unknown>;
 }
 
 export interface ElectronAPI {
@@ -66,6 +93,7 @@ export interface ElectronAPI {
   quickHelpMoveBy: (dx: number, dy: number) => void;
   onNotification: (callback: (notification: NeoNotification) => void) => UnlistenFn;
   ackNotification: (notificationId: string) => Promise<{ ok: boolean; error?: string }>;
+  onNotificationAction: (callback: (event: NotificationActionEvent) => void) => UnlistenFn;
   listConnectedDevices: () => Promise<DeviceInfo[]>;
 }
 
@@ -76,6 +104,7 @@ let quickHelpChunkUnlisten: UnlistenFn | null = null;
 let quickHelpDoneUnlisten: UnlistenFn | null = null;
 let quickHelpErrorUnlisten: UnlistenFn | null = null;
 let notificationUnlisten: UnlistenFn | null = null;
+let notificationActionUnlisten: UnlistenFn | null = null;
 
 export const electronAPI: ElectronAPI = {
   sendMessage: (message: string, model?: string, mode?: string) =>
@@ -269,6 +298,21 @@ export const electronAPI: ElectronAPI = {
   },
 
   ackNotification: (notificationId: string) => invoke('ack_notification', { notificationId }),
+
+  onNotificationAction: (callback: (event: NotificationActionEvent) => void) => {
+    if (notificationActionUnlisten) notificationActionUnlisten();
+    listen<NotificationActionEvent>('notification-action', (event) => {
+      callback(event.payload);
+    }).then((unlisten) => {
+      notificationActionUnlisten = unlisten;
+    });
+    return () => {
+      if (notificationActionUnlisten) {
+        notificationActionUnlisten();
+        notificationActionUnlisten = null;
+      }
+    };
+  },
 
   listConnectedDevices: () => invoke('list_connected_devices'),
 };

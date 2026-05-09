@@ -76,6 +76,7 @@ pub fn run() {
             commands::clear_conversation_history,
             commands::quick_help_ask_stream,
             commands::ack_notification,
+            commands::handle_notification_action,
             commands::list_connected_devices,
         ])
         .setup(|app| {

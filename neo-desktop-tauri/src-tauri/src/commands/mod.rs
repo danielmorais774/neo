@@ -266,6 +266,28 @@ pub async fn ack_notification(notification_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn handle_notification_action(
+    app: AppHandle,
+    notification_id: String,
+    action_type: String,
+    action_payload: Option<serde_json::Value>,
+) -> Result<(), String> {
+    info!("[Neo] handle_notification_action: notification={}, action={}", notification_id, action_type);
+
+    let action_event = serde_json::json!({
+        "notification_id": notification_id,
+        "action_type": action_type,
+        "action_payload": action_payload,
+    });
+
+    if let Err(e) = app.emit("notification-action", action_event) {
+        error!("[Neo] Failed to emit notification-action event: {}", e);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_connected_devices() -> Result<Vec<serde_json::Value>, String> {
     info!("[Neo] list_connected_devices");
     Ok(vec![])

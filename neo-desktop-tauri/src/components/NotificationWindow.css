@@ -13,15 +13,12 @@ html, body, #root {
   left: 0;
   right: 0;
   bottom: 0;
-  display: grid;
+  display: flex;
+  flex-direction: row;
   border-radius: 20px;
-  grid-template-columns: 44px 1fr;
   gap: 12px;
   align-items: center;
   padding: 12px 14px;
-  /* background: rgba(245, 245, 247, 0.95); */
-  /* background: transparent !important; */
-  /* background-color: transparent !important; */
   color: #1d1d1f;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
   border: none;
@@ -35,7 +32,7 @@ html, body, #root {
 
 @media (prefers-color-scheme: dark) {
   .macos-notification {
-    background: rgba(40, 40, 44, 0.65);
+    background: rgba(40, 40, 44, 0.92);
     color: #f5f5f7;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
     border: none;
@@ -125,5 +122,72 @@ html, body, #root {
 @media (prefers-color-scheme: dark) {
   .macos-notification-body {
     color: rgba(235, 235, 245, 0.85);
+  }
+}
+
+.macos-notification-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.macos-notification-field {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.field-label {
+  color: rgba(60, 60, 67, 0.6);
+  font-weight: 500;
+}
+
+@media (prefers-color-scheme: dark) {
+  .field-label {
+    color: rgba(235, 235, 245, 0.6);
+  }
+}
+
+.field-value {
+  color: rgba(60, 60, 67, 0.9);
+}
+
+@media (prefers-color-scheme: dark) {
+  .field-value {
+    color: rgba(235, 235, 245, 0.9);
+  }
+}
+
+.macos-notification-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.macos-notification-action-btn {
+  background: rgba(0, 122, 255, 0.15);
+  color: #007aff;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.macos-notification-action-btn:hover {
+  background: rgba(0, 122, 255, 0.25);
+}
+
+@media (prefers-color-scheme: dark) {
+  .macos-notification-action-btn {
+    background: rgba(0, 122, 255, 0.2);
+    color: #0a84ff;
+  }
+
+  .macos-notification-action-btn:hover {
+    background: rgba(0, 122, 255, 0.35);
   }
 }

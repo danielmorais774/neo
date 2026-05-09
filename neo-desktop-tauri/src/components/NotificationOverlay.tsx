@@ -71,7 +71,7 @@ export default function NotificationOverlay({ onReply }: NotificationOverlayProp
             <div className="notification-icon">{icon}</div>
             <div className="notification-content">
               <div className="notification-title">{notification.title}</div>
-              <div className="notification-body">{notification.body}</div>
+              <div className="notification-body">{notification.description}</div>
             </div>
             <div className="notification-actions">
               {isReplyable && (
