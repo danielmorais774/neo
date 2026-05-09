@@ -90,6 +90,25 @@ async def send_test_notification(device_id: str) -> dict:
     return {"ok": True, "sent_to": device_id}
 
 
+@router.post("/debug/test-notification")
+async def debug_send_notification(notification: dict) -> dict:
+    """Send a full notification payload to a device via WebSocket.
+
+    Accepts the complete notification shape with actions, fields, config, etc.
+    Device is identified by 'device_id' in the notification body.
+    """
+    from core.notifications.device_notif_broadcaster import get_device_notif_broadcaster
+
+    broadcaster = get_device_notif_broadcaster()
+
+    device_id = notification.get("device_id", "test-device")
+    sent = await broadcaster.send_notification(device_id, notification)
+    if not sent:
+        raise HTTPException(status_code=503, detail="Device not connected to notifications WS")
+
+    return {"ok": True, "sent_to": device_id}
+
+
 @router.websocket("/ws/devices/online")
 async def ws_device_online(websocket: WebSocket, device_id: str = Query(...)):
     """WebSocket endpoint for device online/offline signaling.
