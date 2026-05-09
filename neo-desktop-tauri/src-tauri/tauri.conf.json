@@ -24,6 +24,21 @@
         "skipTaskbar": false,
         "visible": true,
         "url": "index.html"
+      },
+      {
+        "label": "notification",
+        "title": "Neo Notification",
+        "width": 360,
+        "height": 110,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "shadow": false,
+        "url": "notification.html"
       }
     ],
     "security": {

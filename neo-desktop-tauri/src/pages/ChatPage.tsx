@@ -1,9 +1,7 @@
 import { useCallback, useState, useEffect } from 'react';
 import Chat from '../components/Chat';
 import PasswordModal from '../components/PasswordModal';
-import NotificationOverlay from '../components/NotificationOverlay';
 import type { Message } from '../types';
-import type { NeoNotification } from '../types/electron';
 import { 
   useMessages, 
   useAgentState, 
@@ -153,17 +151,6 @@ export const ChatPage = () => {
     }
   };
 
-  const [notificationDraft, setNotificationDraft] = useState<string>('');
-
-  const handleNotificationReply = useCallback((notif: NeoNotification) => {
-    const contactLabel =
-      notif.payload?.contact_label || notif.payload?.contactLabel || 'esse contato';
-    const inbound =
-      notif.payload?.inbound_text || notif.payload?.inboundText || notif.body || '';
-    const seed = `${contactLabel} respondeu: "${inbound}". O que devo responder?`;
-    setNotificationDraft(seed);
-  }, []);
-
   const handleNewChat = async () => {
     if (isExecuting) {
       handleStop();
@@ -183,8 +170,6 @@ export const ChatPage = () => {
 
   return (
     <>
-      <NotificationOverlay onReply={handleNotificationReply} />
-
       {startupNotification && (
         <div className="startup-banner" role="status">
           <span>{startupNotification}</span>
@@ -219,7 +204,7 @@ export const ChatPage = () => {
         selectedMode={chatMode}
         selectedProvider={selectedProvider}
         windowMode={windowMode}
-        initialInput={notificationDraft || `manda uma mensagem para minha irmã avisando que vou chegar mais tarde`}
+        initialInput={`manda uma mensagem para minha irmã avisando que vou chegar mais tarde`}
       />
     </>
   );

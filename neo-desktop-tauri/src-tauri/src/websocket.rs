@@ -2,9 +2,59 @@ use futures_util::StreamExt;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const NOTIFICATION_WINDOW_LABEL: &str = "notification";
+const NOTIFICATION_AUTO_HIDE_SECS: u64 = 7;
+const NOTIFICATION_MARGIN: i32 = 16;
+
+/// Reposition the notification window to the bottom-right corner of the
+/// primary monitor and show it. Then schedule auto-hide.
+fn show_notification_window(app_handle: &AppHandle) {
+    let Some(window) = app_handle.get_webview_window(NOTIFICATION_WINDOW_LABEL) else {
+        warn!("[DeviceWS] Notification window not found");
+        return;
+    };
+
+    let monitor = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten());
+
+    if let Some(monitor) = monitor {
+        let monitor_size = monitor.size();
+        let monitor_pos = monitor.position();
+        let scale = monitor.scale_factor();
+
+        if let Ok(window_size) = window.outer_size() {
+            let x = monitor_pos.x
+                + monitor_size.width as i32
+                - window_size.width as i32
+                - (NOTIFICATION_MARGIN as f64 * scale) as i32;
+            let y = monitor_pos.y
+                + monitor_size.height as i32
+                - window_size.height as i32
+                - (NOTIFICATION_MARGIN as f64 * scale) as i32;
+            let _ = window.set_position(PhysicalPosition::new(x, y));
+        }
+    }
+
+    let _ = window.show();
+    let _ = window.set_always_on_top(true);
+
+    // Schedule auto-hide after a few seconds (frontend also fades out, this is
+    // a safety net so the OS-level window goes away even without focus).
+    let app_clone = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(NOTIFICATION_AUTO_HIDE_SECS)).await;
+        if let Some(w) = app_clone.get_webview_window(NOTIFICATION_WINDOW_LABEL) {
+            let _ = w.hide();
+        }
+    });
+}
 
 /// Notification received from neo-core via WebSocket
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -133,8 +183,15 @@ impl DeviceWsManager {
                                 match serde_json::from_str::<NeoNotification>(&text) {
                                     Ok(notification) => {
                                         info!("[DeviceWS] Notification received: {:?}", notification.title);
-                                        // Emit to frontend via Tauri event
-                                        if let Err(e) = app_handle.emit("notification", &notification) {
+                                        // Show the dedicated notification window and forward
+                                        // the payload only to it (so it's visually outside
+                                        // the main chat window).
+                                        show_notification_window(&app_handle);
+                                        if let Err(e) = app_handle.emit_to(
+                                            NOTIFICATION_WINDOW_LABEL,
+                                            "notification",
+                                            &notification,
+                                        ) {
                                             error!("[DeviceWS] Failed to emit notification: {}", e);
                                         }
                                     }
