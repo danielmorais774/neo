@@ -25,17 +25,21 @@ fn show_notification_window(app_handle: &AppHandle) {
         .or_else(|| window.current_monitor().ok().flatten());
 
     if let Some(monitor) = monitor {
-        let monitor_size = monitor.size();
-        let monitor_pos = monitor.position();
+        // Use work_area instead of size to account for macOS Dock and Menu Bar.
+        // This is the "safe area" - the visible screen space excluding system UI.
+        let work_area = monitor.work_area();
+        let work_area_pos = work_area.position;
+        let work_area_size = work_area.size;
         let scale = monitor.scale_factor();
 
         if let Ok(window_size) = window.outer_size() {
-            let x = monitor_pos.x
-                + monitor_size.width as i32
+            // Position relative to work area (safe area), with small margin
+            let x = work_area_pos.x
+                + work_area_size.width as i32
                 - window_size.width as i32
                 - (NOTIFICATION_MARGIN as f64 * scale) as i32;
-            let y = monitor_pos.y
-                + monitor_size.height as i32
+            let y = work_area_pos.y
+                + work_area_size.height as i32
                 - window_size.height as i32
                 - (NOTIFICATION_MARGIN as f64 * scale) as i32;
             let _ = window.set_position(PhysicalPosition::new(x, y));
