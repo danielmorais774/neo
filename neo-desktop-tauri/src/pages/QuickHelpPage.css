@@ -1,0 +1,289 @@
+/* ============================================================
+   Quick Help — macOS dark mode style
+   ============================================================ */
+
+.qh-root {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  border-radius: 14px;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #f2f2f7;
+  -webkit-app-region: drag;
+
+  background: rgba(28, 28, 30, 0.91);
+  backdrop-filter: blur(72px) saturate(200%) brightness(0.9);
+  -webkit-backdrop-filter: blur(72px) saturate(200%) brightness(0.9);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+}
+
+/* Top highlight */
+.qh-root::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(255, 255, 255, 0.18) 30%,
+    rgba(255, 255, 255, 0.24) 50%,
+    rgba(255, 255, 255, 0.18) 70%,
+    transparent
+  );
+  z-index: 10;
+  pointer-events: none;
+}
+
+/* ── Search bar ───────────────────────────────────────────── */
+
+.qh-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  height: 64px;
+  min-height: 64px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  -webkit-app-region: no-drag;
+  position: relative;
+  z-index: 2;
+}
+
+.qh-drag-handle {
+  color: rgba(235, 235, 245, 0.18);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  cursor: grab;
+  padding: 4px 2px;
+  border-radius: 4px;
+  transition: color 0.15s;
+  -webkit-app-region: no-drag;
+}
+
+.qh-drag-handle:hover {
+  color: rgba(235, 235, 245, 0.45);
+}
+
+.qh-drag-handle:active {
+  cursor: grabbing;
+}
+
+.qh-icon {
+  color: rgba(235, 235, 245, 0.40);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.qh-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 20px;
+  font-weight: 400;
+  color: #f2f2f7;
+  caret-color: #0a84ff;
+  letter-spacing: -0.01em;
+}
+
+.qh-input::placeholder {
+  color: rgba(235, 235, 245, 0.28);
+  font-size: 17px;
+}
+
+/* ── Spinner ──────────────────────────────────────────────── */
+
+.qh-spinner {
+  width: 17px;
+  height: 17px;
+  border: 1.5px solid rgba(10, 132, 255, 0.20);
+  border-top-color: #0a84ff;
+  border-radius: 50%;
+  animation: qh-spin 0.65s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes qh-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Clear button ─────────────────────────────────────────── */
+
+.qh-clear {
+  background: rgba(255, 255, 255, 0.10);
+  border: none;
+  border-radius: 50%;
+  color: rgba(235, 235, 245, 0.50);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  transition: background 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+
+.qh-clear:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #f2f2f7;
+}
+
+/* ── Answer panel ─────────────────────────────────────────── */
+
+.qh-answer {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  z-index: 2;
+}
+
+.qh-answer-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 8px;
+  font-size: 15px;
+  line-height: 1.65;
+  color: rgba(235, 235, 245, 0.80);
+  -webkit-app-region: no-drag;
+}
+
+.qh-answer-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+
+.qh-answer-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.qh-answer-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+}
+
+/* Markdown */
+.qh-answer-scroll p {
+  margin: 0 0 9px;
+}
+
+.qh-answer-scroll p:last-child {
+  margin-bottom: 0;
+}
+
+.qh-answer-scroll code {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-size: 12.5px;
+  color: #64d2ff;
+}
+
+.qh-answer-scroll pre {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.qh-answer-scroll pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: #f2f2f7;
+  font-size: 12.5px;
+}
+
+.qh-answer-scroll ul,
+.qh-answer-scroll ol {
+  padding-left: 18px;
+  margin: 4px 0 9px;
+}
+
+.qh-answer-scroll li {
+  margin: 3px 0;
+}
+
+.qh-answer-scroll strong {
+  color: #f2f2f7;
+  font-weight: 600;
+}
+
+.qh-answer-scroll h1,
+.qh-answer-scroll h2,
+.qh-answer-scroll h3 {
+  color: #f2f2f7;
+  margin: 12px 0 5px;
+  font-weight: 600;
+}
+
+.qh-answer--error .qh-answer-scroll {
+  color: #ff453a;
+}
+
+/* ── Streaming cursor ─────────────────────────────────────── */
+
+.qh-cursor-blink {
+  display: inline-block;
+  width: 2px;
+  height: 15px;
+  background: #0a84ff;
+  border-radius: 1px;
+  animation: qh-blink 0.85s step-end infinite;
+  vertical-align: middle;
+  margin-left: 2px;
+}
+
+.qh-typing-dot {
+  display: inline-block;
+  width: 6px;
+  height: 13px;
+  background: #0a84ff;
+  border-radius: 1px;
+  animation: qh-blink 0.85s step-end infinite;
+  vertical-align: text-bottom;
+  margin-left: 1px;
+}
+
+@keyframes qh-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ── Hint bar ─────────────────────────────────────────────── */
+
+.qh-hint {
+  position: relative;
+  z-index: 2;
+  padding: 5px 18px 7px;
+  font-size: 10.5px;
+  color: rgba(235, 235, 245, 0.22);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  text-align: center;
+  letter-spacing: 0.02em;
+  -webkit-app-region: no-drag;
+}
+
+.qh-hint kbd {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 3px;
+  padding: 0px 4px;
+  font-family: inherit;
+  font-size: 10px;
+  color: rgba(235, 235, 245, 0.35);
+}

@@ -1,0 +1,493 @@
+/* ========================================
+   CHAT CONTAINER
+   ======================================== */
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ========================================
+   TOP BAR - Novo Chat + Settings
+   ======================================== */
+
+.chat-top-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.btn-new-chat-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 20px;
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  -webkit-app-region: no-drag;
+}
+
+.btn-new-chat-top:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.22);
+  border-color: rgba(59, 130, 246, 0.4);
+  color: #bfdbfe;
+}
+
+.btn-new-chat-top:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-settings-top {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  -webkit-app-region: no-drag;
+}
+
+.btn-settings-top:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+/* ========================================
+   MESSAGES CONTAINER
+   ======================================== */
+
+/* Enable selection inside messages container (overrides global body setting) */
+.messages-container {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ========================================
+   WELCOME MESSAGE
+   ======================================== */
+
+.welcome-message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  padding: 24px;
+}
+
+.welcome-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  animation: float 3s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+.welcome-message h2 {
+  font-size: 20px;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.welcome-message p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+.welcome-subtitle {
+  font-size: 12px;
+  color: var(--accent);
+  margin-top: -12px;
+  margin-bottom: 20px;
+  opacity: 0.8;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.suggestions button {
+  padding: 10px 16px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 20px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  backdrop-filter: blur(10px);
+}
+
+.suggestions button:hover {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.3);
+  transform: translateY(-2px);
+}
+
+/* ========================================
+   INPUT CONTAINER
+   ======================================== */
+
+.input-container {
+  padding: 12px 16px 10px;
+  background: rgba(10, 14, 26, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid rgba(59, 130, 246, 0.08);
+}
+
+.input-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  background: rgba(20, 27, 45, 0.8);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 24px;
+  padding: 6px 8px 6px 6px;
+  transition: all 0.2s;
+  margin-bottom: 8px;
+  backdrop-filter: blur(10px);
+}
+
+.input-wrapper:focus-within {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.15), 0 0 20px rgba(59, 130, 246, 0.05);
+}
+
+.btn-attachment {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-attachment:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.input-wrapper textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  max-height: 120px;
+  font-family: inherit;
+  padding: 6px 0;
+}
+
+.input-wrapper textarea::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+
+.btn-mic {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-mic:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-send {
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  color: white;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-send:hover:not(:disabled) {
+  transform: scale(1.08);
+  box-shadow: 0 0 16px rgba(59, 130, 246, 0.35);
+}
+
+.btn-send:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  transform: scale(1);
+}
+
+.btn-send svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Botão stop inline no input */
+.input-wrapper .btn-stop-inline {
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: white;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  font-size: 16px;
+  animation: pulse-stop 1.5s infinite;
+}
+
+.input-wrapper .btn-stop-inline:hover {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  transform: scale(1.05);
+}
+
+/* ========================================
+   INPUT CONTROLS (Agent/Model selects)
+   ======================================== */
+
+.input-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.chat-mode-select,
+.model-select {
+  background: rgba(20, 27, 45, 0.6);
+  border: 1px solid rgba(59, 130, 246, 0.12);
+  color: var(--text-primary);
+  padding: 5px 24px 5px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s;
+  font-family: inherit;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23a0a0a0' d='M6 8L2 4h8z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+.chat-mode-select {
+  font-weight: 600;
+  min-width: 75px;
+}
+
+.model-select {
+  font-weight: 500;
+  min-width: 100px;
+  color: var(--text-secondary);
+}
+
+.chat-mode-select:hover,
+.model-select:hover {
+  background-color: rgba(30, 40, 65, 0.8);
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
+.chat-mode-select:focus,
+.model-select:focus {
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+.chat-mode-select option,
+.model-select option {
+  background: #141b2d;
+  color: var(--text-primary);
+  padding: 10px;
+}
+
+/* ========================================
+   AGENT SYSTEM - Progress, Thinking, Plans, Steps
+   ======================================== */
+
+/* Botão Stop */
+.btn-stop {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  border: none;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  animation: pulse-stop 1.5s infinite;
+  transition: all 0.2s;
+}
+
+.btn-stop:hover {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  transform: scale(1.02);
+}
+
+@keyframes pulse-stop {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+/* Barra de progresso do agente */
+.agent-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: rgba(15, 20, 35, 0.6);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.1);
+}
+
+.progress-bar-container {
+  flex: 1;
+  height: 4px;
+  background: rgba(59, 130, 246, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #06b6d4);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* Thinking Indicator */
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  margin: 4px 0;
+  background: rgba(74, 222, 128, 0.06);
+  border-left: 3px solid rgba(74, 222, 128, 0.4);
+  border-radius: 8px;
+  animation: fadeInSlide 0.3s ease-out;
+  backdrop-filter: blur(8px);
+}
+
+@keyframes fadeInSlide {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.thinking-spinner {
+  flex-shrink: 0;
+}
+
+.thinking-spinner .spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(74, 222, 128, 0.2);
+  border-top-color: rgba(74, 222, 128, 0.8);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.thinking-text-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex: 1;
+  min-width: 0;
+}
+
+.thinking-label {
+  color: rgba(74, 222, 128, 0.9);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.thinking-detail {
+  color: var(--text-secondary);
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

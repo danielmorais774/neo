@@ -1,0 +1,110 @@
+.notification-overlay {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+  max-width: 360px;
+}
+
+.notification-card {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: 32px 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 12px 14px;
+  background: rgba(28, 28, 32, 0.92);
+  color: #f5f5f7;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(14px);
+  animation: notif-slide-in 220ms ease-out;
+}
+
+@keyframes notif-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.notification-card.kind-approval_required {
+  border-left: 3px solid #f5a623;
+}
+.notification-card.kind-mission_update {
+  border-left: 3px solid #4a90e2;
+}
+.notification-card.kind-unsolicited_message {
+  border-left: 3px solid #50e3c2;
+}
+
+.notification-icon {
+  font-size: 20px;
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.notification-content {
+  min-width: 0;
+}
+
+.notification-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #fff;
+}
+
+.notification-body {
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(245, 245, 247, 0.78);
+  white-space: pre-wrap;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+
+.notification-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.notif-btn {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: rgba(245, 245, 247, 0.85);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.notif-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+}
+
+.notif-btn-primary {
+  background: #4a90e2;
+  border-color: #4a90e2;
+  color: #fff;
+  font-weight: 600;
+}
+
+.notif-btn-primary:hover {
+  background: #5da0ee;
+  border-color: #5da0ee;
+}
