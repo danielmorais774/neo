@@ -1,6 +1,6 @@
 use crate::AppState;
 use crate::services::ai_agent::GrpcClient;
-use tauri::{State, Emitter, AppHandle, Window};
+use tauri::{State, Emitter, AppHandle, Window, Manager};
 use serde::{Deserialize, Serialize};
 use log::{info, error};
 use std::sync::Mutex;
@@ -291,4 +291,79 @@ pub async fn handle_notification_action(
 pub async fn list_connected_devices() -> Result<Vec<serde_json::Value>, String> {
     info!("[Neo] list_connected_devices");
     Ok(vec![])
+}
+
+#[tauri::command]
+pub async fn resize_notification_window(
+    app: AppHandle,
+    height: f64,
+    width: f64,
+    position: Option<String>,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notification") {
+        let min_height = 72.0;
+        let max_height = 720.0;
+        let min_width = 296.0;
+        let max_width = 420.0;
+        let clamped_height = height.min(max_height).max(min_height);
+        let clamped_width = width.min(max_width).max(min_width);
+        window
+            .set_size(tauri::Size::Logical(tauri::LogicalSize {
+                width: clamped_width,
+                height: clamped_height,
+            }))
+            .map_err(|e| e.to_string())?;
+
+        let monitor = window
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.current_monitor().ok().flatten());
+
+        if let Some(monitor) = monitor {
+            let work_area = monitor.work_area();
+            let work_area_pos = work_area.position;
+            let work_area_size = work_area.size;
+            let scale = monitor.scale_factor();
+            let margin = (16.0 * scale) as i32;
+            let requested_position = position.as_deref().unwrap_or("bottom_right");
+
+            if let Ok(window_size) = window.outer_size() {
+                let (x, y) = match requested_position {
+                    "top_left" => (work_area_pos.x + margin, work_area_pos.y + margin),
+                    "top_right" => (
+                        work_area_pos.x + work_area_size.width as i32
+                            - window_size.width as i32
+                            - margin,
+                        work_area_pos.y + margin,
+                    ),
+                    "bottom_left" => (
+                        work_area_pos.x + margin,
+                        work_area_pos.y + work_area_size.height as i32
+                            - window_size.height as i32
+                            - margin,
+                    ),
+                    "center" => (
+                        work_area_pos.x
+                            + (work_area_size.width as i32 - window_size.width as i32) / 2,
+                        work_area_pos.y
+                            + (work_area_size.height as i32 - window_size.height as i32) / 2,
+                    ),
+                    _ => (
+                        work_area_pos.x + work_area_size.width as i32
+                            - window_size.width as i32
+                            - margin,
+                        work_area_pos.y + work_area_size.height as i32
+                            - window_size.height as i32
+                            - margin,
+                    ),
+                };
+
+                window
+                    .set_position(tauri::PhysicalPosition::new(x, y))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }

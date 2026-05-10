@@ -78,6 +78,7 @@ pub fn run() {
             commands::ack_notification,
             commands::handle_notification_action,
             commands::list_connected_devices,
+            commands::resize_notification_window,
         ])
         .setup(|app| {
             info!("[Neo] Desktop initialized!");

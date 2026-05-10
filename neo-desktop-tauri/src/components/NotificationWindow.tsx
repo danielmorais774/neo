@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -45,10 +45,16 @@ const KIND_ICON: Record<string, string> = {
 };
 
 const AUTO_DISMISS_MS = 6000;
+const WINDOW_INSET_PX = 8;
+const MIN_CARD_WIDTH = 280;
+const MAX_CARD_WIDTH = 360;
+const MIN_WINDOW_HEIGHT = 72;
 
 export default function NotificationWindow() {
   const [notif, setNotif] = useState<NeoNotificationPayload | null>(null);
   const [visible, setVisible] = useState(false);
+  const notificationRef = useRef<HTMLDivElement | null>(null);
+  const lastWindowSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
@@ -79,10 +85,78 @@ export default function NotificationWindow() {
     };
   }, []);
 
+  // Resize the native window to the rendered notification card.
+  useEffect(() => {
+    if (!notif) return;
+
+    lastWindowSizeRef.current = null;
+
+    let animationFrame: number | undefined;
+
+    const resizeWindow = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+
+      animationFrame = window.requestAnimationFrame(() => {
+        const el = notificationRef.current;
+        if (!el) return;
+
+        const rect = el.getBoundingClientRect();
+        const cardWidth = Math.ceil(Math.max(rect.width, el.scrollWidth));
+        const cardHeight = Math.ceil(Math.max(rect.height, el.scrollHeight));
+        const maxWindowHeight = Math.max(
+          MIN_WINDOW_HEIGHT,
+          Math.min(Math.floor(window.screen.availHeight - 48), 720),
+        );
+        const nextWidth = Math.ceil(
+          Math.min(Math.max(cardWidth, MIN_CARD_WIDTH), MAX_CARD_WIDTH) + WINDOW_INSET_PX * 2,
+        );
+        const nextHeight = Math.ceil(
+          Math.min(Math.max(cardHeight + WINDOW_INSET_PX * 2, MIN_WINDOW_HEIGHT), maxWindowHeight),
+        );
+
+        const previous = lastWindowSizeRef.current;
+        if (previous?.width === nextWidth && previous?.height === nextHeight) return;
+
+        lastWindowSizeRef.current = { width: nextWidth, height: nextHeight };
+        invoke('resize_notification_window', {
+          height: nextHeight,
+          width: nextWidth,
+          position: notif.config?.position ?? 'bottom_right',
+        }).catch(console.error);
+      });
+    };
+
+    const observer = new ResizeObserver(() => {
+      resizeWindow();
+    });
+
+    const el = notificationRef.current;
+    if (el) observer.observe(el);
+
+    resizeWindow();
+    const settleTimeout = window.setTimeout(resizeWindow, 320);
+    window.addEventListener('resize', resizeWindow);
+
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      window.clearTimeout(settleTimeout);
+      observer.disconnect();
+      window.removeEventListener('resize', resizeWindow);
+    };
+  }, [notif]);
+
   const handleClick = () => {
     if (notif?.id) {
       invoke('ack_notification', { notificationId: notif.id }).catch(() => {});
     }
+    setVisible(false);
+    window.setTimeout(() => {
+      getCurrentWindow().hide().catch(() => {});
+    }, 200);
+  };
+
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation();
     setVisible(false);
     window.setTimeout(() => {
       getCurrentWindow().hide().catch(() => {});
@@ -110,10 +184,18 @@ export default function NotificationWindow() {
 
   return (
     <div
+      ref={notificationRef}
       className={`macos-notification ${visible ? 'visible' : 'hidden'}`}
       onClick={handleClick}
       role="alert"
     >
+      <button
+        className="macos-notification-close"
+        onClick={handleClose}
+        aria-label="Fechar notificação"
+      >
+        ×
+      </button>
       <div className="macos-notification-icon">
         <div className="icon-bubble">{icon}</div>
       </div>
