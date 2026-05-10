@@ -174,68 +174,188 @@ html, body, #root {
 .macos-notification-fields {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  margin-top: 2px;
+  gap: 3px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
 }
 
 .macos-notification-field {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 12px;
   font-size: 11px;
+  line-height: 1.3;
 }
 
 .field-label {
-  color: rgba(60, 60, 67, 0.6);
+  color: rgba(60, 60, 67, 0.7);
   font-weight: 500;
-}
-
-@media (prefers-color-scheme: dark) {
-  .field-label {
-    color: rgba(235, 235, 245, 0.6);
-  }
+  flex-shrink: 0;
 }
 
 .field-value {
   color: rgba(60, 60, 67, 0.9);
+  font-weight: 400;
+  text-align: right;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.field-input {
+  background: rgba(0, 0, 0, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: rgba(60, 60, 67, 0.9);
+  outline: none;
+  min-width: 80px;
+  max-width: 140px;
+}
+
+.field-input:focus {
+  border-color: #007aff;
+  background: rgba(0, 122, 255, 0.05);
+}
+
+.field-text {
+  text-align: right;
+}
+
+.field-select {
+  cursor: pointer;
 }
 
 @media (prefers-color-scheme: dark) {
+  .macos-notification-fields {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .field-label {
+    color: rgba(235, 235, 245, 0.7);
+  }
+
   .field-value {
     color: rgba(235, 235, 245, 0.9);
+  }
+
+  .field-input {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: rgba(235, 235, 245, 0.9);
+  }
+
+  .field-input:focus {
+    border-color: #0a84ff;
+    background: rgba(10, 132, 255, 0.1);
   }
 }
 
 .macos-notification-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .macos-notification-action-btn {
-  background: rgba(0, 122, 255, 0.15);
+  background: rgba(120, 120, 128, 0.15);
   color: #007aff;
   border: none;
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 11px;
+  border-radius: 14px;
+  padding: 5px 14px;
+  font-size: 12px;
   font-weight: 500;
   cursor: pointer;
   transition: background 150ms ease;
+  line-height: 1.2;
 }
 
 .macos-notification-action-btn:hover {
-  background: rgba(0, 122, 255, 0.25);
+  background: rgba(120, 120, 128, 0.25);
+}
+
+.macos-notification-action-btn.contained {
+  background: #007aff;
+  color: #ffffff;
+}
+.macos-notification-action-btn.contained:hover {
+  background: #0056b3;
+}
+
+.macos-notification-action-btn.outlined {
+  background: transparent;
+  color: #007aff;
+  border: 1px solid #007aff;
+}
+.macos-notification-action-btn.outlined:hover {
+  background: rgba(0, 122, 255, 0.1);
+}
+
+.macos-notification-action-btn.text {
+  background: transparent;
+  color: #007aff;
+  border: none;
+  padding: 5px 8px;
+}
+.macos-notification-action-btn.text:hover {
+  background: rgba(120, 120, 128, 0.15);
+}
+
+.macos-notification-action-btn.ghost {
+  background: rgba(120, 120, 128, 0.15);
+  color: #007aff;
+  border: none;
+}
+.macos-notification-action-btn.ghost:hover {
+  background: rgba(120, 120, 128, 0.3);
 }
 
 @media (prefers-color-scheme: dark) {
   .macos-notification-action-btn {
-    background: rgba(0, 122, 255, 0.2);
+    background: rgba(120, 120, 128, 0.2);
     color: #0a84ff;
   }
 
   .macos-notification-action-btn:hover {
-    background: rgba(0, 122, 255, 0.35);
+    background: rgba(120, 120, 128, 0.35);
+  }
+
+  .macos-notification-action-btn.contained {
+    background: #0a84ff;
+    color: #ffffff;
+  }
+  .macos-notification-action-btn.contained:hover {
+    background: #0066cc;
+  }
+
+  .macos-notification-action-btn.outlined {
+    background: transparent;
+    color: #0a84ff;
+    border: 1px solid #0a84ff;
+  }
+  .macos-notification-action-btn.outlined:hover {
+    background: rgba(10, 132, 255, 0.15);
+  }
+
+  .macos-notification-action-btn.text {
+    background: transparent;
+    color: #0a84ff;
+    border: none;
+    padding: 5px 8px;
+  }
+  .macos-notification-action-btn.text:hover {
+    background: rgba(120, 120, 128, 0.2);
+  }
+
+  .macos-notification-action-btn.ghost {
+    background: rgba(120, 120, 128, 0.2);
+    color: #0a84ff;
+    border: none;
+  }
+  .macos-notification-action-btn.ghost:hover {
+    background: rgba(120, 120, 128, 0.4);
   }
 }

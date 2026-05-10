@@ -42,12 +42,18 @@ pub struct NotificationAction {
     pub label: String,
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub button_style: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationField {
     pub label: String,
     pub value: String,
+    #[serde(default)]
+    pub field_type: Option<String>,
+    #[serde(default)]
+    pub options: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

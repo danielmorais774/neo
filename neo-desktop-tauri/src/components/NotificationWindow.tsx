@@ -8,11 +8,15 @@ interface NotificationAction {
   action_type: string;
   label: string;
   payload?: Record<string, unknown>;
+  button_style?: 'contained' | 'outlined' | 'text' | 'ghost';
 }
 
 interface NotificationField {
   label: string;
   value: string;
+  field_type?: 'text' | 'select';
+  options?: string;
+  input_value?: string;
 }
 
 interface NotificationConfig {
@@ -37,11 +41,11 @@ interface NeoNotificationPayload {
 }
 
 const KIND_ICON: Record<string, string> = {
-  approval_required: '✋',
+  approval_required: '🤖',
   mission_update: '💬',
   unsolicited_message: '📩',
-  mission_started: '🚀',
-  mission_completed: '✅',
+  mission_started: '⚡',
+  mission_completed: '✨',
 };
 
 const AUTO_DISMISS_MS = 6000;
@@ -211,7 +215,42 @@ export default function NotificationWindow() {
             {notif.fields.map((field, i) => (
               <div key={i} className="macos-notification-field">
                 <span className="field-label">{field.label}</span>
-                <span className="field-value">{field.value}</span>
+                {field.field_type === 'select' ? (
+                  <select
+                    className="field-input field-select"
+                    defaultValue={field.value}
+                    onChange={(e) => {
+                      if (notif) {
+                        const updated = { ...notif };
+                        if (updated.fields) {
+                          updated.fields[i] = { ...updated.fields[i], input_value: e.target.value };
+                          setNotif(updated);
+                        }
+                      }
+                    }}
+                  >
+                    {(field.options || '').split(',').filter(o => o.trim()).map(opt => (
+                      <option key={opt} value={opt.trim()}>{opt.trim()}</option>
+                    ))}
+                  </select>
+                ) : field.field_type === 'text' ? (
+                  <input
+                    type="text"
+                    className="field-input field-text"
+                    defaultValue={field.value}
+                    onChange={(e) => {
+                      if (notif) {
+                        const updated = { ...notif };
+                        if (updated.fields) {
+                          updated.fields[i] = { ...updated.fields[i], input_value: e.target.value };
+                          setNotif(updated);
+                        }
+                      }
+                    }}
+                  />
+                ) : (
+                  <span className="field-value">{field.value}</span>
+                )}
               </div>
             ))}
           </div>
@@ -221,7 +260,7 @@ export default function NotificationWindow() {
             {notif.actions.map((action, i) => (
               <button
                 key={i}
-                className="macos-notification-action-btn"
+                className={`macos-notification-action-btn${action.button_style ? ` ${action.button_style}` : ''}`}
                 onClick={(e) => handleActionClick(e, action)}
               >
                 {action.label}

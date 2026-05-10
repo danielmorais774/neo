@@ -12,11 +12,11 @@ interface NotificationOverlayProps {
 }
 
 const KIND_ICON: Record<string, string> = {
-  approval_required: '✋',
+  approval_required: '🤖',
   mission_update: '💬',
   unsolicited_message: '📩',
-  mission_started: '🚀',
-  mission_completed: '✅',
+  mission_started: '⚡',
+  mission_completed: '✨',
 };
 
 const AUTO_DISMISS_MS = 12000;
