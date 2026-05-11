@@ -1,5 +1,6 @@
 mod commands;
 mod grpc_gen;
+mod notch_host;
 mod services;
 mod websocket;
 
@@ -9,8 +10,11 @@ use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    Manager, RunEvent,
 };
+
+#[cfg(target_os = "macos")]
+use crate::notch_host::{start_notch_host, stop_notch_host, NotchHostState};
 
 pub struct AppState {
     pub device_id: String,
@@ -47,7 +51,7 @@ pub fn run() {
 
     info!("[Neo] Device ID: {}", device_id);
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
@@ -58,7 +62,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_fs::init());
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.manage(NotchHostState::default());
+    }
+
+    builder
         .manage(AppState {
             device_id,
             user_id,
@@ -189,9 +200,22 @@ pub fn run() {
                 ws_manager_clone.connect().await;
             });
 
+            #[cfg(target_os = "macos")]
+            {
+                let notch_state = app.state::<NotchHostState>();
+                start_notch_host(&notch_state);
+            }
+
             info!("[Neo] WebSocket connections initiated");
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |_app, event| {
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Exit = event {
+                let notch_state = _app.state::<NotchHostState>();
+                stop_notch_host(&notch_state);
+            }
+        });
 }

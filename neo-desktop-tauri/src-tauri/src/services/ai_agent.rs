@@ -41,9 +41,6 @@ impl GrpcClient {
         self.session_id = session_id.to_string();
     }
 
-    pub fn new_session(&mut self) {
-        self.session_id = Uuid::new_v4().to_string();
-    }
 
     /// Run a task end-to-end: opens a bidi stream, sends the user input,
     /// emits each CoreMessage to the frontend in real time, and ends as
