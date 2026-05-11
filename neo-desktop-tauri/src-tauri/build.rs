@@ -27,6 +27,8 @@ fn build_macos_notch_host() {
         .join("target")
         .join(&profile)
         .join("NeoNotchHost");
+    let clang_cache = manifest_dir.join("target").join("clang-module-cache");
+    let _ = std::fs::create_dir_all(&clang_cache);
 
     if !source.exists() {
         println!(
@@ -42,6 +44,7 @@ fn build_macos_notch_host() {
         .arg("-O")
         .arg("-o")
         .arg(&output)
+        .env("CLANG_MODULE_CACHE_PATH", &clang_cache)
         .output();
 
     match output_result {

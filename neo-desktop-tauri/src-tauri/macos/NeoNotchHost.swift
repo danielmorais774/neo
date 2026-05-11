@@ -23,12 +23,19 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         layer?.masksToBounds = true
 
         promptField.placeholderString = "Pergunte ou peça algo ao Neo..."
-        promptField.font = NSFont.systemFont(ofSize: 16, weight: .regular)
+        promptField.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         promptField.focusRingType = .none
         promptField.isBordered = false
         promptField.drawsBackground = true
-        promptField.backgroundColor = NSColor.white.withAlphaComponent(0.09)
+        promptField.backgroundColor = .clear
         promptField.textColor = .white
+        promptField.placeholderAttributedString = NSAttributedString(
+            string: "Pergunte ou peça algo ao Neo...",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .regular),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.38)
+            ]
+        )
         promptField.delegate = self
         promptField.isHidden = true
         addSubview(promptField)
@@ -44,12 +51,12 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     override func layout() {
         super.layout()
-        promptField.frame = NSRect(x: 24, y: 104, width: bounds.width - 48, height: 42)
+        promptField.frame = NSRect(x: 66, y: 126, width: bounds.width - 148, height: 26)
     }
 
     private func applyState() {
         promptField.isHidden = islandState != .expanded
-        layer?.cornerRadius = islandState == .idle ? 19 : 30
+        layer?.cornerRadius = islandState == .idle ? 19 : 34
         needsDisplay = true
         if islandState == .expanded {
             DispatchQueue.main.async { [weak self] in
@@ -73,19 +80,19 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawBackground() {
-        let radius = islandState == .idle ? bounds.height / 2 : 30
+        let radius = islandState == .idle ? bounds.height / 2 : 34
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: radius, yRadius: radius)
-        NSColor.black.withAlphaComponent(0.91).setFill()
+        NSColor.black.withAlphaComponent(0.985).setFill()
         path.fill()
 
-        NSColor.white.withAlphaComponent(0.14).setStroke()
+        NSColor.white.withAlphaComponent(0.10).setStroke()
         path.lineWidth = 1
         path.stroke()
     }
 
     private func drawIdle() {
-        let glint = NSBezierPath(roundedRect: bounds.insetBy(dx: 12, dy: 9), xRadius: 6, yRadius: 6)
-        NSColor.white.withAlphaComponent(0.12).setFill()
+        let glint = NSBezierPath(roundedRect: bounds.insetBy(dx: 14, dy: 9), xRadius: 8, yRadius: 8)
+        NSColor.white.withAlphaComponent(0.1).setFill()
         glint.fill()
     }
 
@@ -97,22 +104,268 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawExpanded() {
-        drawAvatar(at: NSRect(x: 24, y: 44, width: 44, height: 44))
-        drawText("Neo Assistant", in: NSRect(x: 82, y: 43, width: 240, height: 24), size: 19, weight: .semibold, color: .white, alignment: .left)
-        drawText(isThinking ? "pensando..." : "pronto para ajudar", in: NSRect(x: 82, y: 67, width: 240, height: 20), size: 14, weight: .regular, color: NSColor.white.withAlphaComponent(0.7), alignment: .left)
-        drawStatusDot(center: NSPoint(x: bounds.width - 32, y: 66))
+        drawHeaderCard()
+        drawPromptCard()
 
-        drawSegmentedControls()
-        drawDivider(y: 206)
-        drawText("RECENTES", in: NSRect(x: 24, y: 226, width: 120, height: 18), size: 12, weight: .bold, color: NSColor.white.withAlphaComponent(0.48), alignment: .left)
-        drawText("Resumo do call de produto", in: NSRect(x: 32, y: 256, width: bounds.width - 120, height: 22), size: 16, weight: .medium, color: .white, alignment: .left)
-        drawText("agora", in: NSRect(x: bounds.width - 86, y: 256, width: 54, height: 22), size: 14, weight: .regular, color: NSColor.white.withAlphaComponent(0.44), alignment: .right)
-        drawText("Reescrever onboarding email", in: NSRect(x: 32, y: 292, width: bounds.width - 120, height: 22), size: 16, weight: .medium, color: .white, alignment: .left)
-        drawText("1h", in: NSRect(x: bounds.width - 86, y: 292, width: 54, height: 22), size: 14, weight: .regular, color: NSColor.white.withAlphaComponent(0.44), alignment: .right)
-        drawText("Gerar variantes de logo", in: NSRect(x: 32, y: 328, width: bounds.width - 120, height: 22), size: 16, weight: .medium, color: .white, alignment: .left)
-        drawText("ontem", in: NSRect(x: bounds.width - 86, y: 328, width: 54, height: 22), size: 14, weight: .regular, color: NSColor.white.withAlphaComponent(0.44), alignment: .right)
-        drawDivider(y: 368)
-        drawText("⌘↵ enviar", in: NSRect(x: bounds.width - 116, y: bounds.height - 36, width: 88, height: 20), size: 13, weight: .medium, color: NSColor.white.withAlphaComponent(0.58), alignment: .right)
+        drawSectionTitle("NOTIFICAÇÕES", count: "3", y: 170)
+        drawNotificationCard(y: 196, kind: .spark, title: "Resumo do call pronto", subtitle: "12 itens · 4 ações sugeridas", time: "agora", badge: nil)
+        drawNotificationCard(y: 256, kind: .chat, title: "Marina Lopes", subtitle: "Te envio o briefing em 10min", time: "2m", badge: nil)
+        drawNotificationCard(y: 316, kind: .chat, title: "Time · Acme", subtitle: "Lucas: revisei a PR, pode mergear", time: "8m", badge: "3")
+
+        drawSectionTitle("FILAS DE PROCESSAMENTO", count: "3 ativas", y: 386)
+        drawQueueCard(y: 412)
+
+        drawText("⌘ Espaço · abrir Neo", in: NSRect(x: 24, y: bounds.height - 34, width: 150, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.42), alignment: .left)
+        drawKeycap("fn", in: NSRect(x: bounds.width - 76, y: bounds.height - 36, width: 25, height: 20))
+        drawText("ditar", in: NSRect(x: bounds.width - 46, y: bounds.height - 32, width: 32, height: 14), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.48), alignment: .left)
+    }
+
+    private func drawHeaderCard() {
+        let card = NSRect(x: 24, y: 30, width: bounds.width - 48, height: 76)
+        fillRoundedCard(card, radius: 20, alpha: 0.40)
+        drawBotIcon(in: NSRect(x: 44, y: 48, width: 44, height: 44))
+        drawText("Olá, em que posso ajudar?", in: NSRect(x: 108, y: 50, width: bounds.width - 220, height: 22), size: 15, weight: .bold, color: .white, alignment: .left)
+        drawDottedLine(x: 108, y: 82, dots: 16)
+
+        let mic = NSRect(x: bounds.width - 78, y: 46, width: 46, height: 46)
+        let micPath = NSBezierPath(ovalIn: mic)
+        NSColor(calibratedRed: 0.37, green: 0.30, blue: 0.94, alpha: 1.0).setFill()
+        micPath.fill()
+        drawMicGlyph(in: mic)
+    }
+
+    private func drawPromptCard() {
+        let card = NSRect(x: 24, y: 122, width: bounds.width - 48, height: 44)
+        fillRoundedCard(card, radius: 14, alpha: 0.50)
+        drawSearchGlyph(in: NSRect(x: 42, y: 135, width: 18, height: 18))
+        drawKeyIcon("↵", in: NSRect(x: bounds.width - 80, y: 129, width: 30, height: 30))
+        drawKeyIcon("↑", in: NSRect(x: bounds.width - 45, y: 129, width: 30, height: 30))
+    }
+
+    private func drawSectionTitle(_ title: String, count: String, y: CGFloat) {
+        drawText(title, in: NSRect(x: 30, y: y, width: 250, height: 18), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.56), alignment: .left)
+        drawText(count, in: NSRect(x: bounds.width - 96, y: y, width: 70, height: 18), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.64), alignment: .right)
+    }
+
+    private enum NotificationKind {
+        case spark
+        case chat
+    }
+
+    private func drawNotificationCard(y: CGFloat, kind: NotificationKind, title: String, subtitle: String, time: String, badge: String?) {
+        let card = NSRect(x: 24, y: y, width: bounds.width - 48, height: 52)
+        fillRoundedCard(card, radius: 13, alpha: 0.38)
+
+        let iconRect = NSRect(x: 38, y: y + 10, width: 32, height: 32)
+        drawAppIcon(kind, in: iconRect)
+
+        drawText(title, in: NSRect(x: 84, y: y + 10, width: bounds.width - 194, height: 18), size: 13, weight: .bold, color: .white, alignment: .left)
+        drawText(subtitle, in: NSRect(x: 84, y: y + 29, width: bounds.width - 202, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.62), alignment: .left)
+        drawText(time, in: NSRect(x: bounds.width - 84, y: y + 13, width: 54, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.55), alignment: .right)
+
+        if let badge {
+            let badgeRect = NSRect(x: bounds.width - 52, y: y + 27, width: 21, height: 21)
+            let badgePath = NSBezierPath(ovalIn: badgeRect)
+            NSColor.systemGreen.setFill()
+            badgePath.fill()
+            drawText(badge, in: badgeRect.offsetBy(dx: 0, dy: 4), size: 11, weight: .bold, color: .white, alignment: .center)
+        }
+    }
+
+    private func drawQueueCard(y: CGFloat) {
+        let card = NSRect(x: 24, y: y, width: bounds.width - 48, height: 126)
+        fillRoundedCard(card, radius: 14, alpha: 0.38)
+
+        drawQueueLine(y: y + 17, title: "Indexar Notion", pct: "72%", eta: "1m", widthFactor: 0.72)
+        drawThinDivider(y: y + 52)
+        drawQueueLine(y: y + 58, title: "Transcrição · call.mp3", pct: "34%", eta: "4m", widthFactor: 0.34)
+        drawThinDivider(y: y + 93)
+        drawQueueLine(y: y + 99, title: "Gerar 6 thumbs", pct: "12%", eta: "7m", widthFactor: 0.12)
+    }
+
+    private func drawQueueLine(y: CGFloat, title: String, pct: String, eta: String, widthFactor: CGFloat) {
+        drawPurpleDot(center: NSPoint(x: 43, y: y + 6))
+        drawText(title, in: NSRect(x: 56, y: y - 4, width: 270, height: 19), size: 13, weight: .semibold, color: .white, alignment: .left)
+        drawText("\(pct)  ·  \(eta)", in: NSRect(x: bounds.width - 108, y: y - 3, width: 78, height: 18), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.58), alignment: .right)
+
+        let track = NSRect(x: 42, y: y + 23, width: bounds.width - 84, height: 3)
+        let trackPath = NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2)
+        NSColor.white.withAlphaComponent(0.08).setFill()
+        trackPath.fill()
+
+        let fill = NSRect(x: 42, y: y + 23, width: (bounds.width - 84) * widthFactor, height: 3)
+        let fillPath = NSBezierPath(roundedRect: fill, xRadius: 2, yRadius: 2)
+        NSColor(calibratedRed: 0.36, green: 0.46, blue: 1.0, alpha: 1.0).setFill()
+        fillPath.fill()
+    }
+
+    private func fillRoundedCard(_ rect: NSRect, radius: CGFloat, alpha: CGFloat) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        NSColor(calibratedWhite: 0.055, alpha: alpha).setFill()
+        path.fill()
+        NSColor.white.withAlphaComponent(0.095).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    private func drawBotIcon(in rect: NSRect) {
+        NSColor(calibratedRed: 0.39, green: 0.31, blue: 0.80, alpha: 0.22).setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: -9, dy: -9)).fill()
+
+        let antenna = NSBezierPath()
+        antenna.move(to: NSPoint(x: rect.midX, y: rect.minY - 11))
+        antenna.line(to: NSPoint(x: rect.midX, y: rect.minY))
+        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 1.0).setStroke()
+        antenna.lineWidth = 2
+        antenna.stroke()
+        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: NSRect(x: rect.midX - 3.5, y: rect.minY - 15, width: 7, height: 7)).fill()
+
+        let outer = NSBezierPath(roundedRect: rect, xRadius: 15, yRadius: 15)
+        NSColor(calibratedWhite: 0.16, alpha: 1.0).setFill()
+        outer.fill()
+        NSColor.white.withAlphaComponent(0.12).setStroke()
+        outer.lineWidth = 1
+        outer.stroke()
+
+        let face = NSBezierPath(roundedRect: rect.insetBy(dx: 9, dy: 14), xRadius: 6, yRadius: 6)
+        NSColor(calibratedWhite: 0.08, alpha: 1.0).setFill()
+        face.fill()
+        NSColor.white.withAlphaComponent(0.08).setStroke()
+        face.stroke()
+
+        drawGlowDot(center: NSPoint(x: rect.midX - 7, y: rect.midY + 2), radius: 3)
+        drawGlowDot(center: NSPoint(x: rect.midX + 7, y: rect.midY + 2), radius: 3)
+    }
+
+    private func drawAppIcon(_ kind: NotificationKind, in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9)
+        switch kind {
+        case .spark:
+            NSColor(calibratedRed: 0.36, green: 0.28, blue: 0.94, alpha: 1.0).setFill()
+        case .chat:
+            NSColor(calibratedRed: 0.12, green: 0.78, blue: 0.34, alpha: 1.0).setFill()
+        }
+        path.fill()
+
+        switch kind {
+        case .spark:
+            drawSparkGlyph(in: rect)
+        case .chat:
+            drawChatGlyph(in: rect)
+        }
+    }
+
+    private func drawSparkGlyph(in rect: NSRect) {
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: rect.midX, y: rect.minY + 8))
+        path.line(to: NSPoint(x: rect.midX + 4, y: rect.midY - 2))
+        path.line(to: NSPoint(x: rect.maxX - 8, y: rect.midY))
+        path.line(to: NSPoint(x: rect.midX + 4, y: rect.midY + 3))
+        path.line(to: NSPoint(x: rect.midX, y: rect.maxY - 8))
+        path.line(to: NSPoint(x: rect.midX - 4, y: rect.midY + 3))
+        path.line(to: NSPoint(x: rect.minX + 8, y: rect.midY))
+        path.line(to: NSPoint(x: rect.midX - 4, y: rect.midY - 2))
+        path.close()
+        NSColor.white.setFill()
+        path.fill()
+    }
+
+    private func drawChatGlyph(in rect: NSRect) {
+        let bubble = NSBezierPath(ovalIn: rect.insetBy(dx: 8, dy: 8))
+        NSColor.white.setFill()
+        bubble.fill()
+
+        let tail = NSBezierPath()
+        tail.move(to: NSPoint(x: rect.midX - 3, y: rect.maxY - 12))
+        tail.line(to: NSPoint(x: rect.midX - 9, y: rect.maxY - 7))
+        tail.line(to: NSPoint(x: rect.midX, y: rect.maxY - 9))
+        tail.close()
+        tail.fill()
+
+        NSColor(calibratedRed: 0.12, green: 0.78, blue: 0.34, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: NSRect(x: rect.midX - 6, y: rect.midY - 2, width: 2.5, height: 2.5)).fill()
+        NSBezierPath(ovalIn: NSRect(x: rect.midX, y: rect.midY + 1, width: 2.5, height: 2.5)).fill()
+    }
+
+    private func drawMicGlyph(in rect: NSRect) {
+        NSColor.white.setStroke()
+        let capsule = NSBezierPath(roundedRect: NSRect(x: rect.midX - 4, y: rect.midY - 11, width: 8, height: 16), xRadius: 4, yRadius: 4)
+        capsule.lineWidth = 1.6
+        capsule.stroke()
+
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: NSPoint(x: rect.midX, y: rect.midY - 2), radius: 11, startAngle: 205, endAngle: 335, clockwise: true)
+        arc.lineWidth = 1.6
+        arc.stroke()
+
+        let stem = NSBezierPath()
+        stem.move(to: NSPoint(x: rect.midX, y: rect.midY + 12))
+        stem.line(to: NSPoint(x: rect.midX, y: rect.midY + 15))
+        stem.move(to: NSPoint(x: rect.midX - 5, y: rect.midY + 15))
+        stem.line(to: NSPoint(x: rect.midX + 5, y: rect.midY + 15))
+        stem.lineWidth = 1.6
+        stem.stroke()
+    }
+
+    private func drawSearchGlyph(in rect: NSRect) {
+        NSColor.white.withAlphaComponent(0.48).setStroke()
+        let circle = NSBezierPath(ovalIn: NSRect(x: rect.minX + 2, y: rect.minY + 2, width: 13, height: 13))
+        circle.lineWidth = 1.7
+        circle.stroke()
+        let handle = NSBezierPath()
+        handle.move(to: NSPoint(x: rect.minX + 14, y: rect.minY + 15))
+        handle.line(to: NSPoint(x: rect.maxX - 2, y: rect.maxY - 2))
+        handle.lineWidth = 1.7
+        handle.stroke()
+    }
+
+    private func drawKeyIcon(_ text: String, in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        NSColor.white.withAlphaComponent(0.12).setFill()
+        path.fill()
+        drawText(text, in: rect.offsetBy(dx: 0, dy: 6), size: 17, weight: .bold, color: .white, alignment: .center)
+    }
+
+    private func drawKeycap(_ text: String, in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        NSColor.white.withAlphaComponent(0.11).setFill()
+        path.fill()
+        NSColor.white.withAlphaComponent(0.14).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        drawText(text, in: rect.offsetBy(dx: 0, dy: 4), size: 12, weight: .bold, color: NSColor.white.withAlphaComponent(0.80), alignment: .center)
+    }
+
+    private func drawDottedLine(x: CGFloat, y: CGFloat, dots: Int) {
+        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 0.72).setFill()
+        for index in 0..<dots {
+            let dotX = x + CGFloat(index) * 6
+            NSBezierPath(ovalIn: NSRect(x: dotX, y: y, width: 2.5, height: 2.5)).fill()
+        }
+    }
+
+    private func drawPurpleDot(center: NSPoint) {
+        NSColor(calibratedRed: 0.59, green: 0.47, blue: 1.0, alpha: 0.32).setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - 6, y: center.y - 6, width: 12, height: 12)).fill()
+        NSColor(calibratedRed: 0.61, green: 0.50, blue: 1.0, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - 3, y: center.y - 3, width: 6, height: 6)).fill()
+    }
+
+    private func drawGlowDot(center: NSPoint, radius: CGFloat) {
+        NSColor(calibratedRed: 0.61, green: 0.50, blue: 1.0, alpha: 0.34).setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius - 5, y: center.y - radius - 5, width: radius * 2 + 10, height: radius * 2 + 10)).fill()
+        NSColor(calibratedRed: 0.72, green: 0.62, blue: 1.0, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
+    }
+
+    private func drawThinDivider(y: CGFloat) {
+        NSColor.white.withAlphaComponent(0.055).setStroke()
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: 28, y: y))
+        path.line(to: NSPoint(x: bounds.width - 28, y: y))
+        path.lineWidth = 1
+        path.stroke()
     }
 
     private func drawAvatar(at rect: NSRect) {
@@ -134,32 +387,6 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         let rect = NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
         NSColor.systemGreen.withAlphaComponent(isThinking && pulsePhase ? 0.42 : 1).setFill()
         NSBezierPath(ovalIn: rect).fill()
-    }
-
-    private func drawSegmentedControls() {
-        let labels = ["Llama 70B", "Haiku 4.5", "GPT-4o"]
-        let gap: CGFloat = 10
-        let width = (bounds.width - 48 - gap * 2) / 3
-        for (index, label) in labels.enumerated() {
-            let x = 24 + CGFloat(index) * (width + gap)
-            let rect = NSRect(x: x, y: 162, width: width, height: 36)
-            let path = NSBezierPath(roundedRect: rect, xRadius: 12, yRadius: 12)
-            (index == 0 ? NSColor.systemIndigo.withAlphaComponent(0.48) : NSColor.white.withAlphaComponent(0.06)).setFill()
-            path.fill()
-            NSColor.white.withAlphaComponent(index == 0 ? 0.2 : 0.1).setStroke()
-            path.lineWidth = 1
-            path.stroke()
-            drawText(label, in: rect, size: 14, weight: .semibold, color: index == 0 ? .white : NSColor.white.withAlphaComponent(0.66), alignment: .center)
-        }
-    }
-
-    private func drawDivider(y: CGFloat) {
-        NSColor.white.withAlphaComponent(0.08).setStroke()
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: 24, y: y))
-        path.line(to: NSPoint(x: bounds.width - 24, y: y))
-        path.lineWidth = 1
-        path.stroke()
     }
 
     private func drawText(_ text: String, in rect: NSRect, size: CGFloat, weight: NSFont.Weight, color: NSColor, alignment: NSTextAlignment) {
@@ -211,7 +438,7 @@ final class NotchController {
 
     private let idleSize = NSSize(width: 136, height: 30)
     private let peekSize = NSSize(width: 460, height: 46)
-    private let expandedSize = NSSize(width: 640, height: 430)
+    private let expandedSize = NSSize(width: 560, height: 570)
     private let movementTolerance: CGFloat = 8
     private let peekIntentDelay: TimeInterval = 0.14
     private let expandIntentDelay: TimeInterval = 0.72
