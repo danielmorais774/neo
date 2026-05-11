@@ -50,7 +50,7 @@ async def webhook(
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(x_signature, expected):
-            logger.warning({"got": x_signature}, "Invalid webhook signature")
+            logger.warning("Invalid webhook signature: got=%s", x_signature)
             raise HTTPException(status_code=401, detail="Invalid signature")
 
     # 2. Parse event
@@ -59,7 +59,7 @@ async def webhook(
     message_id = body.get("message_id", "")
     timestamp = body.get("timestamp")
 
-    logger.info({"jid": jid, "message_id": message_id, "text": text[:50]}, "Webhook received")
+    logger.info("Webhook received: jid=%s message_id=%s text=%s", jid, message_id, text[:50])
 
     if not _db:
         logger.error("DB not initialized")
@@ -81,7 +81,7 @@ async def webhook(
 
     # 5. Check idempotency (skip duplicate message_id)
     if mission.last_inbound_message_id == message_id:
-        logger.info({message_id}, "Duplicate message, skipping")
+        logger.info("Duplicate message, skipping: message_id=%s", message_id)
         return {"ok": True, "action": "duplicate"}
 
     # 6. Dispatch to skill pipeline (fire and forget for speed)
@@ -137,9 +137,9 @@ async def _notify_unsolicited(jid: str, text: str, message_id: str) -> None:
                     },
                 )
             except Exception as e:
-                logger.warning({"err": str(e)}, "Broker publish failed (unsolicited)")
+                logger.warning("Broker publish failed (unsolicited): err=%s", e)
     except Exception as e:
-        logger.warning({"err": str(e), "jid": jid}, "Unsolicited notify failed")
+        logger.warning("Unsolicited notify failed: jid=%s err=%s", jid, e)
 
 
 def _phone_from_jid(jid: str | None) -> str | None:
@@ -178,7 +178,7 @@ async def _process_inbound(
             },
         )
     except Exception as e:
-        logger.error({mission.id, e}, "Inbound processing failed")
+        logger.error("Inbound processing failed: mission_id=%s err=%s", mission.id, e)
         await _db.update_mission_status(
             mission.id,
             status="failed",
@@ -190,7 +190,7 @@ async def _process_inbound(
     try:
         await _db.update_mission_last_inbound_message_id(mission.id, message_id)
     except Exception as e:
-        logger.warning({mission.id, e}, "Failed to update last_inbound_message_id")
+        logger.warning("Failed to update last_inbound_message_id: mission_id=%s err=%s", mission.id, e)
 
 
 # ── Panel-facing endpoints ────────────────────────────────────────────────
@@ -239,7 +239,7 @@ async def send_message(
         message_id = await gateway.send_message(jid=jid, text=text)
         return {"ok": True, "message_id": message_id}
     except Exception as e:
-        logger.error({jid, e}, "Failed to send message")
+        logger.error("Failed to send message: jid=%s err=%s", jid, e)
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         await gateway.close()
@@ -310,7 +310,7 @@ async def list_chats() -> dict:
         chats = await gateway.list_chats()
         return {"chats": chats}
     except Exception as e:
-        logger.error({"err": str(e)}, "Failed to list chats")
+        logger.error("Failed to list chats: err=%s", e)
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         await gateway.close()
@@ -324,7 +324,7 @@ async def get_chat_messages(jid: str) -> dict:
         messages = await gateway.get_chat_messages(jid)
         return {"messages": messages}
     except Exception as e:
-        logger.error({"err": str(e), "jid": jid}, "Failed to get chat messages")
+        logger.error("Failed to get chat messages: jid=%s err=%s", jid, e)
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         await gateway.close()
@@ -337,7 +337,7 @@ async def get_chat_media(jid: str, msg_id: str) -> dict:
     try:
         return await gateway.get_chat_media(jid, msg_id)
     except Exception as e:
-        logger.error({"err": str(e), "jid": jid, "msg_id": msg_id}, "Failed to get chat media")
+        logger.error("Failed to get chat media: jid=%s msg_id=%s err=%s", jid, msg_id, e)
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         await gateway.close()

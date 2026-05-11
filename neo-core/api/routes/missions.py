@@ -4,6 +4,7 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from db.async_client import AsyncPostgresClient
 
@@ -12,6 +13,10 @@ router = APIRouter(prefix="/api/v1/missions", tags=["missions"])
 
 _db: AsyncPostgresClient | None = None
 _pipeline_factory = None
+
+
+class MissionApprovalRequest(BaseModel):
+    edited_text: str | None = None
 
 
 def set_db(db: AsyncPostgresClient) -> None:
@@ -76,7 +81,7 @@ async def get_mission(mission_id: UUID):
 
 
 @router.post("/{mission_id}/approve", response_model=dict)
-async def approve_mission(mission_id: UUID, edited_text: str | None = None):
+async def approve_mission(mission_id: UUID, request: MissionApprovalRequest | None = None):
     """Approve a mission (personal mode approval flow)."""
     if not _db:
         raise HTTPException(status_code=500, detail="DB not initialized")
@@ -95,7 +100,11 @@ async def approve_mission(mission_id: UUID, edited_text: str | None = None):
     from observability.session_file_logger import SessionFileLogger
     from uuid import UUID as _UUID
     _slog = SessionFileLogger(str(mission.session_id))
-    result = await pipeline._handle_approval(mission, {"approved": True, "edited_text": edited_text}, _slog)
+    result = await pipeline._handle_approval(
+        mission,
+        {"approved": True, "edited_text": request.edited_text if request else None},
+        _slog,
+    )
 
     return {"ok": result.ok, "message": result.message, "mission_id": str(mission_id)}
 

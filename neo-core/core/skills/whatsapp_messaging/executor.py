@@ -166,12 +166,19 @@ class WhatsAppMessagingExecutor:
         else:
             body_lines.append(f"\nDestinatário: {contact_label}")
 
-        await self.db.create_notification(
+        actions = [
+            {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
+            {"action_type": "edit", "label": "Eu escrevo", "button_style": "outlined"},
+            {"action_type": "cancel", "label": "Não fazer nada", "button_style": "ghost"},
+        ]
+        config = {"persistent": True, "position": "bottom_right", "play_sound": True}
+        body = "\n".join(body_lines)
+        notif = await self.db.create_notification(
             user_id=user_id,
             mission_id=mission_id,
-            kind="approval_required",
+            kind="confirm_reply",
             title=f"Aprovar mensagem: {contact_label}",
-            body="\n".join(body_lines),
+            body=body,
             payload={
                 "mission_id": str(mission_id),
                 "question": question,
@@ -179,8 +186,43 @@ class WhatsAppMessagingExecutor:
                 "contact_label": contact_label,
                 "contact_jid": mission.contact_jid,
                 "contact_phone_e164": contact_phone,
+                "actions": actions,
+                "config": config,
             },
         )
+        try:
+            from core.notifications.device_notif_broadcaster import get_device_notif_broadcaster
+
+            notification = {
+                "id": str(notif.id),
+                "user_id": str(user_id),
+                "mission_id": str(mission_id),
+                "kind": "confirm_reply",
+                "title": f"Aprovar mensagem: {contact_label}",
+                "body": body,
+                "description": body,
+                "payload": {
+                    "mission_id": str(mission_id),
+                    "question": question,
+                    "draft_text": draft_text,
+                    "contact_label": contact_label,
+                    "contact_jid": mission.contact_jid,
+                    "contact_phone_e164": contact_phone,
+                },
+                "actions": actions,
+                "config": config,
+                "created_at_unix": int(notif.created_at.timestamp()) if notif.created_at else 0,
+            }
+            broadcaster = get_device_notif_broadcaster()
+            devices = await self.db.get_connected_devices(user_id)
+            sent_to: set[str] = set()
+            for device in devices:
+                for key in (device.device_id, device.ws_connection_id):
+                    if key and key not in sent_to:
+                        if await broadcaster.send_notification(key, notification):
+                            sent_to.add(key)
+        except Exception:
+            pass
 
         return {"ok": True, "status": "awaiting_confirmation"}
 

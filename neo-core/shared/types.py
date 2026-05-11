@@ -50,6 +50,7 @@ class NotificationKind(str, Enum):
     MISSION_COMPLETED = "mission_completed"
     MISSION_FAILED = "mission_failed"
     APPROVAL_REQUIRED = "approval_required"
+    CONFIRM_REPLY = "confirm_reply"
     UNSOLICITED_MESSAGE = "unsolicited_message"
 
 
