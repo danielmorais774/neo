@@ -1,9 +1,9 @@
-use crate::AppState;
 use crate::services::ai_agent::GrpcClient;
-use tauri::{State, Emitter, AppHandle, Window, Manager};
+use crate::AppState;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
-use log::{info, error};
 use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
@@ -41,8 +41,8 @@ pub async fn execute_with_loop(
     let device_id = state.device_id.clone();
     let user_id = state.user_id.clone();
     let session_id = state.session_id.lock().unwrap().clone();
-    let neo_core_url = std::env::var("NEO_CORE_URL")
-        .unwrap_or_else(|_| "localhost:50051".to_string());
+    let neo_core_url =
+        std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "localhost:50051".to_string());
 
     let app_handle = app.clone();
 
@@ -51,7 +51,12 @@ pub async fn execute_with_loop(
         client.set_session_id(&session_id);
 
         let result = client
-            .execute_task(app_handle.clone(), message, model.as_deref(), provider.as_deref())
+            .execute_task(
+                app_handle.clone(),
+                message,
+                model.as_deref(),
+                provider.as_deref(),
+            )
             .await;
 
         match result {
@@ -115,7 +120,11 @@ pub async fn execute_command(command: String) -> Result<CommandResult, String> {
     if output.status.success() {
         Ok(CommandResult {
             success: true,
-            output: Some(if stdout.is_empty() { stderr.clone() } else { stdout }),
+            output: Some(if stdout.is_empty() {
+                stderr.clone()
+            } else {
+                stdout
+            }),
             error: None,
         })
     } else {
@@ -142,10 +151,10 @@ pub fn get_history() -> Result<Vec<Message>, String> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read history: {}", e))?;
-    let messages: Vec<Message> = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse history: {}", e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read history: {}", e))?;
+    let messages: Vec<Message> =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse history: {}", e))?;
     Ok(messages)
 }
 
@@ -153,8 +162,7 @@ pub fn get_history() -> Result<Vec<Message>, String> {
 pub fn clear_history() -> Result<(), String> {
     let path = get_history_path();
     if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to clear history: {}", e))?;
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to clear history: {}", e))?;
     }
     Ok(())
 }
@@ -181,8 +189,7 @@ pub struct NeoCoreStatus {
 
 #[tauri::command]
 pub async fn get_neo_core_status() -> Result<NeoCoreStatus, String> {
-    let url = std::env::var("NEO_CORE_URL")
-        .unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -215,14 +222,10 @@ pub fn get_window_mode() -> &'static str {
 // ============ QUICK HELP ============
 
 #[tauri::command]
-pub async fn quick_help_ask_stream(
-    window: Window,
-    question: String,
-) -> Result<(), String> {
+pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(), String> {
     info!("[Neo] quick_help_ask_stream: {}", question);
 
-    let url = std::env::var("NEO_CORE_URL")
-        .unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -238,12 +241,16 @@ pub async fn quick_help_ask_stream(
 
     if !resp.status().is_success() {
         let error_text = resp.text().await.unwrap_or_default();
-        window.emit("quick-help-error", format!("Server error: {}", error_text))
+        window
+            .emit("quick-help-error", format!("Server error: {}", error_text))
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
 
-    let text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
 
     // Send chunks
     for chunk in text.split(|c| c == '\n' || c == ' ') {
@@ -272,7 +279,10 @@ pub async fn handle_notification_action(
     action_type: String,
     action_payload: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    info!("[Neo] handle_notification_action: notification={}, action={}", notification_id, action_type);
+    info!(
+        "[Neo] handle_notification_action: notification={}, action={}",
+        notification_id, action_type
+    );
 
     let action_event = serde_json::json!({
         "notification_id": notification_id,
@@ -364,6 +374,67 @@ pub async fn resize_notification_window(
                     .map_err(|e| e.to_string())?;
             }
         }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_notification_window_interactive(
+    app: AppHandle,
+    interactive: bool,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notification") {
+        window
+            .set_focusable(false)
+            .map_err(|e| e.to_string())?;
+        window
+            .set_ignore_cursor_events(!interactive)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_notification_window_focusable(
+    app: AppHandle,
+    focusable: bool,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notification") {
+        window.set_focusable(focusable).map_err(|e| e.to_string())?;
+        if focusable {
+            let _ = window.set_focus();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn is_cursor_over_notification_window(app: AppHandle) -> Result<bool, String> {
+    let Some(window) = app.get_webview_window("notification") else {
+        return Ok(false);
+    };
+
+    if !window.is_visible().map_err(|e| e.to_string())? {
+        return Ok(false);
+    }
+
+    let cursor = app.cursor_position().map_err(|e| e.to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let left = position.x as f64;
+    let top = position.y as f64;
+    let right = left + size.width as f64;
+    let bottom = top + size.height as f64;
+
+    Ok(cursor.x >= left && cursor.x <= right && cursor.y >= top && cursor.y <= bottom)
+}
+
+#[tauri::command]
+pub async fn hide_notification_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notification") {
+        let _ = window.set_focusable(false);
+        let _ = window.set_ignore_cursor_events(true);
+        window.hide().map_err(|e| e.to_string())?;
     }
     Ok(())
 }

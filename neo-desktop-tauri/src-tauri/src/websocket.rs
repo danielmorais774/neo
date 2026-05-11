@@ -10,7 +10,7 @@ const NOTIFICATION_WINDOW_LABEL: &str = "notification";
 const NOTIFICATION_MARGIN: i32 = 16;
 
 // Default notification config
-fn default_duration_ms() -> u64 { 6000 }
+fn default_duration_ms() -> u64 { 12000 }
 fn default_position() -> String { "bottom_right".to_string() }
 fn default_play_sound() -> bool { true }
 
@@ -50,6 +50,9 @@ pub struct NotificationAction {
 pub struct NotificationField {
     pub label: String,
     pub value: String,
+    pub source: String,
+    #[serde(default)]
+    pub placeholder: Option<String>,
     #[serde(default)]
     pub field_type: Option<String>,
     #[serde(default)]
@@ -135,6 +138,8 @@ fn show_notification_window(app_handle: &AppHandle, notification: &NeoNotificati
         }
     }
 
+    let _ = window.set_focusable(false);
+    let _ = window.set_ignore_cursor_events(false);
     let _ = window.show();
     let _ = window.set_always_on_top(true);
 }
@@ -233,7 +238,7 @@ impl DeviceWsManager {
                     error!("[DeviceWS] Failed to connect online WS: {}", e);
                 }
             }
-            
+
             // Reconnect after delay with exponential backoff
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
@@ -286,7 +291,7 @@ impl DeviceWsManager {
                     error!("[DeviceWS] Failed to connect notifications WS: {}", e);
                 }
             }
-            
+
             // Reconnect after delay
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
@@ -295,7 +300,7 @@ impl DeviceWsManager {
     /// Stop all WebSocket connections
     pub async fn disconnect(&self) {
         info!("[DeviceWS] Disconnecting all connections");
-        
+
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(()).await;
         }

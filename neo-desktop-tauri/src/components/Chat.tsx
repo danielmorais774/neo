@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useCallback, useState, useRef, useEffect } from 'react';
 import type { Message } from '../types';
 import MessageBubble from './MessageBubble';
 import GlassSelect from './GlassSelect';
@@ -88,7 +88,6 @@ function Chat({
   currentIteration = 0,
   maxIterations = 10,
   onSendMessage, 
-  onClearHistory, 
   onNewChat, 
   onStop,
   onPermissionResponse,
@@ -106,6 +105,14 @@ function Chat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  const resizeInput = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+  }, []);
+
   useEffect(() => {
     // Always scroll to the end when messages change
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -118,30 +125,44 @@ function Chat({
         el.focus();
         // move caret to the end so user can continue typing immediately
         const len = el.value.length;
-        try { el.setSelectionRange(len, len); } catch (err) { /* noop */ }
+        try { el.setSelectionRange(len, len); } catch { /* noop */ }
       }
     }
   }, [messages, isLoading, isExecuting]);
 
   useEffect(() => {
     inputRef.current?.focus();
-  }, []);
+    resizeInput();
+  }, [resizeInput]);
+
+  useEffect(() => {
+    resizeInput();
+  }, [input, resizeInput]);
 
   // When initialInput changes (e.g. user clicked "Responder" on a notification
   // toast), prefill the textarea so the seed text is visible immediately.
   useEffect(() => {
-    if (initialInput) {
+    if (!initialInput) return;
+
+    let focusFrame: number | undefined;
+    const inputFrame = requestAnimationFrame(() => {
       setInput(initialInput);
-      requestAnimationFrame(() => {
+      focusFrame = requestAnimationFrame(() => {
         const el = inputRef.current;
         if (el) {
+          resizeInput();
           el.focus();
           const len = el.value.length;
           try { el.setSelectionRange(len, len); } catch { /* noop */ }
         }
       });
-    }
-  }, [initialInput]);
+    });
+
+    return () => {
+      cancelAnimationFrame(inputFrame);
+      if (focusFrame) cancelAnimationFrame(focusFrame);
+    };
+  }, [initialInput, resizeInput]);
 
   // Listen for new-chat event from titlebar
   useEffect(() => {
@@ -155,6 +176,7 @@ function Chat({
     if (input.trim() && !isLoading && !isExecuting) {
       onSendMessage(input.trim());
       setInput('');
+      requestAnimationFrame(resizeInput);
       // keep focus in the textarea so user can continue typing
       inputRef.current?.focus();
     }

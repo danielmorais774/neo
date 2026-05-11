@@ -3,14 +3,14 @@ mod grpc_gen;
 mod services;
 mod websocket;
 
+use crate::websocket::DeviceWsManager;
+use log::info;
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     Manager,
 };
-use std::sync::{Arc, Mutex};
-use log::info;
-use crate::websocket::DeviceWsManager;
 
 pub struct AppState {
     pub device_id: String,
@@ -48,9 +48,11 @@ pub fn run() {
     info!("[Neo] Device ID: {}", device_id);
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
@@ -79,6 +81,10 @@ pub fn run() {
             commands::handle_notification_action,
             commands::list_connected_devices,
             commands::resize_notification_window,
+            commands::set_notification_window_interactive,
+            commands::set_notification_window_focusable,
+            commands::is_cursor_over_notification_window,
+            commands::hide_notification_window,
         ])
         .setup(|app| {
             info!("[Neo] Desktop initialized!");
@@ -94,54 +100,63 @@ pub fn run() {
             // which leaks through the rounded corners of the notification body.
             if let Some(notif_window) = app.get_webview_window("notification") {
                 let _ = notif_window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
+                let _ = notif_window.set_focusable(false);
+                let _ = notif_window.set_ignore_cursor_events(true);
             }
 
             // Get icon path
-            let icon_path = app.path().resource_dir()
+            let icon_path = app
+                .path()
+                .resource_dir()
                 .unwrap_or_default()
                 .join("icons")
                 .join("icon.png");
 
             // Create system tray with menu
             let open_item = MenuItem::with_id(app, "open", "💬 Abrir Chat", true, None::<&str>)?;
-            let agent_item = MenuItem::with_id(app, "agent", "🤖 Abrir Agente", true, None::<&str>)?;
+            let agent_item =
+                MenuItem::with_id(app, "agent", "🤖 Abrir Agente", true, None::<&str>)?;
             let help_item = MenuItem::with_id(app, "help", "🔍 Ajuda Rápida", true, None::<&str>)?;
             let separator = MenuItem::with_id(app, "sep", "─────────", false, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "❌ Sair", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&open_item, &agent_item, &help_item, &separator, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[&open_item, &agent_item, &help_item, &separator, &quit_item],
+            )?;
 
             let _tray = TrayIconBuilder::new()
-                .icon(tauri::image::Image::from_path(&icon_path).unwrap_or_else(|_| {
-                    tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png")).unwrap()
-                }))
+                .icon(
+                    tauri::image::Image::from_path(&icon_path).unwrap_or_else(|_| {
+                        tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                            .unwrap()
+                    }),
+                )
                 .tooltip("Neo Assistant")
                 .menu(&menu)
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "open" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
-                        "agent" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "help" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "quit" => {
-                            app.exit(0);
-                        }
-                        _ => {}
                     }
+                    "agent" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "help" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let tauri::tray::TrayIconEvent::Click { .. } = event {
@@ -159,15 +174,15 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let state = app.state::<AppState>();
             let device_id = state.device_id.clone();
-            
+
             // Create and start WebSocket manager
             let ws_manager = Arc::new(DeviceWsManager::new(device_id, app_handle.clone()));
-            
+
             // Store in state for later cleanup
             if let Ok(mut guard) = state.ws_manager.lock() {
                 *guard = Some(ws_manager.clone());
             }
-            
+
             // Connect WebSockets
             let ws_manager_clone = ws_manager.clone();
             tauri::async_runtime::spawn(async move {
