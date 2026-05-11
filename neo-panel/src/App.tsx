@@ -1,4 +1,5 @@
 import { Admin, Resource } from 'react-admin';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import DebugPanel from './DebugPanel';
 import NeoFrameAnalyzer from './NeoFrameAnalyzer';
@@ -7,10 +8,14 @@ import SessionLogsPanel from './SessionLogsPanel';
 import KnowledgeGraphPanel from './KnowledgeGraphPanel';
 import WhatsAppPanel from './WhatsAppPanel';
 import WhatsAppStatusPanel from './WhatsAppStatusPanel';
+import MissionsPanel from './MissionsPanel';
+import ConnectedDevicesPanel from './ConnectedDevicesPanel';
+import Sidebar from './Sidebar';
+import { ToastContainer, useToast } from './ToastNotification';
 
 const dataProvider = {
   getList: async (resource: string, _params: any) => {
-    const response = await fetch(`http://localhost:8001/logs/${resource}`);
+    const response = await fetch(`http://localhost:8000/logs/${resource}`);
     if (!response.ok) {
       throw new Error('Failed to fetch logs');
     }
@@ -38,7 +43,7 @@ const AllLogsList = () => {
   const fetchAllLogs = async () => {
     const logsPromises = stages.map(async (stage) => {
       try {
-        const response = await fetch(`http://localhost:8001/logs/${stage}`);
+        const response = await fetch(`http://localhost:8000/logs/${stage}`);
         if (!response.ok) return { stage, logs: [] };
         const data = await response.json();
         return { stage, logs: data.logs.map((log: any, index: number) => ({ ...log, id: `${stage}-${index}` })) };
@@ -64,7 +69,7 @@ const AllLogsList = () => {
     <div>
       <h1>All Pipeline Logs</h1>
       <button onClick={async () => {
-        await fetch('http://localhost:8001/clear-logs', { method: 'POST' });
+        await fetch('http://localhost:8000/clear-logs', { method: 'POST' });
         fetchAllLogs();
       }} style={{ marginBottom: '20px' }}>Clear Logs</button>
       {stages.map((stage) => (
@@ -83,62 +88,50 @@ const AllLogsList = () => {
 
 const Dashboard = () => <AllLogsList />;
 
-const TAB_STYLE = (active: boolean): React.CSSProperties => ({
-  padding: '8px 20px',
-  cursor: 'pointer',
-  border: 'none',
-  borderBottom: active ? '2px solid #7c3aed' : '2px solid transparent',
-  background: 'transparent',
-  color: active ? '#a78bfa' : '#64748b',
-  fontWeight: active ? 600 : 400,
-  fontSize: 14,
-  transition: 'color 0.15s',
-})
-
 function App() {
-  const [tab, setTab] = useState<'logs' | 'debug' | 'vision' | 'frame' | 'session-logs' | 'knowledge-graph' | 'whatsapp' | 'whatsapp-status'>('whatsapp-status')
+  const { toasts, removeToast } = useToast();
 
   return (
-    <div style={{ background: '#0f1117', height: '100vh', display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden' }}>
-      {/* Top tab bar */}
+    <BrowserRouter>
       <div style={{
+        background: '#0f1117',
+        height: '100vh',
         display: 'flex',
-        alignItems: 'center',
-        gap: 8,
-        background: '#13161f',
-        borderBottom: '1px solid #1e2235',
-        padding: '0 20px',
+        flexDirection: 'column',
+        width: '100%',
+        overflow: 'hidden'
       }}>
-        <span style={{ color: '#7c3aed', fontWeight: 700, marginRight: 12 }}>Neo Panel</span>
-        <button style={TAB_STYLE(tab === 'debug')} onClick={() => setTab('debug')}>🔬 Debug</button>
-        <button style={TAB_STYLE(tab === 'session-logs')} onClick={() => setTab('session-logs')}>📝 Session Logs</button>
-        <button style={TAB_STYLE(tab === 'vision')} onClick={() => setTab('vision')}>🎬 Vision</button>
-        <button style={TAB_STYLE(tab === 'frame')} onClick={() => setTab('frame')}>🔍 Frame</button>
-        <button style={TAB_STYLE(tab === 'knowledge-graph')} onClick={() => setTab('knowledge-graph')}>🕸️ Knowledge Graph</button>
-        <button style={TAB_STYLE(tab === 'whatsapp')} onClick={() => setTab('whatsapp')}>📱 WhatsApp</button>
-        <button style={TAB_STYLE(tab === 'whatsapp-status')} onClick={() => setTab('whatsapp-status')}>🔑 WhatsApp Status</button>
-        <button style={TAB_STYLE(tab === 'logs')} onClick={() => setTab('logs')}>📋 Logs (legado)</button>
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          <Sidebar />
+          <main style={{ flex: 1, overflow: 'auto' }}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/whatsapp-status" replace />} />
+              <Route path="/whatsapp-status" element={<WhatsAppStatusPanel />} />
+              <Route path="/whatsapp" element={<WhatsAppPanel />} />
+              <Route path="/debug" element={<DebugPanel />} />
+              <Route path="/session-logs" element={<SessionLogsPanel />} />
+              <Route path="/vision" element={<NeoVisionPanel />} />
+              <Route path="/frame" element={<NeoFrameAnalyzer />} />
+              <Route path="/knowledge-graph" element={<KnowledgeGraphPanel />} />
+              <Route path="/missions" element={<MissionsPanel />} />
+              <Route path="/devices" element={<ConnectedDevicesPanel />} />
+              <Route path="/logs" element={
+                <Admin dataProvider={dataProvider} dashboard={Dashboard}>
+                  <Resource name="validation" />
+                  <Resource name="classification" />
+                  <Resource name="external" />
+                  <Resource name="build_prompt" />
+                  <Resource name="generate_response" />
+                  <Resource name="post_process" />
+                </Admin>
+              } />
+            </Routes>
+          </main>
+        </div>
+        <ToastContainer toasts={toasts} onRemove={removeToast} position="bottom-right" />
       </div>
-
-      {tab === 'knowledge-graph' && <KnowledgeGraphPanel />}
-      {tab === 'whatsapp' && <WhatsAppPanel />}
-      {tab === 'whatsapp-status' && <WhatsAppStatusPanel />}
-      {tab === 'debug' && <DebugPanel />}
-      {tab === 'session-logs' && <SessionLogsPanel />}
-      {tab === 'vision' && <NeoVisionPanel />}
-      {tab === 'frame' && <NeoFrameAnalyzer />}
-      {tab === 'logs' && (
-        <Admin dataProvider={dataProvider} dashboard={Dashboard}>
-          <Resource name="validation" />
-          <Resource name="classification" />
-          <Resource name="external" />
-          <Resource name="build_prompt" />
-          <Resource name="generate_response" />
-          <Resource name="post_process" />
-        </Admin>
-      )}
-    </div>
-  )
+    </BrowserRouter>
+  );
 }
 
 export default App;

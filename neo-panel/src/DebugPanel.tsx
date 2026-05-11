@@ -710,6 +710,48 @@ export default function DebugPanel() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(true)
+  const [notifStatus, setNotifStatus] = useState<'idle' | 'sending' | 'ok' | 'err'>('idle')
+  const [targetDeviceId, setTargetDeviceId] = useState('5a998544-c3f3-423f-bebb-1cc42fca6063')
+
+  const sendTestNotification = useCallback(async () => {
+    setNotifStatus('sending')
+    try {
+      const payload = {
+        id: `test-${Date.now()}`,
+        user_id: 'test-user',
+        mission_id: null,
+        kind: 'approval_required',
+        title: 'Teste de Notificação',
+        description: 'Esta é uma notificação de teste enviada pelo botão no neo-panel.',
+        fields: [
+          { label: 'Enviado de', value: 'neo-panel DebugPanel' },
+          { label: 'Timestamp', value: new Date().toISOString() },
+        ],
+        actions: [
+          { action_type: 'reply', label: 'Responder', payload: { teste: true } },
+          { action_type: 'dismiss', label: 'Dispensar', payload: null },
+        ],
+        payload: { source: 'debug-panel-test' },
+        created_at_unix: Math.floor(Date.now() / 1000),
+        config: {
+          duration_ms: 0,
+          position: 'bottom_right',
+          persistent: true,
+          play_sound: true,
+        },
+        device_id: targetDeviceId,
+      }
+      const res = await fetch('http://localhost:8000/api/v1/debug/test-notification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      setNotifStatus(res.ok ? 'ok' : 'err')
+    } catch {
+      setNotifStatus('err')
+    }
+    setTimeout(() => setNotifStatus('idle'), 3000)
+  }, [targetDeviceId])
 
   // Lifted expand state — keyed stably so refresh doesn't collapse open cards
   const [openTraces, setOpenTraces] = useState<Set<string>>(new Set())
@@ -803,6 +845,28 @@ export default function DebugPanel() {
         </button>
         <button onClick={loadSessions} className="header-btn">
           🔄 Refresh
+        </button>
+        <input
+          value={targetDeviceId}
+          onChange={e => setTargetDeviceId(e.target.value)}
+          placeholder="device_id"
+          style={{
+            background: '#13161f',
+            border: '1px solid #1e2235',
+            borderRadius: 6,
+            padding: '4px 10px',
+            color: '#e2e8f0',
+            fontSize: 12,
+            width: 180,
+            outline: 'none',
+          }}
+        />
+        <button
+          onClick={sendTestNotification}
+          className={`header-btn ${notifStatus === 'ok' ? 'btn-success' : notifStatus === 'err' ? 'btn-err' : ''}`}
+          style={notifStatus === 'ok' ? { background: '#065f46' } : notifStatus === 'err' ? { background: '#7f1d1d' } : {}}
+        >
+          {notifStatus === 'sending' ? '⏳ Enviando…' : notifStatus === 'ok' ? '✅ Notificação enviada' : notifStatus === 'err' ? '❌ Erro' : '🔔 Testar Notificação'}
         </button>
       </div>
 

@@ -21,7 +21,16 @@ export default function WhatsAppStatus() {
 
   // Connect to WebSocket for real-time updates
   useEffect(() => {
+    let mounted = true
+
+    // Initial fetch in case WS takes a moment to connect
+    fetch(`${REST_URL}/qr-status`)
+      .then(r => r.json())
+      .then(data => { if (mounted) setQrStatus(data) })
+      .catch(() => { if (mounted) setQrStatus({ qr: null, state: 'unreachable' }) })
+
     const connect = () => {
+      if (!mounted) return
       const ws = new WebSocket(WS_URL)
 
       ws.onopen = () => {
@@ -40,8 +49,10 @@ export default function WhatsAppStatus() {
 
       ws.onclose = () => {
         wsConnectedRef.current = false
-        console.log('[WS] QR status disconnected, reconnecting in 3s')
-        setTimeout(connect, 3000)
+        if (mounted) {
+          console.log('[WS] QR status disconnected, reconnecting in 3s')
+          setTimeout(connect, 3000)
+        }
       }
 
       ws.onerror = () => {
@@ -54,6 +65,7 @@ export default function WhatsAppStatus() {
     connect()
 
     return () => {
+      mounted = false
       if (wsRef.current) {
         wsRef.current.onclose = null // prevent reconnect on intentional unmount
         wsRef.current.close()
