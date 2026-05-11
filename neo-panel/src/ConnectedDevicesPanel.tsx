@@ -469,6 +469,44 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
           />
         </div>
 
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <button
+            onClick={() => {
+              setNotifKind('approval_required');
+              setNotifTitle('Confirmação Necessária');
+              setNotifDescription('Clique em Confirmar para prosseguir');
+              setActions([
+                { label: '✅ Confirmar', actionType: 'reply', buttonStyle: 'contained' },
+                { label: '❌ Cancelar', actionType: 'dismiss', buttonStyle: 'outlined' },
+              ]);
+            }}
+            style={{
+              flex: 1, padding: '8px 12px', borderRadius: 8,
+              background: '#059669', color: '#fff', border: 'none',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600
+            }}
+          >
+            ⚡ Notificação Confirm Reply
+          </button>
+          <button
+            onClick={() => {
+              setNotifKind('mission_started');
+              setNotifTitle('Missao Iniciada');
+              setNotifDescription('Uma nova missao foi iniciada com sucesso');
+              setActions([
+                { label: 'Ver Detalhes', actionType: 'reply', buttonStyle: 'outlined' },
+              ]);
+            }}
+            style={{
+              flex: 1, padding: '8px 12px', borderRadius: 8,
+              background: '#7c3aed', color: '#fff', border: 'none',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600
+            }}
+          >
+            🚀 Notificação Mission
+          </button>
+        </div>
+
         <button
           onClick={sendTestNotification}
           disabled={sending || !device.is_online || !device.ws_connection_id}
