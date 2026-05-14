@@ -213,6 +213,15 @@ class AgentExecutor:
 
         # Construir mensagens iniciais
         initial_messages = prompt_builder.build_initial_messages(task, available_tools)
+        if memory and memory.get_messages():
+            task_message = initial_messages[-1]
+            memory_messages = [
+                msg for msg in memory.get_messages()
+                if msg.role != MessageRole.SYSTEM
+            ]
+            initial_messages = [initial_messages[0], *memory_messages]
+            if not memory_messages or not self._same_message(memory_messages[-1], task_message):
+                initial_messages.append(task_message)
 
         # Injetar hints de loop do outer loop
         for loop_type in loop_hints:
@@ -234,7 +243,8 @@ class AgentExecutor:
 
         if memory:
             for msg in initial_messages:
-                memory.add_message(msg)
+                if not any(self._same_message(existing, msg) for existing in memory.messages):
+                    memory.add_message(msg)
 
         try:
             while iteration < self.settings.max_iterations:
@@ -346,6 +356,10 @@ class AgentExecutor:
         ex = executor or self.tool_executor
         tasks = [ex.execute_tool_call(tc) for tc in tool_calls]
         return await asyncio.gather(*tasks)
+
+    @staticmethod
+    def _same_message(left: Message, right: Message) -> bool:
+        return left.role == right.role and left.content == right.content
 
     @staticmethod
     def _build_result(

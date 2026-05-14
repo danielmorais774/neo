@@ -123,6 +123,7 @@ class WhatsAppMessagingExecutor:
             tool_name="whatsapp_send_message",
             tool_call_id=message_id,
             user_id=user_id,
+            mission_id=mission_id,
         )
 
         await self.db.update_mission_status(

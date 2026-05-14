@@ -225,11 +225,27 @@ async def _process_inbound(
             db=_db,
             broker=_skill_executor.broker,
         )
+        history_messages = await _db.fetch_session_messages(
+            mission.session_id,
+            limit=30,
+            roles=["user", "assistant"],
+            exclude_tool_calls=True,
+        )
+        history = [
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "tool_name": msg.tool_name or "",
+                "mission_id": str(msg.mission_id) if msg.mission_id else "",
+            }
+            for msg in history_messages
+            if msg.content and len(msg.content.strip()) >= 5
+        ]
 
         await pipeline.run(
             session_id=mission.session_id,
             user_message=text,
-            history=[],
+            history=history,
             mission_id=mission.id,
             extra={
                 "user_id": mission.user_id,

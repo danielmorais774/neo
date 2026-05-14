@@ -16,6 +16,7 @@ Inbound replies and approvals reuse the existing handlers.
 import logging
 import os
 import re
+import asyncio
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 from core.agent.agent_executor import AgentExecutor
 from core.agent.prompt_builder import PromptBuilder
+from core.memory import ConversationMemory
 from core.skills import SkillPipeline, SkillResult
 from core.skills.whatsapp_messaging.executor import WhatsAppMessagingExecutor
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
@@ -96,6 +98,10 @@ _COMMERCIAL_HINTS = {
 
 _JID_RE = re.compile(r"\b(\d{6,20}@(?:c\.us|lid|s\.whatsapp\.net|g\.us))\b")
 _PHONE_RE = re.compile(r"\+?\d{10,15}")
+_DEFAULT_MESSAGE_DELAY_MS = 1200
+_MAX_PERSONAL_MESSAGE_PARTS = 3
+_MAX_COMMERCIAL_MESSAGE_PARTS = 2
+_MAX_MESSAGE_PART_CHARS = 180
 
 
 class WhatsAppMessagingPipeline(SkillPipeline):
@@ -223,7 +229,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
             if extra.get("approved") is not None:
                 return await self._handle_approval(mission, extra, slog)
-            return await self._handle_inbound(mission, user_message, slog, extra)
+            return await self._handle_inbound(mission, user_message, slog, extra, history)
 
         return await self._handle_kickoff(session_id, user_message, extra, slog, user_id)
 
@@ -434,10 +440,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         draft_text: str,
         slog: "SessionFileLogger",
     ) -> SkillResult:
+        draft_messages = _split_whatsapp_messages(draft_text, mode="personal")
         await self.db.update_mission_status(
             mission_id,
             status="awaiting_confirmation",
-            extra_metadata={"draft_text": draft_text},
+            extra_metadata={"draft_text": draft_text, "draft_messages": draft_messages},
         )
         await self.db.set_mission_next_action(
             mission_id=mission_id,
@@ -445,15 +452,18 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             action_params={
                 "jid": contact_jid,
                 "text": draft_text,
+                "messages": draft_messages,
+                "delay_ms": _DEFAULT_MESSAGE_DELAY_MS,
                 "idempotency_key": str(mission_id),
             },
         )
 
         phone_label = contact_phone or _phone_from_jid(contact_jid) or contact_jid
-        body = f"Para {contact_label} ({phone_label}):\n\n{draft_text}"
+        body = _build_approval_body(contact_label, phone_label, draft_text, draft_messages)
         notification_payload = {
             "mission_id": str(mission_id),
             "draft_text": draft_text,
+            "draft_messages": draft_messages,
             "contact_label": contact_label,
             "contact_jid": contact_jid,
             "contact_phone_e164": contact_phone or phone_label,
@@ -482,6 +492,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 "contact_jid": contact_jid,
                 "phone": phone_label,
                 "draft_text": draft_text,
+                "draft_messages": draft_messages,
                 "notification": {
                     "kind": "confirm_reply",
                     "title": f"Enviar mensagem para {contact_label}",
@@ -498,6 +509,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             "contactJid": contact_jid,
             "contactPhone": contact_phone or phone_label,
             "draftText": draft_text,
+            "draftMessages": draft_messages,
         }, ensure_ascii=False)
         return SkillResult(
             ok=True,
@@ -617,6 +629,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         inbound_text: str,
         slog: "SessionFileLogger",
         extra: dict[str, Any],
+        history: list[dict[str, str]] | None = None,
     ) -> SkillResult:
         locked = await self.db.lock_mission_for_update(mission.id)
         if not locked:
@@ -657,12 +670,14 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 inbound_text=inbound_text,
                 slog=slog,
             )
+            reply_messages = _split_whatsapp_messages(reply_text, mode="personal")
             await self.db.update_mission_status(
                 mission.id,
                 status="awaiting_confirmation",
                 extra_metadata={
                     "last_inbound_text": inbound_text,
                     "draft_text": reply_text,
+                    "draft_messages": reply_messages,
                     "pending_inbound_ack": True,
                 },
             )
@@ -672,6 +687,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 action_params={
                     "jid": mission.contact_jid,
                     "text": reply_text,
+                    "messages": reply_messages,
+                    "delay_ms": _DEFAULT_MESSAGE_DELAY_MS,
                     "idempotency_key": str(mission.id),
                 },
             )
@@ -684,15 +701,23 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 "contact_phone_e164": contact_phone or phone_label,
                 "inbound_text": inbound_text,
                 "draft_text": reply_text,
+                "draft_messages": reply_messages,
                 "mode": "personal",
                 "pending_inbound_ack": True,
             }
+            approval_body = _build_approval_body(
+                contact_label,
+                phone_label,
+                reply_text,
+                reply_messages,
+                prefix=f"Recebido: {inbound_text}",
+            )
             await self._notify(
                 user_id=mission.user_id,
                 mission_id=mission.id,
                 kind="confirm_reply",
                 title=f"Aprovar resposta para {contact_label}",
-                body=f"Recebido: {inbound_text}\n\nVou enviar para {contact_label} ({phone_label}):\n\n{reply_text}",
+                body=approval_body,
                 payload=notification_payload,
                 actions=[
                     {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
@@ -707,10 +732,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     "mission_id": str(mission.id),
                     "received_text": inbound_text,
                     "draft_reply": reply_text,
+                    "draft_messages": reply_messages,
                     "notification": {
                         "kind": "confirm_reply",
                         "title": f"Aprovar resposta para {contact_label}",
-                        "body": f"Recebido: {inbound_text}\n\nVou enviar para {contact_label} ({phone_label}):\n\n{reply_text}",
+                        "body": approval_body,
                         "payload": notification_payload,
                     },
                 },
@@ -722,12 +748,19 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 mission_id=mission.id,
             )
 
+        memory = await self._build_conversation_memory(
+            session_id=mission.session_id,
+            current_user_message=inbound_text,
+            history=history,
+            mission_id=mission.id,
+        )
         system_prompt = self._build_system_prompt(
             mode="commercial",
             contact_label=contact_label or mission.title,
             contact_jid=mission.contact_jid,
             contact_phone=contact_phone,
             goal=mission.goal,
+            goal_status=self._build_goal_status(memory),
         )
         slog.log_event(
             "whatsapp_messaging.inbound_commercial_system_prompt",
@@ -737,6 +770,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 "contact_jid": mission.contact_jid,
                 "contact_phone": contact_phone,
                 "goal": mission.goal,
+                "goal_already_communicated": self._has_prior_assistant_message(
+                    memory.get_messages()
+                ),
+                "history_message_count": memory.message_count(),
                 "inbound_text": inbound_text,
                 "system_prompt": system_prompt,
                 "tools": [tool.name for tool in WHATSAPP_MESSAGING_TOOLS],
@@ -744,9 +781,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         )
         slog.log_llm_request(
             stage="whatsapp_messaging.inbound_commercial_initial_agent_request",
-            messages=PromptBuilder(system_prompt=system_prompt).build_initial_messages(
+            messages=self._build_logged_initial_messages(
+                system_prompt,
                 inbound_text,
-                WHATSAPP_MESSAGING_TOOLS,
+                memory,
             ),
             model=self.agent_executor.llm_router.get_default_model(None),
             provider=self.agent_executor.llm_router.get_provider(None).__class__.__name__,
@@ -760,6 +798,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             tool_subset=WHATSAPP_MESSAGING_TOOLS,
             tool_executor=self.executor,
             available_tools=WHATSAPP_MESSAGING_TOOLS,
+            memory=memory,
         )
         self._log_agent_steps(slog, result.get("steps", []))
 
@@ -785,6 +824,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         "Responda como Daniel responderia: natural, direto e sem formalidade excessiva. "
                         "Retorne somente o texto da mensagem, sem aspas, sem explicação, "
                         "sem markdown e com no máximo 180 caracteres. "
+                        "Assuma que o contato já conhece o contexto anterior da conversa. "
+                        "Reaja principalmente à última mensagem recebida do contato. "
+                        "Não repita nem reexplique o pedido original do usuário, salvo se o contato pedir esclarecimento. "
+                        "Evite respostas completas demais; prefira continuação natural da conversa. "
+                        "Não adicione risadas, emojis ou gírias fortes sem sinal explícito no contexto. "
                         "Não invente horário, motivo, preço, endereço nem compromisso que não esteja no contexto. "
                         "Se a resposta exigir uma informação ausente, faça uma pergunta curta."
                     ),
@@ -795,8 +839,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         f"Pedido original do usuário: {mission_goal}\n"
                         f"Contato: {contact_label}\n"
                         f"Mensagem recebida do contato: {inbound_text}\n\n"
-                        "Escreva uma resposta curta apropriada para enviar ao contato, "
-                        "mantendo o tom de conversa de WhatsApp."
+                        "Escreva uma resposta curta reagindo à mensagem recebida. "
+                        "Use o pedido original apenas para entender o contexto, não para repetir informações já comunicadas."
                     ),
                 ),
             ]
@@ -881,7 +925,20 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         target_jid = action_params.get("jid") or mission.contact_jid
         action_text = action_params.get("text") or (mission.extra_metadata or {}).get("draft_text", "")
         text_to_send = edited_text or action_text
-        logger.info(f"_handle_approval: mission={mission.id} approved={approved} text_to_send={text_to_send[:50] if text_to_send else 'EMPTY'}")
+        message_parts = _normalize_message_parts(
+            _split_whatsapp_messages(text_to_send, mode=(mission.extra_metadata or {}).get("mode", "personal"))
+            if edited_text
+            else action_params.get("messages"),
+            fallback_text=text_to_send,
+        )
+        delay_ms = _normalize_delay_ms(action_params.get("delay_ms"))
+        logger.info(
+            "_handle_approval: mission=%s approved=%s parts=%s text=%s",
+            mission.id,
+            approved,
+            len(message_parts),
+            text_to_send[:50] if text_to_send else "EMPTY",
+        )
         if not text_to_send:
             slog.log_error_recovery(
                 1,
@@ -899,6 +956,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             "json": {
                 "jid": target_jid,
                 "text": text_to_send,
+                "messages": message_parts,
+                "delay_ms": delay_ms,
                 "idempotency_key": action_params.get("idempotency_key") or str(mission.id),
             },
         }
@@ -908,18 +967,31 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             execution="server-side",
         )
         start = perf_counter()
+        sent_messages: list[dict[str, Any]] = []
         try:
-            message_id = await self.gateway.send_message(
-                jid=target_jid,
-                text=text_to_send,
-                idempotency_key=action_params.get("idempotency_key") or str(mission.id),
-            )
+            base_idempotency_key = action_params.get("idempotency_key") or str(mission.id)
+            for index, message_part in enumerate(message_parts):
+                message_id = await self.gateway.send_message(
+                    jid=target_jid,
+                    text=message_part,
+                    idempotency_key=f"{base_idempotency_key}:{index}",
+                )
+                sent_messages.append(
+                    {
+                        "index": index,
+                        "message_id": message_id,
+                        "text": message_part,
+                    }
+                )
+                if index < len(message_parts) - 1:
+                    await asyncio.sleep(delay_ms / 1000)
         except Exception as e:
             logger.error("Approval send failed: mission=%s err=%s", mission.id, e)
             slog.log_tool_result(
                 tool_name="whatsapp_send_message",
                 success=False,
                 error=str(e),
+                result={"sent_messages": sent_messages},
                 duration_ms=(perf_counter() - start) * 1000,
                 execution="server-side",
             )
@@ -929,36 +1001,56 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         slog.log_tool_result(
             tool_name="whatsapp_send_message",
             success=True,
-            result={"message_id": message_id, "to": target_jid},
+            result={
+                "message_ids": [m["message_id"] for m in sent_messages],
+                "messages": sent_messages,
+                "to": target_jid,
+                "delay_ms": delay_ms,
+            },
             duration_ms=(perf_counter() - start) * 1000,
             execution="server-side",
         )
 
-        await self.db.save_message(
-            session_id=mission.session_id,
-            role="assistant",
-            content=text_to_send,
-            tool_name="whatsapp_send_message",
-            tool_call_id=message_id,
-            user_id=mission.user_id,
-            mission_id=mission.id,
-        )
+        for item in sent_messages:
+            await self.db.save_message(
+                session_id=mission.session_id,
+                role="assistant",
+                content=item["text"],
+                tool_name="whatsapp_send_message",
+                tool_call_id=item["message_id"],
+                user_id=mission.user_id,
+                mission_id=mission.id,
+                metadata={
+                    "batch_id": str(mission.id),
+                    "batch_index": item["index"],
+                    "batch_size": len(sent_messages),
+                    "send_mode": "batch" if len(sent_messages) > 1 else "single",
+                },
+            )
+        last_message_id = sent_messages[-1]["message_id"]
         slog.log_event(
-            "Outbound message saved",
+            "Outbound messages saved",
             {
                 "mission_id": str(mission.id),
                 "session_id": str(mission.session_id),
                 "role": "assistant",
                 "tool_name": "whatsapp_send_message",
-                "tool_call_id": message_id,
+                "message_count": len(sent_messages),
+                "message_ids": [m["message_id"] for m in sent_messages],
+                "delay_ms": delay_ms,
                 "content": text_to_send,
+                "messages": [m["text"] for m in sent_messages],
             },
         )
 
         await self.db.update_mission_status(
             mission.id,
             status="awaiting_reply",
-            extra_metadata={"last_outbound_id": message_id},
+            extra_metadata={
+                "last_outbound_id": last_message_id,
+                "last_outbound_ids": [m["message_id"] for m in sent_messages],
+                "last_outbound_messages": [m["text"] for m in sent_messages],
+            },
         )
         await self.db.clear_mission_next_action(mission.id)
         slog.log_event(
@@ -966,7 +1058,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             {
                 "mission_id": str(mission.id),
                 "status": "awaiting_reply",
-                "last_outbound_id": message_id,
+                "last_outbound_id": last_message_id,
+                "message_count": len(sent_messages),
             },
         )
 
@@ -980,7 +1073,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 mission_id=mission.id,
                 kind="mission_completed",
                 title=f"Resposta enviada para {contact_label}",
-                body=f"Recebido: {inbound_text}\n\nEnviado: {text_to_send}",
+                body=_build_sent_body(inbound_text, message_parts),
                 payload={
                     "mission_id": str(mission.id),
                     "contact_label": contact_label,
@@ -988,7 +1081,9 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     "contact_phone_e164": meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid),
                     "inbound_text": inbound_text,
                     "reply_text": text_to_send,
-                    "message_id": message_id,
+                    "reply_messages": message_parts,
+                    "message_id": last_message_id,
+                    "message_ids": [m["message_id"] for m in sent_messages],
                 },
             )
             await self.db.update_mission_status(
@@ -996,9 +1091,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 status="completed",
                 result_summary=summary,
                 extra_metadata={
-                    "last_outbound_id": message_id,
+                    "last_outbound_id": last_message_id,
+                    "last_outbound_ids": [m["message_id"] for m in sent_messages],
                     "last_inbound_text": inbound_text,
                     "auto_reply_text": text_to_send,
+                    "auto_reply_messages": message_parts,
                     "pending_inbound_ack": False,
                 },
             )
@@ -1010,6 +1107,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             "contactJid": mission.contact_jid,
             "contactPhone": (mission.extra_metadata or {}).get("contact_phone_e164") or _phone_from_jid(mission.contact_jid) or mission.contact_jid,
             "draftText": text_to_send,
+            "draftMessages": message_parts,
         }, ensure_ascii=False)
         return SkillResult(
             ok=True,
@@ -1152,6 +1250,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         contact_jid: str,
         contact_phone: str | None,
         goal: str,
+        goal_status: str | None = None,
     ) -> str:
         try:
             template = (Path(__file__).parent / "prompt.md").read_text()
@@ -1164,10 +1263,90 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             contact_jid=contact_jid,
             contact_phone=contact_phone or "(telefone não disponível)",
             goal=goal,
+            goal_status=goal_status or "Ainda não há histórico carregado sobre o andamento do objetivo.",
             user_address=DEFAULT_USER_ADDRESS,
             user_phone=DEFAULT_USER_PHONE,
             user_payment_prefs=DEFAULT_PAYMENT_PREFS,
         )
+
+    async def _build_conversation_memory(
+        self,
+        session_id: UUID,
+        current_user_message: str,
+        history: list[dict[str, str]] | None = None,
+        mission_id: UUID | None = None,
+    ) -> ConversationMemory:
+        memory = ConversationMemory(session_id=session_id)
+        rows = history or await self.db.fetch_session_history(session_id, limit=20)
+        rows = self._whatsapp_conversation_rows(rows, mission_id)
+        for index, row in enumerate(rows):
+            role = row.get("role")
+            content = (row.get("content") or "").strip()
+            if not content or role not in {"user", "assistant"}:
+                continue
+            if role == "user" and content == current_user_message and index == len(rows) - 1:
+                continue
+            memory.add_message(
+                Message(
+                    role=MessageRole(role),
+                    content=content,
+                )
+            )
+        return memory
+
+    @staticmethod
+    def _whatsapp_conversation_rows(
+        rows: list[dict[str, str]],
+        mission_id: UUID | None = None,
+    ) -> list[dict[str, str]]:
+        mission_key = str(mission_id) if mission_id else ""
+        if mission_key and any(row.get("mission_id") == mission_key for row in rows):
+            return [row for row in rows if row.get("mission_id") == mission_key]
+        for index, row in enumerate(rows):
+            if row.get("tool_name") == "whatsapp_send_message":
+                return rows[index:]
+        for index, row in enumerate(rows):
+            if row.get("role") == "assistant":
+                return rows[index:]
+        return []
+
+    def _build_goal_status(self, memory: ConversationMemory) -> str:
+        if self._has_prior_assistant_message(memory.get_messages()):
+            return (
+                "Já houve mensagem enviada por você nesta missão. "
+                "Use o histórico para ver o que já foi comunicado e não repita o objetivo original "
+                "a menos que o contato peça esclarecimento."
+            )
+        return (
+            "Ainda não há mensagem sua no histórico desta missão. "
+            "Se precisar agir, comunique o objetivo sem inventar dados."
+        )
+
+    @staticmethod
+    def _has_prior_assistant_message(messages: list[Message]) -> bool:
+        return any(msg.role == MessageRole.ASSISTANT for msg in messages)
+
+    @staticmethod
+    def _build_logged_initial_messages(
+        system_prompt: str,
+        inbound_text: str,
+        memory: ConversationMemory,
+    ) -> list[Message]:
+        messages = PromptBuilder(system_prompt=system_prompt).build_initial_messages(
+            inbound_text,
+            WHATSAPP_MESSAGING_TOOLS,
+        )
+        if not memory.get_messages():
+            return messages
+        task_message = messages[-1]
+        history_messages = [
+            msg for msg in memory.get_messages()
+            if msg.role != MessageRole.SYSTEM
+        ]
+        messages = [messages[0], *history_messages]
+        if not history_messages or history_messages[-1].content != task_message.content:
+            messages.append(task_message)
+        return messages
 
     def _log_agent_steps(
         self,
@@ -1243,6 +1422,96 @@ def _phone_from_jid(jid: str | None) -> str | None:
         return None
     user = jid.split("@", 1)[0]
     return f"+{user}" if user.isdigit() else None
+
+
+def _split_whatsapp_messages(text: str, mode: str = "personal") -> list[str]:
+    """Split a WhatsApp draft into a small, natural batch of message bubbles."""
+    text = " ".join((text or "").strip().split())
+    if not text:
+        return []
+
+    max_parts = _MAX_COMMERCIAL_MESSAGE_PARTS if mode == "commercial" else _MAX_PERSONAL_MESSAGE_PARTS
+    if len(text) <= 55:
+        return [text]
+
+    protected = re.search(r"https?://|www\.|\b\d{1,2}:\d{2}\b|R\$\s*\d|@\w+|\+\d{10,15}", text)
+    if protected:
+        return [text[:_MAX_MESSAGE_PART_CHARS].strip()]
+
+    sentences = [
+        part.strip(" ,")
+        for part in re.split(r"(?<=[.!?])\s+|\s+-\s+|\s+;\s+", text)
+        if part.strip(" ,")
+    ]
+    if len(sentences) <= 1:
+        sentences = [
+            part.strip(" ,")
+            for part in re.split(r"\s*,\s+|\s+e\s+", text)
+            if part.strip(" ,")
+        ]
+
+    parts: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= 70 or not current:
+            current = candidate
+            continue
+        parts.append(current)
+        current = sentence
+        if len(parts) >= max_parts - 1:
+            break
+
+    remainder = " ".join([current, *sentences[len(parts) + 1:]]).strip()
+    if remainder:
+        parts.append(remainder)
+    if not parts:
+        parts = [text]
+
+    cleaned = [part[:_MAX_MESSAGE_PART_CHARS].strip(" ,") for part in parts if part.strip(" ,")]
+    return cleaned[:max_parts] or [text[:_MAX_MESSAGE_PART_CHARS].strip()]
+
+
+def _normalize_message_parts(value: Any, fallback_text: str) -> list[str]:
+    if isinstance(value, list):
+        parts = [" ".join(str(item).strip().split()) for item in value if str(item).strip()]
+    else:
+        parts = []
+    if not parts:
+        parts = _split_whatsapp_messages(fallback_text, mode="personal")
+    return parts or [fallback_text.strip()]
+
+
+def _normalize_delay_ms(value: Any) -> int:
+    try:
+        delay = int(value)
+    except (TypeError, ValueError):
+        delay = _DEFAULT_MESSAGE_DELAY_MS
+    return max(500, min(delay, 3000))
+
+
+def _format_message_parts(messages: list[str]) -> str:
+    if len(messages) <= 1:
+        return messages[0] if messages else ""
+    return "\n".join(f"{index}. {message}" for index, message in enumerate(messages, start=1))
+
+
+def _build_approval_body(
+    contact_label: str,
+    phone_label: str,
+    draft_text: str,
+    messages: list[str],
+    prefix: str | None = None,
+) -> str:
+    formatted = _format_message_parts(messages or [draft_text])
+    header = f"Vou enviar para {contact_label} ({phone_label}):" if prefix else f"Para {contact_label} ({phone_label}):"
+    if prefix:
+        return f"{prefix}\n\n{header}\n\n{formatted}"
+    return f"{header}\n\n{formatted}"
+
+
+def _build_sent_body(inbound_text: str, messages: list[str]) -> str:
+    return f"Recebido: {inbound_text}\n\nEnviado:\n\n{_format_message_parts(messages)}"
 
 
 def _sanitize_personal_ack(text: str) -> str:
