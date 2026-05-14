@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 interface MissionDetailPanelProps {
   missionId: string;
@@ -7,6 +7,8 @@ interface MissionDetailPanelProps {
 
 interface MissionDetail {
   id: string;
+  session_id: string;
+  parent_session_id: string | null;
   title: string;
   goal: string;
   contact_jid: string;
@@ -15,12 +17,16 @@ interface MissionDetail {
   created_at: string;
   last_activity_at: string;
   completed_at: string | null;
+  next_action_type?: string | null;
+  next_action_params?: Record<string, any>;
   extra_metadata: Record<string, any>;
   result_summary: string | null;
 }
 
 interface MessageRow {
   id: string;
+  mission_id?: string | null;
+  session_id?: string | null;
   role: string;
   content: string;
   tool_name: string | null;
@@ -49,7 +55,14 @@ interface TimelineEvent {
   at: string | null;
 }
 
-type TabKey = 'overview' | 'timeline' | 'messages' | 'notifications';
+type TabKey = 'overview' | 'timeline' | 'messages' | 'notifications' | 'pipeline_logs';
+
+interface MissionPipelineLog {
+  exists: boolean;
+  content: string;
+  path: string;
+  updated_at: number | null;
+}
 
 const STATUS_COLORS: Record<string, string> = {
   pending: '#f59e0b',
@@ -82,23 +95,37 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
   const [messages, setMessages] = useState<MessageRow[]>([]);
   const [notifications, setNotifications] = useState<NotificationRow[]>([]);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [pipelineLog, setPipelineLog] = useState<MissionPipelineLog | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingPipelineLog, setLoadingPipelineLog] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const loadPipelineLog = async () => {
+    setLoadingPipelineLog(true);
+    try {
+      const res = await fetch(`http://localhost:8000/api/v1/missions/${missionId}/pipeline-log`);
+      setPipelineLog(res.ok ? await res.json() : null);
+    } finally {
+      setLoadingPipelineLog(false);
+    }
+  };
 
   const load = async () => {
     try {
       const base = `http://localhost:8000/api/v1/missions/${missionId}`;
-      const [mRes, msgRes, notifRes, tlRes] = await Promise.all([
+      const [mRes, msgRes, notifRes, tlRes, logRes] = await Promise.all([
         fetch(base),
         fetch(`${base}/messages?limit=500`),
         fetch(`${base}/notifications`),
         fetch(`${base}/timeline`),
+        fetch(`${base}/pipeline-log`),
       ]);
       if (!mRes.ok) throw new Error(`Mission ${mRes.status}`);
       setMission(await mRes.json());
       setMessages(msgRes.ok ? await msgRes.json() : []);
       setNotifications(notifRes.ok ? await notifRes.json() : []);
       setTimeline(tlRes.ok ? await tlRes.json() : []);
+      setPipelineLog(logRes.ok ? await logRes.json() : null);
       setError(null);
     } catch (e: any) {
       setError(e.message);
@@ -144,7 +171,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
         {!loading && mission && (
           <>
             <div style={tabsStyle}>
-              {(['timeline', 'overview', 'messages', 'notifications'] as TabKey[]).map(k => (
+              {(['timeline', 'overview', 'messages', 'notifications', 'pipeline_logs'] as TabKey[]).map(k => (
                 <button
                   key={k}
                   onClick={() => setTab(k)}
@@ -157,6 +184,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
                   {k === 'timeline' && `Timeline (${timeline.length})`}
                   {k === 'messages' && `Mensagens (${messages.length})`}
                   {k === 'notifications' && `Notificações (${notifications.length})`}
+                  {k === 'pipeline_logs' && 'Logs Pipeline'}
                 </button>
               ))}
             </div>
@@ -166,6 +194,13 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
               {tab === 'timeline' && <TimelineTab events={timeline} />}
               {tab === 'messages' && <MessagesTab messages={messages} />}
               {tab === 'notifications' && <NotificationsTab notifications={notifications} />}
+              {tab === 'pipeline_logs' && (
+                <PipelineLogsTab
+                  pipelineLog={pipelineLog}
+                  loading={loadingPipelineLog}
+                  onRefresh={loadPipelineLog}
+                />
+              )}
             </div>
           </>
         )}
@@ -196,6 +231,16 @@ function OverviewTab({ mission }: { mission: MissionDetail }) {
           {mission.id}
         </span>
       </Field>
+      <Field label="Session ID">
+        <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace', color: '#93c5fd' }}>
+          {mission.session_id}
+        </span>
+      </Field>
+      <Field label="Parent Session ID">
+        <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace', color: '#93c5fd' }}>
+          {mission.parent_session_id || '-'}
+        </span>
+      </Field>
       <Field label="Objetivo">{mission.goal || '-'}</Field>
       <Field label="Contato">
         {mission.contact_jid}
@@ -203,6 +248,12 @@ function OverviewTab({ mission }: { mission: MissionDetail }) {
       </Field>
       <Field label="Modo">{meta.mode || '-'}</Field>
       <Field label="Canal">{mission.channel}</Field>
+      <Field label="Próxima ação">{mission.next_action_type || '-'}</Field>
+      {mission.next_action_type && (
+        <Field label="Parâmetros da próxima ação">
+          <pre style={jsonBoxStyle}>{JSON.stringify(mission.next_action_params || {}, null, 2)}</pre>
+        </Field>
+      )}
       <Field label="Criada em">{fmt(mission.created_at)}</Field>
       <Field label="Última atividade">{fmt(mission.last_activity_at)}</Field>
       <Field label="Concluída em">{fmt(mission.completed_at)}</Field>
@@ -282,6 +333,7 @@ function MessagesTab({ messages }: { messages: MessageRow[] }) {
             <span style={{ fontWeight: 600 }}>
               {m.role === 'user' ? '👤 Usuário' : m.role === 'assistant' ? '🤖 Assistente' : m.role}
               {m.tool_name && ` · ${m.tool_name}`}
+              {m.mission_id && ' · missão vinculada'}
             </span>
             <span>{fmt(m.created_at)}</span>
           </div>
@@ -316,6 +368,150 @@ function NotificationsTab({ notifications }: { notifications: NotificationRow[] 
       ))}
     </div>
   );
+}
+
+function PipelineLogsTab({
+  pipelineLog,
+  loading,
+  onRefresh,
+}: {
+  pipelineLog: MissionPipelineLog | null;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  const [previewEnabled, setPreviewEnabled] = useState(true);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+        <div style={{ fontSize: 12, color: '#64748b' }}>
+          {pipelineLog?.updated_at
+            ? `Atualizado: ${new Date(pipelineLog.updated_at * 1000).toLocaleString('pt-BR')}`
+            : 'Sem arquivo de log para esta missão'}
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={() => setPreviewEnabled(v => !v)} style={closeBtnStyle}>
+            {previewEnabled ? 'Preview MD: ON' : 'Preview MD: OFF'}
+          </button>
+          <button onClick={onRefresh} style={closeBtnStyle}>
+            {loading ? 'Recarregando...' : 'Recarregar arquivo'}
+          </button>
+        </div>
+      </div>
+
+      {pipelineLog?.exists ? (
+        previewEnabled
+          ? <SimpleMarkdown text={pipelineLog.content} />
+          : <pre style={pipelineLogBoxStyle}>{pipelineLog.content}</pre>
+      ) : (
+        <p style={{ color: '#64748b' }}>Arquivo ainda não foi gerado.</p>
+      )}
+    </div>
+  );
+}
+
+function SimpleMarkdown({ text }: { text: string }) {
+  const rendered = useMemo(() => {
+    const lines = text.split('\n');
+    const elements: React.ReactNode[] = [];
+    let key = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.startsWith('```')) {
+        const language = line.slice(3).trim();
+        const codeLines: string[] = [];
+        i += 1;
+        while (i < lines.length && !lines[i].startsWith('```')) {
+          codeLines.push(lines[i]);
+          i += 1;
+        }
+        elements.push(
+          <div key={key++} style={markdownCodeBlockWrapStyle}>
+            {language && <div style={markdownCodeLangStyle}>{language}</div>}
+            <pre style={markdownCodeBlockStyle}>{codeLines.join('\n') || ' '}</pre>
+          </div>
+        );
+        continue;
+      }
+
+      if (/^---+$/.test(line.trim())) {
+        elements.push(<hr key={key++} style={{ border: 'none', borderTop: '1px solid #2d3355', margin: '12px 0' }} />);
+        continue;
+      }
+
+      const hMatch = line.match(/^(#{1,4})\s+(.+)$/);
+      if (hMatch) {
+        const level = hMatch[1].length;
+        const sizes = [19, 16, 14, 13];
+        const colors = ['#e2e8f0', '#93c5fd', '#67e8f9', '#94a3b8'];
+        elements.push(
+          <div key={key++} style={{ fontSize: sizes[level - 1], fontWeight: 700, color: colors[level - 1], marginTop: level <= 2 ? 14 : 8, marginBottom: 5 }}>
+            {inlineFormat(line.replace(/^#{1,4}\s+/, ''))}
+          </div>
+        );
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(line)) {
+        const content = line.replace(/^\s*[-*]\s+/, '');
+        elements.push(
+          <div key={key++} style={{ display: 'flex', gap: 6, fontSize: 12, color: '#cbd5e1', lineHeight: 1.7 }}>
+            <span style={{ color: '#64748b' }}>•</span>
+            <span>{inlineFormat(content)}</span>
+          </div>
+        );
+        continue;
+      }
+
+      if (!line.trim()) {
+        elements.push(<div key={key++} style={{ height: 8 }} />);
+        continue;
+      }
+
+      elements.push(
+        <div key={key++} style={{ fontSize: 12, color: '#cbd5e1', lineHeight: 1.7 }}>
+          {inlineFormat(line)}
+        </div>
+      );
+    }
+
+    return elements;
+  }, [text]);
+
+  return <div style={pipelineLogMarkdownBoxStyle}>{rendered}</div>;
+}
+
+function inlineFormat(text: string): React.ReactNode {
+  const parts: React.ReactNode[] = [];
+  const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let k = 0;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index));
+    }
+    if (match[2]) {
+      parts.push(<strong key={k++} style={{ color: '#e2e8f0', fontWeight: 700 }}>{match[2]}</strong>);
+    } else if (match[3]) {
+      parts.push(<em key={k++} style={{ color: '#a5b4fc' }}>{match[3]}</em>);
+    } else if (match[4]) {
+      parts.push(
+        <code key={k++} style={{ background: '#111827', color: '#c4b5fd', padding: '1px 5px', borderRadius: 3, fontSize: '0.9em' }}>
+          {match[4]}
+        </code>
+      );
+    }
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex));
+  }
+  return parts.length > 0 ? <>{parts}</> : text;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -401,4 +597,69 @@ const draftBoxStyle: React.CSSProperties = {
   borderRadius: 4,
   fontStyle: 'italic',
   color: '#cbd5e1',
+};
+
+const jsonBoxStyle: React.CSSProperties = {
+  margin: 0,
+  padding: '8px 10px',
+  background: '#0b0f1a',
+  border: '1px solid #263149',
+  borderRadius: 4,
+  color: '#cbd5e1',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+  fontSize: 11,
+  lineHeight: 1.45,
+};
+
+const pipelineLogBoxStyle: React.CSSProperties = {
+  margin: 0,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+  fontSize: 12,
+  lineHeight: 1.45,
+  color: '#cbd5e1',
+  background: '#0b0f1a',
+  border: '1px solid #2d3355',
+  borderRadius: 6,
+  padding: '12px 14px',
+  maxHeight: '70vh',
+  overflow: 'auto',
+};
+
+const pipelineLogMarkdownBoxStyle: React.CSSProperties = {
+  background: '#0b0f1a',
+  border: '1px solid #2d3355',
+  borderRadius: 6,
+  padding: '12px 14px',
+  maxHeight: '70vh',
+  overflow: 'auto',
+};
+
+const markdownCodeBlockWrapStyle: React.CSSProperties = {
+  margin: '10px 0',
+  border: '1px solid #263149',
+  borderRadius: 6,
+  background: '#080d16',
+  overflow: 'hidden',
+};
+
+const markdownCodeLangStyle: React.CSSProperties = {
+  padding: '6px 10px',
+  borderBottom: '1px solid #263149',
+  color: '#93c5fd',
+  background: '#111827',
+  fontSize: 11,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+};
+
+const markdownCodeBlockStyle: React.CSSProperties = {
+  margin: 0,
+  padding: '10px 12px',
+  color: '#dbeafe',
+  whiteSpace: 'pre',
+  overflowX: 'auto',
+  fontSize: 12,
+  lineHeight: 1.55,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
 };

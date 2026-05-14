@@ -4,6 +4,8 @@ import MissionDetailPanel from './MissionDetailPanel';
 interface Mission {
   id: string;
   user_id: string;
+  session_id: string;
+  parent_session_id: string | null;
   title: string;
   goal: string;
   contact_jid: string;
@@ -12,6 +14,8 @@ interface Mission {
   created_at: string;
   last_activity_at: string;
   completed_at: string | null;
+  next_action_type?: string | null;
+  next_action_params?: Record<string, any>;
   extra_metadata: Record<string, any>;
   result_summary: string | null;
 }
@@ -36,6 +40,23 @@ const STATUS_LABELS: Record<string, string> = {
 
 function missionCode(id: string): string {
   return id ? `MIS-${id.slice(0, 8).toUpperCase()}` : 'MIS-';
+}
+
+async function executeMissionCommand(
+  missionId: string,
+  command: 'approve' | 'cancel' | 'edit' | 'retry',
+  editedText?: string,
+) {
+  const res = await fetch(`http://localhost:8000/api/v1/missions/${missionId}/command`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(editedText ? { command, edited_text: editedText } : { command }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.detail || data.message || `Falha ao executar ${command}`);
+  }
+  return data;
 }
 
 export default function MissionsPanel() {
@@ -71,9 +92,23 @@ export default function MissionsPanel() {
 
   const handleApprove = async (missionId: string) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/missions/${missionId}/approve`, { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) alert(data.detail || 'Erro ao aprovar');
+      await executeMissionCommand(missionId, 'approve');
+      fetchMissions();
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
+  const handleEdit = async (mission: Mission) => {
+    const currentText =
+      mission.next_action_params?.text ||
+      mission.extra_metadata?.draft_text ||
+      '';
+    const editedText = window.prompt('Editar mensagem antes de enviar:', currentText);
+    if (!editedText?.trim()) return;
+
+    try {
+      await executeMissionCommand(mission.id, 'edit', editedText.trim());
       fetchMissions();
     } catch (e: any) {
       alert(e.message);
@@ -83,7 +118,16 @@ export default function MissionsPanel() {
   const handleCancel = async (missionId: string) => {
     if (!confirm('Cancelar esta missão?')) return;
     try {
-      await fetch(`http://localhost:8000/api/v1/missions/${missionId}/cancel`, { method: 'POST' });
+      await executeMissionCommand(missionId, 'cancel');
+      fetchMissions();
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
+  const handleRetry = async (missionId: string) => {
+    try {
+      await executeMissionCommand(missionId, 'retry');
       fetchMissions();
     } catch (e: any) {
       alert(e.message);
@@ -134,7 +178,7 @@ export default function MissionsPanel() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {filtered.map(mission => {
           const meta = mission.extra_metadata || {};
-          const draftText = meta.draft_text || '';
+          const draftText = mission.next_action_params?.text || meta.draft_text || '';
           return (
             <div
               key={mission.id}
@@ -191,6 +235,11 @@ export default function MissionsPanel() {
                         ✅ Aprovar
                       </button>
                       <button
+                        onClick={(e) => { e.stopPropagation(); handleEdit(mission); }}
+                        style={{ background: '#0f172a', border: '1px solid #3b82f6', borderRadius: 4, padding: '4px 12px', color: '#bfdbfe', cursor: 'pointer', fontSize: 12 }}>
+                        ✏️ Editar
+                      </button>
+                      <button
                         onClick={(e) => { e.stopPropagation(); handleCancel(mission.id); }}
                         style={{ background: '#ef4444', border: 'none', borderRadius: 4, padding: '4px 12px', color: '#fff', cursor: 'pointer', fontSize: 12 }}>
                         ❌ Cancelar
@@ -199,6 +248,13 @@ export default function MissionsPanel() {
                   )}
                   {mission.status === 'awaiting_reply' && (
                     <span style={{ color: '#8b5cf6', fontSize: 12 }}>⏳ Aguardando resposta...</span>
+                  )}
+                  {mission.status === 'failed' && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleRetry(mission.id); }}
+                      style={{ background: '#f59e0b', border: 'none', borderRadius: 4, padding: '4px 12px', color: '#111827', cursor: 'pointer', fontSize: 12, fontWeight: 700 }}>
+                      ↻ Retry
+                    </button>
                   )}
                 </div>
               </div>
@@ -218,6 +274,7 @@ export default function MissionsPanel() {
                 {meta.contact_phone_e164 && <span>📞 {meta.contact_phone_e164}</span>}
                 {meta.mode && <span>⚙️ {meta.mode}</span>}
                 <span>🕐 {mission.last_activity_at ? new Date(mission.last_activity_at).toLocaleString('pt-BR') : '-'}</span>
+                {mission.next_action_type && <span>▶️ {mission.next_action_type}</span>}
                 {mission.result_summary && <span>📌 {mission.result_summary}</span>}
               </div>
             </div>
