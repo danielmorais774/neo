@@ -1,6 +1,6 @@
 """Create mission, whatsapp_contact, user_notification tables.
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: a7b8c9d0e1f2
 Revises: f6g7h8i9j0k1
 Create Date: 2026-05-02
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "a1b2c3d4e5f6"
+revision: str = "a7b8c9d0e1f2"
 down_revision: Union[str, None] = "f6g7h8i9j0k1"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

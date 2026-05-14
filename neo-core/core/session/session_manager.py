@@ -129,6 +129,7 @@ class PersistentSessionManager:
         metadata: dict[str, Any] | None = None,
         generate_embedding: bool = False,
         user_id: UUID | None = None,
+        mission_id: UUID | None = None,
     ) -> ConversationMessage:
         """Adiciona mensagem com contagem de tokens e embedding opcional."""
         embedding = None
@@ -153,6 +154,7 @@ class PersistentSessionManager:
             metadata=metadata,
             token_count=token_count,
             user_id=user_id,
+            mission_id=mission_id,
         )
 
     async def get_history(

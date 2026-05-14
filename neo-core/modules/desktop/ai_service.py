@@ -327,7 +327,17 @@ class AIService:
                     yield resp
 
             elif decision.intent == IntentType.WHATSAPP_MESSAGING:
-                async for resp in self._handle_whatsapp_messaging(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, metadata=metadata):
+                async for resp in self._handle_whatsapp_messaging(
+                    sid,
+                    user_message,
+                    history,
+                    decision,
+                    trace,
+                    slog=slog,
+                    user_id=user_id,
+                    metadata=metadata,
+                    source_message_id=saved_msg.id if saved_msg else None,
+                ):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
@@ -761,6 +771,7 @@ class AIService:
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
         metadata: dict[str, Any] | None = None,
+        source_message_id: UUID | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle WhatsApp messaging intent — delegates to SkillExecutor."""
 
@@ -798,6 +809,7 @@ class AIService:
             if decision.tool_name:
                 extra["router_tool_name"] = decision.tool_name
 
+            mission_id = None
             result = await skill_executor.execute(
                 skill_name=skill_name,
                 session_id=session_id,
@@ -812,6 +824,7 @@ class AIService:
                 final_text = _raw_text  # keep [MISSION:...] marker in gRPC response so desktop can parse it
                 _mission_meta = None
                 if result.mission_id:
+                    mission_id = result.mission_id
                     import json as _json
                     _mission_meta = _json.dumps({
                         "missionId": str(result.mission_id),
@@ -827,6 +840,11 @@ class AIService:
         except Exception as e:
             logger.exception("WhatsApp messaging execution failed")
             final_text = f"Erro ao processar missão WhatsApp: {str(e)}"
+            _mission_meta = None
+            mission_id = None
+
+        if mission_id and source_message_id:
+            await self.db.attach_message_to_mission(source_message_id, mission_id)
 
         await self.sessions.add_message(
             session_id=session_id,
@@ -834,6 +852,7 @@ class AIService:
             content=final_text,
             generate_embedding=False,
             user_id=user_id,
+            mission_id=mission_id,
             metadata=(_mission_meta and {"mission": _mission_meta}) or None,
         )
         if slog:

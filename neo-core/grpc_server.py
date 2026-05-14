@@ -452,13 +452,16 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
 
         try:
             from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
+            mission = await self.skill_executor.db.get_mission(mission_id)
+            if not mission:
+                return neo_desktop_pb2.MissionPromptAck(ok=False, message="Mission not found")
             pipeline = WhatsAppMessagingPipeline(
                 agent_executor=self.skill_executor.agent_executor,
                 db=self.skill_executor.db,
                 broker=self.skill_executor.broker,
             )
             result = await pipeline.run(
-                session_id=mission_id,
+                session_id=mission.session_id,
                 user_message="",
                 history=[],
                 mission_id=mission_id,
@@ -466,6 +469,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     "approved": request.approved,
                     "edited_text": request.edited_text or None,
                 },
+                user_id=mission.user_id,
             )
             return neo_desktop_pb2.MissionPromptAck(
                 ok=result.ok,

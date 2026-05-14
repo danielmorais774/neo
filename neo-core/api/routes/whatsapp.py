@@ -11,7 +11,7 @@ from starlette.websockets import WebSocketState
 
 from core.skills.skill_executor import SkillExecutor
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
-from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
+from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline, get_mission_dev_logger
 from core.notifications.qr_broadcaster import get_qr_broadcaster
 from db.async_client import AsyncPostgresClient
 from shared.config import get_settings
@@ -79,14 +79,37 @@ async def webhook(
         _aio.create_task(_notify_unsolicited(jid, text, message_id))
         return {"ok": True, "action": "notified"}
 
+    slog = get_mission_dev_logger(mission.id)
+    slog.log_event(
+        "neo-whatsapp webhook received",
+        {
+            "source": "neo-whatsapp",
+            "endpoint": "POST /api/v1/whatsapp/webhook",
+            "jid": jid,
+            "text": text,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "body": body,
+        },
+    )
+    slog.log_event("Inbound routed to mission", _describe_mission_route(mission, jid))
+
     # 5. Check idempotency (skip duplicate message_id)
     if mission.last_inbound_message_id == message_id:
         logger.info("Duplicate message, skipping: message_id=%s", message_id)
+        slog.log_event(
+            "Inbound skipped as duplicate",
+            {
+                "mission_id": str(mission.id),
+                "message_id": message_id,
+                "last_inbound_message_id": mission.last_inbound_message_id,
+            },
+        )
         return {"ok": True, "action": "duplicate"}
 
     # 6. Dispatch to skill pipeline (fire and forget for speed)
     import asyncio
-    asyncio.create_task(_process_inbound(mission, text, message_id, timestamp))
+    asyncio.create_task(_process_inbound(mission, text, message_id, timestamp, jid))
 
     return {"ok": True, "action": "dispatched"}
 
@@ -149,11 +172,47 @@ def _phone_from_jid(jid: str | None) -> str | None:
     return f"+{user}" if user.isdigit() else None
 
 
+def _digits_from_jid(jid: str | None) -> str:
+    if not jid or "@" not in jid:
+        return ""
+    local = jid.split("@", 1)[0]
+    return local if local.isdigit() else ""
+
+
+def _describe_mission_route(mission, inbound_jid: str) -> dict:
+    meta = mission.extra_metadata or {}
+    inbound_digits = _digits_from_jid(inbound_jid)
+    mission_digits = _digits_from_jid(mission.contact_jid)
+    meta_digits = "".join(filter(str.isdigit, meta.get("contact_phone_e164", "") or ""))
+    last_outbound_id = str(meta.get("last_outbound_id") or "")
+
+    if inbound_jid == mission.contact_jid:
+        reason = "exact_contact_jid"
+    elif inbound_digits and inbound_digits in {mission_digits, meta_digits}:
+        reason = "phone_digits_match"
+    elif inbound_jid and inbound_jid in last_outbound_id:
+        reason = "inbound_jid_found_in_last_outbound_id"
+    else:
+        reason = "fallback_active_mission_match"
+
+    return {
+        "mission_id": str(mission.id),
+        "mission_status": mission.status,
+        "mission_contact_jid": mission.contact_jid,
+        "inbound_jid": inbound_jid,
+        "match_reason": reason,
+        "contact_phone_e164": meta.get("contact_phone_e164"),
+        "last_outbound_id": last_outbound_id or None,
+        "session_id": str(mission.session_id),
+    }
+
+
 async def _process_inbound(
     mission,
     text: str,
     message_id: str,
     timestamp: int | None,
+    jid: str,
 ) -> None:
     """Background task: run the skill pipeline for an inbound message."""
     if not _skill_executor or not _db:
@@ -175,6 +234,8 @@ async def _process_inbound(
             extra={
                 "user_id": mission.user_id,
                 "inbound_message_id": message_id,
+                "inbound_jid": jid,
+                "webhook_message_id": message_id,
             },
         )
     except Exception as e:

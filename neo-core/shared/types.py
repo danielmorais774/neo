@@ -21,6 +21,14 @@ class MessageRole(str, Enum):
     TOOL = "tool"
 
 
+class MessageType(str, Enum):
+    """Tipo de mensagem no protocolo de chat."""
+
+    USER_INPUT = "user_input"
+    MISSION_COMMAND = "mission_command"
+    SYSTEM_EVENT = "system_event"
+
+
 class IntentType(str, Enum):
     """Tipo de intenção classificada pelo router."""
 
@@ -191,6 +199,28 @@ class RoutingDecision(BaseModel):
     # --- classifier observability (optional) ---
     classifier_raw: str | None = None  # raw LLM/text response from classifier
     classifier_payload: dict[str, Any] | None = None  # messages/prompt sent to classifier
+
+
+# ---------------------------------------------------------------------------
+# Mission command
+# ---------------------------------------------------------------------------
+
+class MissionCommand(str, Enum):
+    """Comandos estruturados para missões."""
+
+    APPROVE = "approve"
+    CANCEL = "cancel"
+    EDIT = "edit"
+    RETRY = "retry"
+
+
+class MissionCommandPayload(BaseModel):
+    """Payload de comando estruturado para missão."""
+
+    command: MissionCommand
+    mission_id: UUID
+    edited_text: str | None = None
+    user_id: UUID | None = None
 
 
 # ---------------------------------------------------------------------------

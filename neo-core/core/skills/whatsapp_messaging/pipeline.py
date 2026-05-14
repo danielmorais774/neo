@@ -19,6 +19,7 @@ import re
 import unicodedata
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -26,13 +27,14 @@ if TYPE_CHECKING:
     from observability.session_file_logger import SessionFileLogger
 
 from core.agent.agent_executor import AgentExecutor
+from core.agent.prompt_builder import PromptBuilder
 from core.skills import SkillPipeline, SkillResult
 from core.skills.whatsapp_messaging.executor import WhatsAppMessagingExecutor
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
 from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
 from core.notifications.broker import NotificationBroker
 from db.async_client import AsyncPostgresClient
-from observability.session_file_logger import SessionFileLogger
+from observability.session_file_logger import SessionFileLogger, get_session_logger
 from shared import Message, MessageRole
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,34 @@ if not _LOGS_DIR.exists():
 
 
 def _get_pipeline_logger(session_id: UUID) -> SessionFileLogger:
-    return SessionFileLogger(str(session_id))
+    # Reuse one logger instance/path per session to avoid splitting logs.
+    return get_session_logger(str(session_id))
+
+
+def _get_mission_logger(mission_id: UUID) -> SessionFileLogger:
+    return SessionFileLogger(
+        str(mission_id),
+        file_prefix="mission",
+        include_timestamp=False,
+        title="Mission Dev Log",
+    )
+
+
+def get_mission_dev_logger(mission_id: UUID) -> SessionFileLogger:
+    return _get_mission_logger(mission_id)
+
+
+class _FanoutLogger:
+    def __init__(self, *targets: SessionFileLogger) -> None:
+        self._targets = [t for t in targets if t is not None]
+
+    def __getattr__(self, name: str):
+        def _call(*args, **kwargs):
+            for target in self._targets:
+                fn = getattr(target, name, None)
+                if callable(fn):
+                    fn(*args, **kwargs)
+        return _call
 
 
 DEFAULT_USER_ADDRESS = "Rua Exemplo 123, São Paulo, SP"
@@ -157,6 +186,9 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         user_id = user_id or extra.get("user_id")
 
         slog = _get_pipeline_logger(session_id)
+        mission_slog = _get_mission_logger(mission_id) if mission_id else None
+        if mission_slog:
+            slog = _FanoutLogger(slog, mission_slog)
         slog.new_interaction(
             user_message,
             metadata={
@@ -174,11 +206,84 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 )
                 return SkillResult(ok=False, message="Missão não encontrada")
 
+            slog.log_event(
+                "Mission context loaded",
+                {
+                    "mission_id": str(mission.id),
+                    "session_id": str(mission.session_id),
+                    "user_id": str(mission.user_id),
+                    "status": mission.status,
+                    "title": mission.title,
+                    "goal": mission.goal,
+                    "contact_jid": mission.contact_jid,
+                    "extra_metadata": mission.extra_metadata or {},
+                    "extra": extra,
+                },
+            )
+
             if extra.get("approved") is not None:
                 return await self._handle_approval(mission, extra, slog)
             return await self._handle_inbound(mission, user_message, slog, extra)
 
         return await self._handle_kickoff(session_id, user_message, extra, slog, user_id)
+
+    async def execute_mission_command(
+        self,
+        mission_id: UUID,
+        command: str,
+        edited_text: str | None = None,
+        user_id: UUID | None = None,
+        source: str = "api",
+    ) -> SkillResult:
+        """Direct structured command dispatch for mission actions."""
+        mission = await self.db.get_mission(mission_id)
+        if not mission:
+            return SkillResult(ok=False, message="Missão não encontrada", mission_id=mission_id)
+
+        slog = _FanoutLogger(_get_pipeline_logger(mission.session_id), _get_mission_logger(mission_id))
+        slog.new_interaction(
+            f"mission_command:{command}",
+            metadata={
+                "skill": "whatsapp_messaging",
+                "mission_id": str(mission_id),
+                "user_id": str(user_id or mission.user_id),
+                "source": source,
+            },
+        )
+
+        if command == "cancel":
+            return await self._handle_approval(
+                mission,
+                {"approved": False, "approval_source": source, "user_id": user_id or mission.user_id},
+                slog,
+            )
+
+        if command == "edit" and edited_text:
+            return await self._handle_approval(
+                mission,
+                {
+                    "approved": True,
+                    "edited_text": edited_text,
+                    "approval_source": source,
+                    "user_id": user_id or mission.user_id,
+                },
+                slog,
+            )
+        if command == "edit":
+            return SkillResult(
+                ok=False,
+                message="Comando edit requer texto editado.",
+                mission_id=mission_id,
+            )
+
+        if command in {"approve", "edit", "retry"}:
+            return await self._handle_approval(
+                mission,
+                {"approved": True, "approval_source": source, "user_id": user_id or mission.user_id},
+                slog,
+            )
+
+        return SkillResult(ok=False, message=f"Comando inválido: {command}", mission_id=mission_id)
 
     # ───────────────────────────── kickoff ─────────────────────────────
 
@@ -215,8 +320,28 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             message_text = self._extract_message_text(user_message)
 
         mode = self._detect_mode(user_message, recipient_hint, message_text)
+        slog.log_event(
+            "whatsapp_messaging.kickoff_parse",
+            {
+                "recipient_hint": recipient_hint,
+                "message_text": message_text,
+                "detected_mode": mode,
+                "raw_user_message": user_message,
+            },
+        )
 
         resolved = await self._resolve_recipient(user_id, recipient_hint, user_message)
+        slog.log_event(
+            "whatsapp_messaging.resolve_recipient",
+            {
+                "ok": resolved.ok,
+                "jid": resolved.jid,
+                "name": resolved.name,
+                "phone_e164": resolved.phone_e164,
+                "error": resolved.error,
+                "candidates": resolved.candidates,
+            },
+        )
         if not resolved.ok:
             if resolved.candidates:
                 lines = [
@@ -248,25 +373,25 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         except Exception as e:
             logger.warning("upsert_whatsapp_contact failed (non-fatal): err=%s", e)
 
-        mission_session = await self.db.create_conversation_session(
-            user_id=user_id,
-            service="whatsapp-messaging",
-            metadata={
-                "contact_label": contact_label,
-                "goal": user_message,
-                "mode": mode,
-            },
-        )
-
         mission = await self.db.create_mission(
             user_id=user_id,
-            session_id=mission_session.id,
-            parent_session_id=session_id,
+            session_id=session_id,
+            parent_session_id=None,
             title=contact_label[:64],
             goal=user_message,
             contact_jid=contact_jid,
             channel="whatsapp",
         )
+        mission_slog = _get_mission_logger(mission.id)
+        mission_slog.new_interaction(
+            user_message,
+            metadata={
+                "skill": "whatsapp_messaging",
+                "mission_id": str(mission.id),
+                "user_id": str(user_id),
+            },
+        )
+        slog = _FanoutLogger(slog, mission_slog)
         await self.db.update_mission_status(
             mission.id,
             status="pending",
@@ -290,7 +415,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         return await self._kickoff_commercial(
             mission_id=mission.id,
-            mission_session_id=mission_session.id,
+            mission_session_id=session_id,
             user_id=user_id,
             user_message=user_message,
             contact_label=contact_label,
@@ -314,23 +439,33 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             status="awaiting_confirmation",
             extra_metadata={"draft_text": draft_text},
         )
+        await self.db.set_mission_next_action(
+            mission_id=mission_id,
+            action_type="send_whatsapp",
+            action_params={
+                "jid": contact_jid,
+                "text": draft_text,
+                "idempotency_key": str(mission_id),
+            },
+        )
 
         phone_label = contact_phone or _phone_from_jid(contact_jid) or contact_jid
         body = f"Para {contact_label} ({phone_label}):\n\n{draft_text}"
+        notification_payload = {
+            "mission_id": str(mission_id),
+            "draft_text": draft_text,
+            "contact_label": contact_label,
+            "contact_jid": contact_jid,
+            "contact_phone_e164": contact_phone or phone_label,
+            "mode": "personal",
+        }
         await self._notify(
             user_id=user_id,
             mission_id=mission_id,
             kind="confirm_reply",
             title=f"Enviar mensagem para {contact_label}",
             body=body,
-            payload={
-                "mission_id": str(mission_id),
-                "draft_text": draft_text,
-                "contact_label": contact_label,
-                "contact_jid": contact_jid,
-                "contact_phone_e164": contact_phone or phone_label,
-                "mode": "personal",
-            },
+            payload=notification_payload,
             actions=[
                 {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
                 {"action_type": "edit", "label": "Eu escrevo", "button_style": "outlined"},
@@ -341,7 +476,19 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         slog.log_event(
             "whatsapp_messaging.kickoff_personal",
-            f"mission={mission_id} contact={contact_label} phone={phone_label}",
+            {
+                "mission_id": str(mission_id),
+                "contact_label": contact_label,
+                "contact_jid": contact_jid,
+                "phone": phone_label,
+                "draft_text": draft_text,
+                "notification": {
+                    "kind": "confirm_reply",
+                    "title": f"Enviar mensagem para {contact_label}",
+                    "body": body,
+                    "payload": notification_payload,
+                },
+            },
         )
 
         import json as _json
@@ -381,6 +528,28 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             contact_phone=contact_phone,
             goal=user_message,
         )
+        slog.log_event(
+            "whatsapp_messaging.commercial_system_prompt",
+            {
+                "mode": "commercial",
+                "contact_label": contact_label,
+                "contact_jid": contact_jid,
+                "contact_phone": contact_phone,
+                "goal": user_message,
+                "system_prompt": system_prompt,
+                "tools": [tool.name for tool in WHATSAPP_MESSAGING_TOOLS],
+            },
+        )
+        slog.log_llm_request(
+            stage="whatsapp_messaging.commercial_initial_agent_request",
+            messages=PromptBuilder(system_prompt=system_prompt).build_initial_messages(
+                user_message,
+                WHATSAPP_MESSAGING_TOOLS,
+            ),
+            model=self.agent_executor.llm_router.get_default_model(None),
+            provider=self.agent_executor.llm_router.get_provider(None).__class__.__name__,
+            temperature=self.agent_executor.settings.default_temperature,
+        )
 
         result = await self.agent_executor.execute(
             task=user_message,
@@ -398,6 +567,15 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 mission_id,
                 status="awaiting_confirmation",
                 extra_metadata={"draft_text": draft_text},
+            )
+            await self.db.set_mission_next_action(
+                mission_id=mission_id,
+                action_type="send_whatsapp",
+                action_params={
+                    "jid": contact_jid,
+                    "text": draft_text,
+                    "idempotency_key": str(mission_id),
+                },
             )
             phone_label = contact_phone or _phone_from_jid(contact_jid) or contact_jid
             await self._notify(
@@ -452,94 +630,95 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             role="user",
             content=inbound_text,
             user_id=mission.user_id,
+            mission_id=mission.id,
         )
 
         meta = mission.extra_metadata or {}
         mode = meta.get("mode", "commercial")
         contact_label = meta.get("contact_label") or mission.title
         contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
+        slog.log_event(
+            "whatsapp_messaging.inbound_message",
+            {
+                "mission_id": str(mission.id),
+                "mode": mode,
+                "contact_label": contact_label,
+                "contact_jid": mission.contact_jid,
+                "contact_phone": contact_phone,
+                "inbound_text": inbound_text,
+                "extra": extra,
+            },
+        )
 
         if mode == "personal":
             reply_text = await self._build_personal_ack_reply(
                 mission_goal=mission.goal,
                 contact_label=contact_label,
                 inbound_text=inbound_text,
-            )
-
-            try:
-                message_id = await self.gateway.send_message(
-                    jid=mission.contact_jid,
-                    text=reply_text,
-                    idempotency_key=f"{mission.id}:inbound_ack:{extra.get('inbound_message_id') or inbound_text[:64]}",
-                )
-            except Exception as e:
-                summary = f"{contact_label} respondeu, mas falhei ao enviar confirmação: {e}"
-                await self._notify(
-                    user_id=mission.user_id,
-                    mission_id=mission.id,
-                    kind="mission_failed",
-                    title=f"Falha ao responder {contact_label}",
-                    body=f"Recebido: {inbound_text}\n\nErro ao responder: {e}",
-                    payload={
-                        "mission_id": str(mission.id),
-                        "contact_label": contact_label,
-                        "contact_jid": mission.contact_jid,
-                        "inbound_text": inbound_text,
-                        "reply_text": reply_text,
-                        "error": str(e),
-                    },
-                )
-                await self.db.update_mission_status(
-                    mission.id,
-                    status="failed",
-                    result_summary=summary,
-                    extra_metadata={
-                        "last_inbound_text": inbound_text,
-                        "auto_reply_text": reply_text,
-                        "auto_reply_error": str(e),
-                    },
-                )
-                return SkillResult(ok=False, message=summary, mission_id=mission.id)
-
-            await self.db.save_message(
-                session_id=mission.session_id,
-                role="assistant",
-                content=reply_text,
-                tool_name="whatsapp_send_message",
-                tool_call_id=message_id,
-                user_id=mission.user_id,
-            )
-
-            summary = f"{contact_label} respondeu: {inbound_text[:180]} | Neo respondeu: {reply_text[:180]}"
-            await self._notify(
-                user_id=mission.user_id,
-                mission_id=mission.id,
-                kind="mission_completed",
-                title=f"Resposta enviada para {contact_label}",
-                body=f"Recebido: {inbound_text}\n\nEnviado: {reply_text}",
-                payload={
-                    "mission_id": str(mission.id),
-                    "contact_label": contact_label,
-                    "contact_jid": mission.contact_jid,
-                    "contact_phone_e164": contact_phone,
-                    "inbound_text": inbound_text,
-                    "reply_text": reply_text,
-                    "message_id": message_id,
-                },
+                slog=slog,
             )
             await self.db.update_mission_status(
                 mission.id,
-                status="completed",
-                result_summary=summary,
+                status="awaiting_confirmation",
                 extra_metadata={
                     "last_inbound_text": inbound_text,
-                    "auto_reply_text": reply_text,
-                    "last_outbound_id": message_id,
+                    "draft_text": reply_text,
+                    "pending_inbound_ack": True,
                 },
             )
+            await self.db.set_mission_next_action(
+                mission_id=mission.id,
+                action_type="send_whatsapp",
+                action_params={
+                    "jid": mission.contact_jid,
+                    "text": reply_text,
+                    "idempotency_key": str(mission.id),
+                },
+            )
+
+            phone_label = contact_phone or _phone_from_jid(mission.contact_jid) or mission.contact_jid
+            notification_payload = {
+                "mission_id": str(mission.id),
+                "contact_label": contact_label,
+                "contact_jid": mission.contact_jid,
+                "contact_phone_e164": contact_phone or phone_label,
+                "inbound_text": inbound_text,
+                "draft_text": reply_text,
+                "mode": "personal",
+                "pending_inbound_ack": True,
+            }
+            await self._notify(
+                user_id=mission.user_id,
+                mission_id=mission.id,
+                kind="confirm_reply",
+                title=f"Aprovar resposta para {contact_label}",
+                body=f"Recebido: {inbound_text}\n\nVou enviar para {contact_label} ({phone_label}):\n\n{reply_text}",
+                payload=notification_payload,
+                actions=[
+                    {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
+                    {"action_type": "edit", "label": "Eu escrevo", "button_style": "outlined"},
+                    {"action_type": "cancel", "label": "Não fazer nada", "button_style": "ghost"},
+                ],
+                config={"persistent": True, "position": "bottom_right", "play_sound": True},
+            )
+            slog.log_event(
+                "whatsapp_messaging.inbound_personal_confirmation",
+                {
+                    "mission_id": str(mission.id),
+                    "received_text": inbound_text,
+                    "draft_reply": reply_text,
+                    "notification": {
+                        "kind": "confirm_reply",
+                        "title": f"Aprovar resposta para {contact_label}",
+                        "body": f"Recebido: {inbound_text}\n\nVou enviar para {contact_label} ({phone_label}):\n\n{reply_text}",
+                        "payload": notification_payload,
+                    },
+                },
+            )
+
             return SkillResult(
                 ok=True,
-                message=f"{contact_label} respondeu e o Neo enviou uma confirmação.",
+                message=f"{contact_label} respondeu. Rascunho pronto, aguardando sua aprovação para enviar.",
                 mission_id=mission.id,
             )
 
@@ -549,6 +728,29 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             contact_jid=mission.contact_jid,
             contact_phone=contact_phone,
             goal=mission.goal,
+        )
+        slog.log_event(
+            "whatsapp_messaging.inbound_commercial_system_prompt",
+            {
+                "mode": "commercial",
+                "contact_label": contact_label or mission.title,
+                "contact_jid": mission.contact_jid,
+                "contact_phone": contact_phone,
+                "goal": mission.goal,
+                "inbound_text": inbound_text,
+                "system_prompt": system_prompt,
+                "tools": [tool.name for tool in WHATSAPP_MESSAGING_TOOLS],
+            },
+        )
+        slog.log_llm_request(
+            stage="whatsapp_messaging.inbound_commercial_initial_agent_request",
+            messages=PromptBuilder(system_prompt=system_prompt).build_initial_messages(
+                inbound_text,
+                WHATSAPP_MESSAGING_TOOLS,
+            ),
+            model=self.agent_executor.llm_router.get_default_model(None),
+            provider=self.agent_executor.llm_router.get_provider(None).__class__.__name__,
+            temperature=self.agent_executor.settings.default_temperature,
         )
 
         result = await self.agent_executor.execute(
@@ -569,40 +771,69 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         mission_goal: str,
         contact_label: str,
         inbound_text: str,
+        slog: SessionFileLogger | None = None,
     ) -> str:
         fallback = _fallback_personal_ack(inbound_text)
         try:
             llm_provider = self.agent_executor.llm_router.get_provider(None)
+            model = self.agent_executor.llm_router.get_default_model(None)
+            messages = [
+                Message(
+                    role=MessageRole.SYSTEM,
+                    content=(
+                        "Você escreve respostas curtas de WhatsApp em português do Brasil. "
+                        "Responda como Daniel responderia: natural, direto e sem formalidade excessiva. "
+                        "Retorne somente o texto da mensagem, sem aspas, sem explicação, "
+                        "sem markdown e com no máximo 180 caracteres. "
+                        "Não invente horário, motivo, preço, endereço nem compromisso que não esteja no contexto. "
+                        "Se a resposta exigir uma informação ausente, faça uma pergunta curta."
+                    ),
+                ),
+                Message(
+                    role=MessageRole.USER,
+                    content=(
+                        f"Pedido original do usuário: {mission_goal}\n"
+                        f"Contato: {contact_label}\n"
+                        f"Mensagem recebida do contato: {inbound_text}\n\n"
+                        "Escreva uma resposta curta apropriada para enviar ao contato, "
+                        "mantendo o tom de conversa de WhatsApp."
+                    ),
+                ),
+            ]
+            if slog:
+                slog.log_llm_request(
+                    stage="whatsapp_messaging.personal_ack_reply",
+                    messages=messages,
+                    model=model,
+                    provider=llm_provider.__class__.__name__,
+                    temperature=0.4,
+                )
+            start = perf_counter()
             response = await llm_provider.complete(
-                messages=[
-                    Message(
-                        role=MessageRole.SYSTEM,
-                        content=(
-                            "Você escreve respostas curtas de WhatsApp em português do Brasil. "
-                            "Responda como a própria pessoa, de forma natural e educada. "
-                            "Retorne somente o texto da mensagem, sem aspas, sem explicação, "
-                            "sem markdown e com no máximo 180 caracteres."
-                        ),
-                    ),
-                    Message(
-                        role=MessageRole.USER,
-                        content=(
-                            f"Pedido original do usuário: {mission_goal}\n"
-                            f"Contato: {contact_label}\n"
-                            f"Mensagem recebida do contato: {inbound_text}\n\n"
-                            "Escreva uma confirmação curta apropriada."
-                        ),
-                    ),
-                ],
+                messages=messages,
                 tools=[],
-                model=self.agent_executor.llm_router.get_default_model(None),
+                model=model,
                 temperature=0.4,
                 max_tokens=80,
             )
             text = _sanitize_personal_ack(response.get_content() or "")
+            if slog:
+                slog.log_llm_response(
+                    stage="whatsapp_messaging.personal_ack_reply",
+                    response=response.get_content() or "",
+                    duration_ms=(perf_counter() - start) * 1000,
+                    model=model,
+                )
             return text or fallback
         except Exception as e:
             logger.warning("Personal ack generation failed err=%s", e)
+            if slog:
+                slog.log_error_recovery(
+                    1,
+                    "PersonalAckGenerationFailed",
+                    "fallback_personal_ack",
+                    {"error": str(e), "fallback": fallback},
+                )
             return fallback
 
     # ─────────────────────────── approval ───────────────────────────────
@@ -615,29 +846,93 @@ class WhatsAppMessagingPipeline(SkillPipeline):
     ) -> SkillResult:
         approved = extra.get("approved", False)
         edited_text = extra.get("edited_text")
+        slog.log_event(
+            "Mission approval received",
+            {
+                "mission_id": str(mission.id),
+                "approved": approved,
+                "edited_text": edited_text,
+                "source_extra": extra,
+            },
+        )
 
         if not approved:
             await self.db.update_mission_status(mission.id, status="cancelled")
+            await self.db.clear_mission_next_action(mission.id)
+            slog.log_event("Mission cancelled by approval flow", {"mission_id": str(mission.id)})
             return SkillResult(ok=False, message="Missão cancelada.", mission_id=mission.id)
 
-        text_to_send = edited_text or (mission.extra_metadata or {}).get("draft_text", "")
+        action_type = mission.next_action_type
+        action_params = mission.next_action_params or {}
+        if not action_type:
+            action_type = "send_whatsapp"
+            action_params = {
+                "jid": mission.contact_jid,
+                "text": (mission.extra_metadata or {}).get("draft_text", ""),
+                "idempotency_key": str(mission.id),
+            }
+        if action_type != "send_whatsapp":
+            return SkillResult(
+                ok=False,
+                message=f"Ação pendente não suportada: {action_type}",
+                mission_id=mission.id,
+            )
+
+        target_jid = action_params.get("jid") or mission.contact_jid
+        action_text = action_params.get("text") or (mission.extra_metadata or {}).get("draft_text", "")
+        text_to_send = edited_text or action_text
         logger.info(f"_handle_approval: mission={mission.id} approved={approved} text_to_send={text_to_send[:50] if text_to_send else 'EMPTY'}")
         if not text_to_send:
+            slog.log_error_recovery(
+                1,
+                "EmptyDraftText",
+                "abort_send",
+                {"mission_id": str(mission.id), "extra_metadata": mission.extra_metadata or {}},
+            )
             return SkillResult(
                 ok=False, message="Nenhum texto para enviar.", mission_id=mission.id
             )
 
+        gateway_payload = {
+            "method": "POST",
+            "url": f"{self.gateway.base_url}/send",
+            "json": {
+                "jid": target_jid,
+                "text": text_to_send,
+                "idempotency_key": action_params.get("idempotency_key") or str(mission.id),
+            },
+        }
+        slog.log_tool_request(
+            tool_name="whatsapp_send_message",
+            arguments=gateway_payload,
+            execution="server-side",
+        )
+        start = perf_counter()
         try:
             message_id = await self.gateway.send_message(
-                jid=mission.contact_jid,
+                jid=target_jid,
                 text=text_to_send,
-                idempotency_key=str(mission.id),
+                idempotency_key=action_params.get("idempotency_key") or str(mission.id),
             )
         except Exception as e:
             logger.error("Approval send failed: mission=%s err=%s", mission.id, e)
+            slog.log_tool_result(
+                tool_name="whatsapp_send_message",
+                success=False,
+                error=str(e),
+                duration_ms=(perf_counter() - start) * 1000,
+                execution="server-side",
+            )
             return SkillResult(
                 ok=False, message=f"Falha ao enviar: {e}", mission_id=mission.id
             )
+        slog.log_tool_result(
+            tool_name="whatsapp_send_message",
+            success=True,
+            result={"message_id": message_id, "to": target_jid},
+            duration_ms=(perf_counter() - start) * 1000,
+            execution="server-side",
+        )
 
         await self.db.save_message(
             session_id=mission.session_id,
@@ -646,6 +941,18 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             tool_name="whatsapp_send_message",
             tool_call_id=message_id,
             user_id=mission.user_id,
+            mission_id=mission.id,
+        )
+        slog.log_event(
+            "Outbound message saved",
+            {
+                "mission_id": str(mission.id),
+                "session_id": str(mission.session_id),
+                "role": "assistant",
+                "tool_name": "whatsapp_send_message",
+                "tool_call_id": message_id,
+                "content": text_to_send,
+            },
         )
 
         await self.db.update_mission_status(
@@ -653,6 +960,48 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             status="awaiting_reply",
             extra_metadata={"last_outbound_id": message_id},
         )
+        await self.db.clear_mission_next_action(mission.id)
+        slog.log_event(
+            "Mission status updated",
+            {
+                "mission_id": str(mission.id),
+                "status": "awaiting_reply",
+                "last_outbound_id": message_id,
+            },
+        )
+
+        meta = mission.extra_metadata or {}
+        if meta.get("pending_inbound_ack"):
+            inbound_text = meta.get("last_inbound_text", "")
+            contact_label = (meta.get("contact_label") or mission.title or mission.contact_jid)
+            summary = f"{contact_label} respondeu: {inbound_text[:180]} | Neo respondeu: {text_to_send[:180]}"
+            await self._notify(
+                user_id=mission.user_id,
+                mission_id=mission.id,
+                kind="mission_completed",
+                title=f"Resposta enviada para {contact_label}",
+                body=f"Recebido: {inbound_text}\n\nEnviado: {text_to_send}",
+                payload={
+                    "mission_id": str(mission.id),
+                    "contact_label": contact_label,
+                    "contact_jid": mission.contact_jid,
+                    "contact_phone_e164": meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid),
+                    "inbound_text": inbound_text,
+                    "reply_text": text_to_send,
+                    "message_id": message_id,
+                },
+            )
+            await self.db.update_mission_status(
+                mission.id,
+                status="completed",
+                result_summary=summary,
+                extra_metadata={
+                    "last_outbound_id": message_id,
+                    "last_inbound_text": inbound_text,
+                    "auto_reply_text": text_to_send,
+                    "pending_inbound_ack": False,
+                },
+            )
 
         import json as _json
         _mission_marker = _json.dumps({
@@ -826,29 +1175,48 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         steps: list[dict[str, Any]],
     ) -> None:
         for step in steps or []:
-            for tc in step.get("tool_calls", []):
+            step_number = _obj_get(step, "step_number", "?")
+            thought = _obj_get(step, "thought", None)
+            if thought:
+                slog.log_llm_response(
+                    stage=f"whatsapp_messaging_agent.step_{step_number}.thought",
+                    response=thought,
+                    duration_ms=0,
+                )
+            tool_results = {
+                _obj_get(result, "tool_call_id", ""): result
+                for result in (_obj_get(step, "tool_results", []) or [])
+            }
+            for tc in _obj_get(step, "tool_calls", []) or []:
+                tool_call_id = _obj_get(tc, "id", "")
+                tool_name = _obj_get(tc, "name", "?")
                 slog.log_tool_request(
-                    tool_name=tc.get("name", "?"),
-                    arguments=tc.get("arguments"),
+                    tool_name=tool_name,
+                    arguments={
+                        "tool_call_id": tool_call_id,
+                        "arguments": _obj_get(tc, "arguments", {}),
+                    },
                     execution="server-side",
                 )
-                if tc.get("result"):
+                result = tool_results.get(tool_call_id)
+                if result:
                     slog.log_tool_result(
-                        tool_name=tc.get("name", "?"),
-                        success=tc.get("result", {}).get("ok", False),
-                        result=str(tc.get("result", {})),
-                        duration_ms=0,
+                        tool_name=tool_name,
+                        success=_obj_get(result, "error", None) is None,
+                        result=_obj_get(result, "result", None),
+                        error=_obj_get(result, "error", None),
+                        duration_ms=float(_obj_get(result, "execution_time", 0) or 0) * 1000,
                         execution="server-side",
                     )
-            if step.get("response"):
-                slog.log_llm_response(
-                    stage="whatsapp_messaging_agent",
-                    response=step.get("response", "")[:500],
-                    duration_ms=step.get("duration_ms", 0),
-                )
 
 
 # ─────────────────────────── helpers ────────────────────────────────────
+
+def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
 
 class _ResolvedRecipient:
     __slots__ = ("ok", "jid", "name", "phone_e164", "error", "candidates")

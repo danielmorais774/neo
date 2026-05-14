@@ -328,6 +328,7 @@ class AsyncPostgresClient:
         metadata: dict[str, Any] | None = None,
         token_count: int | None = None,
         user_id: UUID | None = None,
+        mission_id: UUID | None = None,
     ) -> ConversationMessage:
         """Save a message to a conversation session."""
         msg = ConversationMessage(
@@ -340,6 +341,7 @@ class AsyncPostgresClient:
             token_count=token_count,
             extra_metadata=metadata,
             user_id=user_id,
+            mission_id=mission_id,
         )
         async with self.get_session() as db:
             db.add(msg)
@@ -400,6 +402,40 @@ class AsyncPostgresClient:
             )
             result = await db.execute(final_stmt)
             return list(result.scalars().all())
+
+    async def fetch_mission_messages(
+        self,
+        mission_id: UUID,
+        limit: int = 200,
+        roles: list[str] | None = None,
+    ) -> list[ConversationMessage]:
+        """Fetch messages explicitly tied to a mission, ordered chronologically."""
+        async with self.get_session() as db:
+            stmt = (
+                select(ConversationMessage)
+                .where(ConversationMessage.mission_id == mission_id)
+            )
+            if roles:
+                stmt = stmt.where(ConversationMessage.role.in_(roles))
+            stmt = stmt.order_by(ConversationMessage.created_at.asc()).limit(limit)
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
+    async def attach_message_to_mission(
+        self,
+        message_id: UUID,
+        mission_id: UUID,
+    ) -> ConversationMessage | None:
+        """Attach an already-saved conversation message to a mission."""
+        async with self.get_session() as db:
+            msg = await db.get(ConversationMessage, message_id)
+            if not msg:
+                return None
+            msg.mission_id = mission_id
+            db.add(msg)
+            await db.commit()
+            await db.refresh(msg)
+            return msg
 
     async def fetch_session_history(
         self,
@@ -753,6 +789,43 @@ class AsyncPostgresClient:
                 return None
             from datetime import datetime
             mission.last_inbound_message_id = message_id
+            mission.last_activity_at = datetime.utcnow()
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
+    async def set_mission_next_action(
+        self,
+        mission_id: UUID,
+        action_type: str,
+        action_params: dict[str, Any] | None = None,
+    ) -> Mission | None:
+        """Set next action to be executed by structured mission commands."""
+        async with self.get_session() as db:
+            mission = await db.get(Mission, mission_id)
+            if not mission:
+                return None
+            from datetime import datetime
+
+            mission.next_action_type = action_type
+            mission.next_action_params = action_params or {}
+            mission.last_activity_at = datetime.utcnow()
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
+    async def clear_mission_next_action(self, mission_id: UUID) -> Mission | None:
+        """Clear pending next action after command execution/cancel."""
+        async with self.get_session() as db:
+            mission = await db.get(Mission, mission_id)
+            if not mission:
+                return None
+            from datetime import datetime
+
+            mission.next_action_type = None
+            mission.next_action_params = {}
             mission.last_activity_at = datetime.utcnow()
             db.add(mission)
             await db.commit()

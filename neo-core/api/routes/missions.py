@@ -1,22 +1,34 @@
 """Missions management API."""
 
 import logging
+import os
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db.async_client import AsyncPostgresClient
+from shared.types import MissionCommandPayload
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/missions", tags=["missions"])
 
 _db: AsyncPostgresClient | None = None
 _pipeline_factory = None
+_LOGS_DIR = Path(os.environ.get("SESSION_LOGS_DIR", "/app/logs"))
+if not _LOGS_DIR.exists():
+    _LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 
 
 class MissionApprovalRequest(BaseModel):
     edited_text: str | None = None
+
+
+class MissionCommandRequest(BaseModel):
+    command: str
+    edited_text: str | None = None
+    user_id: UUID | None = None
 
 
 def set_db(db: AsyncPostgresClient) -> None:
@@ -40,11 +52,15 @@ async def list_missions(user_id: UUID | None = None, status: str | None = None, 
         {
             "id": str(m.id),
             "user_id": str(m.user_id),
+            "session_id": str(m.session_id),
+            "parent_session_id": str(m.parent_session_id) if m.parent_session_id else None,
             "title": m.title,
             "goal": m.goal,
             "contact_jid": m.contact_jid,
             "status": m.status,
             "channel": m.channel,
+            "next_action_type": m.next_action_type,
+            "next_action_params": m.next_action_params or {},
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "last_activity_at": m.last_activity_at.isoformat() if m.last_activity_at else None,
             "completed_at": m.completed_at.isoformat() if m.completed_at else None,
@@ -67,11 +83,15 @@ async def get_mission(mission_id: UUID):
     return {
         "id": str(mission.id),
         "user_id": str(mission.user_id),
+        "session_id": str(mission.session_id),
+        "parent_session_id": str(mission.parent_session_id) if mission.parent_session_id else None,
         "title": mission.title,
         "goal": mission.goal,
         "contact_jid": mission.contact_jid,
         "status": mission.status,
         "channel": mission.channel,
+        "next_action_type": mission.next_action_type,
+        "next_action_params": mission.next_action_params or {},
         "created_at": mission.created_at.isoformat() if mission.created_at else None,
         "last_activity_at": mission.last_activity_at.isoformat() if mission.last_activity_at else None,
         "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
@@ -82,36 +102,41 @@ async def get_mission(mission_id: UUID):
 
 @router.post("/{mission_id}/approve", response_model=dict)
 async def approve_mission(mission_id: UUID, request: MissionApprovalRequest | None = None):
-    """Approve a mission (personal mode approval flow)."""
-    if not _db:
-        raise HTTPException(status_code=500, detail="DB not initialized")
-
-    if not _pipeline_factory:
-        raise HTTPException(status_code=503, detail="Pipeline factory not set")
-
-    mission = await _db.get_mission(mission_id)
-    if not mission:
-        raise HTTPException(status_code=404, detail="Mission not found")
-
-    if mission.status != "awaiting_confirmation":
-        raise HTTPException(status_code=400, detail=f"Mission is not awaiting confirmation (status={mission.status})")
-
-    pipeline = _pipeline_factory()
-    from observability.session_file_logger import SessionFileLogger
-    from uuid import UUID as _UUID
-    _slog = SessionFileLogger(str(mission.session_id))
-    result = await pipeline._handle_approval(
-        mission,
-        {"approved": True, "edited_text": request.edited_text if request else None},
-        _slog,
+    """Compatibility wrapper: approve mission via structured command."""
+    return await _execute_mission_command(
+        MissionCommandPayload(
+            command="approve",
+            mission_id=mission_id,
+            edited_text=request.edited_text if request else None,
+            user_id=None,
+        ),
+        source="legacy-approve",
     )
 
-    return {"ok": result.ok, "message": result.message, "mission_id": str(mission_id)}
+
+@router.post("/{mission_id}/command", response_model=dict)
+async def command_mission(mission_id: UUID, request: MissionCommandRequest):
+    """Execute a structured mission command (approve/cancel/edit/retry)."""
+    allowed = {"approve", "cancel", "edit", "retry"}
+    if request.command not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid command: {request.command}")
+    if request.command == "edit" and not (request.edited_text or "").strip():
+        raise HTTPException(status_code=400, detail="edited_text é obrigatório para command=edit")
+
+    return await _execute_mission_command(
+        MissionCommandPayload(
+            command=request.command,
+            mission_id=mission_id,
+            edited_text=request.edited_text,
+            user_id=request.user_id,
+        ),
+        source="mission-command",
+    )
 
 
 @router.get("/{mission_id}/messages", response_model=list[dict])
 async def get_mission_messages(mission_id: UUID, limit: int = 200):
-    """Conversation messages tied to this mission's session (chronological)."""
+    """Conversation messages explicitly tied to this mission (chronological)."""
     if not _db:
         raise HTTPException(status_code=500, detail="DB not initialized")
 
@@ -119,10 +144,12 @@ async def get_mission_messages(mission_id: UUID, limit: int = 200):
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
 
-    messages = await _db.fetch_session_messages(mission.session_id, limit=limit)
+    messages = await _db.fetch_mission_messages(mission.id, limit=limit)
     return [
         {
             "id": str(m.id),
+            "mission_id": str(m.mission_id) if m.mission_id else None,
+            "session_id": str(m.session_id),
             "role": m.role,
             "content": m.content,
             "tool_name": m.tool_name,
@@ -182,10 +209,11 @@ async def get_mission_timeline(mission_id: UUID):
             "at": mission.created_at.isoformat(),
         })
 
-    messages = await _db.fetch_session_messages(mission.session_id, limit=500)
+    messages = await _db.fetch_mission_messages(mission.id, limit=500)
     for m in messages:
         events.append({
             "type": "message",
+            "mission_id": str(m.mission_id) if m.mission_id else None,
             "role": m.role,
             "label": "Usuário" if m.role == "user" else ("Assistente" if m.role == "assistant" else m.role),
             "detail": m.content,
@@ -224,15 +252,87 @@ async def get_mission_timeline(mission_id: UUID):
     return events
 
 
+@router.get("/{mission_id}/pipeline-log", response_model=dict)
+async def get_mission_pipeline_log(mission_id: UUID):
+    """Read mission markdown pipeline log file."""
+    log_path = _LOGS_DIR / f"mission-{mission_id}.md"
+    if not log_path.exists():
+        return {"exists": False, "content": "", "path": str(log_path), "updated_at": None}
+
+    try:
+        content = log_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.exception("Failed to read mission log file mission_id=%s: %s", mission_id, e)
+        raise HTTPException(status_code=500, detail="Failed to read mission log")
+
+    stat = log_path.stat()
+    return {
+        "exists": True,
+        "content": content,
+        "path": str(log_path),
+        "updated_at": stat.st_mtime,
+    }
+
+
 @router.post("/{mission_id}/cancel", response_model=dict)
 async def cancel_mission(mission_id: UUID):
-    """Cancel a mission."""
+    """Compatibility wrapper: cancel mission via structured command."""
+    return await _execute_mission_command(
+        MissionCommandPayload(
+            command="cancel",
+            mission_id=mission_id,
+            user_id=None,
+        ),
+        source="legacy-cancel",
+    )
+
+
+async def _execute_mission_command(payload: MissionCommandPayload, source: str) -> dict:
     if not _db:
         raise HTTPException(status_code=500, detail="DB not initialized")
+    if not _pipeline_factory:
+        raise HTTPException(status_code=503, detail="Pipeline factory not set")
 
-    mission = await _db.get_mission(mission_id)
+    mission = await _db.get_mission(payload.mission_id)
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
 
-    await _db.update_mission_status(mission_id, status="cancelled")
-    return {"ok": True, "message": "Missão cancelada.", "mission_id": str(mission_id)}
+    command = payload.command.value if hasattr(payload.command, "value") else str(payload.command)
+    allowed = {"approve", "cancel", "edit", "retry"}
+    if command not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid command: {command}")
+
+    if command in {"approve", "edit"} and mission.status != "awaiting_confirmation":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Mission is not awaiting confirmation (status={mission.status})",
+        )
+    if command == "retry" and mission.status not in {"awaiting_confirmation", "failed"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Mission cannot retry in status={mission.status}",
+        )
+
+    pipeline = _pipeline_factory()
+    result = await pipeline.execute_mission_command(
+        mission_id=mission.id,
+        command=command,
+        edited_text=payload.edited_text,
+        user_id=payload.user_id or mission.user_id,
+        source=source,
+    )
+
+    if not result.ok:
+        return {
+            "ok": False,
+            "message": result.message,
+            "mission_id": str(payload.mission_id),
+            "command": command,
+        }
+
+    return {
+        "ok": True,
+        "message": result.message,
+        "mission_id": str(payload.mission_id),
+        "command": command,
+    }

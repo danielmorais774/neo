@@ -1,7 +1,8 @@
 """Session File Logger — writes a detailed Markdown log per session.
 
-Each session gets its own .md file at /app/logs/session-<id>.md (inside Docker)
-or neo-core/logs/session-<id>.md (local dev).
+Each session gets its own stable .md file at /app/logs/session-<id>.md (inside
+Docker) or neo-core/logs/session-<id>.md (local dev), so all interactions for
+the same session append to a single file.
 
 The log captures every step of the pipeline:
   - Input received
@@ -49,19 +50,31 @@ def _safe_json(obj: Any, indent: int = 2) -> str:
 class SessionFileLogger:
     """Append-only Markdown logger for a single session."""
 
-    def __init__(self, session_id: UUID | str) -> None:
+    def __init__(
+        self,
+        session_id: UUID | str,
+        *,
+        file_prefix: str = "session",
+        include_timestamp: bool = False,
+        title: str = "Session Log",
+    ) -> None:
         self.session_id = str(session_id)
-        # Include a timestamp in the filename so files sort naturally newest-first
-        # and each process run creates a distinct file.
-        _now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-        self._path = _LOGS_DIR / f"session-{_now}-{self.session_id}.md"
+        self.title = title
+        if include_timestamp:
+            # Include a timestamp in the filename so files sort naturally newest-first
+            # and each process run creates a distinct file.
+            _now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+            filename = f"{file_prefix}-{_now}-{self.session_id}.md"
+        else:
+            filename = f"{file_prefix}-{self.session_id}.md"
+        self._path = _LOGS_DIR / filename
         self._interaction = 0
         self._ensure_header()
 
     def _ensure_header(self) -> None:
         if not self._path.exists():
             self._write(
-                f"# Session Log: `{self.session_id}`\n\n"
+                f"# {self.title}: `{self.session_id}`\n\n"
                 f"**Criado em:** {_ts()}\n\n"
                 f"---\n\n"
             )
@@ -298,7 +311,10 @@ class SessionFileLogger:
         if error:
             self._write(f"- **Erro:** {error}\n")
         if result:
-            self._write(f"\n```\n{result}\n```\n\n")
+            if isinstance(result, (dict, list, tuple)):
+                self._write(f"\n```json\n{_safe_json(result)}\n```\n\n")
+            else:
+                self._write(f"\n```\n{result}\n```\n\n")
         self._write("\n")
 
     def log_error_recovery(
@@ -349,11 +365,14 @@ class SessionFileLogger:
         self._write(f"- **Sessão:** `{session_id}`\n")
         self._write(f"- **Conteúdo:** {content_preview}\n\n")
 
-    def log_event(self, title: str, details: str = "") -> None:
+    def log_event(self, title: str, details: Any = "") -> None:
         """Log a generic event."""
         self._write(f"### {title}\n\n")
         if details:
-            self._write(f"{details}\n\n")
+            if isinstance(details, (dict, list, tuple)):
+                self._write(f"```json\n{_safe_json(details)}\n```\n\n")
+            else:
+                self._write(f"{details}\n\n")
 
 
 # ── Cache of active loggers (one per session) ──────────────────

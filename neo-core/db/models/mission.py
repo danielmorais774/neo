@@ -16,7 +16,7 @@ class Mission(SQLModel, table=True):
         sa_column=Column("user_id", SAUuid, nullable=False, index=True),
     )
     session_id: uuid.UUID = Field(
-        sa_column=Column("session_id", SAUuid, nullable=False, unique=True, index=True),
+        sa_column=Column("session_id", SAUuid, nullable=False, index=True),
     )
     parent_session_id: Optional[uuid.UUID] = Field(
         default=None,
@@ -38,6 +38,14 @@ class Mission(SQLModel, table=True):
     status: str = Field(
         default="pending",
         sa_column=Column("status", String(32), nullable=False, index=True),
+    )
+    next_action_type: Optional[str] = Field(
+        default=None,
+        sa_column=Column("next_action_type", String(64), nullable=True),
+    )
+    next_action_params: dict = Field(
+        default_factory=dict,
+        sa_column=Column("next_action_params", JSON, nullable=False),
     )
     last_inbound_message_id: Optional[str] = Field(
         default=None,

@@ -86,6 +86,10 @@ class ConversationMessage(SQLModel, table=True):
         default=None,
         sa_column=Column("user_id", SAUuid, ForeignKey("user.id"), nullable=True, index=True),
     )
+    mission_id: Optional[UUID] = Field(
+        default=None,
+        sa_column=Column("mission_id", SAUuid, ForeignKey("mission.id"), nullable=True, index=True),
+    )
     role: str = Field(
         sa_column=Column("role", String(16), nullable=False),
     )
@@ -123,4 +127,5 @@ class ConversationMessage(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_conv_msg_session_created", "session_id", "created_at"),
+        Index("ix_conv_msg_mission_created", "mission_id", "created_at"),
     )
