@@ -41,6 +41,7 @@ export interface MissionInfo {
   contactJid: string;
   contactPhone?: string;
   draftText: string;
+  draftMessages?: string[];
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
 }
 

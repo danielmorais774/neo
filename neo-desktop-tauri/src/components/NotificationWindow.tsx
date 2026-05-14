@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import './NotificationWindow.css';
 
 interface NotificationAction {
@@ -13,8 +14,6 @@ interface NotificationAction {
 interface NotificationField {
   label: string;
   value: string;
-  source: string;
-  placeholder?: string;
   field_type?: 'text' | 'select';
   options?: string;
   input_value?: string;
@@ -43,14 +42,13 @@ interface NeoNotificationPayload {
 
 const KIND_ICON: Record<string, string> = {
   approval_required: '🤖',
-  confirm_reply: '✦',
   mission_update: '💬',
   unsolicited_message: '📩',
   mission_started: '⚡',
   mission_completed: '✨',
 };
 
-const AUTO_DISMISS_MS = 12000;
+const AUTO_DISMISS_MS = 6000;
 const WINDOW_INSET_PX = 8;
 const MIN_CARD_WIDTH = 280;
 const MAX_CARD_WIDTH = 360;
@@ -59,157 +57,27 @@ const MIN_WINDOW_HEIGHT = 72;
 export default function NotificationWindow() {
   const [notif, setNotif] = useState<NeoNotificationPayload | null>(null);
   const [visible, setVisible] = useState(false);
-  const [dismissProgress, setDismissProgress] = useState(1);
-  const [dismissPaused, setDismissPaused] = useState(false);
-  const [editingReply, setEditingReply] = useState(false);
-  const [manualReplyText, setManualReplyText] = useState('');
   const notificationRef = useRef<HTMLDivElement | null>(null);
-  const manualReplyInputRef = useRef<HTMLInputElement | null>(null);
   const lastWindowSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const dismissTimerRef = useRef<number | undefined>(undefined);
-  const dismissLastTickAtRef = useRef<number | undefined>(undefined);
-  const dismissDurationMsRef = useRef(0);
-  const dismissRemainingMsRef = useRef(0);
-  const dismissPausedRef = useRef(false);
-  const pointerHoverRef = useRef(false);
-  const nativeHoverRef = useRef(false);
-  const nativeHoverCheckInFlightRef = useRef(false);
-  const hideTimerRef = useRef<number | undefined>(undefined);
-  const closeSequenceRef = useRef(0);
-
-  const clearDismissTimer = useCallback(() => {
-    if (dismissTimerRef.current) {
-      window.clearInterval(dismissTimerRef.current);
-      dismissTimerRef.current = undefined;
-    }
-    dismissLastTickAtRef.current = undefined;
-  }, []);
-
-  const resetDismissState = useCallback(() => {
-    clearDismissTimer();
-    dismissDurationMsRef.current = 0;
-    dismissRemainingMsRef.current = 0;
-    dismissPausedRef.current = false;
-    pointerHoverRef.current = false;
-    nativeHoverRef.current = false;
-    nativeHoverCheckInFlightRef.current = false;
-    setDismissProgress(1);
-    setDismissPaused(false);
-  }, [clearDismissTimer]);
-
-  const resetReplyEditor = useCallback(() => {
-    setEditingReply(false);
-    setManualReplyText('');
-    invoke('set_notification_window_focusable', { focusable: false }).catch(() => {});
-  }, []);
-
-  const clearHideTimer = useCallback(() => {
-    if (hideTimerRef.current) {
-      window.clearTimeout(hideTimerRef.current);
-      hideTimerRef.current = undefined;
-    }
-  }, []);
-
-  const closeNotification = useCallback((delayMs = 300) => {
-    resetDismissState();
-    resetReplyEditor();
-    clearHideTimer();
-    const closeSequence = closeSequenceRef.current + 1;
-    closeSequenceRef.current = closeSequence;
-    setVisible(false);
-    invoke('set_notification_window_interactive', { interactive: false }).catch(() => {});
-    hideTimerRef.current = window.setTimeout(() => {
-      invoke('hide_notification_window')
-        .catch(() => {})
-        .finally(() => {
-          if (closeSequenceRef.current !== closeSequence) return;
-          hideTimerRef.current = undefined;
-          setNotif(null);
-        });
-    }, delayMs);
-  }, [clearHideTimer, resetDismissState, resetReplyEditor]);
-
-  const startDismissTimer = useCallback((durationMs: number) => {
-    clearDismissTimer();
-    if (durationMs <= 0) {
-      dismissDurationMsRef.current = 0;
-      dismissRemainingMsRef.current = 0;
-      setDismissProgress(1);
-      return;
-    }
-
-    dismissDurationMsRef.current = durationMs;
-    dismissRemainingMsRef.current = durationMs;
-    dismissPausedRef.current = false;
-    pointerHoverRef.current = false;
-    nativeHoverRef.current = false;
-    dismissLastTickAtRef.current = Date.now();
-    setDismissProgress(1);
-    setDismissPaused(false);
-
-    dismissTimerRef.current = window.setInterval(() => {
-      const now = Date.now();
-      const elapsedMs = now - (dismissLastTickAtRef.current ?? now);
-      dismissLastTickAtRef.current = now;
-
-      if (!nativeHoverCheckInFlightRef.current) {
-        nativeHoverCheckInFlightRef.current = true;
-        invoke<boolean>('is_cursor_over_notification_window')
-          .then((hovered) => {
-            nativeHoverRef.current = hovered;
-          })
-          .catch(() => {
-            nativeHoverRef.current = false;
-          })
-          .finally(() => {
-            nativeHoverCheckInFlightRef.current = false;
-          });
-      }
-
-      const isPaused = pointerHoverRef.current || nativeHoverRef.current;
-      if (dismissPausedRef.current !== isPaused) {
-        dismissPausedRef.current = isPaused;
-        setDismissPaused(isPaused);
-      }
-
-      if (isPaused) return;
-
-      const remainingMs = Math.max(0, dismissRemainingMsRef.current - elapsedMs);
-      dismissRemainingMsRef.current = remainingMs;
-      setDismissProgress(Math.max(0, Math.min(1, remainingMs / durationMs)));
-
-      if (remainingMs <= 0) {
-        closeNotification();
-      }
-    }, 100);
-  }, [clearDismissTimer, closeNotification]);
-
-  const pauseDismissTimer = useCallback(() => {
-    pointerHoverRef.current = true;
-    dismissPausedRef.current = true;
-    setDismissPaused(true);
-  }, []);
-
-  const resumeDismissTimer = useCallback(() => {
-    pointerHoverRef.current = false;
-  }, []);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
+    let dismissTimer: number | undefined;
 
     listen<NeoNotificationPayload>('notification', (event) => {
-      resetDismissState();
-      resetReplyEditor();
-      clearHideTimer();
-      closeSequenceRef.current += 1;
-      invoke('set_notification_window_interactive', { interactive: true }).catch(() => {});
-
       setNotif(event.payload);
       setVisible(true);
 
+      if (dismissTimer) window.clearTimeout(dismissTimer);
+
       const duration = event.payload.config?.persistent ? 0 : (event.payload.config?.duration_ms ?? AUTO_DISMISS_MS);
       if (duration > 0) {
-        startDismissTimer(duration);
+        dismissTimer = window.setTimeout(() => {
+          setVisible(false);
+          window.setTimeout(() => {
+            getCurrentWindow().hide().catch(() => {});
+          }, 280);
+        }, duration);
       }
     }).then((u) => {
       unlistenFn = u;
@@ -217,20 +85,9 @@ export default function NotificationWindow() {
 
     return () => {
       if (unlistenFn) unlistenFn();
-      clearDismissTimer();
-      clearHideTimer();
+      if (dismissTimer) window.clearTimeout(dismissTimer);
     };
-  }, [clearDismissTimer, clearHideTimer, resetDismissState, resetReplyEditor, startDismissTimer]);
-
-  useEffect(() => {
-    if (!editingReply) return;
-
-    const timer = window.setTimeout(() => {
-      manualReplyInputRef.current?.focus();
-    }, 60);
-
-    return () => window.clearTimeout(timer);
-  }, [editingReply]);
+  }, []);
 
   // Resize the native window to the rendered notification card.
   useEffect(() => {
@@ -292,12 +149,22 @@ export default function NotificationWindow() {
     };
   }, [notif]);
 
-  const handleClose = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleClick = () => {
     if (notif?.id) {
       invoke('ack_notification', { notificationId: notif.id }).catch(() => {});
     }
-    closeNotification();
+    setVisible(false);
+    window.setTimeout(() => {
+      getCurrentWindow().hide().catch(() => {});
+    }, 200);
+  };
+
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setVisible(false);
+    window.setTimeout(() => {
+      getCurrentWindow().hide().catch(() => {});
+    }, 200);
   };
 
   const handleActionClick = (e: React.MouseEvent, action: NotificationAction) => {
@@ -306,84 +173,35 @@ export default function NotificationWindow() {
       invoke('handle_notification_action', {
         notificationId: notif.id,
         actionType: action.action_type,
-        actionPayload: action.payload ?? null,
+        actionPayload: {
+          ...(notif.payload ?? {}),
+          ...(action.payload ?? {}),
+          mission_id: notif.mission_id ?? notif.payload?.mission_id,
+        },
       }).catch(() => {});
     }
-    closeNotification();
+    setVisible(false);
+    window.setTimeout(() => {
+      getCurrentWindow().hide().catch(() => {});
+    }, 200);
   };
-
-  const getMissionId = useCallback(() => {
-    const payloadMissionId = notif?.payload?.mission_id;
-    return typeof payloadMissionId === 'string' ? payloadMissionId : notif?.mission_id || '';
-  }, [notif]);
-
-  const submitConfirmReply = useCallback(async (approved: boolean, editedText?: string) => {
-    const missionId = getMissionId();
-    if (!missionId) {
-      closeNotification();
-      return;
-    }
-
-    const endpoint = approved ? 'approve' : 'cancel';
-    const body = approved && editedText ? JSON.stringify({ edited_text: editedText }) : '{}';
-    try {
-      await fetch(`http://localhost:8000/api/v1/missions/${missionId}/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-      });
-      if (notif?.id) {
-        invoke('ack_notification', { notificationId: notif.id }).catch(() => {});
-      }
-    } catch (error) {
-      console.error('[NotificationWindow] confirm_reply action failed:', error);
-    } finally {
-      closeNotification();
-    }
-  }, [closeNotification, getMissionId, notif?.id]);
-
-  const handleConfirmReplyAction = useCallback((action: 'approve' | 'cancel' | 'edit') => {
-    if (action === 'edit') {
-      const initialText = typeof notif?.payload?.draft_text === 'string' ? notif.payload.draft_text : '';
-      setManualReplyText(initialText);
-      setEditingReply(true);
-      invoke('set_notification_window_focusable', { focusable: true }).catch(() => {});
-      return;
-    }
-
-    submitConfirmReply(action === 'approve').catch(() => {});
-  }, [notif?.payload, submitConfirmReply]);
-
-  const handleManualReplySubmit = useCallback((e: React.FormEvent) => {
-    e.preventDefault();
-    const text = manualReplyText.trim();
-    if (!text) return;
-
-    submitConfirmReply(true, text).catch(() => {});
-  }, [manualReplyText, submitConfirmReply]);
 
   if (!notif) return null;
 
   const icon = KIND_ICON[notif.kind || ''] || '🔔';
-  const isConfirmReply = notif.kind === 'confirm_reply';
-  const draftText = typeof notif.payload?.draft_text === 'string' ? notif.payload.draft_text : '';
-  const contactLabel = typeof notif.payload?.contact_label === 'string' ? notif.payload.contact_label : '';
-  const dismissDurationMs = notif.config?.persistent ? 0 : (notif.config?.duration_ms ?? AUTO_DISMISS_MS);
-  const timerKey = `${notif.id ?? notif.created_at_unix ?? notif.title ?? 'notification'}-${dismissDurationMs}`;
+  const draftMessages = Array.isArray(notif.payload?.draft_messages)
+    ? notif.payload.draft_messages.map(String).filter(Boolean)
+    : [];
 
   return (
     <div
       ref={notificationRef}
-      className={`macos-notification ${visible ? 'visible' : 'hidden'}${dismissPaused ? ' timer-paused' : ''}`}
+      className={`macos-notification ${visible ? 'visible' : 'hidden'}`}
+      onClick={handleClick}
       role="alert"
-      onMouseEnter={pauseDismissTimer}
-      onMouseLeave={resumeDismissTimer}
     >
       <button
         className="macos-notification-close"
-        type="button"
-        onPointerDown={(e) => e.stopPropagation()}
-        onMouseDown={(e) => e.stopPropagation()}
         onClick={handleClose}
         aria-label="Fechar notificação"
       >
@@ -391,16 +209,6 @@ export default function NotificationWindow() {
       </button>
       <div className="macos-notification-icon">
         <div className="icon-bubble">{icon}</div>
-        {dismissDurationMs > 0 && (
-          <div
-            key={timerKey}
-            className="notification-countdown"
-            aria-hidden="true"
-            style={{ '--notification-progress': dismissProgress } as React.CSSProperties}
-          >
-            <div className="notification-countdown-fill" />
-          </div>
-        )}
       </div>
       <div className="macos-notification-content">
         <div className="macos-notification-header">
@@ -408,71 +216,36 @@ export default function NotificationWindow() {
           <span className="macos-notification-time">agora</span>
         </div>
         <div className="macos-notification-title">{notif.title || 'Nova notificação'}</div>
-        {isConfirmReply ? (
-          <div className="confirm-reply">
-            {!editingReply ? (
-              <>
-                {contactLabel && <div className="confirm-reply-recipient">Para {contactLabel}</div>}
-                <div className="confirm-reply-preview">{draftText || notif.description}</div>
-                <div className="confirm-reply-actions">
-                  <button
-                    type="button"
-                    className="confirm-reply-btn approve"
-                    onClick={() => handleConfirmReplyAction('approve')}
-                  >
-                    Aprovo
-                  </button>
-                  <button
-                    type="button"
-                    className="confirm-reply-btn edit"
-                    onClick={() => handleConfirmReplyAction('edit')}
-                  >
-                    Eu escrevo
-                  </button>
-                  <button
-                    type="button"
-                    className="confirm-reply-btn cancel"
-                    onClick={() => handleConfirmReplyAction('cancel')}
-                  >
-                    Não fazer nada
-                  </button>
-                </div>
-              </>
-            ) : (
-              <form className="confirm-reply-input-row" onSubmit={handleManualReplySubmit}>
-                <input
-                  ref={manualReplyInputRef}
-                  className="confirm-reply-input"
-                  value={manualReplyText}
-                  onChange={(e) => setManualReplyText(e.target.value)}
-                  placeholder="Responder ao Neo..."
-                />
-                <button
-                  type="submit"
-                  className="confirm-reply-send"
-                  aria-label="Enviar resposta editada"
-                  disabled={!manualReplyText.trim()}
-                >
-                  ↑
-                </button>
-              </form>
-            )}
+        {notif.description && <div className="macos-notification-body">{notif.description}</div>}
+        {draftMessages.length > 1 && (
+          <div className="macos-notification-fields">
+            {draftMessages.map((message, index) => (
+              <div key={index} className="macos-notification-field">
+                <span className="field-label">{index + 1}</span>
+                <span className="field-value">{message}</span>
+              </div>
+            ))}
           </div>
-        ) : notif.description && (
-          <div className="macos-notification-body">{notif.description}</div>
         )}
-        {!isConfirmReply && notif.fields && notif.fields.length > 0 && (
-          <div className={`macos-notification-fields${notif.fields.length === 1 ? ' single-field' : ''}`}>
+        {notif.fields && notif.fields.length > 0 && (
+          <div className="macos-notification-fields">
             {notif.fields.map((field, i) => (
               <div key={i} className="macos-notification-field">
-                {field.label && <span className="field-label">{field.label}</span>}
+                <span className="field-label">{field.label}</span>
                 {field.field_type === 'select' ? (
                   <select
                     className="field-input field-select"
-                    data-source={field.source}
-                    defaultValue={field.value || ''}
+                    defaultValue={field.value}
+                    onChange={(e) => {
+                      if (notif) {
+                        const updated = { ...notif };
+                        if (updated.fields) {
+                          updated.fields[i] = { ...updated.fields[i], input_value: e.target.value };
+                          setNotif(updated);
+                        }
+                      }
+                    }}
                   >
-                    <option value="" disabled>Selecione...</option>
                     {(field.options || '').split(',').filter(o => o.trim()).map(opt => (
                       <option key={opt} value={opt.trim()}>{opt.trim()}</option>
                     ))}
@@ -481,18 +254,25 @@ export default function NotificationWindow() {
                   <input
                     type="text"
                     className="field-input field-text"
-                    data-source={field.source}
-                    placeholder={field.placeholder || field.value || field.label || ''}
-                    defaultValue={field.input_value || ''}
+                    defaultValue={field.value}
+                    onChange={(e) => {
+                      if (notif) {
+                        const updated = { ...notif };
+                        if (updated.fields) {
+                          updated.fields[i] = { ...updated.fields[i], input_value: e.target.value };
+                          setNotif(updated);
+                        }
+                      }
+                    }}
                   />
                 ) : (
-                  <span className="field-value">{field.value || field.label}</span>
+                  <span className="field-value">{field.value}</span>
                 )}
               </div>
             ))}
           </div>
         )}
-        {!isConfirmReply && notif.actions && notif.actions.length > 0 && (
+        {notif.actions && notif.actions.length > 0 && (
           <div className="macos-notification-actions" onClick={(e) => e.stopPropagation()}>
             {notif.actions.map((action, i) => (
               <button

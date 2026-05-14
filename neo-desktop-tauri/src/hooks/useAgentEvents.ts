@@ -203,14 +203,23 @@ export const useAgentEvents = ({
             } else {
               const rawContent = event.data.message || 'Tarefa concluída!';
               // Parse [MISSION:...] marker to attach mission metadata for approval buttons
-              const missionMatch = rawContent.match(/\[MISSION:([^\]]+)\]/);
-              const cleanContent = rawContent.replace(/\[MISSION:[^\]]+\]/, '').trim();
-              const parsedMission = missionMatch ? {
-                missionId: JSON.parse(missionMatch[1]).missionId,
-                contactLabel: JSON.parse(missionMatch[1]).contactLabel,
-                contactJid: JSON.parse(missionMatch[1]).contactJid,
-                contactPhone: JSON.parse(missionMatch[1]).contactPhone,
-                draftText: JSON.parse(missionMatch[1]).draftText,
+              const missionMatch = rawContent.match(/\[MISSION:(\{.*\})\]/);
+              const cleanContent = rawContent.replace(/\[MISSION:\{.*\}\]/, '').trim();
+              let missionPayload: any = null;
+              if (missionMatch?.[1]) {
+                try {
+                  missionPayload = JSON.parse(missionMatch[1]);
+                } catch (error) {
+                  console.error('[useAgentEvents] Failed to parse mission marker:', error, missionMatch[1]);
+                }
+              }
+              const parsedMission = missionPayload ? {
+                missionId: missionPayload.missionId,
+                contactLabel: missionPayload.contactLabel,
+                contactJid: missionPayload.contactJid,
+                contactPhone: missionPayload.contactPhone,
+                draftText: missionPayload.draftText,
+                draftMessages: Array.isArray(missionPayload.draftMessages) ? missionPayload.draftMessages : undefined,
                 status: 'pending' as const,
               } : undefined;
               const msgType = missionMatch ? 'mission' : (event.data.success ? 'result' : 'error');

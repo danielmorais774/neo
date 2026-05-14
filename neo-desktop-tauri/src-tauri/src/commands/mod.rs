@@ -284,6 +284,43 @@ pub async fn handle_notification_action(
         notification_id, action_type
     );
 
+    if matches!(action_type.as_str(), "approve" | "cancel" | "retry") {
+        let payload = action_payload.clone().unwrap_or_default();
+        let mission_id = payload
+            .get("mission_id")
+            .or_else(|| payload.get("missionId"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "notification action missing mission_id".to_string())?;
+
+        let base_url = std::env::var("NEO_CORE_HTTP_URL")
+            .or_else(|_| std::env::var("NEO_CORE_API_URL"))
+            .ok()
+            .or_else(|| {
+                std::env::var("NEO_CORE_URL")
+                    .ok()
+                    .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
+            })
+            .unwrap_or_else(|| "http://localhost:8000".to_string());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("Failed to create client: {}", e))?;
+
+        let resp = client
+            .post(format!("{}/api/v1/missions/{}/command", base_url, mission_id))
+            .json(&serde_json::json!({ "command": action_type }))
+            .send()
+            .await
+            .map_err(|e| format!("Mission command request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Mission command failed: {} {}", status, body));
+        }
+    }
+
     let action_event = serde_json::json!({
         "notification_id": notification_id,
         "action_type": action_type,

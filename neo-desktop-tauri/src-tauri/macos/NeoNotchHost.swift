@@ -16,6 +16,8 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     private var isThinking = false
     private var pulsePhase = false
     private var pulseTimer: Timer?
+    private let horizontalPadding: CGFloat = 24
+    private let interItemSpacing: CGFloat = 10
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -51,7 +53,18 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     override func layout() {
         super.layout()
-        promptField.frame = NSRect(x: 68, y: 128, width: bounds.width - 148, height: 26)
+        let promptCardY: CGFloat = 122
+        let promptCardHeight: CGFloat = 44
+        let promptCardX = horizontalPadding
+        let promptCardWidth = bounds.width - horizontalPadding * 2
+        let leftInset: CGFloat = 44
+        let rightInset: CGFloat = 92
+        promptField.frame = NSRect(
+            x: promptCardX + leftInset,
+            y: promptCardY + (promptCardHeight - 24) / 2,
+            width: max(120, promptCardWidth - (leftInset + rightInset)),
+            height: 24
+        )
     }
 
     private func applyState() {
@@ -121,25 +134,36 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawHeaderCard() {
-        let card = NSRect(x: 24, y: 30, width: bounds.width - 48, height: 76)
+        let card = NSRect(x: horizontalPadding, y: 30, width: bounds.width - horizontalPadding * 2, height: 72)
         fillRoundedCard(card, radius: 20, alpha: 0.40)
-        drawBotIcon(in: NSRect(x: 44, y: 50, width: 36, height: 36))
-        drawText("Olá, em que posso ajudar?", in: NSRect(x: 96, y: 50, width: bounds.width - 200, height: 22), size: 15, weight: .bold, color: .white, alignment: .left)
-        drawDottedLine(x: 96, y: 80, dots: 14)
+        let avatarRect = NSRect(x: card.minX + 18, y: card.minY + 18, width: 34, height: 34)
+        drawBotIcon(in: avatarRect)
 
-        let mic = NSRect(x: bounds.width - 70, y: 50, width: 38, height: 38)
+        let micSize: CGFloat = 45
+        let mic = NSRect(x: card.maxX - micSize - 16, y: card.minY + (card.height - micSize) / 2, width: micSize, height: micSize)
         let micPath = NSBezierPath(ovalIn: mic)
         NSColor(calibratedRed: 0.37, green: 0.30, blue: 0.94, alpha: 1.0).setFill()
         micPath.fill()
-        drawMicGlyph(in: mic)
+        drawMicGlyph(in: mic, scale: 0.42)
+
+        let textX = avatarRect.maxX + interItemSpacing
+        let textMaxWidth = max(120, mic.minX - textX - 14)
+        drawText("Olá, em que posso ajudar?", in: NSRect(x: textX, y: card.minY + 18, width: textMaxWidth, height: 20), size: 14, weight: .semibold, color: .white, alignment: .left)
+        drawDottedLine(x: textX, y: card.minY + 43, dots: max(8, Int(min(14, (textMaxWidth / 12)))))
     }
 
     private func drawPromptCard() {
-        let card = NSRect(x: 24, y: 122, width: bounds.width - 48, height: 44)
+        let card = NSRect(x: horizontalPadding, y: 122, width: bounds.width - horizontalPadding * 2, height: 44)
         fillRoundedCard(card, radius: 14, alpha: 0.50)
-        drawSearchGlyph(in: NSRect(x: 40, y: 135, width: 18, height: 18))
-        drawKeyIcon("↵", in: NSRect(x: bounds.width - 82, y: 129, width: 30, height: 30))
-        drawKeyIcon("↑", in: NSRect(x: bounds.width - 47, y: 129, width: 30, height: 30))
+        let searchRect = NSRect(x: card.minX + 16, y: card.minY + 13, width: 18, height: 18)
+        drawSearchGlyph(in: searchRect)
+
+        let keySize: CGFloat = 26
+        let keysY = card.minY + (card.height - keySize) / 2
+        let rightKeyRect = NSRect(x: card.maxX - keySize - 10, y: keysY, width: keySize, height: keySize)
+        let leftKeyRect = NSRect(x: rightKeyRect.minX - keySize - 6, y: keysY, width: keySize, height: keySize)
+        drawKeyIcon("↵", in: leftKeyRect)
+        drawKeyIcon("↑", in: rightKeyRect)
     }
 
     private func drawSectionTitle(_ title: String, count: String, y: CGFloat) {
@@ -153,27 +177,30 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawNotificationCard(y: CGFloat, kind: NotificationKind, title: String, subtitle: String, time: String, badge: String?) {
-        let card = NSRect(x: 24, y: y, width: bounds.width - 48, height: 52)
+        let card = NSRect(x: horizontalPadding, y: y, width: bounds.width - horizontalPadding * 2, height: 52)
         fillRoundedCard(card, radius: 13, alpha: 0.38)
 
-        let iconRect = NSRect(x: 40, y: y + 10, width: 32, height: 32)
+        let iconRect = NSRect(x: card.minX + 14, y: y + 10, width: 30, height: 30)
         drawAppIcon(kind, in: iconRect)
 
-        drawText(title, in: NSRect(x: 84, y: y + 10, width: bounds.width - 194, height: 18), size: 13, weight: .bold, color: .white, alignment: .left)
-        drawText(subtitle, in: NSRect(x: 84, y: y + 28, width: bounds.width - 202, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.62), alignment: .left)
-        drawText(time, in: NSRect(x: bounds.width - 84, y: y + 12, width: 54, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.55), alignment: .right)
+        let textX = iconRect.maxX + 12
+        let rightMetaWidth: CGFloat = 58
+        let textWidth = max(110, card.maxX - textX - rightMetaWidth - 12)
+        drawText(title, in: NSRect(x: textX, y: y + 10, width: textWidth, height: 17), size: 13, weight: .semibold, color: .white, alignment: .left)
+        drawText(subtitle, in: NSRect(x: textX, y: y + 27, width: textWidth, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.62), alignment: .left)
+        drawText(time, in: NSRect(x: card.maxX - rightMetaWidth, y: y + 12, width: rightMetaWidth - 8, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.55), alignment: .right)
 
         if let badge {
-            let badgeRect = NSRect(x: bounds.width - 52, y: y + 27, width: 21, height: 21)
+            let badgeRect = NSRect(x: card.maxX - 28, y: y + 27, width: 18, height: 18)
             let badgePath = NSBezierPath(ovalIn: badgeRect)
             NSColor.systemGreen.setFill()
             badgePath.fill()
-            drawText(badge, in: badgeRect.offsetBy(dx: 0, dy: 4), size: 11, weight: .bold, color: .white, alignment: .center)
+            drawText(badge, in: badgeRect.offsetBy(dx: 0, dy: 2.8), size: 10, weight: .bold, color: .white, alignment: .center)
         }
     }
 
     private func drawQueueCard(y: CGFloat) {
-        let card = NSRect(x: 24, y: y, width: bounds.width - 48, height: 126)
+        let card = NSRect(x: horizontalPadding, y: y, width: bounds.width - horizontalPadding * 2, height: 126)
         fillRoundedCard(card, radius: 14, alpha: 0.38)
 
         drawQueueLine(y: y + 17, title: "Indexar Notion", pct: "72%", eta: "1m", widthFactor: 0.72)
@@ -184,16 +211,21 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawQueueLine(y: CGFloat, title: String, pct: String, eta: String, widthFactor: CGFloat) {
-        drawPurpleDot(center: NSPoint(x: 40, y: y + 6))
-        drawText(title, in: NSRect(x: 56, y: y - 3, width: 260, height: 19), size: 13, weight: .semibold, color: .white, alignment: .left)
-        drawText("\(pct)  ·  \(eta)", in: NSRect(x: bounds.width - 100, y: y - 2, width: 72, height: 18), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.58), alignment: .right)
+        let cardMinX = horizontalPadding
+        let cardMaxX = bounds.width - horizontalPadding
+        drawPurpleDot(center: NSPoint(x: cardMinX + 16, y: y + 6))
+        let labelX = cardMinX + 32
+        let metaWidth: CGFloat = 78
+        let labelWidth = max(120, cardMaxX - labelX - metaWidth - 12)
+        drawText(title, in: NSRect(x: labelX, y: y - 3, width: labelWidth, height: 19), size: 13, weight: .semibold, color: .white, alignment: .left)
+        drawText("\(pct)  ·  \(eta)", in: NSRect(x: cardMaxX - metaWidth, y: y - 2, width: metaWidth - 4, height: 18), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.58), alignment: .right)
 
-        let track = NSRect(x: 42, y: y + 22, width: bounds.width - 84, height: 3)
+        let track = NSRect(x: cardMinX + 18, y: y + 22, width: (cardMaxX - cardMinX) - 36, height: 3)
         let trackPath = NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2)
         NSColor.white.withAlphaComponent(0.08).setFill()
         trackPath.fill()
 
-        let fill = NSRect(x: 42, y: y + 22, width: (bounds.width - 84) * widthFactor, height: 3)
+        let fill = NSRect(x: track.minX, y: y + 22, width: track.width * widthFactor, height: 3)
         let fillPath = NSBezierPath(roundedRect: fill, xRadius: 2, yRadius: 2)
         NSColor(calibratedRed: 0.36, green: 0.46, blue: 1.0, alpha: 1.0).setFill()
         fillPath.fill()
@@ -288,23 +320,32 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         NSBezierPath(ovalIn: NSRect(x: rect.midX, y: rect.midY + 1, width: 2.5, height: 2.5)).fill()
     }
 
-    private func drawMicGlyph(in rect: NSRect) {
+    private func drawMicGlyph(in rect: NSRect, scale: CGFloat = 1.0) {
+        let scaledWidth = rect.width * scale
+        let scaledHeight = rect.height * scale
+        let r = NSRect(
+            x: rect.midX - scaledWidth / 2,
+            y: rect.midY - scaledHeight / 2,
+            width: scaledWidth,
+            height: scaledHeight
+        )
+        let s = min(scaledWidth, scaledHeight) / 20
         NSColor.white.setStroke()
-        let capsule = NSBezierPath(roundedRect: NSRect(x: rect.midX - 4, y: rect.midY - 11, width: 8, height: 16), xRadius: 4, yRadius: 4)
-        capsule.lineWidth = 1.6
+        let capsule = NSBezierPath(roundedRect: NSRect(x: r.midX - 3.4 * s, y: r.midY - 8.9 * s, width: 6.8 * s, height: 13 * s), xRadius: 3.4 * s, yRadius: 3.4 * s)
+        capsule.lineWidth = 1.4 * s
         capsule.stroke()
 
         let arc = NSBezierPath()
-        arc.appendArc(withCenter: NSPoint(x: rect.midX, y: rect.midY - 2), radius: 11, startAngle: 205, endAngle: 335, clockwise: true)
-        arc.lineWidth = 1.6
+        arc.appendArc(withCenter: NSPoint(x: r.midX, y: r.midY - 1.4 * s), radius: 8.8 * s, startAngle: 205, endAngle: 335, clockwise: true)
+        arc.lineWidth = 1.4 * s
         arc.stroke()
 
         let stem = NSBezierPath()
-        stem.move(to: NSPoint(x: rect.midX, y: rect.midY + 12))
-        stem.line(to: NSPoint(x: rect.midX, y: rect.midY + 15))
-        stem.move(to: NSPoint(x: rect.midX - 5, y: rect.midY + 15))
-        stem.line(to: NSPoint(x: rect.midX + 5, y: rect.midY + 15))
-        stem.lineWidth = 1.6
+        stem.move(to: NSPoint(x: r.midX, y: r.midY + 9.2 * s))
+        stem.line(to: NSPoint(x: r.midX, y: r.midY + 11.6 * s))
+        stem.move(to: NSPoint(x: r.midX - 4.2 * s, y: r.midY + 11.6 * s))
+        stem.line(to: NSPoint(x: r.midX + 4.2 * s, y: r.midY + 11.6 * s))
+        stem.lineWidth = 1.4 * s
         stem.stroke()
     }
 
@@ -321,10 +362,10 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawKeyIcon(_ text: String, in rect: NSRect) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
         NSColor.white.withAlphaComponent(0.12).setFill()
         path.fill()
-        drawText(text, in: rect.offsetBy(dx: 0, dy: 6), size: 17, weight: .bold, color: .white, alignment: .center)
+        drawText(text, in: rect.offsetBy(dx: 0, dy: 5), size: 14, weight: .bold, color: .white, alignment: .center)
     }
 
     private func drawKeycap(_ text: String, in rect: NSRect) {
@@ -445,7 +486,7 @@ final class NotchController {
 
     init(screen: NSScreen) {
         let startFrame = Self.frame(for: idleSize, on: screen)
-        panel = NSPanel(
+        panel = NeoInputPanel(
             contentRect: startFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -556,6 +597,10 @@ final class NotchController {
         } else {
             panel.setFrame(nextFrame, display: true)
         }
+
+        if next == .expanded {
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func activeScreen() -> NSScreen? {
@@ -574,6 +619,11 @@ final class NotchController {
         let y = screenFrame.maxY - size.height
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
+}
+
+final class NeoInputPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

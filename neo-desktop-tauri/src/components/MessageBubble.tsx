@@ -180,6 +180,7 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
   // Renderizar missão WhatsApp pendente de aprovação
   if (message.messageType === 'mission' && message.mission) {
     const mission = message.mission;
+    const draftMessages = mission.draftMessages?.length ? mission.draftMessages : [mission.draftText];
     return (
       <div className="message assistant mission-message">
         <div className="message-avatar">📱</div>
@@ -198,8 +199,14 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
                 )}
               </div>
               <div className="mission-draft">
-                <span className="mission-label">Mensagem:</span>
-                <span className="mission-draft-text">"{mission.draftText}"</span>
+                <span className="mission-label">{draftMessages.length > 1 ? 'Mensagens:' : 'Mensagem:'}</span>
+                <span className="mission-draft-text">
+                  {draftMessages.map((draft, index) => (
+                    <span key={index} style={{ display: 'block' }}>
+                      {draftMessages.length > 1 ? `${index + 1}. ` : ''}"{draft}"
+                    </span>
+                  ))}
+                </span>
               </div>
             </div>
             {mission.status === 'pending' && (

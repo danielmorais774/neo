@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "npm run build && npx tauri dev"
+    "start": "npm run build && npx tauri dev",
+    "start:clean": "cd src-tauri && cargo clean && cd .. && npm run start"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

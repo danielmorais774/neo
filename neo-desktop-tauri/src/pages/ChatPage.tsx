@@ -144,8 +144,16 @@ export const ChatPage = () => {
     );
 
     try {
-      const url = `http://localhost:8000/api/v1/missions/${missionId}/${approved ? 'approve' : 'cancel'}`;
-      await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: editedText ? JSON.stringify({ edited_text: editedText }) : '{}' });
+      const command = approved ? (editedText ? 'edit' : 'approve') : 'cancel';
+      const payload = editedText
+        ? { command, edited_text: editedText }
+        : { command };
+      const url = `http://localhost:8000/api/v1/missions/${missionId}/command`;
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
     } catch (e) {
       console.error('[ChatPage] handleMissionResponse failed:', e);
     }
