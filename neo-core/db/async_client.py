@@ -726,6 +726,46 @@ class AsyncPostgresClient:
             result = await db.execute(stmt)
             return result.scalars().first()
 
+    async def find_active_whatsapp_mission_by_session(
+        self,
+        session_id: UUID,
+        user_id: UUID | None = None,
+    ) -> Mission | None:
+        """Find the most recent active WhatsApp mission in a chat session."""
+        async with self.get_session() as db:
+            stmt = (
+                select(Mission)
+                .where(Mission.session_id == session_id)
+                .where(Mission.channel == "whatsapp")
+                .where(Mission.status.in_(["awaiting_reply", "awaiting_confirmation", "processing"]))
+            )
+            if user_id:
+                stmt = stmt.where(Mission.user_id == user_id)
+            stmt = stmt.order_by(Mission.last_activity_at.desc()).limit(1)
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def list_recent_whatsapp_missions_by_session(
+        self,
+        session_id: UUID,
+        user_id: UUID | None = None,
+        limit: int = 5,
+    ) -> list[Mission]:
+        """List recent WhatsApp missions associated with a chat session."""
+        async with self.get_session() as db:
+            stmt = (
+                select(Mission)
+                .where(Mission.session_id == session_id)
+                .where(Mission.channel == "whatsapp")
+                .where(Mission.status != "cancelled")
+                .order_by(Mission.last_activity_at.desc())
+                .limit(limit)
+            )
+            if user_id:
+                stmt = stmt.where(Mission.user_id == user_id)
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
     async def lock_mission_for_update(self, mission_id: UUID) -> Mission | None:
         """Lock a mission row for update to prevent concurrent agent runs."""
         async with self.get_session() as db:

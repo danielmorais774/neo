@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any
 from uuid import UUID
+from uuid import UUID as _UUID
 
 from core.agent.agent_executor import AgentExecutor
 from core.skills import SkillResult
@@ -71,11 +72,20 @@ class SkillExecutor:
             resolved_user_id = user_id
             if not resolved_user_id and (extra or {}).get("user_id"):
                 resolved_user_id = extra["user_id"]
+            resolved_mission_id = None
+            raw_mission_id = (extra or {}).get("mission_id")
+            if isinstance(raw_mission_id, UUID):
+                resolved_mission_id = raw_mission_id
+            elif isinstance(raw_mission_id, str) and raw_mission_id.strip():
+                try:
+                    resolved_mission_id = _UUID(raw_mission_id.strip())
+                except ValueError:
+                    logger.warning("SkillExecutor.execute: invalid mission_id in extra: %s", raw_mission_id)
             return await pipeline.run(
                 session_id=session_id,
                 user_message=user_message,
                 history=conversation_history,
-                mission_id=None,
+                mission_id=resolved_mission_id,
                 extra=extra or {},
                 user_id=resolved_user_id,
             )

@@ -1,12 +1,14 @@
 """WhatsApp Messaging tool executor — handles tool calls during agent loops."""
 
 import logging
+import asyncio
 from typing import Any
 
 from uuid import UUID
 
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
 from db.async_client import AsyncPostgresClient
+from shared import ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,41 @@ class WhatsAppMessagingExecutor:
     def __init__(self, db: AsyncPostgresClient, gateway: WhatsAppGatewayClient) -> None:
         self.db = db
         self.gateway = gateway
+        self._mission_id: UUID | None = None
+        self._user_id: UUID | None = None
+
+    def set_context(self, mission_id: UUID, user_id: UUID) -> None:
+        """Set mission context used by AgentExecutor tool-call dispatch."""
+        self._mission_id = mission_id
+        self._user_id = user_id
+
+    async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
+        """Adapter expected by AgentExecutor._execute_tools."""
+        start_time = asyncio.get_event_loop().time()
+        try:
+            if not self._mission_id or not self._user_id:
+                raise ValueError("WhatsApp mission context not set for tool execution")
+
+            result = await self.execute(
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                mission_id=self._mission_id,
+                user_id=self._user_id,
+            )
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                result=result,
+                execution_time=asyncio.get_event_loop().time() - start_time,
+            )
+        except Exception as e:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                result=None,
+                error=str(e),
+                execution_time=asyncio.get_event_loop().time() - start_time,
+            )
 
     async def execute(
         self,

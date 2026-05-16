@@ -102,6 +102,107 @@ _DEFAULT_MESSAGE_DELAY_MS = 1200
 _MAX_PERSONAL_MESSAGE_PARTS = 3
 _MAX_COMMERCIAL_MESSAGE_PARTS = 2
 _MAX_MESSAGE_PART_CHARS = 180
+_FOLLOWUP_INSTRUCTION_PREFIXES = (
+    "se ",
+    "caso ",
+    "quando ",
+    "e se ",
+    "ah, se ",
+    "ah se ",
+    "tambem ",
+    "também ",
+)
+_FOLLOWUP_INSTRUCTION_MARKERS = (
+    " ela ",
+    " ele ",
+    " eles ",
+    " elas ",
+    " responder",
+    " perguntar",
+    " falar",
+    " disser",
+    " mandar",
+    " enviar",
+)
+_ACTIVE_MISSION_FOLLOWUP_MARKERS = (
+    "outra resposta",
+    "nova resposta",
+    "gere outra",
+    "gere uma nova",
+    "gere um nova",
+    "gera outra",
+    "gera uma nova",
+    "gera um nova",
+    "gerar outra",
+    "gerar uma nova",
+    "gerar um nova",
+    "refaz",
+    "refaca",
+    "refaça",
+    "reescreve",
+    "reescrever",
+    "muda a resposta",
+    "troca a resposta",
+    "melhor resposta",
+    "mais natural",
+    "mais curto",
+    "nova sugestao",
+    "nova sugestão",
+    "outro rascunho",
+)
+_DRAFT_EDIT_MARKERS = (
+    "coloca",
+    "coloque",
+    "adiciona",
+    "adicione",
+    "bota",
+    "inclui",
+    "inclua",
+    "acrescenta",
+    "acrescente",
+    "tira",
+    "retira",
+    "remove",
+    "remova",
+    "troca",
+    "troque",
+    "muda",
+    "mude",
+    "no final",
+    "ao final",
+    "no começo",
+    "no comeco",
+    "mais gratidao",
+    "mais gratidão",
+    "mais agradecido",
+    "mais agradecida",
+    "mais carinho",
+    "mais carinhoso",
+    "mais carinhosa",
+    "mais seco",
+    "mais direta",
+    "mais direto",
+)
+_MISSION_CANCEL_MARKERS = (
+    "aborta",
+    "abortar",
+    "aborte",
+    "cancela",
+    "cancelar",
+    "cancele",
+    "deixa pra la",
+    "deixa para la",
+    "deixa quieto",
+    "deixa isso quieto",
+    "deixa assim",
+    "nao faz nada",
+    "não faz nada",
+    "nao precisa responder",
+    "não precisa responder",
+    "sem resposta",
+    "ignora",
+    "ignore",
+)
 
 
 class WhatsAppMessagingPipeline(SkillPipeline):
@@ -229,7 +330,29 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
             if extra.get("approved") is not None:
                 return await self._handle_approval(mission, extra, slog)
+            if self._is_operator_instruction(extra):
+                return await self._handle_active_mission_user_message(mission, user_message, slog)
             return await self._handle_inbound(mission, user_message, slog, extra, history)
+
+        if user_id and self._looks_like_active_mission_followup(user_message):
+            active_mission = await self.db.find_active_whatsapp_mission_by_session(session_id, user_id)
+            if active_mission:
+                mission_slog = _get_mission_logger(active_mission.id)
+                fanout_slog = _FanoutLogger(slog, mission_slog)
+                fanout_slog.log_event(
+                    "whatsapp_messaging.user_message_routed_to_active_mission",
+                    {
+                        "mission_id": str(active_mission.id),
+                        "session_id": str(session_id),
+                        "user_message": user_message,
+                        "reason": "active_whatsapp_mission_in_session",
+                    },
+                )
+                return await self._handle_active_mission_user_message(
+                    active_mission,
+                    user_message,
+                    fanout_slog,
+                )
 
         return await self._handle_kickoff(session_id, user_message, extra, slog, user_id)
 
@@ -563,6 +686,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             temperature=self.agent_executor.settings.default_temperature,
         )
 
+        self.executor.set_context(mission_id=mission_id, user_id=user_id)
         result = await self.agent_executor.execute(
             task=user_message,
             session_id=mission_session_id,
@@ -675,6 +799,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 mission_goal=mission.goal,
                 contact_label=contact_label,
                 inbound_text=inbound_text,
+                operator_instructions=self._get_operator_instructions(meta),
                 prior_sent_messages=[
                     *(meta.get("last_outbound_messages") or []),
                     meta.get("draft_text") or "",
@@ -772,6 +897,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             contact_phone=contact_phone,
             goal=mission.goal,
             goal_status=self._build_goal_status(memory),
+            extra_instructions=self._build_extra_instructions_block(meta),
         )
         slog.log_event(
             "whatsapp_messaging.inbound_commercial_system_prompt",
@@ -802,6 +928,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             temperature=self.agent_executor.settings.default_temperature,
         )
 
+        self.executor.set_context(mission_id=mission.id, user_id=mission.user_id)
         result = await self.agent_executor.execute(
             task=inbound_text,
             session_id=mission.session_id,
@@ -821,13 +948,37 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         mission_goal: str,
         contact_label: str,
         inbound_text: str,
+        operator_instructions: list[str] | None = None,
         prior_sent_messages: list[str] | None = None,
+        rewrite_request: str | None = None,
+        previous_draft: str | None = None,
         slog: SessionFileLogger | None = None,
     ) -> str:
+        instruction_reply = None
+        if not rewrite_request:
+            instruction_reply = _reply_from_matching_operator_instruction(
+                operator_instructions or [],
+                inbound_text,
+            )
+        if instruction_reply:
+            if slog:
+                slog.log_event(
+                    "whatsapp_messaging.personal_ack_operator_instruction_match",
+                    {
+                        "inbound_text": inbound_text,
+                        "reply_text": instruction_reply,
+                        "operator_instructions": operator_instructions or [],
+                    },
+                )
+            return instruction_reply
+
         fallback = _fallback_personal_ack(inbound_text)
         try:
             llm_provider = self.agent_executor.llm_router.get_provider(None)
             model = self.agent_executor.llm_router.get_default_model(None)
+            instructions_block = "\n".join(
+                f"- {item}" for item in (operator_instructions or [])[-5:] if item.strip()
+            ) or "Nenhuma."
             messages = [
                 Message(
                     role=MessageRole.SYSTEM,
@@ -839,6 +990,8 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         "Assuma que o contato já conhece o contexto anterior da conversa. "
                         "Reaja principalmente à última mensagem recebida do contato. "
                         "Quando a mensagem recebida for lembrete ou confirmação simples, responda só com confirmação curta. "
+                        "Se houver instrução adicional do Daniel aplicável à mensagem recebida, siga essa instrução acima do pedido original. "
+                        "Se Daniel pediu uma nova versão do rascunho, mantenha o sentido das instruções aplicáveis, mas ajuste o estilo pedido. "
                         "Não repita nem reexplique o pedido original do usuário, salvo se o contato pedir esclarecimento. "
                         "Evite respostas completas demais; prefira continuação natural da conversa. "
                         "Não adicione risadas, emojis ou gírias fortes sem sinal explícito no contexto. "
@@ -851,8 +1004,13 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     content=(
                         f"Pedido original do usuário: {mission_goal}\n"
                         f"Contato: {contact_label}\n"
+                        f"Instruções adicionais do Daniel:\n{instructions_block}\n"
                         f"Mensagem recebida do contato: {inbound_text}\n\n"
+                        f"Pedido atual do Daniel sobre o rascunho: {rewrite_request or 'Gerar resposta curta.'}\n"
+                        f"Rascunho anterior: {previous_draft or '(nenhum)'}\n\n"
                         "Escreva uma resposta curta reagindo à mensagem recebida. "
+                        "Se uma instrução adicional combinar com a mensagem recebida, responda conforme essa instrução. "
+                        "Se houver rascunho anterior, gere uma alternativa diferente e respeite o pedido atual de estilo. "
                         "Use o pedido original apenas para entender o contexto, não para repetir informações já comunicadas. "
                         "Exemplo ruim: 'Vou esquentar sim, mas vou chegar mais tarde hoje'. "
                         "Exemplo bom: 'Pode deixar, vou esquentar sim'."
@@ -878,7 +1036,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             text = _sanitize_personal_ack(response.get_content() or "")
             text = _strip_redundant_personal_context(
                 text,
-                forbidden_phrases=[mission_goal, *(prior_sent_messages or [])],
+                forbidden_phrases=[mission_goal, previous_draft or "", *(prior_sent_messages or [])],
             )
             if slog:
                 slog.log_llm_response(
@@ -1289,6 +1447,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         contact_phone: str | None,
         goal: str,
         goal_status: str | None = None,
+        extra_instructions: str = "",
     ) -> str:
         try:
             template = (Path(__file__).parent / "prompt.md").read_text()
@@ -1302,10 +1461,374 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             contact_phone=contact_phone or "(telefone não disponível)",
             goal=goal,
             goal_status=goal_status or "Ainda não há histórico carregado sobre o andamento do objetivo.",
+            extra_instructions=extra_instructions or "Nenhuma instrução adicional.",
             user_address=DEFAULT_USER_ADDRESS,
             user_phone=DEFAULT_USER_PHONE,
             user_payment_prefs=DEFAULT_PAYMENT_PREFS,
         )
+
+    @staticmethod
+    def _is_operator_instruction(extra: dict[str, Any]) -> bool:
+        if extra.get("approved") is not None:
+            return False
+        # Webhook inbounds sempre trazem identificadores da mensagem recebida.
+        if any(extra.get(k) for k in ("inbound_message_id", "webhook_message_id", "inbound_jid")):
+            return False
+        return True
+
+    @staticmethod
+    def _looks_like_operator_followup_instruction(text: str) -> bool:
+        normalized = _fold_accents((text or "").strip().lower())
+        if not normalized:
+            return False
+        if any(normalized.startswith(prefix) for prefix in _FOLLOWUP_INSTRUCTION_PREFIXES):
+            return True
+        padded = f" {normalized} "
+        return any(marker in padded for marker in _FOLLOWUP_INSTRUCTION_MARKERS) and any(
+            verb in padded for verb in (" responder", " perguntar", " falar", " disser")
+        )
+
+    @staticmethod
+    def _looks_like_active_mission_followup(text: str) -> bool:
+        normalized = _fold_accents((text or "").strip().lower())
+        if not normalized:
+            return False
+        return (
+            WhatsAppMessagingPipeline._looks_like_operator_followup_instruction(text)
+            or WhatsAppMessagingPipeline._looks_like_mission_cancel_request(text)
+            or WhatsAppMessagingPipeline._looks_like_draft_edit_request(text)
+            or any(marker in normalized for marker in _ACTIVE_MISSION_FOLLOWUP_MARKERS)
+        )
+
+    @staticmethod
+    def _looks_like_reply_regeneration_request(text: str) -> bool:
+        normalized = _fold_accents((text or "").strip().lower())
+        return any(marker in normalized for marker in _ACTIVE_MISSION_FOLLOWUP_MARKERS)
+
+    @staticmethod
+    def _looks_like_mission_cancel_request(text: str) -> bool:
+        normalized = _fold_accents((text or "").strip().lower())
+        normalized = " ".join(normalized.split())
+        if not normalized:
+            return False
+        return any(marker in normalized for marker in _MISSION_CANCEL_MARKERS)
+
+    @staticmethod
+    def _looks_like_draft_edit_request(text: str) -> bool:
+        normalized = _fold_accents((text or "").strip().lower())
+        normalized = " ".join(normalized.split())
+        if not normalized:
+            return False
+        return any(marker in normalized for marker in _DRAFT_EDIT_MARKERS)
+
+    async def _handle_active_mission_user_message(
+        self,
+        mission,
+        user_message: str,
+        slog: "SessionFileLogger",
+    ) -> SkillResult:
+        meta = mission.extra_metadata or {}
+        if self._looks_like_mission_cancel_request(user_message):
+            return await self._cancel_active_mission(mission, user_message, slog)
+
+        if (
+            self._looks_like_draft_edit_request(user_message)
+            and meta.get("draft_text")
+        ):
+            return await self._edit_personal_pending_reply(mission, user_message, slog)
+        if self._looks_like_draft_edit_request(user_message):
+            return SkillResult(
+                ok=False,
+                message="Não encontrei um rascunho pendente nessa missão para alterar.",
+                mission_id=mission.id,
+            )
+
+        if (
+            self._looks_like_reply_regeneration_request(user_message)
+            and meta.get("pending_inbound_ack")
+            and meta.get("last_inbound_text")
+        ):
+            return await self._regenerate_personal_inbound_reply(mission, user_message, slog)
+        if self._looks_like_reply_regeneration_request(user_message):
+            return SkillResult(
+                ok=False,
+                message="Não encontrei um rascunho pendente nessa missão para gerar outra resposta.",
+                mission_id=mission.id,
+            )
+
+        if self._looks_like_operator_followup_instruction(user_message):
+            return await self._handle_operator_instruction(mission, user_message, slog)
+
+        slog.log_event(
+            "whatsapp_messaging.active_mission_message_ignored",
+            {
+                "mission_id": str(mission.id),
+                "user_message": user_message,
+                "reason": "not_instruction_or_regeneration_request",
+            },
+        )
+        return SkillResult(
+            ok=True,
+            message="Entendi. Não alterei a missão porque não identifiquei uma instrução futura nem um pedido de novo rascunho.",
+            mission_id=mission.id,
+            extra={
+                "message_type": "mission_note",
+                "mission_id": str(mission.id),
+            },
+        )
+
+    async def _cancel_active_mission(
+        self,
+        mission,
+        user_message: str,
+        slog: "SessionFileLogger",
+    ) -> SkillResult:
+        await self.db.update_mission_status(
+            mission.id,
+            status="cancelled",
+            result_summary="Cancelada por comando do usuário.",
+            extra_metadata={
+                "pending_inbound_ack": False,
+                "cancelled_by_user_message": user_message,
+            },
+        )
+        await self.db.clear_mission_next_action(mission.id)
+        try:
+            acked_count = await self.db.mark_notifications_acked_for_mission(mission.id)
+        except Exception as e:
+            acked_count = 0
+            logger.warning("Failed to ack mission notifications on cancel mission=%s err=%s", mission.id, e)
+
+        slog.log_event(
+            "whatsapp_messaging.active_mission_cancelled_by_user",
+            {
+                "mission_id": str(mission.id),
+                "user_message": user_message,
+                "acked_notifications": acked_count,
+            },
+        )
+        return SkillResult(
+            ok=True,
+            message="Missão cancelada. Não vou continuar nem responder essa conversa.",
+            mission_id=mission.id,
+            extra={
+                "message_type": "mission_cancelled",
+                "mission_id": str(mission.id),
+                "status": "cancelled",
+                "acked_notifications": acked_count,
+            },
+        )
+
+    async def _edit_personal_pending_reply(
+        self,
+        mission,
+        user_message: str,
+        slog: "SessionFileLogger",
+    ) -> SkillResult:
+        meta = mission.extra_metadata or {}
+        previous_draft = (meta.get("draft_text") or "").strip()
+        if not previous_draft:
+            return SkillResult(
+                ok=False,
+                message="Não encontrei um rascunho pendente nessa missão para alterar.",
+                mission_id=mission.id,
+            )
+
+        edited_text = _apply_simple_pending_reply_edit(previous_draft, user_message)
+        if not edited_text:
+            return await self._regenerate_personal_inbound_reply(mission, user_message, slog)
+
+        return await self._replace_personal_pending_reply(
+            mission=mission,
+            reply_text=edited_text,
+            user_message=user_message,
+            slog=slog,
+            event_name="whatsapp_messaging.personal_reply_edited",
+        )
+
+    async def _regenerate_personal_inbound_reply(
+        self,
+        mission,
+        user_message: str,
+        slog: "SessionFileLogger",
+    ) -> SkillResult:
+        meta = mission.extra_metadata or {}
+        contact_label = meta.get("contact_label") or mission.title
+        contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
+        inbound_text = (meta.get("last_inbound_text") or "").strip()
+        previous_draft = (meta.get("draft_text") or "").strip()
+        if not inbound_text:
+            return SkillResult(
+                ok=False,
+                message="Não encontrei a última mensagem recebida dessa missão para gerar outra resposta.",
+                mission_id=mission.id,
+            )
+
+        reply_text = await self._build_personal_ack_reply(
+            mission_goal=mission.goal,
+            contact_label=contact_label,
+            inbound_text=inbound_text,
+            operator_instructions=self._get_operator_instructions(meta),
+            prior_sent_messages=[
+                *(meta.get("last_outbound_messages") or []),
+                previous_draft,
+            ],
+            rewrite_request=user_message,
+            previous_draft=previous_draft,
+            slog=slog,
+        )
+        return await self._replace_personal_pending_reply(
+            mission=mission,
+            reply_text=reply_text,
+            user_message=user_message,
+            slog=slog,
+            event_name="whatsapp_messaging.personal_reply_regenerated",
+        )
+
+    async def _replace_personal_pending_reply(
+        self,
+        mission,
+        reply_text: str,
+        user_message: str,
+        slog: "SessionFileLogger",
+        event_name: str,
+    ) -> SkillResult:
+        meta = mission.extra_metadata or {}
+        contact_label = meta.get("contact_label") or mission.title
+        contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
+        inbound_text = (meta.get("last_inbound_text") or "").strip()
+        previous_draft = (meta.get("draft_text") or "").strip()
+        reply_messages = _split_whatsapp_messages(reply_text, mode="personal")
+        await self.db.update_mission_status(
+            mission.id,
+            status="awaiting_confirmation",
+            extra_metadata={
+                "draft_text": reply_text,
+                "draft_messages": reply_messages,
+                "pending_inbound_ack": True,
+                "last_reply_edit_request": user_message,
+            },
+        )
+        await self.db.set_mission_next_action(
+            mission_id=mission.id,
+            action_type="send_whatsapp",
+            action_params={
+                "jid": mission.contact_jid,
+                "text": reply_text,
+                "messages": reply_messages,
+                "delay_ms": _DEFAULT_MESSAGE_DELAY_MS,
+                "idempotency_key": str(mission.id),
+            },
+        )
+
+        phone_label = contact_phone or _phone_from_jid(mission.contact_jid) or mission.contact_jid
+        notification_payload = {
+            "mission_id": str(mission.id),
+            "contact_label": contact_label,
+            "contact_jid": mission.contact_jid,
+            "contact_phone_e164": contact_phone or phone_label,
+            "inbound_text": inbound_text,
+            "draft_text": reply_text,
+            "draft_messages": reply_messages,
+            "mode": "personal",
+            "pending_inbound_ack": True,
+        }
+        approval_body = _build_approval_body(
+            contact_label,
+            phone_label,
+            reply_text,
+            reply_messages,
+            prefix=f"Recebido: {inbound_text}" if inbound_text else None,
+        )
+        await self._notify(
+            user_id=mission.user_id,
+            mission_id=mission.id,
+            kind="confirm_reply",
+            title=f"Nova sugestão para {contact_label}",
+            body=approval_body,
+            payload=notification_payload,
+            actions=[
+                {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
+                {"action_type": "edit", "label": "Eu escrevo", "button_style": "outlined"},
+                {"action_type": "cancel", "label": "Não fazer nada", "button_style": "ghost"},
+            ],
+            config={"persistent": True, "position": "bottom_right", "play_sound": True},
+        )
+        slog.log_event(
+            event_name,
+            {
+                "mission_id": str(mission.id),
+                "inbound_text": inbound_text,
+                "previous_draft": previous_draft,
+                "draft_reply": reply_text,
+                "draft_messages": reply_messages,
+                "request": user_message,
+            },
+        )
+        return SkillResult(
+            ok=True,
+            message=f"Nova sugestão de resposta para {contact_label}.",
+            mission_id=mission.id,
+        )
+
+    async def _handle_operator_instruction(
+        self,
+        mission,
+        user_message: str,
+        slog: "SessionFileLogger",
+    ) -> SkillResult:
+        instruction = (user_message or "").strip()
+        if not instruction:
+            return SkillResult(ok=False, message="Instrução vazia.", mission_id=mission.id)
+
+        meta = mission.extra_metadata or {}
+        prior = list(meta.get("operator_instructions") or [])
+        prior.append(instruction)
+        prior = prior[-10:]
+
+        await self.db.update_mission_status(
+            mission.id,
+            status=mission.status,
+            extra_metadata={
+                "operator_instruction": instruction,
+                "operator_instructions": prior,
+            },
+        )
+
+        slog.log_event(
+            "whatsapp_messaging.operator_instruction_registered",
+            {
+                "mission_id": str(mission.id),
+                "instruction": instruction,
+                "instruction_count": len(prior),
+            },
+        )
+
+        return SkillResult(
+            ok=True,
+            message="Entendi. Registrei essa instrução e vou seguir isso nas próximas respostas dessa missão.",
+            mission_id=mission.id,
+            extra={
+                "message_type": "mission_instruction",
+                "mission_id": str(mission.id),
+                "instruction": instruction,
+            },
+        )
+
+    @staticmethod
+    def _build_extra_instructions_block(meta: dict[str, Any]) -> str:
+        instructions = WhatsAppMessagingPipeline._get_operator_instructions(meta)
+        if not instructions:
+            return "Nenhuma instrução adicional."
+        return "\n".join(f"- {item}" for item in instructions[-5:])
+
+    @staticmethod
+    def _get_operator_instructions(meta: dict[str, Any]) -> list[str]:
+        instructions = list(meta.get("operator_instructions") or [])
+        latest = (meta.get("operator_instruction") or "").strip()
+        if latest and (not instructions or instructions[-1] != latest):
+            instructions.append(latest)
+        return [str(item).strip() for item in instructions if str(item).strip()]
 
     async def _build_conversation_memory(
         self,
@@ -1583,6 +2106,118 @@ def _strip_redundant_personal_context(text: str, forbidden_phrases: list[str]) -
     if len(cleaned) < 4:
         return text
     return cleaned[:180].strip()
+
+
+def _reply_from_matching_operator_instruction(
+    instructions: list[str],
+    inbound_text: str,
+) -> str | None:
+    inbound_normalized = _fold_accents(inbound_text or "").lower()
+    if not inbound_normalized.strip():
+        return None
+
+    for instruction in reversed(instructions):
+        raw_instruction = (instruction or "").strip()
+        if not raw_instruction:
+            continue
+
+        reply_match = re.search(
+            r"\b(?:diz|responde|fala|mande|manda)\s+que\s+(.+)$",
+            raw_instruction,
+            flags=re.IGNORECASE,
+        )
+        if not reply_match:
+            continue
+
+        condition = raw_instruction[: reply_match.start()]
+        if not _operator_instruction_condition_matches(condition, inbound_normalized):
+            continue
+
+        reply = _sanitize_personal_ack(reply_match.group(1))
+        if reply:
+            return reply[:180].strip()
+    return None
+
+
+def _operator_instruction_condition_matches(condition: str, inbound_normalized: str) -> bool:
+    condition_normalized = _fold_accents(condition or "").lower()
+    if not condition_normalized.strip():
+        return False
+
+    semantic_groups = (
+        {"comida", "janta", "jantar", "almoco", "almocar", "mesa", "geladeira", "quentinha", "marmita"},
+        {"ketchup", "molho", "maionese", "mostarda"},
+        {"chegar", "cheguei", "chegando", "atrasar", "atrasado", "tarde"},
+    )
+    inbound_tokens = set(re.findall(r"\w{4,}", inbound_normalized))
+    condition_tokens = set(re.findall(r"\w{4,}", condition_normalized))
+
+    for group in semantic_groups:
+        if condition_tokens & group and inbound_tokens & group:
+            return True
+
+    ignored = {
+        "minha", "meu", "irma", "irmao", "falar", "responder", "perguntar",
+        "disser", "dizer", "deixar", "deixou", "deixa", "caso", "quando",
+        "para", "pela", "pelo", "isso", "essa", "esse",
+    }
+    meaningful_terms = {token for token in condition_tokens if token not in ignored and len(token) >= 4}
+    return bool(meaningful_terms & inbound_tokens)
+
+
+def _apply_simple_pending_reply_edit(previous_draft: str, user_message: str) -> str | None:
+    draft = " ".join((previous_draft or "").strip().split())
+    request = " ".join((user_message or "").strip().split())
+    if not draft or not request:
+        return None
+
+    append_match = re.search(
+        r"\b(?:coloca|coloque|adiciona|adicione|bota|inclui|inclua|acrescenta|acrescente)\s+(.+?)\s+(?:no|ao)\s+final\b",
+        request,
+        flags=re.IGNORECASE,
+    )
+    if append_match:
+        addition = _clean_draft_edit_fragment(append_match.group(1))
+        if not addition:
+            return None
+        folded_draft = _fold_accents(draft).lower()
+        folded_addition = _fold_accents(addition).lower()
+        if folded_draft.endswith(folded_addition):
+            return draft[:180].strip()
+        base = re.sub(r"[.!?]+$", "", draft).strip()
+        separator = " " if base.endswith((",", ";", ":")) else ", "
+        return f"{base}{separator}{addition}"[:180].strip(" ,")
+
+    replace_match = re.search(
+        r"\b(?:troca|troque|muda|mude)\s+(?:por|para)\s+(.+)$",
+        request,
+        flags=re.IGNORECASE,
+    )
+    if replace_match:
+        replacement = _sanitize_personal_ack(replace_match.group(1))
+        return replacement or None
+
+    remove_match = re.search(
+        r"\b(?:tira|retira|remove|remova)\s+(.+)$",
+        request,
+        flags=re.IGNORECASE,
+    )
+    if remove_match:
+        fragment = _clean_draft_edit_fragment(remove_match.group(1))
+        if not fragment:
+            return None
+        cleaned = re.sub(re.escape(fragment), "", draft, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+        return cleaned[:180].strip() if cleaned and cleaned != draft else None
+
+    return None
+
+
+def _clean_draft_edit_fragment(fragment: str) -> str:
+    text = " ".join((fragment or "").strip().strip('"“”').split())
+    text = re.sub(r"^(?:um|uma|uns|umas)\s+", "", text, flags=re.IGNORECASE)
+    text = text.strip(" ,.;:")
+    return text[:80].strip()
 
 
 def _fallback_personal_ack(inbound_text: str) -> str:

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from datetime import date
 from typing import Any
@@ -75,6 +76,81 @@ def _mission_chat_status(status: str | None) -> str:
     if status == "failed":
         return "rejected"
     return "pending"
+
+
+def _looks_like_whatsapp_mission_followup(text: str) -> bool:
+    normalized = "".join(
+        c for c in unicodedata.normalize("NFD", (text or "").strip().lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return False
+    markers = (
+        "outra resposta",
+        "nova resposta",
+        "gere outra",
+        "gere uma nova",
+        "gere um nova",
+        "gera outra",
+        "gera uma nova",
+        "gera um nova",
+        "gerar outra",
+        "gerar uma nova",
+        "gerar um nova",
+        "refaz",
+        "refaca",
+        "reescreve",
+        "mais natural",
+        "mais curto",
+        "nova sugestão",
+        "nova sugestao",
+        "outro rascunho",
+        "coloca",
+        "coloque",
+        "adiciona",
+        "adicione",
+        "bota",
+        "inclui",
+        "inclua",
+        "acrescenta",
+        "acrescente",
+        "tira",
+        "retira",
+        "remove",
+        "remova",
+        "troca",
+        "troque",
+        "muda",
+        "mude",
+        "no final",
+        "ao final",
+        "mais gratidao",
+        "mais agradecido",
+        "mais agradecida",
+        "mais carinho",
+        "mais carinhoso",
+        "mais carinhosa",
+        "aborta",
+        "abortar",
+        "aborte",
+        "cancela",
+        "cancelar",
+        "cancele",
+        "deixa pra la",
+        "deixa para la",
+        "deixa quieto",
+        "deixa isso quieto",
+        "deixa assim",
+        "nao faz nada",
+        "nao precisa responder",
+        "sem resposta",
+        "ignora",
+        "ignore",
+    )
+    if normalized.startswith(("se ", "caso ", "quando ", "e se ")):
+        return True
+    return any(marker in normalized for marker in markers)
 
 
 def _build_mission_card_metadata(
@@ -288,7 +364,6 @@ class AIService:
         # 2+4. Salvar mensagem (com embedding) E buscar histórico EM PARALELO
         # get_history roda sem current_embedding (re-rank semântico ignorado para msgs novas;
         # só afeta sessões com >30 msgs). O classify recebe o histórico diretamente.
-        sys_context = self._build_system_context(metadata)
         t0_parallel = time.monotonic()
         saved_msg, history = await asyncio.gather(
             self.sessions.add_message(
@@ -309,6 +384,11 @@ class AIService:
         hist_ms = 0.0           # sobrepostos — não contados separadamente
         current_embedding = saved_msg.embedding if saved_msg else None
         slog.log_message_saved("user", user_message, str(sid))
+
+        sys_context = self._build_system_context(metadata)
+        mission_context = await self._build_recent_missions_context(sid, user_id)
+        if mission_context:
+            sys_context = "\n\n".join(part for part in (sys_context, mission_context) if part)
 
         # If session was rotated, carry some context from the previous session
         # so the classifier and LLM have continuity.
@@ -340,7 +420,24 @@ class AIService:
         # útil para testes sem precisar aguardar o classificador.
         _force_intent = (metadata or {}).get("force_intent", "").upper()
         t0 = time.monotonic()
-        if _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "SERVER_TOOL"):
+        active_whatsapp_mission = await self.db.find_active_whatsapp_mission_by_session(sid, user_id)
+        if active_whatsapp_mission and _looks_like_whatsapp_mission_followup(user_message):
+            decision = RoutingDecision(
+                intent=IntentType.WHATSAPP_MESSAGING,
+                confidence=1.0,
+                skill_name="whatsapp_messaging",
+                needs_plan=False,
+                requires_approval=False,
+                explanation=(
+                    "Mensagem interpretada como continuidade da missão WhatsApp ativa "
+                    f"{active_whatsapp_mission.id}."
+                ),
+            )
+            logger.info(
+                "[INTENT-OVERRIDE] active whatsapp mission follow-up mission=%s",
+                active_whatsapp_mission.id,
+            )
+        elif _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "SERVER_TOOL"):
             from shared.types import RoutingDecision as _RD
             _intent_map = {
                 "CLIENT_TOOL": IntentType.CLIENT_TOOL,
@@ -922,7 +1019,14 @@ class AIService:
                 if result.mission_id:
                     mission_id = result.mission_id
                     mission = await self.db.get_mission(mission_id)
-                    if mission:
+                    result_extra = getattr(result, "extra", None) or {}
+                    if result_extra.get("message_type") in {
+                        "mission_instruction",
+                        "mission_note",
+                        "mission_cancelled",
+                    }:
+                        _mission_meta = result_extra
+                    elif mission:
                         _intro = _stored_text or "Pode deixar, estou cuidando disso para voce."
                         _mission_meta = _build_mission_card_metadata(
                             mission,
@@ -2344,6 +2448,54 @@ class AIService:
                 props_str = ", ".join(f"{k}: {v}" for k, v in props.items() if v is not None)
                 lines.append(f"- [{g['type']}] {g['name']}" + (f" — {props_str}" if props_str else ""))
 
+        return "\n".join(lines)
+
+    async def _build_recent_missions_context(
+        self,
+        session_id: UUID,
+        user_id: UUID | None,
+    ) -> str | None:
+        try:
+            missions = await self.db.list_recent_whatsapp_missions_by_session(
+                session_id=session_id,
+                user_id=user_id,
+                limit=5,
+            )
+        except Exception as e:
+            logger.warning("Failed to build recent mission context: %s", e)
+            return None
+        if not missions:
+            return None
+
+        lines = [
+            "## Missões WhatsApp recentes nesta conversa",
+            (
+                "Quando o usuário disser 'ela', 'ele', 'outra resposta', 'refaz', "
+                "'gera outra', 'coloca ... no final', ou der uma instrução condicional, considere que pode estar "
+                "se referindo à missão WhatsApp ativa abaixo. Se disser 'cancela', "
+                "'aborta', 'deixa pra lá' ou 'não faz nada', trate como cancelamento da missão ativa."
+            ),
+        ]
+        for mission in missions:
+            if mission.status == "cancelled":
+                continue
+            meta = mission.extra_metadata or {}
+            contact = meta.get("contact_label") or mission.title
+            draft = meta.get("draft_text") or ""
+            inbound = meta.get("last_inbound_text") or ""
+            instructions = meta.get("operator_instructions") or []
+            lines.append(
+                f"- mission_id={mission.id} status={mission.status} contato={contact} "
+                f"objetivo={mission.goal[:160]}"
+            )
+            if inbound:
+                lines.append(f"  ultima_mensagem_do_contato={inbound[:160]}")
+            if draft:
+                lines.append(f"  rascunho_atual={draft[:160]}")
+            if instructions:
+                compact = " | ".join(str(item).strip() for item in instructions[-3:] if str(item).strip())
+                if compact:
+                    lines.append(f"  instrucoes_do_usuario={compact[:240]}")
         return "\n".join(lines)
 
     @staticmethod
