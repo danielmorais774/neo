@@ -44,6 +44,12 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    window.electronAPI?.setNotificationContext(activeTab).catch((err) => {
+      console.warn('[Neo] Failed to sync notification context:', err);
+    });
+  }, [activeTab]);
+
   if (_urlMode === 'quick-help') {
     document.documentElement.style.background = 'transparent';
     document.body.style.background = 'transparent';

@@ -771,6 +771,13 @@
   padding: 12px 16px;
 }
 
+.mission-intro {
+  color: #e2e8f0;
+  font-size: 14px;
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
 .mission-header {
   display: flex;
   align-items: center;

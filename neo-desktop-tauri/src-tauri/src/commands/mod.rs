@@ -1,14 +1,19 @@
 use crate::services::ai_agent::GrpcClient;
 use crate::AppState;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
-    pub role: String,
-    pub content: String,
+    #[serde(flatten)]
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationHistoryResponse {
+    messages: Vec<Message>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,6 +150,45 @@ fn get_history_path() -> std::path::PathBuf {
         .join("conversation-history.json")
 }
 
+fn neo_core_http_url() -> String {
+    std::env::var("NEO_CORE_HTTP_URL")
+        .or_else(|_| std::env::var("NEO_CORE_API_URL"))
+        .ok()
+        .or_else(|| {
+            std::env::var("NEO_CORE_URL")
+                .ok()
+                .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
+        })
+        .unwrap_or_else(|| "http://localhost:8000".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+async fn ack_notification_http(notification_id: &str) -> Result<(), String> {
+    let base_url = neo_core_http_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/missions/notifications/{}/ack",
+            base_url, notification_id
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("Notification ack request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Notification ack failed: {} {}", status, body));
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_history() -> Result<Vec<Message>, String> {
     let path = get_history_path();
@@ -168,13 +212,46 @@ pub fn clear_history() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_conversation_history() -> Result<Vec<Message>, String> {
+pub async fn get_conversation_history(state: State<'_, AppState>) -> Result<Vec<Message>, String> {
+    let session_id = state.session_id.lock().unwrap().clone();
+    let base_url = neo_core_http_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let url = format!("{}/api/v1/desktop/session/{}/history", base_url, session_id);
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ConversationHistoryResponse>().await {
+            Ok(history) => return Ok(history.messages),
+            Err(e) => warn!("[Neo] Failed to parse backend history, using local history: {}", e),
+        },
+        Ok(resp) => warn!(
+            "[Neo] Backend history unavailable (status={}), using local history",
+            resp.status()
+        ),
+        Err(e) => warn!("[Neo] Backend history request failed, using local history: {}", e),
+    }
+
     get_history()
 }
 
 #[tauri::command]
 pub fn clear_conversation_history() -> Result<(), String> {
     clear_history()
+}
+
+#[tauri::command]
+pub fn save_conversation_history(messages: Vec<Message>) -> Result<(), String> {
+    let path = get_history_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create history dir: {}", e))?;
+    }
+    let payload = serde_json::to_string_pretty(&messages)
+        .map_err(|e| format!("Failed to serialize history: {}", e))?;
+    std::fs::write(&path, payload).map_err(|e| format!("Failed to write history: {}", e))?;
+    Ok(())
 }
 
 // ============ NEO CORE STATUS ============
@@ -269,7 +346,7 @@ pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(
 #[tauri::command]
 pub async fn ack_notification(notification_id: String) -> Result<(), String> {
     info!("[Neo] ack_notification: {}", notification_id);
-    Ok(())
+    ack_notification_http(&notification_id).await
 }
 
 #[tauri::command]
@@ -292,15 +369,7 @@ pub async fn handle_notification_action(
             .and_then(|v| v.as_str())
             .ok_or_else(|| "notification action missing mission_id".to_string())?;
 
-        let base_url = std::env::var("NEO_CORE_HTTP_URL")
-            .or_else(|_| std::env::var("NEO_CORE_API_URL"))
-            .ok()
-            .or_else(|| {
-                std::env::var("NEO_CORE_URL")
-                    .ok()
-                    .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
-            })
-            .unwrap_or_else(|| "http://localhost:8000".to_string());
+        let base_url = neo_core_http_url();
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -319,6 +388,10 @@ pub async fn handle_notification_action(
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Mission command failed: {} {}", status, body));
         }
+    }
+
+    if let Err(e) = ack_notification_http(&notification_id).await {
+        warn!("[Neo] Failed to ack notification {}: {}", notification_id, e);
     }
 
     let action_event = serde_json::json!({
@@ -472,6 +545,17 @@ pub async fn hide_notification_window(app: AppHandle) -> Result<(), String> {
         let _ = window.set_focusable(false);
         let _ = window.set_ignore_cursor_events(true);
         window.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_notification_context(
+    state: State<'_, AppState>,
+    active_tab: String,
+) -> Result<(), String> {
+    if let Ok(mut ctx) = state.notification_context.lock() {
+        ctx.active_tab = active_tab;
     }
     Ok(())
 }

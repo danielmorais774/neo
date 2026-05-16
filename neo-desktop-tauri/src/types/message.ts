@@ -43,6 +43,10 @@ export interface MissionInfo {
   draftText: string;
   draftMessages?: string[];
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  backendStatus?: string;
+  nextActionType?: string | null;
+  nextActionParams?: Record<string, any>;
+  resultSummary?: string | null;
 }
 
 export interface MessageDetails {

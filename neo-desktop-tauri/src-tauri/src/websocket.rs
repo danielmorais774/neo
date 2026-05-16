@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use crate::AppState;
 
 const NOTIFICATION_WINDOW_LABEL: &str = "notification";
 const NOTIFICATION_MARGIN: i32 = 16;
@@ -144,6 +145,25 @@ fn show_notification_window(app_handle: &AppHandle, notification: &NeoNotificati
     let _ = window.set_always_on_top(true);
 }
 
+fn should_show_notification(app_handle: &AppHandle) -> bool {
+    let Some(main_window) = app_handle.get_webview_window("main") else {
+        return true;
+    };
+
+    let is_visible = main_window.is_visible().unwrap_or(true);
+    let is_minimized = main_window.is_minimized().unwrap_or(false);
+    let is_focused = main_window.is_focused().unwrap_or(false);
+
+    let active_tab = app_handle
+        .state::<AppState>()
+        .notification_context
+        .lock()
+        .map(|ctx| ctx.active_tab.clone())
+        .unwrap_or_else(|_| "chat".to_string());
+
+    !(is_visible && !is_minimized && is_focused && active_tab == "chat")
+}
+
 /// WebSocket manager for device online/offline signaling and notifications
 pub struct DeviceWsManager {
     device_id: String,
@@ -258,16 +278,27 @@ impl DeviceWsManager {
                                 match serde_json::from_str::<NeoNotification>(&text) {
                                     Ok(notification) => {
                                         info!("[DeviceWS] Notification received: {:?}", notification.title);
-                                        // Show the dedicated notification window and forward
-                                        // the payload only to it (so it's visually outside
-                                        // the main chat window).
-                                        show_notification_window(&app_handle, &notification);
                                         if let Err(e) = app_handle.emit_to(
-                                            NOTIFICATION_WINDOW_LABEL,
+                                            "main",
                                             "notification",
                                             &notification,
                                         ) {
-                                            error!("[DeviceWS] Failed to emit notification: {}", e);
+                                            error!("[DeviceWS] Failed to emit notification to main window: {}", e);
+                                        }
+                                        if should_show_notification(&app_handle) {
+                                            // Show the dedicated notification window and forward
+                                            // the payload only to it (so it's visually outside
+                                            // the main chat window).
+                                            show_notification_window(&app_handle, &notification);
+                                            if let Err(e) = app_handle.emit_to(
+                                                NOTIFICATION_WINDOW_LABEL,
+                                                "notification",
+                                                &notification,
+                                            ) {
+                                                error!("[DeviceWS] Failed to emit notification: {}", e);
+                                            }
+                                        } else {
+                                            info!("[DeviceWS] Notification suppressed by desktop context");
                                         }
                                     }
                                     Err(e) => {

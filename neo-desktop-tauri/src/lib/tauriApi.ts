@@ -74,6 +74,7 @@ export interface ElectronAPI {
   respondToPassword: (password: string | null) => void;
   getConversationHistory: () => Promise<unknown[]>;
   clearHistory: () => Promise<void>;
+  saveConversationHistory: (messages: unknown[]) => Promise<void>;
   getWindowMode: () => Promise<'tooltip' | 'agent'>;
   getNeoCoreStatus: () => Promise<{
     connected: boolean;
@@ -95,6 +96,7 @@ export interface ElectronAPI {
   ackNotification: (notificationId: string) => Promise<{ ok: boolean; error?: string }>;
   onNotificationAction: (callback: (event: NotificationActionEvent) => void) => UnlistenFn;
   listConnectedDevices: () => Promise<DeviceInfo[]>;
+  setNotificationContext: (activeTab: 'chat' | 'devices') => Promise<void>;
 }
 
 let passwordRequestUnlisten: UnlistenFn | null = null;
@@ -103,8 +105,6 @@ let screenCaptureUnlisten: UnlistenFn | null = null;
 let quickHelpChunkUnlisten: UnlistenFn | null = null;
 let quickHelpDoneUnlisten: UnlistenFn | null = null;
 let quickHelpErrorUnlisten: UnlistenFn | null = null;
-let notificationUnlisten: UnlistenFn | null = null;
-let notificationActionUnlisten: UnlistenFn | null = null;
 
 export const electronAPI: ElectronAPI = {
   sendMessage: (message: string, model?: string, mode?: string) =>
@@ -186,6 +186,8 @@ export const electronAPI: ElectronAPI = {
 
   getConversationHistory: () => invoke('get_conversation_history'),
   clearHistory: () => invoke('clear_conversation_history'),
+  saveConversationHistory: (messages: unknown[]) =>
+    invoke('save_conversation_history', { messages }),
 
   getWindowMode: () => invoke('get_window_mode'),
 
@@ -283,16 +285,22 @@ export const electronAPI: ElectronAPI = {
   },
 
   onNotification: (callback: (notification: NeoNotification) => void) => {
-    if (notificationUnlisten) notificationUnlisten();
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
     listen<NeoNotification>('notification', (event) => {
       callback(event.payload);
-    }).then((unlisten) => {
-      notificationUnlisten = unlisten;
+    }).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
     });
     return () => {
-      if (notificationUnlisten) {
-        notificationUnlisten();
-        notificationUnlisten = null;
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
       }
     };
   },
@@ -300,19 +308,27 @@ export const electronAPI: ElectronAPI = {
   ackNotification: (notificationId: string) => invoke('ack_notification', { notificationId }),
 
   onNotificationAction: (callback: (event: NotificationActionEvent) => void) => {
-    if (notificationActionUnlisten) notificationActionUnlisten();
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
     listen<NotificationActionEvent>('notification-action', (event) => {
       callback(event.payload);
-    }).then((unlisten) => {
-      notificationActionUnlisten = unlisten;
+    }).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
     });
     return () => {
-      if (notificationActionUnlisten) {
-        notificationActionUnlisten();
-        notificationActionUnlisten = null;
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
       }
     };
   },
 
   listConnectedDevices: () => invoke('list_connected_devices'),
+  setNotificationContext: (activeTab: 'chat' | 'devices') =>
+    invoke('set_notification_context', { activeTab }),
 };

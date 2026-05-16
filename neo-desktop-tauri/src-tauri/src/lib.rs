@@ -21,6 +21,12 @@ pub struct AppState {
     pub user_id: String,
     pub session_id: Mutex<String>,
     pub ws_manager: Mutex<Option<Arc<DeviceWsManager>>>,
+    pub notification_context: Mutex<NotificationContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationContext {
+    pub active_tab: String,
 }
 
 fn get_or_create_device_id() -> String {
@@ -75,6 +81,9 @@ pub fn run() {
             user_id,
             session_id: Mutex::new(session_id),
             ws_manager: Mutex::new(None),
+            notification_context: Mutex::new(NotificationContext {
+                active_tab: "chat".to_string(),
+            }),
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
@@ -87,6 +96,7 @@ pub fn run() {
             commands::get_window_mode,
             commands::get_conversation_history,
             commands::clear_conversation_history,
+            commands::save_conversation_history,
             commands::quick_help_ask_stream,
             commands::ack_notification,
             commands::handle_notification_action,
@@ -96,6 +106,7 @@ pub fn run() {
             commands::set_notification_window_focusable,
             commands::is_cursor_over_notification_window,
             commands::hide_notification_window,
+            commands::set_notification_context,
         ])
         .setup(|app| {
             info!("[Neo] Desktop initialized!");

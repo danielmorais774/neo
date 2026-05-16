@@ -16,4 +16,12 @@ export class HistoryService {
       console.warn('Não foi possível limpar histórico via IPC:', error);
     }
   }
+
+  static async saveHistory(messages: unknown[]): Promise<void> {
+    try {
+      await window.electronAPI?.saveConversationHistory(messages);
+    } catch (error) {
+      console.warn('Não foi possível salvar histórico via IPC:', error);
+    }
+  }
 }

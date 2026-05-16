@@ -185,6 +185,9 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
       <div className="message assistant mission-message">
         <div className="message-avatar">📱</div>
         <div className="message-body">
+          {message.content && (
+            <div className="mission-intro">{message.content}</div>
+          )}
           <div className="message-content">
             <div className="mission-header">
               <span className="mission-icon">📲</span>
