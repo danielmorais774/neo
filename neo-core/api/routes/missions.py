@@ -186,6 +186,30 @@ async def get_mission_notifications(mission_id: UUID):
     ]
 
 
+@router.post("/notifications/{notification_id}/ack", response_model=dict)
+async def ack_notification(notification_id: UUID):
+    """Mark a notification as acknowledged by desktop/client."""
+    if not _db:
+        raise HTTPException(status_code=500, detail="DB not initialized")
+
+    await _db.mark_notification_acked(notification_id)
+    return {"ok": True, "notification_id": str(notification_id)}
+
+
+@router.post("/{mission_id}/notifications/ack", response_model=dict)
+async def ack_mission_notifications(mission_id: UUID):
+    """Ack all pending notifications for a mission."""
+    if not _db:
+        raise HTTPException(status_code=500, detail="DB not initialized")
+
+    mission = await _db.get_mission(mission_id)
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+
+    count = await _db.mark_notifications_acked_for_mission(mission_id)
+    return {"ok": True, "mission_id": str(mission_id), "acked_count": count}
+
+
 @router.get("/{mission_id}/timeline", response_model=list[dict])
 async def get_mission_timeline(mission_id: UUID):
     """Chronological timeline blending status milestones, messages and
@@ -335,4 +359,7 @@ async def _execute_mission_command(payload: MissionCommandPayload, source: str) 
         "message": result.message,
         "mission_id": str(payload.mission_id),
         "command": command,
+        "display_message": result.extra.get("display_message") if result.extra else None,
+        "sent_text": result.extra.get("sent_text") if result.extra else None,
+        "is_auto_reply": result.extra.get("is_auto_reply") if result.extra else None,
     }

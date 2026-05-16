@@ -5,6 +5,26 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from shared.types import MessageType, MissionCommand
+
+
+class DesktopChatMessage(BaseModel):
+    """Structured desktop chat message.
+
+    USER_INPUT is natural language and belongs on the normal AI path.
+    MISSION_COMMAND is an explicit UI command and must bypass intent routing.
+    """
+
+    type: MessageType = Field(default=MessageType.USER_INPUT)
+    user_message: str | None = None
+    session_id: UUID | None = None
+    provider: Literal["openai", "anthropic", "ollama"] | None = None
+    model: str | None = None
+    command: MissionCommand | None = None
+    mission_id: UUID | None = None
+    edited_text: str | None = None
+    user_id: UUID | None = None
+
 
 class ExecuteTaskRequest(BaseModel):
     """Request para executar uma task."""

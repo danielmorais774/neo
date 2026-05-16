@@ -94,6 +94,18 @@ async def webhook(
     )
     slog.log_event("Inbound routed to mission", _describe_mission_route(mission, jid))
 
+    if jid.endswith("@lid"):
+        try:
+            await _db.merge_mission_extra_metadata(
+                mission.id,
+                {
+                    "contact_lid": jid,
+                    "last_inbound_jid": jid,
+                },
+            )
+        except Exception as e:
+            logger.warning("Failed to persist contact_lid metadata: mission_id=%s err=%s", mission.id, e)
+
     # 5. Check idempotency (skip duplicate message_id)
     if mission.last_inbound_message_id == message_id:
         logger.info("Duplicate message, skipping: message_id=%s", message_id)

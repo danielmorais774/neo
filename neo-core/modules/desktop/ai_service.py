@@ -42,6 +42,101 @@ from shared import (
 logger = logging.getLogger(__name__)
 
 
+def _strip_mission_marker(text: str) -> tuple[str, dict[str, Any] | None]:
+    """Remove a desktop mission marker and return its JSON payload."""
+    marker = "[MISSION:"
+    start = text.find(marker)
+    if start < 0:
+        return text, None
+
+    payload_start = start + len(marker)
+    decoder = json.JSONDecoder()
+    try:
+        payload, payload_len = decoder.raw_decode(text[payload_start:])
+    except json.JSONDecodeError:
+        return text, None
+
+    end = payload_start + payload_len
+    if end < len(text) and text[end] == "]":
+        end += 1
+
+    clean_text = f"{text[:start]}{text[end:]}".strip()
+    return clean_text, payload if isinstance(payload, dict) else None
+
+
+def _mission_chat_status(status: str | None) -> str:
+    """Map backend mission states to the compact UI status used by the chat."""
+    if status == "awaiting_confirmation":
+        return "pending"
+    if status in {"awaiting_reply", "processing", "completed"}:
+        return "approved"
+    if status == "cancelled":
+        return "cancelled"
+    if status == "failed":
+        return "rejected"
+    return "pending"
+
+
+def _build_mission_card_metadata(
+    mission: Any,
+    *,
+    intro: str,
+    result: Any | None = None,
+    marker_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the structured chat payload used to restore mission cards."""
+    marker_payload = marker_payload or {}
+    mission_meta = mission.extra_metadata or {}
+    next_action_params = mission.next_action_params or {}
+
+    draft_text = (
+        mission_meta.get("draft_text")
+        or marker_payload.get("draftText")
+        or next_action_params.get("text")
+        or getattr(result, "draft_text", None)
+        or ""
+    )
+    draft_messages = (
+        mission_meta.get("draft_messages")
+        or marker_payload.get("draftMessages")
+        or next_action_params.get("messages")
+        or ([draft_text] if draft_text else [])
+    )
+
+    contact_phone = (
+        mission_meta.get("contact_phone_e164")
+        or marker_payload.get("contactPhone")
+        or ""
+    )
+
+    return {
+        "message_type": "mission_card",
+        "intro": intro,
+        "mission": {
+            "missionId": str(mission.id),
+            "contactLabel": (
+                mission_meta.get("contact_label")
+                or marker_payload.get("contactLabel")
+                or getattr(result, "mission_contact_label", None)
+                or mission.title
+            ),
+            "contactJid": (
+                marker_payload.get("contactJid")
+                or getattr(result, "mission_contact_jid", None)
+                or mission.contact_jid
+            ),
+            "contactPhone": contact_phone,
+            "draftText": draft_text,
+            "draftMessages": draft_messages,
+            "status": _mission_chat_status(mission.status),
+            "backendStatus": mission.status,
+            "nextActionType": mission.next_action_type,
+            "nextActionParams": next_action_params,
+            "resultSummary": mission.result_summary,
+        },
+    }
+
+
 class AIServiceResponse:
     """Response from AIService — wraps the different types of responses."""
 
@@ -822,24 +917,28 @@ class AIService:
             if result.ok:
                 _raw_text = result.message
                 final_text = _raw_text  # keep [MISSION:...] marker in gRPC response so desktop can parse it
+                _stored_text, _mission_payload = _strip_mission_marker(_raw_text)
                 _mission_meta = None
                 if result.mission_id:
                     mission_id = result.mission_id
-                    import json as _json
-                    _mission_meta = _json.dumps({
-                        "missionId": str(result.mission_id),
-                        "contactLabel": result.mission_contact_label or "",
-                        "contactJid": result.mission_contact_jid or "",
-                        "contactPhone": result.mission_contact_phone or "",
-                        "draftText": result.draft_text or "",
-                    }, ensure_ascii=False)
+                    mission = await self.db.get_mission(mission_id)
+                    if mission:
+                        _intro = _stored_text or "Pode deixar, estou cuidando disso para voce."
+                        _mission_meta = _build_mission_card_metadata(
+                            mission,
+                            intro=_intro,
+                            result=result,
+                            marker_payload=_mission_payload,
+                        )
             else:
                 final_text = f"Erro na missão: {result.message}"
+                _stored_text = final_text
                 _mission_meta = None
 
         except Exception as e:
             logger.exception("WhatsApp messaging execution failed")
             final_text = f"Erro ao processar missão WhatsApp: {str(e)}"
+            _stored_text = final_text
             _mission_meta = None
             mission_id = None
 
@@ -849,11 +948,11 @@ class AIService:
         await self.sessions.add_message(
             session_id=session_id,
             role="assistant",
-            content=final_text,
+            content=_stored_text,
             generate_embedding=False,
             user_id=user_id,
             mission_id=mission_id,
-            metadata=(_mission_meta and {"mission": _mission_meta}) or None,
+            metadata=_mission_meta,
         )
         if slog:
             slog.log_final_response(final_text, "WHATSAPP_MESSAGING", iterations=1)

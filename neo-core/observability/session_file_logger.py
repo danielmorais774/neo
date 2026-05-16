@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,8 +69,8 @@ class SessionFileLogger:
         else:
             filename = f"{file_prefix}-{self.session_id}.md"
         self._path = _LOGS_DIR / filename
-        self._interaction = 0
         self._ensure_header()
+        self._interaction = self._load_existing_interaction_count()
 
     def _ensure_header(self) -> None:
         if not self._path.exists():
@@ -85,6 +86,19 @@ class SessionFileLogger:
                 f.write(text)
         except Exception as e:
             logger.warning(f"[SessionFileLogger] Failed to write log: {e}")
+
+    def _load_existing_interaction_count(self) -> int:
+        try:
+            if not self._path.exists():
+                return 0
+            content = self._path.read_text(encoding="utf-8")
+            matches = re.findall(r"^## Interação (\d+)$", content, flags=re.MULTILINE)
+            if not matches:
+                return 0
+            return max(int(value) for value in matches)
+        except Exception as e:
+            logger.warning(f"[SessionFileLogger] Failed to load interaction count: {e}")
+            return 0
 
     # ── Public API ──────────────────────────────────────────────
 

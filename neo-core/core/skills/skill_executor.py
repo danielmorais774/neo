@@ -60,8 +60,10 @@ class SkillExecutor:
         pipeline = self._create_pipeline(skill_name)
 
         logger.info(
-            {skill_name, session_id, user_id},
-            f"SkillExecutor.execute: {skill_name}"
+            "SkillExecutor.execute: skill=%s session_id=%s user_id=%s",
+            skill_name,
+            session_id,
+            user_id,
         )
 
         async with _GLOBAL_SEMAPHORE:

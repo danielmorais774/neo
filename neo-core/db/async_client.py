@@ -6,6 +6,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text, func
+from sqlalchemy import update
 from sqlmodel import select
 
 from db.models.user import User
@@ -48,6 +49,11 @@ def _mission_matches_whatsapp_contact(mission: Mission, contact_jid: str) -> boo
     phone_digits = _digits_from_whatsapp_jid(contact_jid)
     candidate_digits = _digits_from_whatsapp_jid(mission.contact_jid)
     meta = mission.extra_metadata or {}
+    if contact_jid and contact_jid in {
+        str(meta.get("contact_lid") or ""),
+        str(meta.get("last_inbound_jid") or ""),
+    }:
+        return True
     meta_phone = meta.get("contact_phone_e164", "")
     meta_digits = "".join(filter(str.isdigit, meta_phone or ""))
     if phone_digits and phone_digits in {candidate_digits, meta_digits}:
@@ -832,6 +838,25 @@ class AsyncPostgresClient:
             await db.refresh(mission)
         return mission
 
+    async def merge_mission_extra_metadata(
+        self,
+        mission_id: UUID,
+        metadata: dict[str, Any],
+    ) -> Mission | None:
+        """Merge mission metadata keys without changing mission state."""
+        async with self.get_session() as db:
+            mission = await db.get(Mission, mission_id)
+            if not mission:
+                return None
+            from datetime import datetime
+
+            mission.extra_metadata = {**(mission.extra_metadata or {}), **(metadata or {})}
+            mission.last_activity_at = datetime.utcnow()
+            db.add(mission)
+            await db.commit()
+            await db.refresh(mission)
+        return mission
+
     # ---------------------------------------------------------------
     # WhatsAppContact CRUD
     # ---------------------------------------------------------------
@@ -1042,6 +1067,21 @@ class AsyncPostgresClient:
                 notif.acked_at = datetime.utcnow()
                 db.add(notif)
                 await db.commit()
+
+    async def mark_notifications_acked_for_mission(self, mission_id: UUID) -> int:
+        """Ack all unacked notifications tied to a mission."""
+        from datetime import datetime
+
+        async with self.get_session() as db:
+            stmt = (
+                update(UserNotification)
+                .where(UserNotification.mission_id == mission_id)
+                .where(UserNotification.acked_at.is_(None))
+                .values(acked_at=datetime.utcnow())
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return int(result.rowcount or 0)
 
     # ---------------------------------------------------------------
     # ConnectedDevice CRUD

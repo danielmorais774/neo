@@ -637,6 +637,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         mission.status = "processing"
         mission.last_activity_at = datetime.utcnow()
+        meta = mission.extra_metadata or {}
+        mode = meta.get("mode", "commercial")
+        contact_label = meta.get("contact_label") or mission.title
+        contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
 
         await self.db.save_message(
             session_id=mission.session_id,
@@ -644,12 +648,15 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             content=inbound_text,
             user_id=mission.user_id,
             mission_id=mission.id,
+            metadata={
+                "message_type": "whatsapp_inbound",
+                "contact_label": contact_label,
+                "contact_jid": mission.contact_jid,
+                "contact_phone_e164": contact_phone,
+                "inbound_message_id": extra.get("inbound_message_id") or extra.get("webhook_message_id"),
+            },
         )
 
-        meta = mission.extra_metadata or {}
-        mode = meta.get("mode", "commercial")
-        contact_label = meta.get("contact_label") or mission.title
-        contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
         slog.log_event(
             "whatsapp_messaging.inbound_message",
             {
@@ -668,6 +675,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 mission_goal=mission.goal,
                 contact_label=contact_label,
                 inbound_text=inbound_text,
+                prior_sent_messages=[
+                    *(meta.get("last_outbound_messages") or []),
+                    meta.get("draft_text") or "",
+                ],
                 slog=slog,
             )
             reply_messages = _split_whatsapp_messages(reply_text, mode="personal")
@@ -810,6 +821,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         mission_goal: str,
         contact_label: str,
         inbound_text: str,
+        prior_sent_messages: list[str] | None = None,
         slog: SessionFileLogger | None = None,
     ) -> str:
         fallback = _fallback_personal_ack(inbound_text)
@@ -826,6 +838,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         "sem markdown e com no máximo 180 caracteres. "
                         "Assuma que o contato já conhece o contexto anterior da conversa. "
                         "Reaja principalmente à última mensagem recebida do contato. "
+                        "Quando a mensagem recebida for lembrete ou confirmação simples, responda só com confirmação curta. "
                         "Não repita nem reexplique o pedido original do usuário, salvo se o contato pedir esclarecimento. "
                         "Evite respostas completas demais; prefira continuação natural da conversa. "
                         "Não adicione risadas, emojis ou gírias fortes sem sinal explícito no contexto. "
@@ -840,7 +853,9 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         f"Contato: {contact_label}\n"
                         f"Mensagem recebida do contato: {inbound_text}\n\n"
                         "Escreva uma resposta curta reagindo à mensagem recebida. "
-                        "Use o pedido original apenas para entender o contexto, não para repetir informações já comunicadas."
+                        "Use o pedido original apenas para entender o contexto, não para repetir informações já comunicadas. "
+                        "Exemplo ruim: 'Vou esquentar sim, mas vou chegar mais tarde hoje'. "
+                        "Exemplo bom: 'Pode deixar, vou esquentar sim'."
                     ),
                 ),
             ]
@@ -861,6 +876,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 max_tokens=80,
             )
             text = _sanitize_personal_ack(response.get_content() or "")
+            text = _strip_redundant_personal_context(
+                text,
+                forbidden_phrases=[mission_goal, *(prior_sent_messages or [])],
+            )
             if slog:
                 slog.log_llm_response(
                     stage="whatsapp_messaging.personal_ack_reply",
@@ -1099,6 +1118,19 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     "pending_inbound_ack": False,
                 },
             )
+            slog.log_event(
+                "Mission completed",
+                {
+                    "mission_id": str(mission.id),
+                    "status": "completed",
+                    "result_summary": summary,
+                    "last_inbound_text": inbound_text,
+                    "auto_reply_text": text_to_send,
+                    "auto_reply_messages": message_parts,
+                    "last_outbound_id": last_message_id,
+                    "pending_inbound_ack": False,
+                },
+            )
 
         import json as _json
         _mission_marker = _json.dumps({
@@ -1113,6 +1145,12 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             ok=True,
             message=f"[MISSION:{_mission_marker}]Mensagem enviada para {mission.title}.",
             mission_id=mission.id,
+            extra={
+                "display_message": f"Acabei de enviar a sua mensagem para {mission.title}.",
+                "sent_text": text_to_send,
+                "sent_messages": message_parts,
+                "is_auto_reply": bool(meta.get("pending_inbound_ack")),
+            },
         )
 
     # ───────────────────── recipient resolution ─────────────────────────
@@ -1452,17 +1490,20 @@ def _split_whatsapp_messages(text: str, mode: str = "personal") -> list[str]:
 
     parts: list[str] = []
     current = ""
-    for sentence in sentences:
+    consumed = 0
+    for index, sentence in enumerate(sentences):
         candidate = f"{current} {sentence}".strip() if current else sentence
         if len(candidate) <= 70 or not current:
             current = candidate
+            consumed = index + 1
             continue
         parts.append(current)
         current = sentence
+        consumed = index + 1
         if len(parts) >= max_parts - 1:
             break
 
-    remainder = " ".join([current, *sentences[len(parts) + 1:]]).strip()
+    remainder = " ".join([current, *sentences[consumed:]]).strip()
     if remainder:
         parts.append(remainder)
     if not parts:
@@ -1523,6 +1564,25 @@ def _sanitize_personal_ack(text: str) -> str:
     if any(fragment in lowered for fragment in blocked_fragments):
         return ""
     return text[:180].strip()
+
+
+def _strip_redundant_personal_context(text: str, forbidden_phrases: list[str]) -> str:
+    if not text:
+        return text
+
+    cleaned = text
+    for phrase in forbidden_phrases:
+        candidate = " ".join((phrase or "").strip().split())
+        if not candidate or len(candidate) < 8:
+            continue
+        pattern = rf"(?:,?\s*(?:mas|porem|porém|so que|só que)\s*)?{re.escape(candidate)}(?:\s+hoje)?"
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+    cleaned = re.sub(r"(?:,?\s*(?:mas|porem|porém|so que|só que))\s*$", "", cleaned, flags=re.IGNORECASE).strip(" ,;:-")
+    if len(cleaned) < 4:
+        return text
+    return cleaned[:180].strip()
 
 
 def _fallback_personal_ack(inbound_text: str) -> str:

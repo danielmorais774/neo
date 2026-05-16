@@ -191,6 +191,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tool_registry=_tool_registry,
     )
     desktop.set_desktop_service(_desktop_service)
+    desktop.set_db(_db)
 
     providers = _llm_router.list_available_providers()
     print(f"✅ Available LLM providers: {', '.join(providers)}")
