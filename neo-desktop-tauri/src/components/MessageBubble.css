@@ -178,18 +178,21 @@
 
 .message-details-button {
   background: rgba(59, 130, 246, 0.08);
-  color: var(--text-primary);
+  color: var(--text-secondary);
   border: 1px solid rgba(59, 130, 246, 0.15);
   border-radius: 999px;
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 4px 8px;
   cursor: pointer;
   transition: background 0.2s ease, transform 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .message-details-button:hover {
   background: rgba(59, 130, 246, 0.16);
   transform: translateY(-1px);
+  color: var(--text-primary);
 }
 
 .message-details-panel {
@@ -782,7 +785,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .mission-icon {
@@ -790,9 +793,9 @@
 }
 
 .mission-title {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
-  color: #93c5fd;
+  color: #dbeafe;
 }
 
 .mission-info {
@@ -834,7 +837,7 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 8px 10px;
+  padding: 10px 12px;
   background: rgba(0,0,0,0.2);
   border-radius: 6px;
   border-left: 3px solid #3b82f6;
@@ -849,7 +852,7 @@
 .mission-actions {
   display: flex;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .mission-status {
@@ -862,10 +865,10 @@
 .status-cancelled { color: #f59e0b; }
 
 .btn-approve-inline {
-  background: #22c55e;
+  background: #16a34a;
   border: none;
   border-radius: 6px;
-  padding: 6px 14px;
+  padding: 7px 14px;
   color: #fff;
   font-size: 12px;
   font-weight: 600;
@@ -874,15 +877,15 @@
 }
 .btn-approve-inline:hover { background: #16a34a; }
 
-.btn-reject-inline {
+.btn-edit-inline {
   background: transparent;
-  border: 1px solid rgba(239,68,68,0.4);
+  border: 1px solid rgba(148,163,184,0.45);
   border-radius: 6px;
-  padding: 6px 14px;
-  color: #ef4444;
+  padding: 7px 14px;
+  color: #cbd5e1;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   transition: background 0.15s;
 }
-.btn-reject-inline:hover { background: rgba(239,68,68,0.1); }
+.btn-edit-inline:hover { background: rgba(148,163,184,0.14); }

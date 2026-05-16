@@ -181,28 +181,31 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
   if (message.messageType === 'mission' && message.mission) {
     const mission = message.mission;
     const draftMessages = mission.draftMessages?.length ? mission.draftMessages : [mission.draftText];
+    const isReplySuggestion = message.details?.eventType === 'whatsapp_reply_draft';
+    const cardTitle = isReplySuggestion ? `Sugestão de resposta para ${mission.contactLabel}:` : `Mensagem para ${mission.contactLabel}:`;
+
+    const handleEdit = () => {
+      const currentText = draftMessages.join('\n');
+      const edited = window.prompt('Editar mensagem antes de enviar:', currentText);
+      if (edited === null) return;
+      const normalized = edited.trim();
+      if (!normalized) return;
+      onMissionResponse?.(mission.missionId, true, normalized);
+    };
+
     return (
       <div className="message assistant mission-message">
         <div className="message-avatar">📱</div>
         <div className="message-body">
-          {message.content && (
+          {message.content && message.content.trim() && (
             <div className="mission-intro">{message.content}</div>
           )}
           <div className="message-content">
             <div className="mission-header">
-              <span className="mission-icon">📲</span>
-              <span className="mission-title">Aprovação de Mensagem WhatsApp</span>
+              <span className="mission-title">{cardTitle}</span>
             </div>
             <div className="mission-info">
-              <div className="mission-contact">
-                <span className="mission-label">Para:</span>
-                <span className="mission-value">{mission.contactLabel}</span>
-                {mission.contactPhone && (
-                  <span className="mission-phone">{mission.contactPhone}</span>
-                )}
-              </div>
               <div className="mission-draft">
-                <span className="mission-label">{draftMessages.length > 1 ? 'Mensagens:' : 'Mensagem:'}</span>
                 <span className="mission-draft-text">
                   {draftMessages.map((draft, index) => (
                     <span key={index} style={{ display: 'block' }}>
@@ -215,22 +218,22 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
             {mission.status === 'pending' && (
               <div className="mission-actions">
                 <button
-                  className="btn-reject-inline"
-                  onClick={() => onMissionResponse?.(mission.missionId, false)}
-                >
-                  ✕ Cancelar
-                </button>
-                <button
                   className="btn-approve-inline"
                   onClick={() => onMissionResponse?.(mission.missionId, true)}
                 >
-                  ✓ Aprovar e Enviar
+                  Enviar
+                </button>
+                <button
+                  className="btn-edit-inline"
+                  onClick={handleEdit}
+                >
+                  Editar
                 </button>
               </div>
             )}
             {mission.status !== 'pending' && (
               <div className="mission-status">
-                {mission.status === 'approved' && <span className="status-approved">✅ Aprovada</span>}
+                {mission.status === 'approved' && <span className="status-approved">Enviado ✅</span>}
                 {mission.status === 'rejected' && <span className="status-rejected">❌ Rejeitada</span>}
                 {mission.status === 'cancelled' && <span className="status-cancelled">⚠️ Cancelada</span>}
               </div>
@@ -291,7 +294,11 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
                 onClick={() => setDetailsOpen(open => !open)}
                 title="Ver detalhes da mensagem"
               >
-                🧪🧪🧪
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="16" x2="12" y2="12" />
+                  <line x1="12" y1="8" x2="12.01" y2="8" />
+                </svg>
               </button>
             )}
           </div>

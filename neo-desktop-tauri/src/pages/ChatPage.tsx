@@ -100,9 +100,13 @@ export const ChatPage = () => {
 
   useEffect(() => {
     const unlisten = window.electronAPI?.onNotification?.((notification: any) => {
+      const kind = String(notification.kind || '').trim();
+      if (!['confirm_reply', 'unsolicited_message', 'mission_completed'].includes(kind)) {
+        return;
+      }
+
       const payload = notification.payload || {};
       const inboundText = String(payload.inbound_text || payload.inboundText || '').trim();
-      if (!inboundText) return;
 
       const notificationId = String(notification.id || `${Date.now()}`);
       const missionId = String(
@@ -125,10 +129,28 @@ export const ChatPage = () => {
           return prev;
         }
 
+        if (kind === 'mission_completed') {
+          return prev.map(msg =>
+            msg.mission?.missionId === missionId && msg.mission.status === 'pending'
+              ? { ...msg, mission: { ...msg.mission, status: 'approved' as any } }
+              : msg
+          );
+        }
+
+        if (!inboundText) {
+          return prev;
+        }
+
+        const inboundDedup = prev.some(
+          msg =>
+            msg.details?.eventType === 'whatsapp_inbound' &&
+            msg.details?.missionId === missionId &&
+            msg.details?.inboundText === inboundText
+        );
         const inboundMessage: Message = {
           id: `${notificationId}-inbound`,
           role: 'assistant',
-          content: `${contactLabel} respondeu: "${inboundText}"`,
+          content: `${contactLabel} respondeu:\n"${inboundText}"`,
           messageType: 'text',
           timestamp: new Date(),
           details: {
@@ -142,14 +164,25 @@ export const ChatPage = () => {
           },
         };
 
-        if (!missionId || draftMessages.length === 0) {
-          return [...prev, inboundMessage];
+        const withInbound = inboundDedup ? prev : [...prev, inboundMessage];
+        if (kind !== 'confirm_reply' || !missionId || draftMessages.length === 0) {
+          return withInbound;
         }
 
+        const replyCardDedup = withInbound.some(
+          msg =>
+            msg.messageType === 'mission' &&
+            msg.mission?.missionId === missionId &&
+            msg.mission?.status === 'pending' &&
+            msg.mission?.draftText === (draftText || draftMessages[0])
+        );
+        if (replyCardDedup) {
+          return withInbound;
+        }
         const replyCard: Message = {
           id: `${notificationId}-reply-card`,
           role: 'assistant',
-          content: `${contactLabel} respondeu. Rascunho pronto, aguardando sua aprovação para enviar.`,
+          content: '',
           messageType: 'mission',
           timestamp: new Date(),
           mission: {
@@ -170,7 +203,7 @@ export const ChatPage = () => {
           },
         };
 
-        return [...prev, inboundMessage, replyCard];
+        return [...withInbound, replyCard];
       });
     });
 
@@ -247,19 +280,6 @@ export const ChatPage = () => {
   };
 
   const handleMissionResponse = async (missionId: string, approved: boolean, editedText?: string) => {
-    const tempId = `sending-${missionId}-${Date.now()}`;
-
-    const sendingMsg: Message = {
-      id: tempId,
-      role: 'assistant',
-      content: 'enviando...',
-      messageType: 'text',
-      timestamp: new Date(),
-      details: { eventType: 'sending_indicator' },
-    };
-
-    setMessages(prev => [...prev, sendingMsg]);
-
     setMessages(prev =>
       prev.map(msg =>
         msg.mission?.missionId === missionId && msg.mission.status === 'pending'
@@ -285,27 +305,8 @@ export const ChatPage = () => {
       }).catch((ackErr) => {
         console.warn('[ChatPage] notification ack by mission failed:', ackErr);
       });
-
-      setMessages(prev => prev.filter(msg => msg.id !== tempId));
-
-      if (data.display_message) {
-        addMessage({
-          role: 'assistant',
-          content: data.display_message,
-          messageType: 'text',
-        });
-      }
-
-      if (data.is_auto_reply && data.sent_text) {
-        addMessage({
-          role: 'assistant',
-          content: `Responder para o contato: "${data.sent_text}"`,
-          messageType: 'text',
-        });
-      }
     } catch (e) {
       console.error('[ChatPage] handleMissionResponse failed:', e);
-      setMessages(prev => prev.filter(msg => msg.id !== tempId));
     }
   };
 
