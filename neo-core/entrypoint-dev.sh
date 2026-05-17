@@ -31,4 +31,5 @@ exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
   --reload-dir /app/shared \
   --reload-dir /app/modules \
   --reload-dir /app/db \
-  --reload-dir /app/grpc_server.py
+  --reload-dir /app/grpc_server.py \
+  2>&1 | tee -a /app/logs/app.log

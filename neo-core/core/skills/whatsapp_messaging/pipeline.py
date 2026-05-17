@@ -1102,6 +1102,22 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         target_jid = action_params.get("jid") or mission.contact_jid
         action_text = action_params.get("text") or (mission.extra_metadata or {}).get("draft_text", "")
         text_to_send = edited_text or action_text
+
+        # ── Dev mode phone block ─────────────────────────────────────────
+        import os
+        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "5511912345678")
+        jid_digits = "".join(filter(str.isdigit, target_jid or ""))
+        if jid_digits and jid_digits != allowed_phone:
+            slog.log_event(
+                "Dev block: rejected send to non-allowed number",
+                {"target_jid": target_jid, "digits": jid_digits, "allowed": allowed_phone},
+            )
+            return SkillResult(
+                ok=False,
+                message=f"Envio bloqueado: número {target_jid} não autorizado (permitido: {allowed_phone})",
+                mission_id=mission.id,
+            )
+
         message_parts = _normalize_message_parts(
             _split_whatsapp_messages(text_to_send, mode=(mission.extra_metadata or {}).get("mode", "personal"))
             if edited_text

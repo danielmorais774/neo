@@ -116,6 +116,28 @@ class WhatsAppMessagingExecutor:
         user_id: UUID,
         recipient: str | None = None,
     ) -> dict[str, Any]:
+        # ── Dev mode phone block ─────────────────────────────────────────
+        import os
+        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "5511912345678")
+        target_jid = None
+        if recipient:
+            contact = await self.db.search_whatsapp_contact(user_id, recipient)
+            if contact:
+                target_jid = contact.jid
+            else:
+                raw = recipient.strip()
+                if "@" in raw:
+                    target_jid = raw
+                else:
+                    digits = "".join(filter(str.isdigit, raw))
+                    target_jid = f"{digits}@c.us" if digits else raw
+
+        if target_jid:
+            jid_digits = "".join(filter(str.isdigit, target_jid))
+            if jid_digits and jid_digits != allowed_phone:
+                logger.warning({"target_jid": target_jid, "digits": jid_digits, "allowed": allowed_phone}, "Dev block: rejected send to non-allowed number")
+                return {"ok": False, "error": f"Envio bloqueado: número {target_jid} não autorizado (permitido: {allowed_phone})"}
+
         mission = await self.db.get_mission(mission_id)
         if not mission:
             return {"ok": False, "error": "Mission not found"}
@@ -130,7 +152,8 @@ class WhatsAppMessagingExecutor:
                 draft_text=text,
             )
 
-        target_jid = mission.contact_jid
+        if not target_jid:
+            target_jid = mission.contact_jid
         if recipient:
             contact = await self.db.search_whatsapp_contact(user_id, recipient)
             if contact:

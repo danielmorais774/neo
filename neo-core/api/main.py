@@ -7,19 +7,42 @@ from typing import AsyncIterator
 
 # Configure logging early so all loggers (including modules) respect LOG_LEVEL
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# File handler for app logs
+_logs_dir = os.environ.get("SESSION_LOGS_DIR", "/app/logs")
+_file_handler = None
+try:
+    os.makedirs(_logs_dir, exist_ok=True)
+    _file_handler = logging.FileHandler(f"{_logs_dir}/app.log")
+    _file_handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
+    _file_handler.setLevel(getattr(logging, _log_level, logging.INFO))
+except Exception as e:
+    print(f"⚠️  Could not create app.log file handler: {e}")
+
+# Configure root logger
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
     format="%(levelname)s:     %(name)s - %(message)s",
     force=True,
 )
+# Add file handler if available
+if _file_handler:
+    logging.root.addHandler(_file_handler)
 # Silence noisy third-party loggers
 for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
+# Also configure uvicorn loggers to write to app.log
+for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _uv_logger = logging.getLogger(_uv_logger_name)
+    if _file_handler and _uv_logger.level == 0:
+        _uv_logger.addHandler(_file_handler)
+        _uv_logger.setLevel(getattr(logging, _log_level, logging.INFO))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -271,3 +294,5 @@ app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
 app.include_router(missions.router)
 app.include_router(devices.router, prefix="/api/v1")
+app.include_router(app_logs.router, prefix="/api/v1")
+app.include_router(letta.router)
