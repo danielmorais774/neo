@@ -10,6 +10,7 @@ It uses IntentRouter to classify messages and dispatches to the correct handler:
 import asyncio
 import json
 import logging
+import re
 import time
 import unicodedata
 from collections.abc import AsyncIterator
@@ -19,6 +20,7 @@ from uuid import UUID, uuid4
 
 from core.agent.agent_executor import AgentExecutor
 from core.llm.router import LLMRouter
+from core.pks import PKSService
 from core.planning.plan_manager import ExecutionPlan, PlanManager, PlanStep
 from core.router.intent_router import IntentRouter
 from core.session.session_manager import PersistentSessionManager
@@ -26,8 +28,6 @@ from core.session.preference_extractor import PreferenceExtractor
 from core.tools.executor import ToolExecutor
 from core.tools.registry import ToolRegistry
 from db.async_client import AsyncPostgresClient
-from modules.context.knowledge_retriever import KnowledgeRetriever
-from modules.context.knowledge_writer import KnowledgeGraphWriter
 from observability.logger import get_obs, MessageTrace
 from observability.session_file_logger import get_session_logger
 from shared import (
@@ -250,8 +250,7 @@ class AIService:
         agent_executor: AgentExecutor,
         db: AsyncPostgresClient,
         preference_extractor: PreferenceExtractor | None = None,
-        knowledge_retriever: KnowledgeRetriever | None = None,
-        knowledge_writer: KnowledgeGraphWriter | None = None,
+        pks: PKSService | None = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -261,8 +260,7 @@ class AIService:
         self.agent = agent_executor
         self.db = db
         self.preferences = preference_extractor
-        self.knowledge_retriever = knowledge_retriever
-        self.knowledge_writer = knowledge_writer
+        self.pks = pks
         self.settings = get_settings()
         self._pending_traces: dict[str, MessageTrace] = {}
         self._skill_executor: "SkillExecutor | None" = None
@@ -306,6 +304,9 @@ class AIService:
         )
         session_ms = round((time.monotonic() - t0_session) * 1000, 1)
         sid = session.id
+        if user_id is None and session.user_id is not None:
+            user_id = session.user_id
+            logger.info("[PKS] Resolved user_id from existing session: %s", user_id)
         slog = get_session_logger(sid)
         slog.new_interaction(user_message, desktop_session_id=str(session_id) if session_id else None, metadata=metadata)
         logger.info(f"[HISTORY-DEBUG] Resolved DB session: {sid} (message_count={session.message_count})")
@@ -503,7 +504,18 @@ class AIService:
         dispatch_error: str | None = None
         try:
             if decision.intent == IntentType.DIRECT_RESPONSE:
-                async for resp in self._handle_direct_response(sid, user_message, history, decision, trace, sys_context, slog=slog, user_id=user_id, metadata=metadata):
+                async for resp in self._handle_direct_response(
+                    sid,
+                    user_message,
+                    history,
+                    decision,
+                    trace,
+                    sys_context,
+                    slog=slog,
+                    user_id=user_id,
+                    metadata=metadata,
+                    source_message_id=str(saved_msg.id) if saved_msg else None,
+                ):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
@@ -563,6 +575,7 @@ class AIService:
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
         metadata: dict | None = None,
+        source_message_id: str | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM."""
 
@@ -631,61 +644,100 @@ class AIService:
             "7. Para tarefas de automação ou desktop, explique o que está fazendo e por quê.\n"
             "8. Você tem acesso ao terminal do usuário via ferramenta 'run_command'. "
             "Se o usuário pedir algo que seria melhor respondido executando um comando (verificar versão, espaço em disco, processos, etc.), "
-            "informe que pode executar o comando se ele quiser."
+            "informe que pode executar o comando se ele quiser.\n"
+            "9. Nunca afirme que salvou algo na memória sem confirmação explícita no contexto do sistema. "
+            "Se essa confirmação não existir, não diga que salvou."
         )
 
         # Inject OS/system context when provided by the desktop client
         if system_context:
             system_prompt += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
 
-        # Inject persistent user preferences
         prefs_ms = 0.0
+
+        # Ensure PKS exists and persist direct factual statements before the reply.
+        pks_prewrite: dict[str, Any] | None = None
+        pks_system_prewrite: dict[str, Any] | None = None
+        if self.pks and user_id:
+            try:
+                await self.pks.ensure_user_pks(user_id=user_id)
+                pks_prewrite = await self.pks.learn_before_response(
+                    user_id=user_id,
+                    user_message=user_message,
+                    memory_target="user",
+                    source_message_id=source_message_id,
+                )
+                pks_system_prewrite = await self.pks.learn_before_response(
+                    user_id=user_id,
+                    user_message=user_message,
+                    memory_target="system",
+                    source_message_id=source_message_id,
+                )
+            except Exception as e:
+                logger.warning(f"[PKS] Failed pre-response bootstrap/write: {e}", exc_info=True)
+
+        # Load Neo's own identity before normal user knowledge retrieval.
+        if self.pks:
+            try:
+                system_memory_context = await self.pks.retrieve_system_context(user_message=user_message)
+                if system_memory_context:
+                    system_prompt += (
+                        "\n\n## Memória do Neo (Workspace do Sistema - Alta Prioridade)\n"
+                        "Use estas diretrizes como comportamento persistente do assistente:\n"
+                        f"{system_memory_context}"
+                    )
+            except Exception as e:
+                logger.warning(f"[PKS] Failed to retrieve system memory context: {e}", exc_info=True)
+
+        # Inject persistent user preferences after Neo's global behavior rules.
         if self.preferences:
             try:
                 t0_prefs = time.monotonic()
-                prefs_text = await self.preferences.get_preferences_text(service="neo-desktop")
+                prefs_text = await self.preferences.get_preferences_text(user_id=user_id, service="neo-desktop")
                 prefs_ms = round((time.monotonic() - t0_prefs) * 1000, 1)
                 if prefs_text:
-                    system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as sempre:{prefs_text}"
+                    system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as quando não conflitarem com regras globais do Neo:{prefs_text}"
                     logger.info(f"[PREF] Injected user preferences into system prompt")
                     if slog:
                         slog.log_event("Preferências Injetadas", f"```\n{prefs_text}\n```")
             except Exception as e:
                 logger.warning(f"[PREF] Failed to load preferences: {e}")
 
-        # Inject knowledge graph context
-        kg_ms = 0.0
-        if self.knowledge_retriever and user_id:
+        # Inject PKS context
+        pks_ms = 0.0
+        pks_context = ""
+        pks_result: dict[str, Any] | None = None
+        if self.pks and user_id:
             try:
-                t0_kg = time.monotonic()
-                kg_result = await self.knowledge_retriever.retrieve(
+                t0_pks = time.monotonic()
+                pks_result, pks_context = await self.pks.retrieve_context(
                     user_id=user_id,
-                    user_input=user_message,
-                    keywords=decision.knowledge_keywords or None,
+                    user_message=user_message,
+                    keywords=decision.knowledge_keywords,
                 )
-                kg_ms = round((time.monotonic() - t0_kg) * 1000, 1)
-                kg_context = self._format_knowledge_context(kg_result)
-                if kg_context:
-                    system_prompt += f"\n\n## Usuário Atual (com quem você está conversando agora)\n{kg_context}"
+                pks_ms = round((time.monotonic() - t0_pks) * 1000, 1)
+                if pks_context:
+                    system_prompt += f"\n\n## Conhecimento do Usuário\n{pks_context}"
+                    meta = pks_result.get("metadata", {}) if pks_result else {}
                     logger.info(
-                        f"[KG] Injected knowledge context: "
-                        f"{kg_result['metadata']['contexts_matched']} contexts, "
-                        f"{kg_result['metadata']['global_nodes']} globals, "
-                        f"keywords={kg_result['metadata']['keywords_extracted']}"
+                        "[PKS] Injected knowledge context: entities=%s neighborhoods=%s keywords=%s",
+                        meta.get("entities_matched"),
+                        meta.get("neighborhoods"),
+                        meta.get("keywords_extracted"),
                     )
                     if slog:
-                        kw_source = "intent" if decision.knowledge_keywords else "llm"
+                        kw_source = "intent" if decision.knowledge_keywords else "fallback"
                         slog.log_event(
-                            "Contexto do Grafo Injetado",
-                            f"- **Keywords** (via {kw_source}): `{kg_result['metadata']['keywords_extracted']}`\n"
-                            f"- **Contextos:** {kg_result['metadata']['contexts_matched']} "
-                            f"| **Globais:** {kg_result['metadata']['global_nodes']}\n\n"
-                            f"```\n{kg_context}\n```",
+                            "Contexto PKS Injetado",
+                            f"- **Keywords** (via {kw_source}): `{meta.get('keywords_extracted')}`\n"
+                            f"- **Entidades:** {meta.get('entities_matched')} "
+                            f"| **Neighborhoods:** {meta.get('neighborhoods')}\n\n"
+                            f"```\n{pks_context}\n```",
                         )
             except Exception as e:
-                logger.warning(f"[KG] Failed to retrieve knowledge context: {e}")
+                logger.warning(f"[PKS] Failed to retrieve knowledge context: {e}", exc_info=True)
         else:
-            logger.warning(f"[KG] Skipped: retriever={'yes' if self.knowledge_retriever else 'no'}, user_id={user_id}")
+            logger.warning("[PKS] Skipped: service=%s, user_id=%s", "yes" if self.pks else "no", user_id)
 
         logger.info(f"[HISTORY-DEBUG] recover_context returned {len(recovered_context) if recovered_context else 0} results")
         # Filter out very short memories (game moves, numbers, etc.)
@@ -706,6 +758,32 @@ class AIService:
                 logger.info(f"[HISTORY-DEBUG]   memory: {ctx.content[:100]} (score={ctx.final_score:.3f})")
                 context_text += f"\n[memória] {ctx.content[:300]}\n"
             system_prompt += context_text
+
+        if pks_prewrite and pks_prewrite.get("confirm_profile_save") and pks_prewrite.get("saved_name"):
+            system_prompt += (
+                "\n\n## Escrita PKS Confirmada\n"
+                f"A informação de perfil do usuário foi persistida com sucesso agora mesmo: nome = {pks_prewrite['saved_name']}.\n"
+                "Na sua resposta, confirme isso de forma natural uma única vez, sem soar robótico. "
+                "Exemplo de tom: 'Olá, Daniel. Prazer em te conhecer, vou lembrar do seu nome.' "
+                "Não diga que salvou nada se esta seção não existir."
+            )
+        if pks_system_prewrite and pks_system_prewrite.get("applied"):
+            saved_properties = pks_system_prewrite.get("properties") or {}
+            saved_ops = pks_system_prewrite.get("operations") or []
+            saved_entities = sorted(
+                {
+                    str(op.get("entity"))
+                    for op in saved_ops
+                    if isinstance(op, dict) and op.get("entity")
+                }
+            )
+            saved_entities_text = ", ".join(saved_entities) if saved_entities else "entidade de sistema"
+            system_prompt += (
+                "\n\n## Escrita PKS do Sistema Confirmada\n"
+                f"As entities de sistema persistidas neste turno: {saved_entities_text}.\n"
+                f"Properties atualizadas: {saved_properties}\n"
+                "Você pode confirmar que salvou apenas essa atualização de memória de sistema."
+            )
 
         messages: list[Message] = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -803,11 +881,11 @@ class AIService:
             user_id=user_id,
         )
         save_ms = round((time.monotonic() - t0_save) * 1000, 1)
-        logger.info(f"[TIMING-DIRECT] recover={recover_ms}ms prefs={prefs_ms}ms kg={kg_ms}ms llm={llm_ms:.0f}ms save_assistant={save_ms}ms")
+        logger.info(f"[TIMING-DIRECT] recover={recover_ms}ms prefs={prefs_ms}ms pks={pks_ms}ms llm={llm_ms:.0f}ms save_assistant={save_ms}ms")
         if slog:
             slog.record_step_timing("Recuperação de Contexto", recover_ms)
             slog.record_step_timing("Preferências do Usuário", prefs_ms)
-            slog.record_step_timing("Grafo de Conhecimento", kg_ms)
+            slog.record_step_timing("PKS", pks_ms)
             slog.record_step_timing("LLM (resposta)", round(llm_ms, 1))
             slog.record_step_timing("Salvar resposta (DB)", save_ms)
             slog.log_message_saved("assistant", full_response, str(session_id))
@@ -830,6 +908,7 @@ class AIService:
                 extracted = await self.preferences.extract_and_save(
                     user_message=user_message,
                     assistant_response=full_response,
+                    user_id=user_id,
                 )
                 if extracted and slog:
                     import json as _json
@@ -840,45 +919,149 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PREF] Post-response extraction failed: {e}")
 
-        async def _bg_kg() -> None:
-            if not (self.knowledge_writer and user_id and full_response):
+        async def _bg_pks() -> None:
+            if not (self.pks and user_id and full_response):
                 return
             try:
-                kg_context_for_writer = ""
-                if self.knowledge_retriever:
-                    kg_raw = await self.knowledge_retriever.retrieve(
-                        user_id=user_id,
-                        user_input=user_message,
-                        keywords=decision.knowledge_keywords,
-                    )
-                    kg_context_for_writer = self._format_knowledge_context(kg_raw)
+                memory_source_response = full_response
+                use_prior_assistant_artifact = self._is_memory_confirmation(user_message)
+                if use_prior_assistant_artifact:
+                    artifact = self._find_memory_artifact(history, full_response)
+                    if artifact:
+                        memory_source_response = artifact
 
                 recent_history_lines = []
                 for msg in history[-(6 + 1):-1] if len(history) > 1 else []:
                     role_label = "Usuário" if msg.get("role") == "user" else "Assistente"
-                    content_preview = (msg.get("content") or "")[:500]
+                    raw_content = msg.get("content") or ""
+                    content_preview = raw_content if use_prior_assistant_artifact else raw_content[:500]
                     recent_history_lines.append(f"[{role_label}]: {content_preview}")
                 recent_history_str = "\n".join(recent_history_lines)
 
-                applied = await self.knowledge_writer.extract_and_apply(
+                applied = await self.pks.learn(
                     user_id=user_id,
                     user_message=user_message,
-                    assistant_response=full_response,
-                    kg_context=kg_context_for_writer,
+                    assistant_response=memory_source_response,
+                    memory_target="user",
+                    pks_context=pks_context,
                     keywords=decision.knowledge_keywords,
                     recent_history=recent_history_str,
+                    recent_messages=history[-12:],
+                    source_message_id=source_message_id,
+                )
+                system_applied = await self.pks.learn(
+                    user_id=user_id,
+                    user_message=user_message,
+                    assistant_response=memory_source_response,
+                    memory_target="system",
+                    pks_context="",
+                    keywords=None,
+                    recent_history=recent_history_str,
+                    recent_messages=history[-12:],
+                    source_message_id=source_message_id,
                 )
                 if applied and slog:
                     import json as _json
                     slog.log_event(
-                        "Grafo Atualizado",
+                        "PKS Atualizado",
                         f"```json\n{_json.dumps(applied, ensure_ascii=False, indent=2)}\n```",
                     )
+                if system_applied and slog:
+                    import json as _json
+                    slog.log_event(
+                        "PKS Sistema Atualizado",
+                        f"```json\n{_json.dumps(system_applied, ensure_ascii=False, indent=2)}\n```",
+                    )
             except Exception as e:
-                logger.warning(f"[KGW] Post-response write failed: {e}")
+                logger.warning(f"[PKS] Post-response write failed: {e}", exc_info=True)
 
         asyncio.create_task(_bg_prefs())
-        asyncio.create_task(_bg_kg())
+        asyncio.create_task(_bg_pks())
+
+    @staticmethod
+    def _is_memory_confirmation(text: str) -> bool:
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFD", (text or "").strip().lower())
+            if unicodedata.category(c) != "Mn"
+        )
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+        normalized = " ".join(normalized.split())
+        confirmations = (
+            "salva so na sua memoria",
+            "salva na sua memoria",
+            "salva isso na memoria",
+            "salva na memoria",
+            "salva isso",
+            "pode salvar",
+            "pode salvar isso",
+            "guarda na memoria",
+            "guarda isso",
+            "lembra disso",
+            "memoriza isso",
+            "vou fazer esse",
+            "vou fazer esses",
+            "esse sera meu treino",
+            "esse vai ser meu treino",
+        )
+        return any(phrase in normalized for phrase in confirmations)
+
+    @staticmethod
+    def _last_assistant_message(history: list[dict[str, str]]) -> str | None:
+        for msg in reversed(history):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                return msg["content"]
+        return None
+
+    @classmethod
+    def _find_memory_artifact(cls, history: list[dict[str, str]], fallback: str | None = None) -> str | None:
+        candidates: list[str] = []
+        for msg in reversed(history):
+            if msg.get("role") != "assistant":
+                continue
+            content = (msg.get("content") or "").strip()
+            if content:
+                candidates.append(content)
+        if fallback:
+            candidates.insert(0, fallback)
+
+        for candidate in candidates:
+            if cls._looks_like_workout_artifact(candidate):
+                return candidate
+        for candidate in candidates:
+            if cls._looks_like_persistable_artifact(candidate):
+                return candidate
+        return fallback or (candidates[0] if candidates else None)
+
+    @staticmethod
+    def _looks_like_workout_artifact(text: str) -> bool:
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFD", (text or "").strip().lower())
+            if unicodedata.category(c) != "Mn"
+        )
+        normalized = " ".join(normalized.split())
+        weekday_hits = sum(1 for token in ("segunda", "terça", "terca", "quarta", "quinta", "sexta", "sabado", "sábado", "domingo") if token in normalized)
+        return weekday_hits >= 2 or ("treino abcde" in normalized) or ("| exercício |" in normalized and "| séries |" in normalized)
+
+    @classmethod
+    def _looks_like_persistable_artifact(cls, text: str) -> bool:
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFD", (text or "").strip().lower())
+            if unicodedata.category(c) != "Mn"
+        )
+        normalized = " ".join(normalized.split())
+        if len(normalized) < 180:
+            return False
+        ephemeral_tokens = (
+            "vou salvar aqui na memoria",
+            "ja salvei na memoria",
+            "perfeito daniel",
+            "como posso ajudar",
+            "quer que eu ajuste algo",
+            "pode deixar que vou te chamar assim",
+        )
+        if any(token in normalized for token in ephemeral_tokens):
+            return False
+        return ("| " in text and " |" in text) or text.count("\n") >= 8 or bool(re.search(r"\b\d+\s*[x×]\s*\d+", normalized))
 
     # ---------------------------------------------------------------
     # Handler: SERVER_TOOL — tools running on neo-core host

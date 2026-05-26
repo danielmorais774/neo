@@ -57,6 +57,7 @@ from core import (
     ToolRegistry,
 )
 from core.memory import SessionManager
+from core.pks import PKSService
 from core.skills.skill_executor import SkillExecutor
 from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
 from core.notifications import NotificationBroker
@@ -157,19 +158,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry)
     preference_extractor = PreferenceExtractor(llm_router=_llm_router, db=_db)
 
-    # ── Knowledge Graph routes ────────────────────────────────────
-    knowledge_graph.set_db(_db)
-
-    # ── Knowledge Retriever (context routes) ────────────────────
-    from modules.context.knowledge_retriever import KnowledgeRetriever
-    from modules.context.knowledge_writer import KnowledgeGraphWriter
-    _knowledge_retriever = KnowledgeRetriever(
-        session_factory=_db.session_factory,
-        llm_router=_llm_router,
+    # ── Personal Knowledge Store ─────────────────────────────────
+    _pks = PKSService(db=_db, llm_router=_llm_router)
+    context.set_pks_service(_pks)
+    knowledge_graph.set_pks_service(_pks)
+    print("✅ PKS ready")
+    system_pks = await _pks.ensure_system_pks()
+    print(
+        "✅ Neo system PKS bootstrap ready "
+        f"(workspace={system_pks['workspace_id']}, agent={system_pks['agent_id']})"
     )
-    _knowledge_writer = KnowledgeGraphWriter(llm_router=_llm_router, db=_db)
-    context.set_knowledge_retriever(_knowledge_retriever)
-    print(f"✅ Knowledge retriever ready")
 
     _ai_service = AIService(
         llm_router=_llm_router,
@@ -180,8 +178,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         agent_executor=_agent_executor,
         db=_db,
         preference_extractor=preference_extractor,
-        knowledge_retriever=_knowledge_retriever,
-        knowledge_writer=_knowledge_writer,
+        pks=_pks,
     )
 
     # ── Skills + Notifications ─────────────────────────────────────
@@ -214,6 +211,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tool_registry=_tool_registry,
     )
     desktop.set_desktop_service(_desktop_service)
+    desktop.set_ai_service(_ai_service)
     desktop.set_db(_db)
 
     providers = _llm_router.list_available_providers()

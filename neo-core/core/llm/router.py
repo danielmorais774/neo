@@ -28,6 +28,8 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "claude-3-sonnet-20240229": "anthropic",
     "claude-3-haiku-20240307": "anthropic",
     # DeepSeek
+    "deepseek-v4-flash": "deepseek",
+    "deepseek-v4-pro": "deepseek",
     "deepseek-chat": "deepseek",
     "deepseek-reasoner": "deepseek",
     # Gemini

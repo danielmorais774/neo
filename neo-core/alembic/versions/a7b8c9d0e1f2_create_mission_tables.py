@@ -38,6 +38,7 @@ def upgrade() -> None:
         sa.Column("extra_metadata", postgresql.JSON(), nullable=False, server_default="{}"),
         sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
         sa.Column("completed_at", sa.DateTime(), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_mission_id", "mission", ["id"], unique=False)
     op.create_index("ix_mission_user_id", "mission", ["user_id"], unique=False)
@@ -56,6 +57,7 @@ def upgrade() -> None:
         sa.Column("phone_e164", sa.String(32), nullable=False),
         sa.Column("notes", sa.Text(), nullable=True),
         sa.Column("last_used_at", sa.DateTime(), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_whatsapp_contact_id", "whatsapp_contact", ["id"], unique=False)
     op.create_index("ix_whatsapp_contact_user_id", "whatsapp_contact", ["user_id"], unique=False)
@@ -77,6 +79,7 @@ def upgrade() -> None:
         sa.Column("delivered_at", sa.DateTime(), nullable=True),
         sa.Column("acked_at", sa.DateTime(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_user_notification_id", "user_notification", ["id"], unique=False)
     op.create_index("ix_user_notification_user_id", "user_notification", ["user_id"], unique=False)

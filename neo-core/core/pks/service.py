@@ -1,0 +1,249 @@
+"""Facade for PKS read/write operations."""
+
+from __future__ import annotations
+
+from typing import Any
+from uuid import UUID
+
+from core.llm.router import LLMRouter
+from core.pks.audit import AuditLogger
+from core.pks.bootstrap import PKSBootstrap
+from core.pks.context_builder import ContextBuilder
+from core.pks.entity_resolver import EntityResolver
+from core.pks.ontology import OntologyResolver, OntologyValidator
+from core.pks.repository import PKSRepository
+from core.pks.retriever import PKSRetriever
+from core.pks.system_bootstrap import (
+    NeoSystemBootstrap,
+    SYSTEM_COMMUNICATION_PREFS_NAME,
+    SYSTEM_COMMUNICATION_PREFS_TYPE,
+    SYSTEM_CORRECTION_EXAMPLE_TYPE,
+    SYSTEM_GOALS_NAME,
+    SYSTEM_GOALS_TYPE,
+    SYSTEM_LEARNED_LESSON_TYPE,
+    SYSTEM_OPERATING_PROCEDURES_NAME,
+    SYSTEM_OPERATING_PROCEDURES_TYPE,
+    SYSTEM_PERSONALITY_NAME,
+    SYSTEM_PERSONALITY_TYPE,
+    SYSTEM_PROFILE_NAME,
+    SYSTEM_PROFILE_TYPE,
+    SYSTEM_PROJECTS_NAME,
+    SYSTEM_PROJECTS_TYPE,
+    SYSTEM_RESPONSE_RULES_NAME,
+    SYSTEM_RESPONSE_RULES_TYPE,
+    SYSTEM_WORLD_STATE_NAME,
+    SYSTEM_WORLD_STATE_TYPE,
+)
+from core.pks.writer import PKSWriter
+from db.async_client import AsyncPostgresClient
+from shared.config import get_settings
+
+
+class PKSService:
+    def __init__(self, db: AsyncPostgresClient, llm_router: LLMRouter) -> None:
+        self.db = db
+        self.llm = llm_router
+        self.repository = PKSRepository(db.session_factory)
+        self.ontology = OntologyResolver()
+        self.validator = OntologyValidator(self.ontology)
+        self.audit = AuditLogger()
+        self.bootstrap = PKSBootstrap(db, self.repository)
+        self.system_bootstrap = NeoSystemBootstrap(
+            db,
+            self.repository,
+            state_file=get_settings().pks_system_state_file,
+        )
+        self.resolver = EntityResolver(self.repository, self.ontology)
+        self.context_builder = ContextBuilder()
+        self.retriever = PKSRetriever(
+            db=db,
+            repository=self.repository,
+            bootstrap=self.bootstrap,
+            resolver=self.resolver,
+            context_builder=self.context_builder,
+        )
+        self.writer = PKSWriter(
+            db=db,
+            llm_router=llm_router,
+            repository=self.repository,
+            bootstrap=self.bootstrap,
+            resolver=self.resolver,
+            validator=self.validator,
+            audit=self.audit,
+        )
+
+    async def retrieve_context(
+        self,
+        *,
+        user_id: UUID,
+        keywords: list[str] | None,
+        user_message: str,
+    ) -> tuple[dict[str, Any], str]:
+        result, context_text = await self.retriever.retrieve(
+            user_id=user_id,
+            user_message=user_message,
+            keywords=keywords,
+        )
+        return result.model_dump(mode="json"), context_text
+
+    async def ensure_user_pks(self, *, user_id: UUID) -> UUID:
+        return await self.bootstrap.ensure_workspace(user_id)
+
+    async def ensure_system_pks(self) -> dict[str, Any]:
+        return await self.system_bootstrap.ensure()
+
+    async def learn_before_response(
+        self,
+        *,
+        user_id: UUID,
+        user_message: str,
+        memory_target: str = "user",
+        source_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.writer.learn_before_response(
+            user_id=user_id,
+            user_message=user_message,
+            memory_target=memory_target,
+            source_message_id=source_message_id,
+        )
+
+    async def learn(
+        self,
+        *,
+        user_id: UUID,
+        user_message: str,
+        assistant_response: str,
+        memory_target: str = "user",
+        pks_context: str = "",
+        keywords: list[str] | None = None,
+        recent_history: str = "",
+        recent_messages: list[dict[str, str]] | None = None,
+        source_message_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.writer.learn(
+            user_id=user_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            memory_target=memory_target,
+            pks_context=pks_context,
+            keywords=keywords,
+            recent_history=recent_history,
+            recent_messages=recent_messages,
+            source_message_id=source_message_id,
+        )
+
+    async def retrieve_system_context(self, *, user_message: str = "") -> str:
+        async with self.db.get_session() as session:
+            workspace = await self.repository.get_system_workspace(session)
+            if not workspace:
+                return ""
+            lines: list[str] = []
+            structured_entities = (
+                (SYSTEM_PERSONALITY_NAME, SYSTEM_PERSONALITY_TYPE),
+                (SYSTEM_RESPONSE_RULES_NAME, SYSTEM_RESPONSE_RULES_TYPE),
+                (SYSTEM_OPERATING_PROCEDURES_NAME, SYSTEM_OPERATING_PROCEDURES_TYPE),
+                (SYSTEM_COMMUNICATION_PREFS_NAME, SYSTEM_COMMUNICATION_PREFS_TYPE),
+                (SYSTEM_GOALS_NAME, SYSTEM_GOALS_TYPE),
+                (SYSTEM_PROFILE_NAME, SYSTEM_PROFILE_TYPE),
+                (SYSTEM_PROJECTS_NAME, SYSTEM_PROJECTS_TYPE),
+                (SYSTEM_WORLD_STATE_NAME, SYSTEM_WORLD_STATE_TYPE),
+            )
+            for entity_name, entity_type in structured_entities:
+                entity = await self.repository.find_entity_by_name(
+                    session,
+                    workspace["id"],
+                    entity_name,
+                    entity_type,
+                )
+                if not entity:
+                    continue
+                properties_field = await self.repository.get_field(session, entity.id, "properties")
+                properties = properties_field.value if properties_field else None
+                if not isinstance(properties, dict):
+                    continue
+                if entity_name in {SYSTEM_COMMUNICATION_PREFS_NAME, SYSTEM_RESPONSE_RULES_NAME}:
+                    lines.append(f"### {entity_name} [{entity_type}] (Alta Prioridade)")
+                else:
+                    lines.append(f"### {entity_name} [{entity_type}]")
+                lines.extend(self._format_system_properties(properties, user_message=user_message))
+
+            for extra_type in (SYSTEM_CORRECTION_EXAMPLE_TYPE, SYSTEM_LEARNED_LESSON_TYPE):
+                entities = await self.repository.list_entities_by_type(
+                    session,
+                    workspace["id"],
+                    extra_type,
+                    limit=6,
+                )
+                for entity in entities:
+                    properties_field = await self.repository.get_field(session, entity.id, "properties")
+                    properties = properties_field.value if properties_field else None
+                    if not isinstance(properties, dict):
+                        continue
+                    lines.append(f"### {entity.name} [{entity.type}]")
+                    lines.extend(self._format_system_properties(properties, user_message=user_message))
+
+            agent = await self.repository.get_system_agent_entity(session, workspace["id"])
+            if agent:
+                fields = await self.repository.get_entity_fields(session, agent.id)
+                blocks = {
+                    field.key: field.value
+                    for field in fields
+                    if field.key in {"identity", "procedures"}
+                }
+                identity = blocks.get("identity")
+                if isinstance(identity, dict) and identity.get("persona"):
+                    lines.append(f"- Base persona: {identity['persona']}")
+                procedures = blocks.get("procedures")
+                if isinstance(procedures, dict):
+                    learned = procedures.get("learned")
+                    if isinstance(learned, list):
+                        for item in learned[-3:]:
+                            lines.append(f"- Procedimento aprendido: {item}")
+            return "\n".join(lines)
+
+    def _format_system_properties(self, properties: dict[str, Any], *, user_message: str = "") -> list[str]:
+        lines: list[str] = []
+        for key, value in properties.items():
+            if isinstance(value, list):
+                for item in value[-8:]:
+                    if isinstance(item, dict):
+                        if not self._should_render_training_item(item, user_message=user_message):
+                            continue
+                        description = item.get("description") or item.get("rule_description")
+                        rule_key = item.get("rule_key")
+                        priority = item.get("priority")
+                        if description:
+                            prefix = f"- {key}"
+                            if priority:
+                                prefix += f" ({priority})"
+                            if rule_key:
+                                prefix += f" [{rule_key}]"
+                            lines.append(f"{prefix}: {description}")
+                        continue
+                    lines.append(f"- {key}: {item}")
+                continue
+            if value is not None:
+                lines.append(f"- {key}: {value}")
+        return lines
+
+    def _should_render_training_item(self, item: dict[str, Any], *, user_message: str) -> bool:
+        if item.get("priority") == "high":
+            return True
+        if not user_message:
+            return True
+        description = str(item.get("description") or item.get("rule_description") or "").lower()
+        query_terms = {term for term in user_message.lower().split() if len(term) >= 4}
+        return any(term in description for term in query_terms)
+
+    async def search_entities(self, *, user_id: UUID, query: str) -> list[dict[str, Any]]:
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            rows = await self.repository.search_entities(session, workspace_id, query)
+            return [
+                {
+                    **entity.model_dump(mode="json"),
+                    "score": score,
+                    "matched_by": matched_by,
+                }
+                for entity, score, matched_by in rows
+            ]

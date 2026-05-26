@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from typing import Any
+from uuid import UUID
 
 from core.llm.router import LLMRouter
 from db.async_client import AsyncPostgresClient
@@ -63,7 +66,7 @@ class PreferenceExtractor:
         self,
         user_message: str,
         assistant_response: str,
-        user_id: None = None,
+        user_id: UUID | None = None,
         service: str = "neo-desktop",
     ) -> list[dict[str, str]]:
         """Analyze a conversation turn and extract/save any preferences.
@@ -73,6 +76,9 @@ class PreferenceExtractor:
         """
         # Skip very short messages — unlikely to contain preferences
         if len(user_message.strip()) < 20:
+            return []
+        if self._looks_like_agent_training(user_message):
+            logger.info("[PREF] Skipping user preference extraction for agent training message")
             return []
 
         try:
@@ -164,9 +170,33 @@ class PreferenceExtractor:
             logger.debug(f"[PREF] Failed to parse extraction response: {response[:200]}")
             return []
 
+    @staticmethod
+    def _looks_like_agent_training(text: str) -> bool:
+        normalized = unicodedata.normalize("NFD", (text or "").strip().lower())
+        normalized = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
+        normalized = re.sub(r"[^a-z0-9_ ]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        markers = (
+            "neo modo treino",
+            "modo treino",
+            "treine o neo",
+            "treinar o neo",
+            "neo deve",
+            "quando acontecer",
+            "quando isso acontecer",
+            "quando ocorrer",
+            "isso foi errado",
+            "correto seria",
+            "nao aja assim",
+            "a partir de agora voce deve",
+            "a partir de agora vc deve",
+            "a partir de agora o neo deve",
+        )
+        return any(marker in normalized for marker in markers)
+
     async def get_preferences_text(
         self,
-        user_id: None = None,
+        user_id: UUID | None = None,
         service: str = "neo-desktop",
     ) -> str | None:
         """Build a formatted text block of all user preferences for injection into system prompt."""

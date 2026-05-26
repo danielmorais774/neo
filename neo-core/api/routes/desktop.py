@@ -18,7 +18,7 @@ from api.schemas.requests import (
 from api.routes.missions import _execute_mission_command
 from db.async_client import AsyncPostgresClient
 from db.models import ConversationMessage, Mission
-from modules.desktop import DesktopService
+from modules.desktop import AIService, DesktopService
 from shared import NeoError
 from shared.types import MessageType, MissionCommandPayload
 
@@ -27,6 +27,7 @@ router = APIRouter(prefix="/desktop", tags=["desktop"])
 
 # Dependency injection do service (será configurado no main.py)
 _desktop_service: DesktopService | None = None
+_ai_service: AIService | None = None
 _db: AsyncPostgresClient | None = None
 
 
@@ -34,6 +35,12 @@ def set_desktop_service(service: DesktopService) -> None:
     """Define o service instance."""
     global _desktop_service
     _desktop_service = service
+
+
+def set_ai_service(service: AIService) -> None:
+    """Define the AI service instance for chat endpoints."""
+    global _ai_service
+    _ai_service = service
 
 
 def set_db(db: AsyncPostgresClient) -> None:
@@ -60,6 +67,16 @@ def get_db() -> AsyncPostgresClient:
             detail="DB not initialized",
         )
     return _db
+
+
+def get_ai_service() -> AIService:
+    """Dependency para injetar o AIService."""
+    if _ai_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI service not initialized",
+        )
+    return _ai_service
 
 
 def _mission_chat_status(status_value: str | None) -> str:
@@ -282,6 +299,7 @@ async def execute_task(
 @router.post("/chat", response_model=dict)
 async def handle_desktop_chat_message(
     request: DesktopChatMessage,
+    ai_service: AIService = Depends(get_ai_service),
 ) -> dict[str, Any]:
     """Handle structured desktop chat messages.
 
@@ -313,14 +331,36 @@ async def handle_desktop_chat_message(
     if not (request.user_message or "").strip():
         raise HTTPException(status_code=400, detail="user_message é obrigatório para user_input")
 
-    service = get_desktop_service()
-    result = await service.execute_task(
-        task=request.user_message.strip(),
+    final_response: str | None = None
+    final_session_id: str | None = str(request.session_id) if request.session_id else None
+    iterations = 1
+    metadata = {
+        "client": "desktop-chat",
+    }
+    if request.provider:
+        metadata["provider"] = request.provider
+    if request.model:
+        metadata["model"] = request.model
+
+    async for resp in ai_service.process_user_input(
+        user_message=request.user_message.strip(),
         session_id=request.session_id,
-        provider=request.provider,
-        model=request.model,
-    )
-    return result
+        user_id=request.user_id,
+        service="desktop-chat",
+        metadata=metadata,
+    ):
+        final_session_id = str(resp.session_id)
+        if resp.is_final:
+            final_response = resp.message
+            iterations = resp.iterations
+
+    return {
+        "status": "completed",
+        "final_response": final_response,
+        "steps": [],
+        "iterations": iterations,
+        "session_id": final_session_id,
+    }
 
 
 @router.get("/tools", response_model=ListToolsResponse)

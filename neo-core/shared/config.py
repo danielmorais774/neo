@@ -171,6 +171,12 @@ class Settings(BaseSettings):
         description="Maximum concurrent missions across all users",
     )
 
+    # PKS bootstrap
+    pks_system_state_file: str = Field(
+        default="/tmp/neo-core-dev/pks-system-bootstrap.json",
+        description="Local state file used to persist Neo system PKS bootstrap IDs",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

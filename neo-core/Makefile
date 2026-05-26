@@ -2,7 +2,7 @@
 # Código é copiado no build da imagem, então mudanças em
 # migrations/models precisam de rebuild antes de executar.
 
-.PHONY: help build migrate migrate-create migrate-history migrate-current migrate-downgrade db-shell db-tables
+.PHONY: help build migrate migrate-create migrate-history migrate-current migrate-downgrade db-shell db-tables pks-test-up pks-test-run pks-test-down
 
 help: ## Mostra comandos disponíveis
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -41,3 +41,14 @@ db-shell: ## Abre psql no banco neodb
 
 db-tables: ## Lista tabelas do banco
 	docker compose exec neo-postgres psql -U neo -d neodb -c "\dt"
+
+# ── PKS test harness ─────────────────────────────────────
+
+pks-test-up: ## Sobe ambiente isolado de teste do PKS
+	./scripts/pks_first_message_test.sh up
+
+pks-test-run: ## Reseta banco de teste, replica users, envia a 1a mensagem e confere pks_*
+	./scripts/pks_first_message_test.sh run
+
+pks-test-down: ## Derruba ambiente isolado de teste do PKS e remove volume
+	./scripts/pks_first_message_test.sh down

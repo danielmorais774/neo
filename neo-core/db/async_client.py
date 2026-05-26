@@ -1,5 +1,6 @@
 """Async PostgreSQL client — SQLAlchemy async engine + SQLModel models."""
 
+import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -20,6 +21,57 @@ from db.models.connected_device import ConnectedDevice
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_embedding_vector(value: Any) -> list[float] | None:
+    """Normalize embedding payloads to pgvector-compatible list[float]."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        try:
+            return [float(v) for v in value]
+        except (TypeError, ValueError):
+            logger.warning("[DB] Invalid embedding sequence; dropping value")
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [float(v) for v in parsed]
+        except Exception:
+            pass
+        if raw.startswith("[") and raw.endswith("]"):
+            parts = [p.strip() for p in raw[1:-1].split(",")]
+            try:
+                return [float(p) for p in parts if p]
+            except ValueError:
+                logger.warning("[DB] Invalid embedding string; dropping value")
+                return None
+    logger.warning("[DB] Unsupported embedding type %s; dropping value", type(value).__name__)
+    return None
+
+
+def _embedding_vector_literal(value: Any) -> str | None:
+    vector = _normalize_embedding_vector(value)
+    if vector is None:
+        return None
+    return str(vector)
+
+
+def _embedding_bytes_payload(value: Any) -> bytes | None:
+    vector = _normalize_embedding_vector(value)
+    if vector is None:
+        return None
+    return json.dumps(vector, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _jsonb_payload(value: Any) -> str:
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _digits_from_whatsapp_jid(jid: str | None) -> str:
@@ -74,6 +126,7 @@ class AsyncPostgresClient:
         self.dsn = dsn or settings.database_url
         self.engine = create_async_engine(self.dsn, echo=False, pool_size=10, max_overflow=20)
         self.session_factory = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+        self._topic_embedding_column_type: str | None = None
 
     async def dispose(self) -> None:
         """Dispose engine connections."""
@@ -116,37 +169,185 @@ class AsyncPostgresClient:
     async def get_conversation_session(self, session_id: UUID) -> ConversationSession | None:
         """Get session by ID."""
         async with self.get_session() as db:
-            return await db.get(ConversationSession, session_id)
+            result = await db.execute(
+                text(
+                    """
+                    SELECT id, user_id, service, status, topic_summary, message_count,
+                           started_at, last_activity_at, ended_at, session_metadata
+                    FROM conversation_session
+                    WHERE id = :session_id
+                    LIMIT 1
+                    """
+                ),
+                {"session_id": session_id},
+            )
+            row = result.mappings().first()
+            if not row:
+                return None
+            return ConversationSession(
+                id=row["id"],
+                user_id=row["user_id"],
+                service=row["service"],
+                status=row["status"],
+                topic_summary=row["topic_summary"],
+                topic_embedding=None,
+                message_count=row["message_count"] or 0,
+                started_at=row["started_at"],
+                last_activity_at=row["last_activity_at"],
+                ended_at=row["ended_at"],
+                extra_metadata=row["session_metadata"],
+            )
 
     async def get_active_session(self, user_id: UUID | None = None, service: str = "neo-desktop") -> ConversationSession | None:
         """Get the most recent active session for a user/service."""
         async with self.get_session() as db:
-            stmt = (
-                select(ConversationSession)
-                .where(ConversationSession.status == "active")
-                .where(ConversationSession.service == service)
-            )
+            user_filter = "AND user_id = :user_id" if user_id else ""
+            params: dict[str, Any] = {"service": service}
             if user_id:
-                stmt = stmt.where(ConversationSession.user_id == user_id)
-            stmt = stmt.order_by(ConversationSession.last_activity_at.desc()).limit(1)
-            result = await db.execute(stmt)
-            return result.scalars().first()
+                params["user_id"] = user_id
+            result = await db.execute(
+                text(
+                    f"""
+                    SELECT id, user_id, service, status, topic_summary, message_count,
+                           started_at, last_activity_at, ended_at, session_metadata
+                    FROM conversation_session
+                    WHERE status = 'active'
+                      AND service = :service
+                      {user_filter}
+                    ORDER BY last_activity_at DESC
+                    LIMIT 1
+                    """
+                ),
+                params,
+            )
+            row = result.mappings().first()
+            if not row:
+                return None
+            return ConversationSession(
+                id=row["id"],
+                user_id=row["user_id"],
+                service=row["service"],
+                status=row["status"],
+                topic_summary=row["topic_summary"],
+                topic_embedding=None,
+                message_count=row["message_count"] or 0,
+                started_at=row["started_at"],
+                last_activity_at=row["last_activity_at"],
+                ended_at=row["ended_at"],
+                extra_metadata=row["session_metadata"],
+            )
 
     async def update_session(self, session: ConversationSession) -> None:
         """Update a session (topic, status, etc.)."""
         async with self.get_session() as db:
-            db.add(session)
+            column_type = await self._get_topic_embedding_column_type(db)
+            params = {
+                "status": session.status,
+                "topic_summary": session.topic_summary,
+                "last_activity_at": session.last_activity_at,
+                "ended_at": session.ended_at,
+                "session_metadata": _jsonb_payload(session.extra_metadata),
+                "session_id": session.id,
+            }
+            if column_type == "vector":
+                params["topic_embedding"] = _embedding_vector_literal(session.topic_embedding)
+                await db.execute(
+                    text(
+                        """
+                        UPDATE conversation_session
+                        SET status = :status,
+                            topic_summary = :topic_summary,
+                            topic_embedding = CASE
+                                WHEN :topic_embedding IS NULL THEN NULL
+                                ELSE CAST(:topic_embedding AS vector)
+                            END,
+                            last_activity_at = :last_activity_at,
+                            ended_at = :ended_at,
+                            session_metadata = CAST(:session_metadata AS jsonb)
+                        WHERE id = :session_id
+                        """
+                    ),
+                    params,
+                )
+            elif column_type == "bytea":
+                params["topic_embedding"] = _embedding_bytes_payload(session.topic_embedding)
+                await db.execute(
+                    text(
+                        """
+                        UPDATE conversation_session
+                        SET status = :status,
+                            topic_summary = :topic_summary,
+                            topic_embedding = :topic_embedding,
+                            last_activity_at = :last_activity_at,
+                            ended_at = :ended_at,
+                            session_metadata = CAST(:session_metadata AS jsonb)
+                        WHERE id = :session_id
+                        """
+                    ),
+                    params,
+                )
+            else:
+                logger.warning(
+                    "[DB] Unknown conversation_session.topic_embedding type '%s'; persisting NULL",
+                    column_type,
+                )
+                await db.execute(
+                    text(
+                        """
+                        UPDATE conversation_session
+                        SET status = :status,
+                            topic_summary = :topic_summary,
+                            topic_embedding = NULL,
+                            last_activity_at = :last_activity_at,
+                            ended_at = :ended_at,
+                            session_metadata = CAST(:session_metadata AS jsonb)
+                        WHERE id = :session_id
+                        """
+                    ),
+                    params,
+                )
             await db.commit()
-            await db.refresh(session)
+
+    async def _get_topic_embedding_column_type(self, db: AsyncSession) -> str:
+        if self._topic_embedding_column_type:
+            return self._topic_embedding_column_type
+        result = await db.execute(
+            text(
+                """
+                SELECT COALESCE(NULLIF(udt_name, ''), data_type) AS column_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'conversation_session'
+                  AND column_name = 'topic_embedding'
+                LIMIT 1
+                """
+            )
+        )
+        row = result.mappings().first()
+        self._topic_embedding_column_type = str((row or {}).get("column_type") or "unknown").lower()
+        logger.info(
+            "[DB] conversation_session.topic_embedding type detected: %s",
+            self._topic_embedding_column_type,
+        )
+        return self._topic_embedding_column_type
 
     async def close_session(self, session_id: UUID) -> None:
         """Close a session."""
         async with self.get_session() as db:
-            session = await db.get(ConversationSession, session_id)
+            session = await self.get_conversation_session(session_id)
             if session:
                 from datetime import datetime
-                session.status = "closed"
-                session.ended_at = datetime.utcnow()
+                await db.execute(
+                    text(
+                        """
+                        UPDATE conversation_session
+                        SET status = 'closed',
+                            ended_at = :ended_at
+                        WHERE id = :session_id
+                        """
+                    ),
+                    {"session_id": session_id, "ended_at": datetime.utcnow()},
+                )
                 await db.commit()
 
     async def find_similar_sessions(
@@ -193,7 +394,7 @@ class AsyncPostgresClient:
                 # Load full session objects
                 sessions = []
                 for row in rows:
-                    sess = await db.get(ConversationSession, row[0])
+                    sess = await self.get_conversation_session(row[0])
                     if sess:
                         sessions.append((sess, float(row[2])))
                 return sessions
@@ -353,11 +554,18 @@ class AsyncPostgresClient:
             db.add(msg)
 
             # Update session activity & message count
-            session = await db.get(ConversationSession, session_id)
-            if session:
-                from datetime import datetime
-                session.last_activity_at = datetime.utcnow()
-                session.message_count += 1
+            from datetime import datetime
+            await db.execute(
+                text(
+                    """
+                    UPDATE conversation_session
+                    SET last_activity_at = :last_activity_at,
+                        message_count = COALESCE(message_count, 0) + 1
+                    WHERE id = :session_id
+                    """
+                ),
+                {"session_id": session_id, "last_activity_at": datetime.utcnow()},
+            )
 
             await db.commit()
             await db.refresh(msg)

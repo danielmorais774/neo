@@ -3,7 +3,16 @@ from .user import User
 from .user_message import UserMessage
 from .conversation import ConversationSession, ConversationMessage
 from .user_preference import UserPreference
-from .knowledge_graph import KnowledgeEntity, KnowledgeRelation
+from .pks import (
+    PKSAuditLog,
+    PKSCollection,
+    PKSEntity,
+    PKSEntityField,
+    PKSEntityRelation,
+    PKSSpace,
+    PKSWorkspace,
+    PKSWorkspaceLink,
+)
 from .mission import Mission
 from .whatsapp_contact import WhatsAppContact
 from .user_notification import UserNotification
@@ -15,8 +24,14 @@ __all__ = [
     "ConversationSession",
     "ConversationMessage",
     "UserPreference",
-    "KnowledgeEntity",
-    "KnowledgeRelation",
+    "PKSAuditLog",
+    "PKSCollection",
+    "PKSEntity",
+    "PKSEntityField",
+    "PKSEntityRelation",
+    "PKSSpace",
+    "PKSWorkspace",
+    "PKSWorkspaceLink",
     "Mission",
     "WhatsAppContact",
     "UserNotification",

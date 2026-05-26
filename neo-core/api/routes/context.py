@@ -1,11 +1,11 @@
-"""Context routes — endpoint de busca de contexto no grafo de conhecimento."""
+"""Context routes — endpoint de busca de contexto no PKS."""
 
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from modules.context.knowledge_retriever import KnowledgeRetriever
+from core.pks import PKSService
 
 router = APIRouter(prefix="/context", tags=["context"])
 
@@ -19,39 +19,46 @@ class ContextRetrieveRequest(BaseModel):
 class ContextRetrieveResponse(BaseModel):
     contexts_found: list[dict] = Field(default_factory=list)
     global_: list[dict] = Field(default_factory=list, alias="global")
+    context_text: str = ""
     metadata: dict = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True}
 
 
 # ── Dependency injection ──────────────────────────────────────────
-_knowledge_retriever: KnowledgeRetriever | None = None
+_pks_service: PKSService | None = None
 
 
-def set_knowledge_retriever(retriever: KnowledgeRetriever) -> None:
-    global _knowledge_retriever
-    _knowledge_retriever = retriever
+def set_pks_service(service: PKSService) -> None:
+    global _pks_service
+    _pks_service = service
 
 
-def get_knowledge_retriever() -> KnowledgeRetriever:
-    if _knowledge_retriever is None:
+def get_pks_service() -> PKSService:
+    if _pks_service is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Knowledge retriever not initialized",
+            detail="PKS service not initialized",
         )
-    return _knowledge_retriever
+    return _pks_service
 
 
 # ── Endpoints ─────────────────────────────────────────────────────
 @router.post("/retrieve", response_model=ContextRetrieveResponse)
 async def retrieve_context(
     body: ContextRetrieveRequest,
-    retriever: KnowledgeRetriever = Depends(get_knowledge_retriever),
+    pks: PKSService = Depends(get_pks_service),
 ):
-    """Busca contexto relevante no grafo de conhecimento do usuário."""
-    result = await retriever.retrieve(user_id=body.user_id, user_input=body.user_input)
+    """Busca contexto relevante no PKS do usuário."""
+    result, context_text = await pks.retrieve_context(
+        user_id=body.user_id,
+        user_message=body.user_input,
+        keywords=None,
+    )
+    result["context_text"] = context_text
     return ContextRetrieveResponse(
-        contexts_found=result["contexts_found"],
-        **{"global": result["global"]},
+        contexts_found=result.get("neighborhoods", []),
+        **{"global": []},
+        context_text=context_text,
         metadata=result["metadata"],
     )

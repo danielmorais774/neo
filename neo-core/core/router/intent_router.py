@@ -8,6 +8,7 @@ Routes to one of:
 
 import json
 import logging
+import re
 from typing import Any
 
 from core.llm.router import LLMRouter
@@ -167,7 +168,8 @@ class IntentRouter:
             raw_text = response.get_content() or ""
 
             # Parse routing decision as before, then attach classifier metadata
-            decision = self._parse_classification(raw_text)
+            decision = self._parse_classification(raw_text, user_message=user_message)
+            self._apply_memory_heuristics(decision, user_message)
             # Attach raw classifier response + the prompt/messages sent for later inspection
             decision.classifier_raw = raw_text
             decision.classifier_payload = {
@@ -185,6 +187,7 @@ class IntentRouter:
             logger.exception(f"Intent classification failed: {e}")
             # Return a fallback decision but include the prompt we tried to send (if any)
             fallback = self._fallback_classify(user_message)
+            self._apply_memory_heuristics(fallback, user_message)
             fallback.classifier_payload = {"messages": [
                 {"role": m.role.value if hasattr(m.role, 'value') else str(m.role), "content": m.content[:4000]}
                 for m in messages
@@ -215,7 +218,7 @@ class IntentRouter:
             lines.append(f"- {name}: {manifest.description} (keywords: {', '.join(manifest.keywords)})")
         return "\n".join(lines)
 
-    def _parse_classification(self, raw_text: str) -> RoutingDecision:
+    def _parse_classification(self, raw_text: str, user_message: str = "") -> RoutingDecision:
         """Parse LLM JSON response into RoutingDecision."""
         text = raw_text.strip()
         # Strip markdown fences if present
@@ -225,19 +228,22 @@ class IntentRouter:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            # LLM returned prose instead of JSON — try to extract embedded JSON object
-            import re as _re
-            json_match = _re.search(r'\{[^{}]*"intent"[^{}]*\}', text, _re.DOTALL)
-            if json_match:
+            # LLM returned prose instead of JSON — try to extract an embedded JSON object.
+            json_text = self._extract_embedded_json(text)
+            if json_text:
                 try:
-                    data = json.loads(json_match.group())
+                    data = json.loads(json_text)
                     logger.warning("Router: extracted JSON from prose response")
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to parse router response (bad embedded JSON): {text[:200]}")
-                    return self._fallback_classify(raw_text)
+                    fallback = self._fallback_classify(user_message or raw_text)
+                    self._apply_memory_heuristics(fallback, user_message or raw_text)
+                    return fallback
             else:
                 logger.warning(f"Failed to parse router response (no JSON found): {text[:200]}")
-                return self._fallback_classify(raw_text)
+                fallback = self._fallback_classify(user_message or raw_text)
+                self._apply_memory_heuristics(fallback, user_message or raw_text)
+                return fallback
 
         intent_str = data.get("intent", "DIRECT_RESPONSE").upper()
         intent_map = {
@@ -254,7 +260,7 @@ class IntentRouter:
         if isinstance(raw_keywords, list):
             knowledge_keywords = [str(k).lower().strip() for k in raw_keywords if k] or None
 
-        return RoutingDecision(
+        decision = RoutingDecision(
             intent=intent,
             confidence=float(data.get("confidence", 0.8)),
             tool_name=data.get("tool_name"),
@@ -268,6 +274,39 @@ class IntentRouter:
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
             skill_name=data.get("skill_name"),
         )
+        return decision
+
+    @staticmethod
+    def _extract_embedded_json(text: str) -> str | None:
+        start = text.find("{")
+        while start >= 0:
+            depth = 0
+            in_string = False
+            escape = False
+            for index in range(start, len(text)):
+                char = text[index]
+                if escape:
+                    escape = False
+                    continue
+                if char == "\\":
+                    escape = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:index + 1]
+                        if '"intent"' in candidate:
+                            return candidate
+                        break
+            start = text.find("{", start + 1)
+        return None
 
     def _fallback_classify(self, message: str) -> RoutingDecision:
         """Keyword-based fallback when LLM is unavailable."""
@@ -336,8 +375,69 @@ class IntentRouter:
                 explanation="Fallback: detectado pedido via WhatsApp",
             )
 
-        return RoutingDecision(
+        decision = RoutingDecision(
             intent=IntentType.DIRECT_RESPONSE,
             confidence=0.5,
             explanation="Fallback: resposta direta",
         )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
+    def _apply_memory_heuristics(self, decision: RoutingDecision, message: str) -> None:
+        """Backend guardrail: factual personal messages must not lose memory flags."""
+        text = (message or "").lower()
+        normalized = text
+        for src, dst in {
+            "á": "a", "à": "a", "â": "a", "ã": "a",
+            "é": "e", "ê": "e", "í": "i",
+            "ó": "o", "ô": "o", "õ": "o",
+            "ú": "u", "ç": "c",
+        }.items():
+            normalized = normalized.replace(src, dst)
+
+        memory_terms = {
+            "academia": "academia",
+            "treino": "treino",
+            "exercicio": "exercicio",
+            "exercicios": "exercicio",
+            "supino": "supino",
+            "crucifixo": "crucifixo",
+            "crusifixo": "crucifixo",
+            "triceps": "triceps",
+            "biceps": "biceps",
+            "peito": "peito",
+            "costa": "costas",
+            "costas": "costas",
+            "perna": "perna",
+            "ombro": "ombro",
+            "reps": "reps",
+            "repeticoes": "reps",
+            "sessoes": "series",
+            "series": "series",
+            "quilos": "peso",
+            "kg": "peso",
+            "meu nome": "nome",
+            "menu nome": "nome",
+            "eu me chamo": "nome",
+            "meu pc": "pc",
+            "minha irma": "familia",
+        }
+        weekdays = ("segunda", "terca", "terça", "quarta", "quinta", "sexta", "sabado", "sábado", "domingo")
+        has_numeric_training = bool(re.search(r"\b\d+\s*(kg|quilo|quilos|reps?|repeticoes|repetições|sessoes|sessões|series|séries)\b", normalized))
+        detected = [kw for token, kw in memory_terms.items() if token in normalized]
+        if any(day in normalized for day in weekdays):
+            detected.extend(["rotina", "treino"])
+        if has_numeric_training:
+            detected.extend(["exercicio", "peso", "series", "reps"])
+
+        if not detected:
+            return
+
+        decision.needs_memory = True
+        existing = list(decision.knowledge_keywords or [])
+        for kw in detected:
+            if kw not in existing:
+                existing.append(kw)
+        decision.knowledge_keywords = existing[:6] or None
+        if decision.intent == IntentType.DIRECT_RESPONSE and decision.confidence < 0.65:
+            decision.confidence = 0.65

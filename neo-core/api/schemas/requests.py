@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field
 from shared.types import MessageType, MissionCommand
 
 
+LLMProviderName = Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"]
+
+
 class DesktopChatMessage(BaseModel):
     """Structured desktop chat message.
 
@@ -18,7 +21,7 @@ class DesktopChatMessage(BaseModel):
     type: MessageType = Field(default=MessageType.USER_INPUT)
     user_message: str | None = None
     session_id: UUID | None = None
-    provider: Literal["openai", "anthropic", "ollama"] | None = None
+    provider: LLMProviderName | None = None
     model: str | None = None
     command: MissionCommand | None = None
     mission_id: UUID | None = None
@@ -31,7 +34,7 @@ class ExecuteTaskRequest(BaseModel):
 
     task: str = Field(..., description="Descrição da task a executar")
     session_id: UUID | None = Field(None, description="ID da sessão (opcional)")
-    provider: Literal["openai", "anthropic", "ollama"] | None = Field(
+    provider: LLMProviderName | None = Field(
         None, description="Provider LLM a usar"
     )
     model: str | None = Field(None, description="Modelo específico")
