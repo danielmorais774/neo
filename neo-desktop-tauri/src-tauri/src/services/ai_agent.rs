@@ -144,12 +144,28 @@ impl GrpcClient {
         let mut got_final = false;
         let mut last_response_message: Option<String> = None;
         let mut last_total_iterations: i32 = 0;
+        let mut active_session_id = self.session_id.clone();
 
         loop {
             let next = tokio::time::timeout_at(task_deadline, stream.message()).await;
 
             match next {
                 Ok(Ok(Some(core_msg))) => {
+                    if !core_msg.session_id.is_empty() && core_msg.session_id != active_session_id {
+                        let previous_session_id = active_session_id.clone();
+                        active_session_id = core_msg.session_id.clone();
+                        let evt = AgentEvent {
+                            event_type: "session_changed".to_string(),
+                            data: serde_json::json!({
+                                "sessionId": active_session_id.clone(),
+                                "previousSessionId": previous_session_id,
+                                "reason": "core_assigned_session",
+                            }),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = app_handle.emit("agent-event", &evt);
+                    }
+
                     // Emit a real-time event for this CoreMessage.
                     if let Some(evt) = self.core_message_to_event(&core_msg) {
                         if let Err(e) = app_handle.emit("agent-event", &evt) {
@@ -214,6 +230,7 @@ impl GrpcClient {
                     "message": last_response_message.unwrap_or_default(),
                     "iterations": last_total_iterations,
                     "durationMs": duration_ms,
+                    "sessionId": active_session_id.clone(),
                 }),
                 timestamp: chrono::Utc::now().to_rfc3339(),
             };
@@ -233,6 +250,7 @@ impl GrpcClient {
             core_message::Content::Thinking(t) => AgentEvent {
                 event_type: "thinking".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "type": "processing",
                     "content": t.message,
                     "iteration": t.iteration,
@@ -242,6 +260,7 @@ impl GrpcClient {
             core_message::Content::ToolRequest(t) => AgentEvent {
                 event_type: "tool_request".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "id": t.tool_call_id,
                     "name": t.tool_name,
                     "arguments": serde_json::from_str::<serde_json::Value>(&t.arguments)
@@ -253,6 +272,7 @@ impl GrpcClient {
             core_message::Content::CommandRequest(c) => AgentEvent {
                 event_type: "command_request".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "id": c.command_id,
                     "cmd": c.command,
                     "command": c.command,
@@ -270,6 +290,7 @@ impl GrpcClient {
                     AgentEvent {
                         event_type: "response".to_string(),
                         data: serde_json::json!({
+                            "sessionId": msg.session_id,
                             "message": r.message,
                             "isFinal": true,
                             "totalIterations": r.total_iterations,
@@ -280,6 +301,7 @@ impl GrpcClient {
                     AgentEvent {
                         event_type: "thinking".to_string(),
                         data: serde_json::json!({
+                            "sessionId": msg.session_id,
                             "type": "response",
                             "content": r.message,
                         }),
@@ -290,6 +312,7 @@ impl GrpcClient {
             core_message::Content::Error(e) => AgentEvent {
                 event_type: "error".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "message": if !e.error.is_empty() { e.error.clone() } else { e.details.clone() },
                     "error": e.error,
                     "details": e.details,
@@ -299,6 +322,7 @@ impl GrpcClient {
             core_message::Content::Iteration(i) => AgentEvent {
                 event_type: "iteration".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "current": i.current,
                     "max": i.max,
                 }),
@@ -307,6 +331,7 @@ impl GrpcClient {
             core_message::Content::PlanUpdate(p) => AgentEvent {
                 event_type: "plan_update".to_string(),
                 data: serde_json::json!({
+                    "sessionId": msg.session_id,
                     "planId": p.plan_id,
                     "goal": p.goal,
                     "currentStep": p.current_step,

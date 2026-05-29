@@ -19,6 +19,12 @@ export const useAgentEvents = ({
       console.log('[useAgentEvents] Agent event:', event.type, event.data);
       
       switch (event.type) {
+        case 'session_changed':
+          if (event.data.sessionId) {
+            void window.electronAPI?.resetAgent(event.data.sessionId);
+          }
+          break;
+
         case 'thinking':
           // Remover thinking anterior e adicionar novo (mantém apenas o mais recente)
           setMessages(prev => {
