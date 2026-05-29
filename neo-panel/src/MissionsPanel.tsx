@@ -42,12 +42,22 @@ function missionCode(id: string): string {
   return id ? `MIS-${id.slice(0, 8).toUpperCase()}` : 'MIS-';
 }
 
+function draftMessagesFor(mission: Mission): string[] {
+  const meta = mission.extra_metadata || {};
+  const value = mission.next_action_params?.messages || meta.draft_messages;
+  if (Array.isArray(value)) {
+    return value.map(v => String(v).trim()).filter(Boolean);
+  }
+  const fallback = mission.next_action_params?.text || meta.draft_text || '';
+  return fallback ? [fallback] : [];
+}
+
 async function executeMissionCommand(
   missionId: string,
   command: 'approve' | 'cancel' | 'edit' | 'retry',
   editedText?: string,
 ) {
-  const res = await fetch(`http://localhost:8000/api/v1/missions/${missionId}/command`, {
+  const res = await fetch(`http://192.168.4.175:8000/api/v1/missions/${missionId}/command`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(editedText ? { command, edited_text: editedText } : { command }),
@@ -72,7 +82,7 @@ export default function MissionsPanel() {
       const params = new URLSearchParams();
       if (statusFilter) params.set('status', statusFilter);
       params.set('limit', '100');
-      const res = await fetch(`http://localhost:8000/api/v1/missions?${params}`);
+      const res = await fetch(`http://192.168.4.175:8000/api/v1/missions?${params}`);
       if (!res.ok) throw new Error('Failed to fetch');
       const data = await res.json();
       setMissions(Array.isArray(data) ? data : []);
@@ -134,6 +144,32 @@ export default function MissionsPanel() {
     }
   };
 
+  const handleDisableAll = async () => {
+    const activeMissions = filtered.filter(m =>
+      m.status === 'pending' || m.status === 'awaiting_confirmation'
+    );
+    if (activeMissions.length === 0) {
+      alert('Não há missões ativas para desabilitar.');
+      return;
+    }
+    if (!confirm(`Desabilitar todas as ${activeMissions.length} missões ativas?`)) return;
+
+    let failed = 0;
+    for (const mission of activeMissions) {
+      try {
+        await executeMissionCommand(mission.id, 'cancel');
+      } catch {
+        failed++;
+      }
+    }
+    if (failed > 0) {
+      alert(`${activeMissions.length - failed} missões desabilitadas, ${failed} falharam.`);
+    } else {
+      alert(`${activeMissions.length} missões desabilitadas com sucesso.`);
+    }
+    fetchMissions();
+  };
+
   const filtered = missions.filter(m => {
     if (filter) {
       const q = filter.toLowerCase();
@@ -151,6 +187,7 @@ export default function MissionsPanel() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
         <h2 style={{ margin: 0, color: '#e2e8f0' }}>📋 Missões WhatsApp</h2>
         <button onClick={fetchMissions} style={{ padding: '4px 12px', cursor: 'pointer' }}>🔄 Atualizar</button>
+        <button onClick={handleDisableAll} style={{ padding: '4px 12px', cursor: 'pointer', background: '#7f1d1d', border: 'none', borderRadius: 4, color: '#fca5a5' }}>⏸ Desabilitar Todas</button>
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={{ padding: '4px 8px' }}>
           <option value="">Todos os status</option>
           <option value="awaiting_confirmation">Aguardando Aprovação</option>
@@ -178,7 +215,7 @@ export default function MissionsPanel() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {filtered.map(mission => {
           const meta = mission.extra_metadata || {};
-          const draftText = mission.next_action_params?.text || meta.draft_text || '';
+          const draftMessages = draftMessagesFor(mission);
           return (
             <div
               key={mission.id}
@@ -263,10 +300,14 @@ export default function MissionsPanel() {
                 <p style={{ margin: 0, fontSize: 12, color: '#94a3b8' }}>🗒️ {mission.goal}</p>
               )}
 
-              {draftText && (
-                <p style={{ margin: 0, fontSize: 13, color: '#cbd5e1', fontStyle: 'italic', padding: '6px 10px', background: '#13161f', borderRadius: 4, borderLeft: '3px solid #3b82f6' }}>
-                  💬 "{draftText}"
-                </p>
+              {draftMessages.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 10px', background: '#13161f', borderRadius: 4, borderLeft: '3px solid #3b82f6' }}>
+                  {draftMessages.map((message, index) => (
+                    <div key={`${mission.id}-${index}`} style={{ fontSize: 13, color: '#cbd5e1', fontStyle: 'italic' }}>
+                      💬 {draftMessages.length > 1 ? `${index + 1}. ` : ''}"{message}"
+                    </div>
+                  ))}
+                </div>
               )}
 
               <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#64748b' }}>

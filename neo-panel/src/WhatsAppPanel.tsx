@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 
-const API = 'http://localhost:8000/api/v1/whatsapp'
+const API = 'http://192.168.4.175:8000/api/v1/whatsapp'
 
 interface Chat {
   jid: string

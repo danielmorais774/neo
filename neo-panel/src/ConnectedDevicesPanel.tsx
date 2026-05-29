@@ -137,7 +137,7 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
         })),
       };
 
-      const response = await fetch('http://localhost:8000/api/v1/debug/test-notification', {
+      const response = await fetch('http://192.168.4.175:8000/api/v1/debug/test-notification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -557,7 +557,7 @@ export default function ConnectedDevicesPanel() {
 
   const fetchDevices = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/v1/devices');
+      const response = await fetch('http://192.168.4.175:8000/api/v1/devices');
       if (response.ok) {
         const data = await response.json();
         setDevices(data.devices || []);

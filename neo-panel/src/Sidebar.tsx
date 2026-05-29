@@ -17,7 +17,9 @@ const NAV_ITEMS: NavItem[] = [
   { path: '/knowledge-graph', label: 'Knowledge Graph', icon: '🕸️' },
   { path: '/missions', label: 'Missões', icon: '📋' },
   { path: '/devices', label: 'Dispositivos', icon: '💻' },
-  { path: '/logs', label: 'Logs (legado)', icon: '📋' },
+  { path: '/logs', label: 'Logs', icon: '📋' },
+  { path: '/letta', label: 'Letta', icon: '🤖' },
+  { path: '/pks', label: 'PKS', icon: '🧠' },
 ];
 
 const Sidebar = () => {
@@ -43,8 +45,8 @@ const Sidebar = () => {
         borderBottom: '1px solid #1e2235',
         gap: 12,
       }}>
-        <img 
-          src="https://minimax-algeng-chat-tts-us.oss-us-east-1.aliyuncs.com/ccv2%2F2026-05-10%2FMiniMax-M2.7%2F2041535798284653487%2Fd8fa7d35b03a166b52bfb6fc3a22fe488cc7db8c725ca5b3a4a4c395586ec5b5..png" 
+        <img
+          src="https://api.dicebear.com/7.x/bottts-neutral/svg?seed=neo&backgroundColor=7c3aed"
           alt="Neo Avatar"
           width={collapsed ? 28 : 24}
           height={collapsed ? 28 : 24}

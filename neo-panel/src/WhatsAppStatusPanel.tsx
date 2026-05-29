@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import QRCode from 'qrcode'
 
-const WS_URL = 'ws://localhost:8000/api/v1/whatsapp/ws/qr-status'
-const REST_URL = 'http://localhost:8000/api/v1/whatsapp'
+const WS_URL = 'ws://192.168.4.175:8000/api/v1/whatsapp/ws/qr-status'
+const REST_URL = 'http://192.168.4.175:8000/api/v1/whatsapp'
 
 interface QrStatus {
   qr: string | null

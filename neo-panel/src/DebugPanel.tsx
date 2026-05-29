@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import './debug.css'
 
-const API = 'http://localhost:8000/api/v1/debug'
+const API = 'http://192.168.4.175:8000/api/v1/debug'
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -741,7 +741,7 @@ export default function DebugPanel() {
         },
         device_id: targetDeviceId,
       }
-      const res = await fetch('http://localhost:8000/api/v1/debug/test-notification', {
+      const res = await fetch('http://192.168.4.175:8000/api/v1/debug/test-notification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

@@ -89,6 +89,16 @@ function missionCode(id: string): string {
   return id ? `MIS-${id.slice(0, 8).toUpperCase()}` : 'MIS-';
 }
 
+function draftMessagesFor(mission: MissionDetail): string[] {
+  const meta = mission.extra_metadata || {};
+  const value = mission.next_action_params?.messages || meta.draft_messages;
+  if (Array.isArray(value)) {
+    return value.map(v => String(v).trim()).filter(Boolean);
+  }
+  const fallback = mission.next_action_params?.text || meta.draft_text || '';
+  return fallback ? [fallback] : [];
+}
+
 export default function MissionDetailPanel({ missionId, onClose }: MissionDetailPanelProps) {
   const [tab, setTab] = useState<TabKey>('timeline');
   const [mission, setMission] = useState<MissionDetail | null>(null);
@@ -103,7 +113,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
   const loadPipelineLog = async () => {
     setLoadingPipelineLog(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/missions/${missionId}/pipeline-log`);
+      const res = await fetch(`http://192.168.4.175:8000/api/v1/missions/${missionId}/pipeline-log`);
       setPipelineLog(res.ok ? await res.json() : null);
     } finally {
       setLoadingPipelineLog(false);
@@ -112,7 +122,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
 
   const load = async () => {
     try {
-      const base = `http://localhost:8000/api/v1/missions/${missionId}`;
+      const base = `http://192.168.4.175:8000/api/v1/missions/${missionId}`;
       const [mRes, msgRes, notifRes, tlRes, logRes] = await Promise.all([
         fetch(base),
         fetch(`${base}/messages?limit=500`),
@@ -211,6 +221,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
 
 function OverviewTab({ mission }: { mission: MissionDetail }) {
   const meta = mission.extra_metadata || {};
+  const draftMessages = draftMessagesFor(mission);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <Field label="Status">
@@ -257,9 +268,15 @@ function OverviewTab({ mission }: { mission: MissionDetail }) {
       <Field label="Criada em">{fmt(mission.created_at)}</Field>
       <Field label="Última atividade">{fmt(mission.last_activity_at)}</Field>
       <Field label="Concluída em">{fmt(mission.completed_at)}</Field>
-      {meta.draft_text && (
-        <Field label="Mensagem rascunho">
-          <div style={draftBoxStyle}>"{meta.draft_text}"</div>
+      {draftMessages.length > 0 && (
+        <Field label={draftMessages.length > 1 ? "Mensagens rascunho" : "Mensagem rascunho"}>
+          <div style={draftBoxStyle}>
+            {draftMessages.map((message, index) => (
+              <div key={index}>
+                {draftMessages.length > 1 ? `${index + 1}. ` : ''}"{message}"
+              </div>
+            ))}
+          </div>
         </Field>
       )}
       {mission.result_summary && (
