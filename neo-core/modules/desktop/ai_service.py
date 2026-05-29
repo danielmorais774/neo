@@ -655,18 +655,32 @@ class AIService:
 
         prefs_ms = 0.0
 
+        # Memory Pipeline v2: detect explicit Neo training to block parallel routes.
+        is_neo_training = False
+        if self.pks:
+            try:
+                is_neo_training = self.pks.is_training_message(user_message)
+            except Exception as e:
+                logger.warning(f"[PKS] Failed training detection: {e}", exc_info=True)
+        if is_neo_training:
+            logger.info(
+                "[PKS] Neo training message detected — blocking user preference/personal memory routes"
+            )
+
         # Ensure PKS exists and persist direct factual statements before the reply.
         pks_prewrite: dict[str, Any] | None = None
         pks_system_prewrite: dict[str, Any] | None = None
         if self.pks and user_id:
             try:
                 await self.pks.ensure_user_pks(user_id=user_id)
-                pks_prewrite = await self.pks.learn_before_response(
-                    user_id=user_id,
-                    user_message=user_message,
-                    memory_target="user",
-                    source_message_id=source_message_id,
-                )
+                # Neo training is never a personal fact — skip the user-memory route.
+                if not is_neo_training:
+                    pks_prewrite = await self.pks.learn_before_response(
+                        user_id=user_id,
+                        user_message=user_message,
+                        memory_target="user",
+                        source_message_id=source_message_id,
+                    )
                 pks_system_prewrite = await self.pks.learn_before_response(
                     user_id=user_id,
                     user_message=user_message,
@@ -904,6 +918,10 @@ class AIService:
         async def _bg_prefs() -> None:
             if not self.preferences:
                 return
+            # Neo training never becomes a personal user preference.
+            if is_neo_training:
+                logger.info("[PREF] Skipping preference extraction for Neo training message")
+                return
             try:
                 extracted = await self.preferences.extract_and_save(
                     user_message=user_message,
@@ -938,17 +956,21 @@ class AIService:
                     recent_history_lines.append(f"[{role_label}]: {content_preview}")
                 recent_history_str = "\n".join(recent_history_lines)
 
-                applied = await self.pks.learn(
-                    user_id=user_id,
-                    user_message=user_message,
-                    assistant_response=memory_source_response,
-                    memory_target="user",
-                    pks_context=pks_context,
-                    keywords=decision.knowledge_keywords,
-                    recent_history=recent_history_str,
-                    recent_messages=history[-12:],
-                    source_message_id=source_message_id,
-                )
+                # Neo training is routed only through the system/agent-training
+                # pipeline — never written as personal user memory.
+                applied = []
+                if not is_neo_training:
+                    applied = await self.pks.learn(
+                        user_id=user_id,
+                        user_message=user_message,
+                        assistant_response=memory_source_response,
+                        memory_target="user",
+                        pks_context=pks_context,
+                        keywords=decision.knowledge_keywords,
+                        recent_history=recent_history_str,
+                        recent_messages=history[-12:],
+                        source_message_id=source_message_id,
+                    )
                 system_applied = await self.pks.learn(
                     user_id=user_id,
                     user_message=user_message,

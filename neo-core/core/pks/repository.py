@@ -601,10 +601,54 @@ class PKSRepository:
     async def upsert_entity(self, session: AsyncSession, data: UpsertEntityInput) -> tuple[EntityRecord, dict[str, Any] | None]:
         aliases = sorted({a.strip() for a in data.aliases if a and a.strip() and normalize_token(a) != normalize_token(data.name)})
         search_text = build_search_text(data.name, aliases, data.metadata)
-        before = await self.find_entity_by_name(session, data.workspace_id, data.name, data.type)
-        if before:
+        # Inline SELECT (same query as find_entity_by_name) so we can read the
+        # extra columns needed for the no-change comparison without an extra
+        # round-trip.
+        existing = await session.execute(
+            text(
+                """
+                SELECT *
+                FROM pks_entity
+                WHERE workspace_id = :workspace_id
+                  AND deleted_at IS NULL
+                  AND (lower(name) = lower(:name) OR lower(:name) = ANY(SELECT lower(unnest(aliases))))
+                  AND type = :type
+                ORDER BY confidence DESC, updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"workspace_id": data.workspace_id, "name": data.name, "type": data.type},
+        )
+        existing_row = existing.mappings().first()
+        before = _entity_from_row(existing_row) if existing_row else None
+        if before and existing_row:
             merged_aliases = sorted({*before.aliases, *aliases})
             merged_metadata = {**before.metadata, **data.metadata}
+            existing_external_refs = existing_row["external_refs"] or {}
+            merged_external_refs = {**existing_external_refs, **data.external_refs}
+            new_space_id = data.space_id or existing_row["space_id"]
+            new_collection_id = data.collection_id or existing_row["collection_id"]
+            new_confidence = max(before.confidence, data.confidence)
+            new_source = data.source if data.source is not None else existing_row.get("source")
+            new_source_message_id = (
+                data.source_message_id
+                if data.source_message_id is not None
+                else existing_row.get("source_message_id")
+            )
+            unchanged = (
+                set(merged_aliases) == set(before.aliases)
+                and merged_metadata == before.metadata
+                and merged_external_refs == existing_external_refs
+                and new_space_id == existing_row["space_id"]
+                and new_collection_id == existing_row["collection_id"]
+                and new_confidence == before.confidence
+                and data.sensitivity == before.sensitivity
+                and new_source == existing_row.get("source")
+                and new_source_message_id == existing_row.get("source_message_id")
+            )
+            if unchanged:
+                # Same data — return current state without touching updated_at.
+                return before, before.model_dump(mode="json")
             result = await session.execute(
                 text(
                     """
@@ -677,7 +721,23 @@ class PKSRepository:
         return _entity_from_row(result.mappings().one()), None
 
     async def upsert_field(self, session: AsyncSession, data: UpsertFieldInput) -> tuple[FieldRecord, dict[str, Any] | None]:
-        before = await self.get_field(session, data.entity_id, data.key)
+        # Inline SELECT (same query as get_field) so we can read the extra
+        # columns we need for the no-change comparison without an extra trip.
+        existing = await session.execute(
+            text(
+                """
+                SELECT *
+                FROM pks_entity_field
+                WHERE entity_id = :entity_id
+                  AND lower(key) = lower(:key)
+                  AND deleted_at IS NULL
+                LIMIT 1
+                """
+            ),
+            {"entity_id": data.entity_id, "key": data.key},
+        )
+        existing_row = existing.mappings().first()
+        before = _field_from_row(existing_row) if existing_row else None
         values = self._encode_field_values(data.value_type, data.value)
         params = {
             "entity_id": data.entity_id,
@@ -692,7 +752,30 @@ class PKSRepository:
             "metadata": _json_dumps(data.metadata),
             **values,
         }
-        if before:
+        if before and existing_row:
+            existing_metadata = existing_row.get("metadata") or {}
+            merged_metadata = {**existing_metadata, **data.metadata}
+            new_confidence = max(before.confidence, data.confidence)
+            new_source = data.source if data.source is not None else existing_row.get("source")
+            new_source_message_id = (
+                data.source_message_id
+                if data.source_message_id is not None
+                else existing_row.get("source_message_id")
+            )
+            new_actor = data.actor if data.actor is not None else existing_row.get("actor")
+            unchanged = (
+                before.value_type == data.value_type
+                and self._field_value_matches(before.value_type, before.value, data.value)
+                and (before.unit or None) == (data.unit or None)
+                and merged_metadata == existing_metadata
+                and new_confidence == before.confidence
+                and data.sensitivity == before.sensitivity
+                and new_source == existing_row.get("source")
+                and new_source_message_id == existing_row.get("source_message_id")
+                and new_actor == existing_row.get("actor")
+            )
+            if unchanged:
+                return before, before.model_dump(mode="json")
             result = await session.execute(
                 text(
                     """
@@ -991,6 +1074,33 @@ class PKSRepository:
             text("UPDATE pks_entity SET last_used_at = NOW() WHERE id = ANY(CAST(:ids AS uuid[]))"),
             {"ids": entity_ids},
         )
+
+    @staticmethod
+    def _field_value_matches(value_type: str, before_value: Any, incoming_value: Any) -> bool:
+        """Type-aware equality used to skip upsert_field UPDATEs on no-op writes."""
+        if value_type == "json":
+            return (before_value or {}) == (incoming_value or {})
+        if value_type == "number":
+            if before_value is None and incoming_value is None:
+                return True
+            if before_value is None or incoming_value is None:
+                return False
+            try:
+                return float(before_value) == float(incoming_value)
+            except (TypeError, ValueError):
+                return False
+        if value_type == "boolean":
+            if before_value is None and incoming_value is None:
+                return True
+            if before_value is None or incoming_value is None:
+                return False
+            return bool(before_value) == bool(incoming_value)
+        if value_type == "date":
+            return before_value == incoming_value
+        # text / fallback
+        before_text = "" if before_value is None else str(before_value)
+        incoming_text = "" if incoming_value is None else str(incoming_value)
+        return before_text == incoming_text
 
     def _encode_field_values(self, value_type: str, value: Any) -> dict[str, Any]:
         encoded = {

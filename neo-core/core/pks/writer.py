@@ -14,6 +14,22 @@ from core.pks.audit import AuditLogger
 from core.pks.bootstrap import PKSBootstrap
 from core.pks.entity_resolver import EntityResolver
 from core.pks.memory_planner import PKSMemoryPlanner
+from core.pks.memory_canonicalizer import (
+    DEST_PERSONALITY,
+    DEST_PROCEDURES,
+    DEST_RESPONSE_RULES,
+    DEST_TRAINING_EXAMPLES,
+    MemoryCanonicalizer,
+)
+from core.pks.memory_ingestion_planner import (
+    MemoryIngestionPlan,
+    MemoryIngestionPlanner,
+)
+from core.pks.memory_plan_validator import (
+    MemoryPlanValidationError,
+    MemoryPlanValidator,
+)
+from core.pks.training_envelope import TrainingEnvelopeParser
 from core.pks.ontology import OntologyValidator, normalize_token
 from core.pks.repository import PKSRepository
 from core.pks.schemas import (
@@ -47,6 +63,7 @@ from core.pks.system_bootstrap import (
     SYSTEM_RESPONSE_RULES_NAME,
     SYSTEM_RESPONSE_RULES_TYPE,
     SYSTEM_TRAINING_EXAMPLES_COLLECTION_NAME,
+    SYSTEM_TRAINING_EXAMPLES_NAME,
     SYSTEM_GOALS_NAME,
     SYSTEM_GOALS_TYPE,
     SYSTEM_PROFILE_NAME,
@@ -86,6 +103,14 @@ class PKSWriter:
         self.validator = validator
         self.audit = audit
         self.memory_planner = PKSMemoryPlanner(llm_router)
+        # Memory Pipeline v2 for Neo training messages.
+        self.envelope_parser = TrainingEnvelopeParser()
+        self.canonicalizer = MemoryCanonicalizer()
+        self.ingestion_planner = MemoryIngestionPlanner(canonicalizer=self.canonicalizer)
+        self.plan_validator = MemoryPlanValidator()
+        # In-process idempotency guard keyed by
+        # (source_message_id, semantic_rule_key, target_agent, target_workspace).
+        self._training_idempotency: set[tuple[str | None, str, str, str]] = set()
 
     async def learn(
         self,
@@ -206,6 +231,27 @@ class PKSWriter:
         user_message: str,
         source_message_id: str | None,
     ) -> dict[str, Any]:
+        # Memory Pipeline v2: explicit Neo training is routed to the canonical,
+        # idempotent training pipeline and bypasses the legacy heuristics.
+        envelope = self.envelope_parser.parse(user_message)
+        if envelope.is_training:
+            plan = self.ingestion_planner.plan(
+                user_message=user_message,
+                source_message_id=source_message_id,
+                user_id=user_id,
+                envelope=envelope,
+            )
+            operations = await self.apply_training_plan(
+                plan=plan,
+                source_message_id=source_message_id,
+            )
+            return {
+                "applied": bool(operations),
+                "target": "system",
+                "memory_type": "agent_training",
+                "operations": operations,
+            }
+
         updates = self._build_system_updates(
             user_id=user_id,
             user_message=user_message,
@@ -228,6 +274,19 @@ class PKSWriter:
         assistant_response: str,
         source_message_id: str | None,
     ) -> list[dict[str, Any]]:
+        envelope = self.envelope_parser.parse(user_message)
+        if envelope.is_training:
+            plan = self.ingestion_planner.plan(
+                user_message=user_message,
+                source_message_id=source_message_id,
+                user_id=user_id,
+                envelope=envelope,
+            )
+            return await self.apply_training_plan(
+                plan=plan,
+                source_message_id=source_message_id,
+            )
+
         updates = self._build_system_updates(
             user_id=user_id,
             user_message=user_message,
@@ -242,6 +301,250 @@ class PKSWriter:
             source_message_id=source_message_id,
         )
         return result.get("operations", []) if result.get("applied") else []
+
+    # ── Memory Pipeline v2: training plan application ────────────────────
+    def plan_agent_training(
+        self,
+        *,
+        user_message: str,
+        source_message_id: str | None,
+        user_id: UUID | None,
+    ) -> MemoryIngestionPlan:
+        """Parse + plan a Neo training message (no DB writes)."""
+        envelope = self.envelope_parser.parse(user_message)
+        return self.ingestion_planner.plan(
+            user_message=user_message,
+            source_message_id=source_message_id,
+            user_id=user_id,
+            envelope=envelope,
+        )
+
+    async def apply_training_plan(
+        self,
+        *,
+        plan: MemoryIngestionPlan,
+        source_message_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Validate and apply a canonical training plan, idempotently."""
+        if not plan.should_write or not plan.destinations:
+            return []
+        try:
+            self.plan_validator.validate_or_raise(plan)
+        except MemoryPlanValidationError as exc:
+            logger.warning("[PKS][training_v2] plan rejected by validator: %s", exc)
+            return []
+
+        updates = self._training_plan_to_updates(plan, source_message_id)
+        if not updates:
+            logger.info("[PKS][training_v2] nothing new to apply (idempotent)")
+            return []
+        result = await self._apply_system_updates(
+            updates=updates,
+            source_message_id=source_message_id,
+        )
+        return result.get("operations", []) if result.get("applied") else []
+
+    def _training_plan_to_updates(
+        self,
+        plan: MemoryIngestionPlan,
+        source_message_id: str | None,
+    ) -> list[dict[str, Any]]:
+        updates: list[dict[str, Any]] = []
+        for destination in plan.destinations:
+            rule_items: list[dict[str, Any]] = []
+            example_items: list[dict[str, Any]] = []
+            persona_props: dict[str, Any] = {}
+
+            for op in destination.updates:
+                key = (
+                    source_message_id,
+                    str(op.get("semantic_rule_key") or op.get("rule_key") or ""),
+                    str(op.get("target_agent")),
+                    str(op.get("target_workspace")),
+                )
+                if key in self._training_idempotency:
+                    continue
+                self._training_idempotency.add(key)
+
+                if destination.kind == "example":
+                    example_items.append(self._example_item_from_op(op))
+                elif destination.kind == "persona":
+                    persona_props = self._merge_persona(
+                        persona_props, op.get("persona_properties") or {}
+                    )
+                    if op.get("description"):
+                        rule_items.append(self._rule_item_from_op(op))
+                else:
+                    rule_items.append(self._rule_item_from_op(op))
+
+            update = self._build_training_update(
+                destination=destination,
+                rule_items=rule_items,
+                example_items=example_items,
+                persona_props=persona_props,
+                source_message_id=source_message_id,
+            )
+            if update:
+                updates.append(update)
+        return updates
+
+    def _build_training_update(
+        self,
+        *,
+        destination,
+        rule_items: list[dict[str, Any]],
+        example_items: list[dict[str, Any]],
+        persona_props: dict[str, Any],
+        source_message_id: str | None,
+    ) -> dict[str, Any] | None:
+        entity = destination.entity
+        common_metadata = {
+            "workspace_name": SYSTEM_WORKSPACE_NAME,
+            "target_agent": SYSTEM_AGENT_NAME,
+            "target_workspace": SYSTEM_WORKSPACE_NAME,
+        }
+        if entity == DEST_PERSONALITY:
+            properties: dict[str, Any] = dict(persona_props)
+            if rule_items:
+                properties["rules"] = rule_items
+            if not properties:
+                return None
+            return {
+                "name": SYSTEM_PERSONALITY_NAME,
+                "type": SYSTEM_PERSONALITY_TYPE,
+                "aliases": ["personality", "neo identity", "neo persona"],
+                "metadata": {
+                    **common_metadata,
+                    "collection_name": "identity",
+                    "collection_type": SYSTEM_PERSONALITY_TYPE,
+                    "is_core_identity": True,
+                },
+                "default_properties": DEFAULT_PERSONALITY_PROPERTIES,
+                "properties": properties,
+                "reason": "treinamento canônico de personalidade do Neo",
+                "confidence": 0.97,
+            }
+        if entity == DEST_RESPONSE_RULES:
+            if not rule_items:
+                return None
+            return {
+                "name": SYSTEM_RESPONSE_RULES_NAME,
+                "type": SYSTEM_RESPONSE_RULES_TYPE,
+                "aliases": ["behavior policies", "response rules", "neo behavior rules"],
+                "metadata": {
+                    **common_metadata,
+                    "collection_name": SYSTEM_BEHAVIOR_POLICIES_COLLECTION_NAME,
+                    "collection_type": SYSTEM_RESPONSE_RULES_TYPE,
+                    "is_behavior_policy_store": True,
+                },
+                "default_properties": DEFAULT_RESPONSE_RULES_PROPERTIES,
+                "properties": {"rules": rule_items},
+                "reason": "treinamento canônico de regra de resposta do Neo",
+                "confidence": 0.97,
+            }
+        if entity == DEST_PROCEDURES:
+            if not rule_items:
+                return None
+            return {
+                "name": SYSTEM_OPERATING_PROCEDURES_NAME,
+                "type": SYSTEM_OPERATING_PROCEDURES_TYPE,
+                "aliases": ["operating procedures", "when then procedures", "neo procedures"],
+                "metadata": {
+                    **common_metadata,
+                    "collection_name": SYSTEM_PROCEDURES_COLLECTION_NAME,
+                    "collection_type": SYSTEM_OPERATING_PROCEDURES_TYPE,
+                    "is_operating_procedure_store": True,
+                },
+                "default_properties": DEFAULT_OPERATING_PROCEDURES_PROPERTIES,
+                "properties": {"procedures": rule_items},
+                "reason": "treinamento canônico de procedimento operacional do Neo",
+                "confidence": 0.97,
+            }
+        if entity == DEST_TRAINING_EXAMPLES:
+            if not example_items:
+                return None
+            return {
+                "name": SYSTEM_TRAINING_EXAMPLES_NAME,
+                "type": SYSTEM_CORRECTION_EXAMPLE_TYPE,
+                "aliases": ["training examples", "correction examples", "neo examples"],
+                "metadata": {
+                    **common_metadata,
+                    "collection_name": SYSTEM_TRAINING_EXAMPLES_COLLECTION_NAME,
+                    "collection_type": SYSTEM_CORRECTION_EXAMPLE_TYPE,
+                    "is_training_examples_store": True,
+                },
+                "default_properties": {"examples": []},
+                "properties": {"examples": example_items},
+                "reason": "exemplo de correção canônico do Neo",
+                "confidence": 0.97,
+            }
+        return None
+
+    def _rule_item_from_op(self, op: dict[str, Any]) -> dict[str, Any]:
+        semantic_key = str(op.get("semantic_rule_key") or op.get("rule_key") or "")
+        item = {
+            "rule_key": semantic_key,
+            "semantic_rule_key": semantic_key,
+            "description": op.get("description", ""),
+            "scope": op.get("scope", "agent_behavior"),
+            "priority": op.get("priority", "high"),
+            "target_agent": op.get("target_agent", SYSTEM_AGENT_NAME),
+            "target_workspace": op.get("target_workspace", SYSTEM_WORKSPACE_NAME),
+            "source_message_id": op.get("source_message_id"),
+            "created_by_user": op.get("created_by_user", "daniel"),
+            "source": self._properties_source_from_op(op),
+            "examples_good": list(op.get("examples_good", [])),
+            "examples_bad": list(op.get("examples_bad", [])),
+            "confidence": op.get("confidence", 0.96),
+        }
+        if op.get("trigger"):
+            item["trigger"] = op["trigger"]
+        if op.get("action"):
+            item["action"] = op["action"]
+        return item
+
+    def _example_item_from_op(self, op: dict[str, Any]) -> dict[str, Any]:
+        example = op.get("example") or {}
+        lesson_key = str(example.get("lesson_key") or op.get("semantic_rule_key") or "")
+        return {
+            "rule_key": lesson_key,
+            "semantic_rule_key": lesson_key,
+            "type": example.get("type", "correction_example"),
+            "lesson_key": lesson_key,
+            "bad_behavior": example.get("bad_behavior", ""),
+            "expected_behavior": example.get("expected_behavior", ""),
+            "examples_bad": list(example.get("examples_bad", [])),
+            "examples_good": list(example.get("examples_good", [])),
+            "description": op.get("description", ""),
+            "priority": op.get("priority", "high"),
+            "source_message_id": op.get("source_message_id"),
+            "source": self._properties_source_from_op(op),
+        }
+
+    @staticmethod
+    def _properties_source_from_op(op: dict[str, Any]) -> dict[str, Any]:
+        """Keep audit pointers in properties without embedding the raw prompt."""
+        source = op.get("source")
+        if not isinstance(source, dict):
+            return {}
+        sanitized = dict(source)
+        sanitized.pop("raw_message", None)
+        return sanitized
+
+    @staticmethod
+    def _merge_persona(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        merged = {**current}
+        for key, value in incoming.items():
+            if key == "traits":
+                existing = merged.get("traits")
+                existing = existing if isinstance(existing, list) else []
+                incoming_traits = value if isinstance(value, list) else []
+                merged["traits"] = sorted(
+                    {str(item) for item in [*existing, *incoming_traits] if item}
+                )
+            elif value is not None:
+                merged[key] = value
+        return merged
 
     async def _apply_system_updates(
         self,

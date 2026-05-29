@@ -165,6 +165,7 @@ async def test_system_bootstrap_is_idempotent_and_persists_state(tmp_path: Path)
     assert first["communication_preferences_entity_id"] == second["communication_preferences_entity_id"]
     assert first["response_rules_entity_id"] == second["response_rules_entity_id"]
     assert first["operating_procedures_entity_id"] == second["operating_procedures_entity_id"]
+    assert first["training_examples_entity_id"] == second["training_examples_entity_id"]
     assert set(second["memory_block_field_ids"]) == set(SYSTEM_MEMORY_BLOCKS)
 
     saved = json.loads(state_file.read_text(encoding="utf-8"))
@@ -195,5 +196,5 @@ async def test_system_bootstrap_reuses_state_file_ids(tmp_path: Path) -> None:
     assert first["workspace_id"] == second["workspace_id"]
     assert first["agent_id"] == second["agent_id"]
     assert repository.workspace_creates == 1
-    assert repository.entity_creates == 9
-    assert repository.field_creates == len(SYSTEM_MEMORY_BLOCKS) + 8
+    assert repository.entity_creates == 10
+    assert repository.field_creates == len(SYSTEM_MEMORY_BLOCKS) + 9

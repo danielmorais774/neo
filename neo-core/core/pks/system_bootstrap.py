@@ -30,6 +30,7 @@ SYSTEM_PROCEDURES_COLLECTION_NAME = "procedures"
 SYSTEM_OPERATING_PROCEDURES_NAME = "neo-operating-procedures"
 SYSTEM_OPERATING_PROCEDURES_TYPE = "document"
 SYSTEM_TRAINING_EXAMPLES_COLLECTION_NAME = "training_examples"
+SYSTEM_TRAINING_EXAMPLES_NAME = "neo-training-examples"
 SYSTEM_CORRECTION_EXAMPLE_TYPE = "correction_example"
 SYSTEM_EVALUATIONS_COLLECTION_NAME = "evaluations"
 SYSTEM_REFLECTION_COLLECTION_NAME = "reflection"
@@ -115,6 +116,10 @@ DEFAULT_RESPONSE_RULES_PROPERTIES: dict[str, Any] = {
 
 DEFAULT_OPERATING_PROCEDURES_PROPERTIES: dict[str, Any] = {
     "procedures": [],
+}
+
+DEFAULT_TRAINING_EXAMPLES_PROPERTIES: dict[str, Any] = {
+    "examples": [],
 }
 
 SYSTEM_MEMORY_BLOCKS: dict[str, dict[str, Any]] = {
@@ -308,8 +313,24 @@ class NeoSystemBootstrap:
                 },
                 properties=DEFAULT_OPERATING_PROCEDURES_PROPERTIES,
             )
+            training_examples = await self._ensure_structured_entity(
+                session,
+                workspace_id=workspace["id"],
+                space_id=space_id,
+                collection_name=SYSTEM_TRAINING_EXAMPLES_COLLECTION_NAME,
+                name=SYSTEM_TRAINING_EXAMPLES_NAME,
+                type_=SYSTEM_CORRECTION_EXAMPLE_TYPE,
+                aliases=["training examples", "correction examples", "neo examples"],
+                metadata={
+                    "workspace_name": SYSTEM_WORKSPACE_NAME,
+                    "is_training_examples_store": True,
+                    "target_agent": SYSTEM_AGENT_NAME,
+                    "target_workspace": SYSTEM_WORKSPACE_NAME,
+                },
+                properties=DEFAULT_TRAINING_EXAMPLES_PROPERTIES,
+            )
             logger.info(
-                "[PKS][system_bootstrap] structured_entities_ready goals=%s profile=%s projects=%s world_state=%s communication_prefs=%s response_rules=%s procedures=%s",
+                "[PKS][system_bootstrap] structured_entities_ready goals=%s profile=%s projects=%s world_state=%s communication_prefs=%s response_rules=%s procedures=%s training_examples=%s",
                 goals.id,
                 profile.id,
                 projects.id,
@@ -317,6 +338,7 @@ class NeoSystemBootstrap:
                 communication_preferences.id,
                 response_rules.id,
                 operating_procedures.id,
+                training_examples.id,
             )
 
             memory_block_field_ids = await self._ensure_memory_blocks(session, agent.id)
@@ -335,6 +357,7 @@ class NeoSystemBootstrap:
             "communication_preferences_entity_id": str(communication_preferences.id),
             "response_rules_entity_id": str(response_rules.id),
             "operating_procedures_entity_id": str(operating_procedures.id),
+            "training_examples_entity_id": str(training_examples.id),
             "memory_block_field_ids": {key: str(value) for key, value in memory_block_field_ids.items()},
         }
         self._persist_local_state(state)

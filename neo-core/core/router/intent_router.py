@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from core.llm.router import LLMRouter
+from core.pks.training_envelope import TrainingEnvelopeParser
 from core.tools.registry import ToolRegistry
 from shared import (
     IntentType,
@@ -21,6 +22,9 @@ from shared import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Shared parser so bare instances (object.__new__) and the fallback path both work.
+_TRAINING_PARSER = TrainingEnvelopeParser()
 
 ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI assistant. Classify the user message into one execution path.
 
@@ -119,6 +123,13 @@ class IntentRouter:
         Returns:
             RoutingDecision with intent, tool info, etc.
         """
+        # Neo training messages are always a direct response (Neo learns + acks).
+        # Guard before the LLM so a long training prompt can never be misrouted
+        # into a tool/terminal command.
+        if self._is_training_message(user_message):
+            logger.info("Intent: Neo training message → DIRECT_RESPONSE (router bypass)")
+            return self._training_decision(user_message)
+
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
         client_tools_desc = self._format_tools("client-side")
@@ -308,8 +319,37 @@ class IntentRouter:
             start = text.find("{", start + 1)
         return None
 
+    def _is_training_message(self, message: str) -> bool:
+        """True when the message is an explicit Neo training message."""
+        try:
+            return _TRAINING_PARSER.parse(message).is_training
+        except Exception:  # pragma: no cover - parser is pure, defensive only
+            return False
+
+    def _training_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision for a Neo training message (no tools)."""
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.95,
+            explanation="Mensagem de treino do Neo — resposta direta (sem ferramenta)",
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
+    @staticmethod
+    def _token_hits(text: str, tokens: list[str]) -> int:
+        """Count tokens present as whole words (avoids 'disco' in 'discordar')."""
+        return sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text))
+
     def _fallback_classify(self, message: str) -> RoutingDecision:
         """Keyword-based fallback when LLM is unavailable."""
+        # Training messages are never a tool call, regardless of keywords.
+        if self._is_training_message(message):
+            return self._training_decision(message)
+
         text = (message or "").lower()
         # Normalize accents
         for src, dst in {
@@ -340,7 +380,7 @@ class IntentRouter:
                 requires_approval=False,
                 needs_plan=True,
             )
-        if sum(1 for t in client_tokens if t in text) >= 2:
+        if self._token_hits(text, client_tokens) >= 2:
             return RoutingDecision(
                 intent=IntentType.CLIENT_TOOL,
                 confidence=0.6,
@@ -354,7 +394,7 @@ class IntentRouter:
             "clima", "tempo", "weather", "temperatura", "previsao",
             "cotacao", "dolar", "bitcoin", "busca", "search", "pesquisa",
         ]
-        if sum(1 for t in server_tokens if t in text) >= 1:
+        if self._token_hits(text, server_tokens) >= 1:
             return RoutingDecision(
                 intent=IntentType.SERVER_TOOL,
                 confidence=0.5,
@@ -367,7 +407,7 @@ class IntentRouter:
             "manda", "mandar", "envia", "enviar", "texto",
             "contato", "telefone", "celular",
         ]
-        if sum(1 for t in whatsapp_tokens if t in text) >= 1:
+        if self._token_hits(text, whatsapp_tokens) >= 1:
             return RoutingDecision(
                 intent=IntentType.WHATSAPP_MESSAGING,
                 confidence=0.7,

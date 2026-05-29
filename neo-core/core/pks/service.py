@@ -132,6 +132,18 @@ class PKSService:
             source_message_id=source_message_id,
         )
 
+    def parse_training_envelope(self, user_message: str):
+        """Parse a message for an explicit Neo training envelope (no DB writes)."""
+        return self.writer.envelope_parser.parse(user_message)
+
+    def is_training_message(self, user_message: str) -> bool:
+        """True when the message is an explicit Neo training message.
+
+        Used by the desktop pipeline to block parallel routes (user preference
+        extraction, personal-memory writes) for Neo training turns.
+        """
+        return self.writer.envelope_parser.parse(user_message).is_training
+
     async def retrieve_system_context(self, *, user_message: str = "") -> str:
         async with self.db.get_session() as session:
             workspace = await self.repository.get_system_workspace(session)
@@ -226,14 +238,28 @@ class PKSService:
                 lines.append(f"- {key}: {value}")
         return lines
 
+    # Envelope fragments that must never be injected as an active rule, even if
+    # they survive in legacy entities created before the Memory Pipeline v2.
+    _ENVELOPE_FRAGMENTS = (
+        "modo treino",
+        "nao e uma preferencia pessoal",
+        "não é uma preferencia pessoal",
+        "não é uma preferência pessoal",
+        "salve no workspace do neo",
+        "salve este aprendizado",
+    )
+
     def _should_render_training_item(self, item: dict[str, Any], *, user_message: str) -> bool:
+        description = str(item.get("description") or item.get("rule_description") or "")
+        normalized = description.lower()
+        if any(fragment in normalized for fragment in self._ENVELOPE_FRAGMENTS):
+            return False
         if item.get("priority") == "high":
             return True
         if not user_message:
             return True
-        description = str(item.get("description") or item.get("rule_description") or "").lower()
         query_terms = {term for term in user_message.lower().split() if len(term) >= 4}
-        return any(term in description for term in query_terms)
+        return any(term in normalized for term in query_terms)
 
     async def search_entities(self, *, user_id: UUID, query: str) -> list[dict[str, Any]]:
         workspace_id = await self.bootstrap.ensure_workspace(user_id)

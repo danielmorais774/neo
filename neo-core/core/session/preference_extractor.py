@@ -16,10 +16,13 @@ from typing import Any
 from uuid import UUID
 
 from core.llm.router import LLMRouter
+from core.pks.training_envelope import TrainingEnvelopeParser
 from db.async_client import AsyncPostgresClient
 from shared.types import Message, MessageRole
 
 logger = logging.getLogger(__name__)
+
+_ENVELOPE_PARSER = TrainingEnvelopeParser()
 
 _EXTRACTION_PROMPT = """\
 You are a preference extractor. Given a user message and the assistant's response,
@@ -77,7 +80,7 @@ class PreferenceExtractor:
         # Skip very short messages — unlikely to contain preferences
         if len(user_message.strip()) < 20:
             return []
-        if self._looks_like_agent_training(user_message):
+        if _ENVELOPE_PARSER.parse(user_message).is_training or self._looks_like_agent_training(user_message):
             logger.info("[PREF] Skipping user preference extraction for agent training message")
             return []
 
