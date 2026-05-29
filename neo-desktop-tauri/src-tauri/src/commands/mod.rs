@@ -47,7 +47,7 @@ pub async fn execute_with_loop(
     let user_id = state.user_id.clone();
     let session_id = state.session_id.lock().unwrap().clone();
     let neo_core_url =
-        std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "localhost:50051".to_string());
+        std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "192.168.4.175:50051".to_string());
 
     let app_handle = app.clone();
 
@@ -159,7 +159,7 @@ fn neo_core_http_url() -> String {
                 .ok()
                 .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
         })
-        .unwrap_or_else(|| "http://localhost:8000".to_string())
+        .unwrap_or_else(|| "http://192.168.4.175:8000".to_string())
         .trim_end_matches('/')
         .to_string()
 }
@@ -266,7 +266,7 @@ pub struct NeoCoreStatus {
 
 #[tauri::command]
 pub async fn get_neo_core_status() -> Result<NeoCoreStatus, String> {
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -302,7 +302,7 @@ pub fn get_window_mode() -> &'static str {
 pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(), String> {
     info!("[Neo] quick_help_ask_stream: {}", question);
 
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))

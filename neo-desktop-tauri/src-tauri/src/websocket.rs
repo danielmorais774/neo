@@ -177,7 +177,7 @@ pub struct DeviceWsManager {
 impl DeviceWsManager {
     pub fn new(device_id: String, app_handle: AppHandle) -> Self {
         let api_url = std::env::var("NEO_CORE_URL")
-            .unwrap_or_else(|_| "http://localhost:8000".to_string());
+            .unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
         
         Self {
             device_id,

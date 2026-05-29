@@ -34,7 +34,7 @@ const PROVIDER_OPTIONS: { value: ProviderType; label: string; description: strin
   { value: 'openai',    label: 'OpenAI',       description: 'GPT-4o, GPT-4.1...' },
   { value: 'groq',      label: 'Groq',         description: 'Llama-3.3, ultra-rápido' },
   { value: 'grok',      label: 'Grok (xAI)',   description: 'Grok-3-mini, Grok-2...' },
-  { value: 'deepseek',  label: 'DeepSeek',     description: 'deepseek-chat...' },
+  { value: 'deepseek',  label: 'DeepSeek',     description: 'V4 Flash, V4 Pro...' },
   { value: 'anthropic', label: 'Anthropic',    description: 'Claude 3...' },
   { value: 'gemini',    label: 'Gemini',       description: 'Gemini 2.5 Pro...' },
   { value: 'ollama',    label: 'Ollama',       description: 'Local (Gemma4...)' },
@@ -62,6 +62,8 @@ const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: string; d
     { value: 'grok-3',           label: 'Grok-3',           description: 'Mais capaz (pago)' },
   ],
   deepseek: [
+    { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', description: 'Mais rápido' },
+    { value: 'deepseek-v4-pro',   label: 'DeepSeek V4 Pro',   description: 'Mais capaz' },
     { value: 'deepseek-chat',     label: 'DeepSeek Chat',     description: 'Uso geral' },
     { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner', description: 'Raciocínio lento' },
   ],

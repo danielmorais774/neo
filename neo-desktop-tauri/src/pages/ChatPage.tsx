@@ -293,14 +293,14 @@ export const ChatPage = () => {
       const payload = editedText
         ? { command, edited_text: editedText }
         : { command };
-      const url = `http://localhost:8000/api/v1/missions/${missionId}/command`;
+      const url = `http://192.168.4.175:8000/api/v1/missions/${missionId}/command`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
-      await fetch(`http://localhost:8000/api/v1/missions/${missionId}/notifications/ack`, {
+      await fetch(`http://192.168.4.175:8000/api/v1/missions/${missionId}/notifications/ack`, {
         method: 'POST',
       }).catch((ackErr) => {
         console.warn('[ChatPage] notification ack by mission failed:', ackErr);
