@@ -59,6 +59,23 @@ class PersistentSessionManager:
         if session_id:
             session = await self.db.get_conversation_session(session_id)
             if session:
+                if self._is_expired(session):
+                    logger.info(f"Sessão {session.id} expirada por inatividade")
+                    await self.close_session(session.id, reason="inactivity")
+                    session = await self.db.create_conversation_session(
+                        user_id=user_id,
+                        service=service,
+                        metadata={
+                            "created_after_expired_session_id": str(session_id),
+                            "created_after_expiration_reason": "inactivity",
+                        },
+                    )
+                    logger.info(
+                        "Nova sessão criada após expiração: %s (anterior=%s)",
+                        session.id,
+                        session_id,
+                    )
+                    return session
                 # Found session — reactivate if it was closed
                 if session.status != "active":
                     logger.info(f"Reativando sessão {session.id} (status={session.status})")
