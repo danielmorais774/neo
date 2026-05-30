@@ -353,6 +353,24 @@ class AIService:
             is_new=(session.message_count == 0),
             rotated_from=str(old_sid) if rotated else None,
         )
+        continuity = await self.sessions.resolve_continuity_context(
+            session=session,
+            message=user_message,
+            user_id=user_id,
+            service=service,
+        )
+        if continuity.get("action") != "none":
+            slog.log_event(
+                "Continuidade de Contexto",
+                "\n".join(
+                    [
+                        f"- **Ação:** `{continuity.get('action')}`",
+                        f"- **Confiança:** `{continuity.get('confidence')}`",
+                        f"- **Motivo:** `{continuity.get('reason')}`",
+                        f"- **Sessão fonte:** `{continuity.get('source_session_id')}`",
+                    ]
+                ),
+            )
 
         # 3. Yield thinking status cedo — usuário vê feedback enquanto processamos
         yield AIServiceResponse(
@@ -390,6 +408,50 @@ class AIService:
         mission_context = await self._build_recent_missions_context(sid, user_id)
         if mission_context:
             sys_context = "\n\n".join(part for part in (sys_context, mission_context) if part)
+
+        if continuity.get("action") == "inject" and continuity.get("history"):
+            continuity_history = continuity["history"]
+            logger.info(
+                "[HISTORY-DEBUG] Injecting %s messages from continuity session %s",
+                len(continuity_history),
+                continuity.get("source_session_id"),
+            )
+            history = continuity_history + history
+            continuity_note = (
+                "## Continuidade de Contexto\n"
+                "A mensagem atual depende de uma conversa anterior recuperada automaticamente. "
+                "Use o histórico recuperado como contexto imediato, mas responda à última mensagem do usuário."
+            )
+            sys_context = "\n\n".join(part for part in (sys_context, continuity_note) if part)
+
+        if continuity.get("action") == "disambiguate":
+            candidates = continuity.get("candidates") or []
+            lines = [
+                "Você quer que eu continue qual assunto?",
+                "",
+            ]
+            for index, candidate in enumerate(candidates[:3], start=1):
+                lines.append(f"{index}. {candidate.get('summary')}")
+            lines.append("")
+            lines.append("Me diga o número ou descreva o assunto que eu retomo.")
+            clarification = "\n".join(lines)
+            await self.sessions.add_message(
+                session_id=sid,
+                role="assistant",
+                content=clarification,
+                generate_embedding=False,
+                user_id=user_id,
+            )
+            slog.log_final_response(clarification, "DIRECT_RESPONSE", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE,
+                session_id=sid,
+                message=clarification,
+                is_final=True,
+                iterations=1,
+                metadata={"continuity": continuity},
+            )
+            return
 
         # If session was rotated, carry some context from the previous session
         # so the classifier and LLM have continuity.

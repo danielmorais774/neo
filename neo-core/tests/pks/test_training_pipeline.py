@@ -55,6 +55,19 @@ def test_training_envelope_is_separated_from_clean_content():
     assert any("modo treino" in p.lower() for p in result.envelope_phrases)
 
 
+def test_training_envelope_keeps_inline_content_after_marker():
+    parser = TrainingEnvelopeParser()
+    message = (
+        "Neo, modo treino: Quando eu fizer pergunta aleatória, responda com "
+        "sarcasmo antes da resposta útil."
+    )
+    result = parser.parse(message)
+
+    assert result.is_training is True
+    assert "Quando eu fizer pergunta aleatória" in result.clean_content
+    assert "modo treino" not in result.clean_content.lower()
+
+
 def test_training_plan_does_not_save_envelope_as_active_rule():
     writer = _make_writer()
     message = (
@@ -165,6 +178,46 @@ def test_acid_humor_sets_sharp_persona_without_slightly_funny():
     assert "sarcastic_when_appropriate" in props["traits"]
     assert "anti_corporate_tone" in props["traits"]
     assert "slightly_funny" not in props["traits"]
+
+
+def test_random_useless_question_training_gets_specific_rule_examples_and_variation():
+    writer = _make_writer()
+    message = (
+        "Neo, modo treino: Quando eu fizer uma pergunta muita aleatória e inutil, "
+        "como por exemplo “Qual a capitão da Chipre?” ai o neo deve responder "
+        "com sarcasmos e tirando onda, como por exemplo, "
+        "“ehhh so pode ta com muito tempo livre, mas de qualquer forma aqui vai a resposta [resposta]”, "
+        "“mas pq porra tu que saber de [assunto], [ai responde]” "
+        "ai o resto tu inventa, sempre tenta alternar para nao ficar muito repetitivo"
+    )
+
+    plan = writer.plan_agent_training(
+        user_message=message, source_message_id="msg-random", user_id=None
+    )
+    response_rules = _find_destination(plan, "neo-response-rules")
+    assert response_rules is not None
+
+    specific = next(
+        op for op in response_rules.updates
+        if op["rule_key"] == "answer_random_useless_questions_with_varied_sarcasm"
+    )
+    assert "pergunta aleatória" in specific["description"]
+    assert specific["variation_policy"]["avoid_repetition"] is True
+    assert specific["variation_policy"]["rotate_opening_style"] is True
+    assert specific["examples_good"]
+    assert any("tempo livre" in example for example in specific["examples_good"])
+    assert writer.plan_validator.validate(plan).ok
+
+    updates = writer._training_plan_to_updates(plan, "msg-random")
+    response_update = next(u for u in updates if u["name"] == "neo-response-rules")
+    rules = response_update["properties"]["rules"]
+    persisted = next(
+        rule for rule in rules
+        if rule["rule_key"] == "answer_random_useless_questions_with_varied_sarcasm"
+    )
+    assert persisted["variation_policy"]["keep_answer_useful"] is True
+    assert persisted["examples_good"]
+    assert "raw_message" not in persisted["source"]
 
 
 # ── 6. Good/bad examples ────────────────────────────────────────────────

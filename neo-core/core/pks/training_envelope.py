@@ -133,6 +133,12 @@ class TrainingEnvelopeParser:
             if not stripped:
                 kept_lines.append("")
                 continue
+            inline_clean = _LEADING_ENVELOPE.sub("", stripped)
+            if inline_clean != stripped:
+                removed.append("Neo, modo treino")
+                if inline_clean:
+                    kept_lines.append(inline_clean)
+                continue
             normalized_line = normalize_text(stripped)
             if any(pattern.search(normalized_line) for pattern in _ENVELOPE_LINE_PATTERNS):
                 removed.append(stripped)

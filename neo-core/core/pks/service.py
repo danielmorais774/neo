@@ -231,6 +231,27 @@ class PKSService:
                             if rule_key:
                                 prefix += f" [{rule_key}]"
                             lines.append(f"{prefix}: {description}")
+                            trigger = item.get("trigger")
+                            if trigger:
+                                lines.append(f"  - Gatilho: {trigger}")
+                            action = item.get("action")
+                            if action:
+                                lines.append(f"  - Ação: {action}")
+                            variation_policy = item.get("variation_policy")
+                            if isinstance(variation_policy, dict) and variation_policy:
+                                enabled = [
+                                    name for name, enabled in variation_policy.items()
+                                    if enabled is True
+                                ]
+                                if enabled:
+                                    lines.append(
+                                        "  - Política de variação: "
+                                        + ", ".join(enabled)
+                                    )
+                            examples_good = item.get("examples_good")
+                            if isinstance(examples_good, list) and examples_good:
+                                preview = "; ".join(str(example) for example in examples_good[:3])
+                                lines.append(f"  - Exemplos bons: {preview}")
                         continue
                     lines.append(f"- {key}: {item}")
                 continue

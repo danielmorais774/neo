@@ -50,6 +50,7 @@ ACID_PERSONA_PROPERTIES: dict[str, Any] = {
 
 _BAD_MARKERS = ("exemplo ruim", "exemplos ruins", "nao aja assim", "exemplo errado")
 _GOOD_MARKERS = ("exemplo bom", "exemplos bons", "correto seria", "certo seria")
+_QUOTE_RE = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{12,240})[\"“”'‘’]")
 
 
 class MemoryCanonicalizer:
@@ -88,6 +89,38 @@ class MemoryCanonicalizer:
             return op
 
         ops: list[dict[str, Any]] = []
+
+        if self._is_random_useless_question_sarcasm(norm):
+            examples_good = self._extract_inline_good_examples(clean_content)
+            ops.append(
+                base_op(
+                    destination=DEST_RESPONSE_RULES,
+                    kind="rule",
+                    semantic_rule_key="answer_random_useless_questions_with_varied_sarcasm",
+                    rule_key="answer_random_useless_questions_with_varied_sarcasm",
+                    description=(
+                        "Quando o usuário fizer uma pergunta aleatória, inútil, boba "
+                        "ou claramente despretensiosa, Neo deve abrir com sarcasmo ou "
+                        "deboche contextual e em seguida responder de forma útil."
+                    ),
+                    scope="response_generation",
+                    priority="high",
+                    trigger=(
+                        "Pergunta aleatória/inútil/despretensiosa, especialmente "
+                        "perguntas factuais simples sem contexto importante."
+                    ),
+                    action=(
+                        "Responder com uma abertura sarcástica curta, variar a frase "
+                        "para não repetir padrão, e então entregar a resposta correta."
+                    ),
+                    examples_good=examples_good,
+                    variation_policy={
+                        "avoid_repetition": True,
+                        "rotate_opening_style": True,
+                        "keep_answer_useful": True,
+                    },
+                )
+            )
 
         if self._is_identity_name_only(norm):
             ops.append(
@@ -252,6 +285,46 @@ class MemoryCanonicalizer:
         return "humor" in norm and ("acido" in norm or "deboche" in norm)
 
     @staticmethod
+    def _is_random_useless_question_sarcasm(norm: str) -> bool:
+        random_question_cues = (
+            "pergunta aleatoria",
+            "perguntas aleatorias",
+            "pergunta inutil",
+            "perguntas inuteis",
+            "pergunta boba",
+            "perguntas bobas",
+            "pergunta besta",
+            "perguntas bestas",
+            "qual a capital",
+            "qual e a capital",
+        )
+        sarcasm_cues = (
+            "sarcasmo",
+            "sarcastico",
+            "sarcastica",
+            "tirando onda",
+            "deboche",
+            "debochar",
+            "zoar",
+            "tirar onda",
+        )
+        variation_cues = (
+            "alternar",
+            "nao ficar muito repetitivo",
+            "nao ficar repetitivo",
+            "variar",
+            "varie",
+        )
+        return (
+            any(cue in norm for cue in random_question_cues)
+            and any(cue in norm for cue in sarcasm_cues)
+        ) or (
+            "pergunta" in norm
+            and "inutil" in norm
+            and any(cue in norm for cue in variation_cues)
+        )
+
+    @staticmethod
     def _is_avoid_unrelated_context(norm: str) -> bool:
         avoid_cues = (
             "evite",
@@ -311,6 +384,30 @@ class MemoryCanonicalizer:
         return "envelope" in norm and "treino" in norm
 
     # ── example extraction ──────────────────────────────────────────────
+    @staticmethod
+    def _extract_inline_good_examples(text: str) -> list[str]:
+        examples: list[str] = []
+        for match in _QUOTE_RE.finditer(text):
+            candidate = " ".join(match.group(1).split()).strip()
+            normalized = normalize_text(candidate)
+            if (
+                "resposta" in normalized
+                or "assunto" in normalized
+                or "tempo livre" in normalized
+                or "porra" in normalized
+                or "pq" in normalized
+                or "porque" in normalized
+            ):
+                examples.append(candidate)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for example in examples:
+            key = normalize_text(example)
+            if key and key not in seen:
+                deduped.append(example)
+                seen.add(key)
+        return deduped[:4]
+
     def _extract_examples(self, text: str) -> list[dict[str, str]]:
         bad: list[str] = []
         good: list[str] = []

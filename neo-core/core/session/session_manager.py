@@ -10,6 +10,7 @@ Responsabilidades:
 from __future__ import annotations
 
 import logging
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any, TYPE_CHECKING
 from uuid import UUID
@@ -407,6 +408,231 @@ class PersistentSessionManager:
                 )
             )
         return results
+
+    # ---------------------------------------------------------------
+    # Context continuity - expired-session follow-up recovery
+    # ---------------------------------------------------------------
+
+    async def resolve_continuity_context(
+        self,
+        session: ConversationSession,
+        message: str,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+    ) -> dict[str, Any]:
+        """Resolve context for elliptical follow-ups after session boundaries.
+
+        This is intentionally conservative: the strongest signal is a new
+        session created by core because the desktop-provided session expired.
+        A user-created new chat has no such metadata, so it will not silently
+        inherit the previous conversation unless the user explicitly asks to
+        return to the prior subject and there is only one recent candidate.
+        """
+        detection = self.detect_context_dependency(message)
+        result: dict[str, Any] = {
+            "detected": detection,
+            "action": "none",
+            "confidence": 0.0,
+            "history": [],
+            "source_session_id": None,
+            "candidates": [],
+            "reason": detection.get("reason", "not_context_dependent"),
+        }
+        if not detection["is_context_dependent"]:
+            return result
+
+        previous_session_id = (session.extra_metadata or {}).get(
+            "created_after_expired_session_id"
+        )
+        if previous_session_id:
+            history = await self._history_from_previous_session(previous_session_id)
+            if history:
+                result.update(
+                    {
+                        "action": "inject",
+                        "confidence": max(0.9, float(detection["confidence"])),
+                        "history": history,
+                        "source_session_id": previous_session_id,
+                        "reason": "expired_session_continuity",
+                    }
+                )
+                return result
+
+        if detection["kind"] != "explicit_return":
+            return result
+
+        recent_sessions = await self._recent_context_candidates(
+            current_session_id=session.id,
+            user_id=user_id,
+            service=service,
+        )
+        candidates = [
+            {
+                "session_id": str(candidate.id),
+                "summary": self._session_candidate_summary(candidate),
+                "last_activity_at": candidate.last_activity_at.isoformat(),
+            }
+            for candidate in recent_sessions
+        ]
+        result["candidates"] = candidates
+
+        if len(recent_sessions) == 1:
+            previous = recent_sessions[0]
+            history = await self.get_history(previous.id, limit=12, max_tokens_budget=2000)
+            if history:
+                result.update(
+                    {
+                        "action": "inject",
+                        "confidence": 0.82,
+                        "history": history,
+                        "source_session_id": str(previous.id),
+                        "reason": "single_recent_explicit_return",
+                    }
+                )
+                return result
+
+        if candidates:
+            result.update(
+                {
+                    "action": "disambiguate",
+                    "confidence": float(detection["confidence"]),
+                    "reason": "multiple_recent_context_candidates",
+                }
+            )
+        return result
+
+    @classmethod
+    def detect_context_dependency(cls, message: str) -> dict[str, Any]:
+        """Detect messages that cannot be answered safely without prior context."""
+        normalized = cls._normalize_context_text(message)
+        compact = " ".join(normalized.split())
+        if not compact:
+            return {
+                "is_context_dependent": False,
+                "kind": "empty",
+                "confidence": 0.0,
+                "reason": "empty_message",
+            }
+
+        explicit_markers = (
+            "voltando ao assunto",
+            "voltando no assunto",
+            "continuando o assunto",
+            "continuando aquele assunto",
+            "sobre o assunto anterior",
+            "sobre aquilo que falamos",
+            "retomando o assunto",
+        )
+        if any(marker in compact for marker in explicit_markers):
+            return {
+                "is_context_dependent": True,
+                "kind": "explicit_return",
+                "confidence": 0.92,
+                "reason": "explicit_return_marker",
+            }
+
+        short_commands = {
+            "continua",
+            "continue",
+            "segue",
+            "faz isso",
+            "refaz",
+            "refaca",
+            "refaz isso",
+            "melhora isso",
+            "corrige isso",
+            "muda isso",
+            "troca isso",
+        }
+        if compact in short_commands:
+            return {
+                "is_context_dependent": True,
+                "kind": "short_followup",
+                "confidence": 0.86,
+                "reason": "short_context_command",
+            }
+
+        referential_markers = (
+            "isso",
+            "essa forma",
+            "desse jeito",
+            "dessa forma",
+            "essa parte",
+            "esse ponto",
+            "aquilo",
+            "anterior",
+            "resposta anterior",
+            "como me passou",
+        )
+        dissatisfaction_markers = (
+            "nao gostei",
+            "nao curti",
+            "ficou ruim",
+            "ta errado",
+            "esta errado",
+            "nao era isso",
+            "pensei melhor",
+        )
+        if len(compact) <= 180 and (
+            any(marker in compact for marker in referential_markers)
+            or any(marker in compact for marker in dissatisfaction_markers)
+        ):
+            return {
+                "is_context_dependent": True,
+                "kind": "referential_followup",
+                "confidence": 0.74,
+                "reason": "referential_or_dissatisfaction_marker",
+            }
+
+        return {
+            "is_context_dependent": False,
+            "kind": "standalone",
+            "confidence": 0.0,
+            "reason": "no_context_dependency_marker",
+        }
+
+    async def _history_from_previous_session(
+        self,
+        session_id: str,
+    ) -> list[dict[str, str]]:
+        try:
+            previous_id = UUID(str(session_id))
+        except (TypeError, ValueError):
+            return []
+        return await self.get_history(previous_id, limit=12, max_tokens_budget=2000)
+
+    async def _recent_context_candidates(
+        self,
+        current_session_id: UUID,
+        user_id: UUID | None,
+        service: str,
+    ) -> list[ConversationSession]:
+        fetch_recent = getattr(self.db, "fetch_recent_sessions", None)
+        if not fetch_recent:
+            return []
+        sessions = await fetch_recent(
+            user_id=user_id,
+            service=service,
+            limit=3,
+            statuses=["active", "closed"],
+            exclude_session_id=current_session_id,
+        )
+        return [session for session in sessions if session.message_count > 0]
+
+    @staticmethod
+    def _normalize_context_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFD", text or "")
+        without_accents = "".join(
+            char for char in normalized if unicodedata.category(char) != "Mn"
+        )
+        return without_accents.lower().strip()
+
+    @staticmethod
+    def _session_candidate_summary(session: ConversationSession) -> str:
+        if session.topic_summary:
+            return session.topic_summary[:160]
+        last_activity = session.last_activity_at.strftime("%d/%m %H:%M")
+        return f"Sessão de {last_activity} com {session.message_count} mensagens"
 
     # ---------------------------------------------------------------
     # Helpers

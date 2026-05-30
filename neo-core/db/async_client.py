@@ -402,6 +402,32 @@ class AsyncPostgresClient:
                 logger.warning(f"pgvector search failed (extension may not be installed): {e}")
                 return []
 
+    async def fetch_recent_sessions(
+        self,
+        user_id: UUID | None = None,
+        service: str = "neo-desktop",
+        limit: int = 5,
+        statuses: list[str] | None = None,
+        exclude_session_id: UUID | None = None,
+    ) -> list[ConversationSession]:
+        """Fetch recent sessions for context-continuity decisions."""
+        async with self.get_session() as db:
+            stmt = select(ConversationSession).where(
+                ConversationSession.service == service
+            )
+            if user_id:
+                stmt = stmt.where(ConversationSession.user_id == user_id)
+            if statuses:
+                stmt = stmt.where(ConversationSession.status.in_(statuses))
+            if exclude_session_id:
+                stmt = stmt.where(ConversationSession.id != exclude_session_id)
+            stmt = (
+                stmt.order_by(ConversationSession.last_activity_at.desc())
+                .limit(limit)
+            )
+            result = await db.execute(stmt)
+            return list(result.scalars().all())
+
     # ---------------------------------------------------------------
     # Vector Search — Messages (pgvector)
     # ---------------------------------------------------------------
