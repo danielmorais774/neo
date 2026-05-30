@@ -43,6 +43,8 @@ Regras obrigatórias:
 - Para upsert_field, sempre informe entity.name e entity.type.
 - Para upsert_relation, sempre informe from_entity, relation_type e to_entity.
 - Resolva por entidade canônica. Não crie entity genérica se já houver contexto PKS.
+- Para relation_type "owns" em que o dono é o usuário atual/Daniel, use from_entity
+  type "person" e name "Daniel Morais"; nunca use type "identity" para o usuário.
 - Se a mensagem atual não tem fato persistente, retorne {"operations": []}.
 - Foque na mensagem atual. Use histórico só para resolver pronomes e contexto.
 - Exceção: se a mensagem atual for uma confirmação explícita para salvar/lembrar algo

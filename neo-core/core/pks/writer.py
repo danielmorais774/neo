@@ -2478,8 +2478,26 @@ class PKSWriter:
         from_type = self._canonical_entity_type(from_name, from_type)
         to_type = self._canonical_entity_type(to_name, to_type)
 
-        from_entity = await self._resolve_or_create_entity(session, workspace_id, from_name, from_type, op.confidence, source_message_id)
-        to_entity = await self._resolve_or_create_entity(session, workspace_id, to_name, to_type, op.confidence, source_message_id)
+        from_entity = await self._resolve_relation_endpoint(
+            session,
+            workspace_id=workspace_id,
+            name=from_name,
+            entity_type=from_type,
+            relation_type=relation_type,
+            position="from",
+            confidence=op.confidence,
+            source_message_id=source_message_id,
+        )
+        to_entity = await self._resolve_relation_endpoint(
+            session,
+            workspace_id=workspace_id,
+            name=to_name,
+            entity_type=to_type,
+            relation_type=relation_type,
+            position="to",
+            confidence=op.confidence,
+            source_message_id=source_message_id,
+        )
         record, before = await self.repository.upsert_relation(
             session,
             UpsertRelationInput(
@@ -2509,6 +2527,31 @@ class PKSWriter:
             source_message_id=source_message_id,
         )
         return {"op": op.op, "relation_id": str(record.id), "relation_type": record.relation_type}
+
+    async def _resolve_relation_endpoint(
+        self,
+        session,
+        *,
+        workspace_id: UUID,
+        name: str,
+        entity_type: str,
+        relation_type: str,
+        position: str,
+        confidence: float,
+        source_message_id: str | None,
+    ):
+        if relation_type == "owns" and position == "from":
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if primary and self._matches_primary_user_reference(name, entity_type, primary):
+                return primary
+        return await self._resolve_or_create_entity(
+            session,
+            workspace_id,
+            name,
+            entity_type,
+            confidence,
+            source_message_id,
+        )
 
     async def _apply_soft_delete_entity(self, session, workspace_id: UUID, op: PKSOperation, source_message_id: str | None):
         entity = op.entity or {}
@@ -2554,6 +2597,9 @@ class PKSWriter:
         source_message_id: str | None,
     ):
         entity_type = self._canonical_entity_type(name, entity_type)
+        primary = await self.repository.get_primary_user_entity(session, workspace_id)
+        if primary and self._matches_primary_user_reference(name, entity_type, primary):
+            return primary
         entity = await self.resolver.resolve_one(
             session,
             workspace_id=workspace_id,
@@ -2576,6 +2622,23 @@ class PKSWriter:
             ),
         )
         return entity
+
+    @staticmethod
+    def _matches_primary_user_reference(name: str, entity_type: str, primary_entity) -> bool:
+        if entity_type not in {"person", "identity"}:
+            return False
+        target = normalize_token(name)
+        if not target:
+            return False
+        primary_names = {normalize_token(primary_entity.name)}
+        for alias in getattr(primary_entity, "aliases", []) or []:
+            primary_names.add(normalize_token(alias))
+        if target in primary_names:
+            return True
+        preferred = (primary_entity.metadata or {}).get("preferred_name")
+        if preferred and target == normalize_token(str(preferred)):
+            return True
+        return False
 
     def _canonical_entity_type(self, name: str, entity_type: str) -> str:
         token = normalize_token(name)

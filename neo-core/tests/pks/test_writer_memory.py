@@ -1,6 +1,76 @@
+import asyncio
 from datetime import date
+from uuid import uuid4
 
+from core.pks.ontology import OntologyValidator
+from core.pks.schemas import EntityRecord, PKSOperation, RelationRecord
 from core.pks.writer import PKSWriter
+
+
+class _NoopAudit:
+    async def log(self, *args, **kwargs):
+        return None
+
+
+class _DeviceRelationRepo:
+    def __init__(self):
+        workspace_id = uuid4()
+        self.primary = EntityRecord(
+            id=uuid4(),
+            workspace_id=workspace_id,
+            name="Daniel Morais",
+            type="person",
+            aliases=["Daniel"],
+            metadata={"is_primary_user": True, "preferred_name": "Daniel"},
+        )
+        self.device = EntityRecord(
+            id=uuid4(),
+            workspace_id=workspace_id,
+            name="MacBook Air M4",
+            type="device",
+        )
+        self.created_entities = []
+        self.relations = []
+
+    async def get_primary_user_entity(self, session, workspace_id):
+        return self.primary
+
+    async def upsert_entity(self, session, data):
+        self.created_entities.append(data)
+        entity = EntityRecord(
+            id=uuid4(),
+            workspace_id=data.workspace_id,
+            name=data.name,
+            type=data.type,
+            aliases=data.aliases,
+            metadata=data.metadata,
+        )
+        return entity, None
+
+    async def upsert_relation(self, session, data):
+        self.relations.append(data)
+        return RelationRecord(
+            id=uuid4(),
+            workspace_id=data.workspace_id,
+            from_entity_id=data.from_entity_id,
+            relation_type=data.relation_type,
+            to_entity_id=data.to_entity_id,
+            metadata=data.metadata,
+            confidence=data.confidence,
+            sensitivity=data.sensitivity,
+        ), None
+
+
+class _DeviceResolver:
+    def __init__(self, repo):
+        self.repo = repo
+        self.calls = []
+
+    async def resolve_one(self, session, *, workspace_id, query, entity_type=None, min_score=0.80):
+        self.calls.append((query, entity_type))
+        if query == "MacBook Air M4" and entity_type == "device":
+            return self.repo.device
+        return None
 
 
 def test_extract_name_statement_supports_full_name_and_ignores_question():
@@ -8,6 +78,61 @@ def test_extract_name_statement_supports_full_name_and_ignores_question():
 
     assert writer._extract_name_statement("o meu nome completo é Carlos Daniel Morais") == "Carlos Daniel Morais"
     assert writer._extract_name_statement("Quem sou eu?") is None
+
+
+def test_owns_relation_uses_primary_user_when_planner_sends_identity_owner():
+    repo = _DeviceRelationRepo()
+    writer = object.__new__(PKSWriter)
+    writer.repository = repo
+    writer.resolver = _DeviceResolver(repo)
+    writer.audit = _NoopAudit()
+    writer.validator = OntologyValidator()
+
+    op = PKSOperation(
+        op="upsert_relation",
+        confidence=0.95,
+        reason="Daniel Morais é dono do MacBook Air M4",
+        relation={
+            "from_entity": {"name": "Daniel Morais", "type": "identity"},
+            "relation_type": "owns",
+            "to_entity": {"name": "MacBook Air M4", "type": "device"},
+        },
+    )
+
+    result = asyncio.run(
+        writer._apply_upsert_relation(
+            object(),
+            repo.primary.workspace_id,
+            op,
+            "msg-macbook",
+        )
+    )
+
+    assert result["relation_type"] == "owns"
+    assert repo.relations[0].from_entity_id == repo.primary.id
+    assert repo.relations[0].to_entity_id == repo.device.id
+    assert not any(item.name == "Daniel Morais" and item.type == "identity" for item in repo.created_entities)
+
+
+def test_resolve_or_create_entity_reuses_primary_user_for_identity_reference():
+    repo = _DeviceRelationRepo()
+    writer = object.__new__(PKSWriter)
+    writer.repository = repo
+    writer.resolver = _DeviceResolver(repo)
+
+    entity = asyncio.run(
+        writer._resolve_or_create_entity(
+            object(),
+            repo.primary.workspace_id,
+            "Daniel Morais",
+            "identity",
+            0.95,
+            "msg-user",
+        )
+    )
+
+    assert entity.id == repo.primary.id
+    assert repo.created_entities == []
 
 
 def test_normalize_birthday_value_supports_partial_dates():
