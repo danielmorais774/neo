@@ -22,6 +22,8 @@ from core.pks.memory_canonicalizer import (
     MemoryCanonicalizer,
 )
 from core.pks.memory_ingestion_planner import (
+    BLOCKED_TRAINING_ROUTES,
+    MEMORY_TYPE_AGENT_TRAINING,
     MemoryIngestionPlan,
     MemoryIngestionPlanner,
 )
@@ -686,12 +688,13 @@ class PKSWriter:
             source_message_id=source_message_id,
             user_id=user_id,
         )
+        if training_updates:
+            return training_updates
+
         communication_policy = self._extract_assistant_communication_policy(user_message)
         style_pref = self._extract_system_style_preference(user_message)
         confirmation = self._is_memory_confirmation(user_message)
         has_memory_intent = self._is_system_memory_intent(user_message)
-
-        updates.extend(training_updates)
 
         if communication_policy:
             updates.append(
@@ -832,6 +835,45 @@ class PKSWriter:
         normalized = normalize_token(user_message)
         if not self._is_agent_training_intent(normalized):
             return []
+
+        canonicalizer = getattr(self, "canonicalizer", None) or MemoryCanonicalizer()
+        ingestion_planner = getattr(self, "ingestion_planner", None) or MemoryIngestionPlanner(
+            canonicalizer=canonicalizer
+        )
+        plan_validator = getattr(self, "plan_validator", None) or MemoryPlanValidator()
+        if not hasattr(self, "_training_idempotency"):
+            self._training_idempotency = set()
+
+        canonical_ops = canonicalizer.canonicalize(
+            clean_content=user_message,
+            source_message_id=source_message_id,
+            user_id=user_id,
+            source_audit={
+                "clean_content": user_message,
+                "removed_envelope_phrases": [],
+            },
+        )
+        if canonical_ops:
+            plan = MemoryIngestionPlan(
+                should_write=True,
+                memory_type=MEMORY_TYPE_AGENT_TRAINING,
+                target_workspace=SYSTEM_WORKSPACE_NAME,
+                target_agent=SYSTEM_AGENT_NAME,
+                blocked_routes=list(BLOCKED_TRAINING_ROUTES),
+                destinations=ingestion_planner._group_destinations(canonical_ops),
+                source_audit={
+                    "clean_content": user_message,
+                    "removed_envelope_phrases": [],
+                },
+            )
+            try:
+                plan_validator.validate_or_raise(plan)
+            except MemoryPlanValidationError as exc:
+                logger.warning("[PKS][training_v2] implicit plan rejected by validator: %s", exc)
+            else:
+                updates = self._training_plan_to_updates(plan, source_message_id)
+                if updates:
+                    return updates
 
         item = self._training_item(
             user_message=user_message,
@@ -1001,6 +1043,12 @@ class PKSWriter:
             "a partir de agora voce deve",
             "a partir de agora vc deve",
             "a partir de agora o neo deve",
+            "exemplo de resposta",
+            "exemplos de resposta",
+            "salvar isso no pks",
+            "salve isso no pks",
+            "ja salvar isso no pks",
+            "já salvar isso no pks",
         )
         return any(marker in normalized for marker in markers)
 
@@ -1096,10 +1144,68 @@ class PKSWriter:
         anonymous: list[Any] = []
         for item in [*existing_items, *incoming_items]:
             if isinstance(item, dict) and item.get("rule_key"):
-                by_key[str(item["rule_key"])] = item
+                rule_key = str(item["rule_key"])
+                current = by_key.get(rule_key)
+                by_key[rule_key] = (
+                    self._merge_rule_item(current, item)
+                    if isinstance(current, dict)
+                    else dict(item)
+                )
             elif item not in anonymous:
                 anonymous.append(item)
         return [*anonymous, *by_key.values()]
+
+    def _merge_rule_item(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(existing)
+        for key, value in incoming.items():
+            if key in {"examples_good", "examples_bad"}:
+                merged[key] = self._merge_text_list(merged.get(key), value)
+            elif key in {"variation_policy", "applicability", "response_style"}:
+                merged[key] = self._merge_dict_value(merged.get(key), value)
+            elif key == "source":
+                merged[key] = self._merge_source_value(merged.get(key), value)
+            elif value not in (None, "", [], {}):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _merge_text_list(existing: Any, incoming: Any) -> list[str]:
+        values: list[str] = []
+        if isinstance(existing, list):
+            values.extend(str(item) for item in existing if str(item).strip())
+        if isinstance(incoming, list):
+            values.extend(str(item) for item in incoming if str(item).strip())
+        elif incoming:
+            values.append(str(incoming))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = normalize_token(value)
+            if normalized and normalized not in seen:
+                deduped.append(value)
+                seen.add(normalized)
+        return deduped
+
+    @staticmethod
+    def _merge_dict_value(existing: Any, incoming: Any) -> dict[str, Any]:
+        merged = existing if isinstance(existing, dict) else {}
+        if not isinstance(incoming, dict):
+            return dict(merged)
+        return {**merged, **incoming}
+
+    @staticmethod
+    def _merge_source_value(existing: Any, incoming: Any) -> dict[str, Any]:
+        merged = existing if isinstance(existing, dict) else {}
+        if not isinstance(incoming, dict):
+            return dict(merged)
+        sanitized = dict(incoming)
+        sanitized.pop("raw_message", None)
+        return {**merged, **sanitized}
 
     def _infer_personality_properties(self, text: str) -> dict[str, Any]:
         normalized = normalize_token(text)

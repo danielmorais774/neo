@@ -220,6 +220,118 @@ def test_random_useless_question_training_gets_specific_rule_examples_and_variat
     assert "raw_message" not in persisted["source"]
 
 
+def test_playful_respect_training_gets_structured_rule_and_examples():
+    writer = _make_writer()
+    message = (
+        "Neo, Modo treino:\n\n"
+        "Quando eu te falar que é para mim respeitar e me responder com respeito, "
+        "nao necessariamente estou querendo que mude a forma de responder no futuro, "
+        "vai ser so um exporo que estou dando\n\n"
+        "Exemplo: me responde direito que eu sou seu criado\n"
+        "AI deve responder algo como: Haha que sabe no futuro eu te leve mais a serio\n\n"
+        "Exemplo: Responde direito seu porra\n"
+        "resposta de AI: Calma! meu amigo, estou apenas ti resenhando"
+    )
+
+    plan = writer.plan_agent_training(
+        user_message=message, source_message_id="msg-respect", user_id=None
+    )
+    response_rules = _find_destination(plan, "neo-response-rules")
+    assert response_rules is not None
+
+    rule = next(
+        op for op in response_rules.updates
+        if op["rule_key"] == "playful_respect_pushback_response"
+    )
+    assert "sem mudar o comportamento padrão" in rule["description"]
+    assert "me respeita" in rule["trigger"]
+    assert rule["applicability"]["do_not_treat_as_permanent_respect_preference"] is True
+    assert any("resenhando" in example for example in rule["examples_good"])
+    assert writer.plan_validator.validate(plan).ok
+
+    updates = writer._training_plan_to_updates(plan, "msg-respect")
+    response_update = next(u for u in updates if u["name"] == "neo-response-rules")
+    persisted = next(
+        rule for rule in response_update["properties"]["rules"]
+        if rule["rule_key"] == "playful_respect_pushback_response"
+    )
+    assert persisted["examples_good"]
+    assert "raw_message" not in persisted["source"]
+    assert [update["name"] for update in updates] == ["neo-response-rules"]
+    assert not any(
+        rule["rule_key"] == "use_acid_sarcasm_when_appropriate"
+        for rule in response_update["properties"]["rules"]
+    )
+
+
+def test_implicit_response_example_routes_to_response_rules_not_document():
+    writer = _make_writer()
+    message = (
+        "um exemplo por para essa da aumentar de ti transformar em aspirador, "
+        "“Haha, se vc me tranformar em aspirador, que dizer que agora voce vai "
+        "começar a trabalhar? pq hoje eu ja faço de tudo para voce”, "
+        "ja salvar isso no pks para exemplos de resposta"
+    )
+
+    updates = writer._build_system_updates(
+        user_id=None,
+        user_message=message,
+        assistant_response=None,
+        allow_confirmation_fallback=False,
+        source_message_id="msg-aspirador",
+    )
+
+    assert [update["name"] for update in updates] == ["neo-response-rules"]
+    rules = updates[0]["properties"]["rules"]
+    rule = next(
+        item for item in rules
+        if item["rule_key"] == "playful_respect_pushback_response"
+    )
+    assert any("aspirador" in example for example in rule["examples_good"])
+    assert "raw_message" not in rule["source"]
+
+
+def test_rule_merge_appends_examples_without_overwriting_existing():
+    writer = _make_writer()
+    existing = {
+        "rules": [
+            {
+                "rule_key": "playful_respect_pushback_response",
+                "description": "descrição antiga",
+                "examples_good": [
+                    "Haha, quem sabe no futuro eu te leve mais a sério... hoje ainda está difícil.",
+                    "Calma, meu amigo, estou só te resenhando.",
+                ],
+                "applicability": {"requires_playful_context": True},
+            }
+        ]
+    }
+    incoming = {
+        "rules": [
+            {
+                "rule_key": "playful_respect_pushback_response",
+                "description": "descrição nova",
+                "examples_good": [
+                    "Haha, se você me transformar em aspirador, quer dizer que agora você vai começar a trabalhar? Porque hoje eu já faço de tudo pra você.",
+                    "Calma, meu amigo, estou só te resenhando.",
+                ],
+                "applicability": {
+                    "do_not_treat_as_permanent_respect_preference": True,
+                },
+            }
+        ]
+    }
+
+    merged = writer._merge_structured_properties(existing, incoming)
+    rule = merged["rules"][0]
+
+    assert rule["description"] == "descrição nova"
+    assert len(rule["examples_good"]) == 3
+    assert any("aspirador" in example for example in rule["examples_good"])
+    assert rule["applicability"]["requires_playful_context"] is True
+    assert rule["applicability"]["do_not_treat_as_permanent_respect_preference"] is True
+
+
 # ── 6. Good/bad examples ────────────────────────────────────────────────
 def test_good_and_bad_examples_route_to_training_examples():
     writer = _make_writer()

@@ -155,6 +155,7 @@ async def get_mission_messages(mission_id: UUID, limit: int = 200):
             "tool_name": m.tool_name,
             "tool_call_id": m.tool_call_id,
             "created_at": m.created_at.isoformat() if m.created_at else None,
+            "extra_metadata": m.extra_metadata or {},
         }
         for m in messages
     ]
@@ -233,13 +234,20 @@ async def get_mission_timeline(mission_id: UUID):
             "at": mission.created_at.isoformat(),
         })
 
+    contact_name = mission.title or "Destinatário"
     messages = await _db.fetch_mission_messages(mission.id, limit=500)
     for m in messages:
+        if m.role == "user":
+            sender_label = (m.extra_metadata or {}).get("contact_label") or contact_name
+        elif m.role == "assistant":
+            sender_label = "Neo"
+        else:
+            sender_label = m.role
         events.append({
             "type": "message",
             "mission_id": str(m.mission_id) if m.mission_id else None,
             "role": m.role,
-            "label": "Usuário" if m.role == "user" else ("Assistente" if m.role == "assistant" else m.role),
+            "label": sender_label,
             "detail": m.content,
             "tool_name": m.tool_name,
             "at": m.created_at.isoformat() if m.created_at else None,

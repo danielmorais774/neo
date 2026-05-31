@@ -90,6 +90,45 @@ class MemoryCanonicalizer:
 
         ops: list[dict[str, Any]] = []
 
+        has_playful_respect_pushback = self._is_playful_respect_pushback(norm)
+
+        if has_playful_respect_pushback:
+            examples_good = self._extract_playful_respect_examples(clean_content)
+            ops.append(
+                base_op(
+                    destination=DEST_RESPONSE_RULES,
+                    kind="rule",
+                    semantic_rule_key="playful_respect_pushback_response",
+                    rule_key="playful_respect_pushback_response",
+                    description=(
+                        "Quando o usuário fizer uma provocação teatral pedindo respeito "
+                        "ou mandando o Neo responder direito, tratar como brincadeira "
+                        "contextual e responder com deboche controlado, sem mudar o "
+                        "comportamento padrão."
+                    ),
+                    scope="response_generation",
+                    priority="high",
+                    trigger=(
+                        "Usuário usa frases como 'me respeita', 'responde direito' ou "
+                        "ameaças absurdas no meio de uma provocação/brincadeira."
+                    ),
+                    action=(
+                        "Entrar na brincadeira com uma resposta curta, sarcástica e "
+                        "bem-humorada, mantendo a utilidade quando houver pedido real."
+                    ),
+                    examples_good=examples_good,
+                    variation_policy={
+                        "avoid_repetition": True,
+                        "keep_answer_useful": True,
+                        "keep_default_behavior": True,
+                    },
+                    applicability={
+                        "do_not_treat_as_permanent_respect_preference": True,
+                        "requires_playful_context": True,
+                    },
+                )
+            )
+
         if self._is_random_useless_question_sarcasm(norm):
             examples_good = self._extract_inline_good_examples(clean_content)
             ops.append(
@@ -139,7 +178,7 @@ class MemoryCanonicalizer:
                 )
             )
 
-        if self._is_acid_humor(norm):
+        if self._is_acid_humor(norm) and not has_playful_respect_pushback:
             ops.append(
                 base_op(
                     destination=DEST_RESPONSE_RULES,
@@ -325,6 +364,51 @@ class MemoryCanonicalizer:
         )
 
     @staticmethod
+    def _is_playful_respect_pushback(norm: str) -> bool:
+        respect_cues = (
+            "me respeita",
+            "responde direito",
+            "responder direito",
+            "responder com respeito",
+            "me responder com respeito",
+        )
+        framing_cues = (
+            "nao necessariamente",
+            "não necessariamente",
+            "nao estou querendo que mude",
+            "não estou querendo que mude",
+            "nao querendo que mude",
+            "sem mudar",
+            "exporo",
+            "esporro",
+            "teatrinho",
+            "brincadeira",
+            "resenhando",
+        )
+        saved_example_cues = (
+            "exemplo de resposta",
+            "exemplos de resposta",
+            "salvar isso no pks",
+            "salve isso no pks",
+            "ja salvar isso no pks",
+            "já salvar isso no pks",
+        )
+        absurd_threat_cues = (
+            "aspirador",
+            "transformar em aspirador",
+            "tranformar em aspirador",
+        )
+
+        if any(cue in norm for cue in respect_cues) and (
+            any(cue in norm for cue in framing_cues)
+            or any(cue in norm for cue in saved_example_cues)
+        ):
+            return True
+        return any(cue in norm for cue in absurd_threat_cues) and any(
+            cue in norm for cue in saved_example_cues
+        )
+
+    @staticmethod
     def _is_avoid_unrelated_context(norm: str) -> bool:
         avoid_cues = (
             "evite",
@@ -407,6 +491,51 @@ class MemoryCanonicalizer:
                 deduped.append(example)
                 seen.add(key)
         return deduped[:4]
+
+    @staticmethod
+    def _extract_playful_respect_examples(text: str) -> list[str]:
+        examples: list[str] = []
+
+        for raw_line in text.splitlines():
+            line = " ".join(raw_line.strip().split())
+            if not line:
+                continue
+            normalized = normalize_text(line)
+            for marker in (
+                "ai deve responder algo como",
+                "ai deve responder",
+                "resposta de ai",
+                "resposta do neo",
+                "neo deve responder",
+            ):
+                if normalized.startswith(marker) and ":" in line:
+                    _, value = line.split(":", 1)
+                    candidate = value.strip().strip("\"'“”‘’").strip()
+                    if candidate:
+                        examples.append(candidate)
+                    break
+
+        for match in _QUOTE_RE.finditer(text):
+            candidate = " ".join(match.group(1).split()).strip()
+            normalized = normalize_text(candidate)
+            if (
+                "respeit" in normalized
+                or "resenhando" in normalized
+                or "aspirador" in normalized
+                or "trabalhar" in normalized
+                or "levo mais a serio" in normalized
+                or "leve mais a serio" in normalized
+            ):
+                examples.append(candidate)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for example in examples:
+            key = normalize_text(example)
+            if key and key not in seen:
+                deduped.append(example)
+                seen.add(key)
+        return deduped[:6]
 
     def _extract_examples(self, text: str) -> list[dict[str, str]]:
         bad: list[str] = []
