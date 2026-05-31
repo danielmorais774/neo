@@ -32,6 +32,7 @@ interface MessageRow {
   tool_name: string | null;
   tool_call_id: string | null;
   created_at: string | null;
+  extra_metadata?: Record<string, any> | null;
 }
 
 interface NotificationRow {
@@ -339,24 +340,32 @@ function MessagesTab({ messages }: { messages: MessageRow[] }) {
   if (messages.length === 0) return <p style={{ color: '#64748b' }}>Sem mensagens.</p>;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {messages.map(m => (
-        <div key={m.id} style={{
-          padding: '8px 12px',
-          background: m.role === 'user' ? '#1f2a44' : '#1e2235',
-          border: '1px solid #2d3355',
-          borderRadius: 6,
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#64748b', marginBottom: 4 }}>
-            <span style={{ fontWeight: 600 }}>
-              {m.role === 'user' ? '👤 Usuário' : m.role === 'assistant' ? '🤖 Assistente' : m.role}
-              {m.tool_name && ` · ${m.tool_name}`}
-              {m.mission_id && ' · missão vinculada'}
-            </span>
-            <span>{fmt(m.created_at)}</span>
+      {messages.map(m => {
+        const meta = m.extra_metadata || {};
+        const senderLabel = m.role === 'user'
+          ? `👤 ${meta.contact_label || meta.contact_jid || 'Destinatário'}`
+          : m.role === 'assistant'
+            ? '🤖 Neo'
+            : m.role;
+        return (
+          <div key={m.id} style={{
+            padding: '8px 12px',
+            background: m.role === 'user' ? '#1f2a44' : '#1e2235',
+            border: '1px solid #2d3355',
+            borderRadius: 6,
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#64748b', marginBottom: 4 }}>
+              <span style={{ fontWeight: 600 }}>
+                {senderLabel}
+                {m.tool_name && ` · ${m.tool_name}`}
+                {m.mission_id && ' · missão vinculada'}
+              </span>
+              <span>{fmt(m.created_at)}</span>
+            </div>
+            <div style={{ fontSize: 13, color: '#cbd5e1', whiteSpace: 'pre-wrap' }}>{m.content}</div>
           </div>
-          <div style={{ fontSize: 13, color: '#cbd5e1', whiteSpace: 'pre-wrap' }}>{m.content}</div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
