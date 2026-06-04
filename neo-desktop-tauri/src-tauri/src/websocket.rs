@@ -1,149 +1,12 @@
 use futures_util::StreamExt;
 use log::{error, info, warn};
-use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::AppState;
-
-const NOTIFICATION_WINDOW_LABEL: &str = "notification";
-const NOTIFICATION_MARGIN: i32 = 16;
-
-// Default notification config
-fn default_duration_ms() -> u64 { 12000 }
-fn default_position() -> String { "bottom_right".to_string() }
-fn default_play_sound() -> bool { true }
-
-/// Custom deserializer to accept both "body" (legacy) and "description" (new)
-/// from the Python/neo-core side during migration.
-fn deserialize_body_or_desc<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BodyOrDesc {
-        New { description: Option<String> },
-        Legacy { body: Option<String> },
-        Plain(Option<String>),
-    }
-
-    let intermediate = BodyOrDesc::deserialize(deserializer)?;
-    match intermediate {
-        BodyOrDesc::New { description } => Ok(description),
-        BodyOrDesc::Legacy { body } => Ok(body),
-        BodyOrDesc::Plain(s) => Ok(s),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationAction {
-    pub action_type: String,
-    pub label: String,
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
-    #[serde(default)]
-    pub button_style: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationField {
-    pub label: String,
-    pub value: String,
-    pub source: String,
-    #[serde(default)]
-    pub placeholder: Option<String>,
-    #[serde(default)]
-    pub field_type: Option<String>,
-    #[serde(default)]
-    pub options: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationConfig {
-    #[serde(default = "default_duration_ms")]
-    pub duration_ms: u64,
-    #[serde(default = "default_position")]
-    pub position: String,
-    #[serde(default)]
-    pub persistent: bool,
-    #[serde(default = "default_play_sound")]
-    pub play_sound: bool,
-}
-
-/// Notification received from neo-core via WebSocket
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct NeoNotification {
-    pub id: Option<String>,
-    pub user_id: Option<String>,
-    pub mission_id: Option<String>,
-    pub kind: Option<String>,
-    pub title: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_body_or_desc")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub fields: Vec<NotificationField>,
-    #[serde(default)]
-    pub actions: Vec<NotificationAction>,
-    pub payload: Option<serde_json::Value>,
-    pub created_at_unix: Option<i64>,
-    #[serde(default)]
-    pub config: Option<NotificationConfig>,
-}
-
-/// Reposition the notification window based on config.position and show it.
-/// Auto-hide scheduling is handled by the frontend based on config.duration_ms / config.persistent.
-fn show_notification_window(app_handle: &AppHandle, notification: &NeoNotification) {
-    let Some(window) = app_handle.get_webview_window(NOTIFICATION_WINDOW_LABEL) else {
-        warn!("[DeviceWS] Notification window not found");
-        return;
-    };
-
-    let monitor = window
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.current_monitor().ok().flatten());
-
-    if let Some(monitor) = monitor {
-        let work_area = monitor.work_area();
-        let work_area_pos = work_area.position;
-        let work_area_size = work_area.size;
-        let scale = monitor.scale_factor();
-
-        if let Ok(window_size) = window.outer_size() {
-            let (x, y) = match notification.config.as_ref().and_then(|c| Some(c.position.as_str())).unwrap_or("bottom_right") {
-                "top_left" => (
-                    work_area_pos.x + (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                    work_area_pos.y + (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                ),
-                "top_right" => (
-                    work_area_pos.x + work_area_size.width as i32 - window_size.width as i32 - (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                    work_area_pos.y + (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                ),
-                "bottom_left" => (
-                    work_area_pos.x + (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                    work_area_pos.y + work_area_size.height as i32 - window_size.height as i32 - (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                ),
-                "center" => (
-                    work_area_pos.x + (work_area_size.width as i32 - window_size.width as i32) / 2,
-                    work_area_pos.y + (work_area_size.height as i32 - window_size.height as i32) / 2,
-                ),
-                _ => ( // "bottom_right" and fallback
-                    work_area_pos.x + work_area_size.width as i32 - window_size.width as i32 - (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                    work_area_pos.y + work_area_size.height as i32 - window_size.height as i32 - (NOTIFICATION_MARGIN as f64 * scale) as i32,
-                ),
-            };
-            let _ = window.set_position(PhysicalPosition::new(x, y));
-        }
-    }
-
-    let _ = window.set_focusable(false);
-    let _ = window.set_ignore_cursor_events(false);
-    let _ = window.show();
-    let _ = window.set_always_on_top(true);
-}
+use crate::notifications;
+use crate::notifications::types::NeoNotification;
 
 fn should_show_notification(app_handle: &AppHandle) -> bool {
     let Some(main_window) = app_handle.get_webview_window("main") else {
@@ -177,7 +40,7 @@ pub struct DeviceWsManager {
 impl DeviceWsManager {
     pub fn new(device_id: String, app_handle: AppHandle) -> Self {
         let api_url = std::env::var("NEO_CORE_URL")
-            .unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
         
         Self {
             device_id,
@@ -278,25 +141,11 @@ impl DeviceWsManager {
                                 match serde_json::from_str::<NeoNotification>(&text) {
                                     Ok(notification) => {
                                         info!("[DeviceWS] Notification received: {:?}", notification.title);
-                                        if let Err(e) = app_handle.emit_to(
-                                            "main",
-                                            "notification",
-                                            &notification,
-                                        ) {
+                                        if let Err(e) = app_handle.emit_to("main", "notification", &notification) {
                                             error!("[DeviceWS] Failed to emit notification to main window: {}", e);
                                         }
                                         if should_show_notification(&app_handle) {
-                                            // Show the dedicated notification window and forward
-                                            // the payload only to it (so it's visually outside
-                                            // the main chat window).
-                                            show_notification_window(&app_handle, &notification);
-                                            if let Err(e) = app_handle.emit_to(
-                                                NOTIFICATION_WINDOW_LABEL,
-                                                "notification",
-                                                &notification,
-                                            ) {
-                                                error!("[DeviceWS] Failed to emit notification: {}", e);
-                                            }
+                                            notifications::show_notification(&notification);
                                         } else {
                                             info!("[DeviceWS] Notification suppressed by desktop context");
                                         }

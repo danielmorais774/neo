@@ -20,7 +20,7 @@ html, body, #root {
   flex-direction: row;
   gap: 12px;
   align-items: flex-start;
-  padding: 12px 14px;
+  padding: 10px 14px 14px;
   background: rgba(246, 246, 248, 0.94);
   color: #1d1d1f;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);

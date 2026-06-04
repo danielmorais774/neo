@@ -48,9 +48,10 @@ pub async fn execute_with_loop(
     let user_id = state.user_id.clone();
     let session_id = state.session_id.lock().unwrap().clone();
     let neo_core_url =
-        std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "192.168.4.175:50051".to_string());
+        std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
 
     let app_handle = app.clone();
+    let cancel_notify = state.cancel_notify.clone();
 
     tokio::spawn(async move {
         let mut client = GrpcClient::new(&device_id, &hardware_id, &user_id, &neo_core_url);
@@ -62,6 +63,7 @@ pub async fn execute_with_loop(
                 message,
                 model.as_deref(),
                 provider.as_deref(),
+                cancel_notify,
             )
             .await;
 
@@ -85,9 +87,11 @@ pub async fn execute_with_loop(
 }
 
 #[tauri::command]
-pub fn stop_execution(_state: State<'_, AppState>) -> Result<(), String> {
-    info!("[Neo] stop_execution requested");
-    // In a full implementation, we'd set a stop flag on the agent
+pub fn stop_execution(state: State<'_, AppState>) -> Result<(), String> {
+    info!("[Neo] stop_execution requested — cancelling in-flight run");
+    // Wake the execute_task read loop, which drops the gRPC stream and thereby
+    // cancels the server-side RPC (grpc.aio cancels the handler on client abort).
+    state.cancel_notify.notify_waiters();
     Ok(())
 }
 
@@ -160,7 +164,7 @@ fn neo_core_http_url() -> String {
                 .ok()
                 .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
         })
-        .unwrap_or_else(|| "http://192.168.4.175:8000".to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:8000".to_string())
         .trim_end_matches('/')
         .to_string()
 }
@@ -267,7 +271,7 @@ pub struct NeoCoreStatus {
 
 #[tauri::command]
 pub async fn get_neo_core_status() -> Result<NeoCoreStatus, String> {
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -303,7 +307,7 @@ pub fn get_window_mode() -> &'static str {
 pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(), String> {
     info!("[Neo] quick_help_ask_stream: {}", question);
 
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://192.168.4.175:8000".to_string());
+    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -352,6 +356,15 @@ pub async fn ack_notification(notification_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn handle_notification_action(
+    app: AppHandle,
+    notification_id: String,
+    action_type: String,
+    action_payload: Option<serde_json::Value>,
+) -> Result<(), String> {
+    process_notification_action(app, notification_id, action_type, action_payload).await
+}
+
+pub async fn process_notification_action(
     app: AppHandle,
     notification_id: String,
     action_type: String,

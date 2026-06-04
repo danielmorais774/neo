@@ -1,6 +1,7 @@
 mod commands;
 mod grpc_gen;
 mod notch_host;
+mod notifications;
 mod services;
 mod websocket;
 
@@ -24,6 +25,8 @@ pub struct AppState {
     pub session_id: Mutex<String>,
     pub ws_manager: Mutex<Option<Arc<DeviceWsManager>>>,
     pub notification_context: Mutex<NotificationContext>,
+    /// Signalled by `stop_execution` to cancel the in-flight agent run.
+    pub cancel_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +156,7 @@ pub fn run() {
             notification_context: Mutex::new(NotificationContext {
                 active_tab: "chat".to_string(),
             }),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
@@ -179,6 +183,7 @@ pub fn run() {
         ])
         .setup(|app| {
             info!("[Neo] Desktop initialized!");
+            notifications::init(&app.handle().clone());
 
             // Show the main window on startup
             if let Some(window) = app.get_webview_window("main") {
@@ -294,6 +299,7 @@ pub fn run() {
         .run(move |_app, event| {
             #[cfg(target_os = "macos")]
             if let RunEvent::Exit = event {
+                notifications::shutdown();
                 let notch_state = _app.state::<NotchHostState>();
                 stop_notch_host(&notch_state);
             }

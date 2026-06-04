@@ -53,6 +53,7 @@ impl GrpcClient {
         message: String,
         model: Option<&str>,
         provider: Option<&str>,
+        cancel: std::sync::Arc<tokio::sync::Notify>,
     ) -> Result<(), String> {
         info!(
             "[GrpcClient] execute_task: {} (session={})",
@@ -152,7 +153,26 @@ impl GrpcClient {
         let mut active_session_id = self.session_id.clone();
 
         loop {
-            let next = tokio::time::timeout_at(task_deadline, stream.message()).await;
+            let next = tokio::select! {
+                biased;
+                // User pressed Stop: drop the stream (cancels the server RPC) and
+                // tell the UI the run was interrupted.
+                _ = cancel.notified() => {
+                    info!("[GrpcClient] execution cancelled by user");
+                    let stopped_evt = AgentEvent {
+                        event_type: "complete".to_string(),
+                        data: serde_json::json!({
+                            "success": true,
+                            "stopped": true,
+                            "sessionId": active_session_id.clone(),
+                        }),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = app_handle.emit("agent-event", &stopped_evt);
+                    return Ok(()); // dropping `stream`/`tx` here cancels the RPC
+                }
+                res = tokio::time::timeout_at(task_deadline, stream.message()) => res,
+            };
 
             match next {
                 Ok(Ok(Some(core_msg))) => {
