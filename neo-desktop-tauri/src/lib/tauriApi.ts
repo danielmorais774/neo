@@ -15,6 +15,7 @@ export interface DeviceInfo {
   device_id: string;
   device_type: string;
   model: string;
+  hardware_id: string;
   os_platform: string;
   os_version: string;
   client_version: string;

@@ -22,15 +22,17 @@ pub struct AgentEvent {
 
 pub struct GrpcClient {
     device_id: String,
+    hardware_id: String,
     user_id: String,
     neo_core_url: String,
     session_id: String,
 }
 
 impl GrpcClient {
-    pub fn new(device_id: &str, user_id: &str, neo_core_url: &str) -> Self {
+    pub fn new(device_id: &str, hardware_id: &str, user_id: &str, neo_core_url: &str) -> Self {
         Self {
             device_id: device_id.to_string(),
+            hardware_id: hardware_id.to_string(),
             user_id: user_id.to_string(),
             neo_core_url: neo_core_url.to_string(),
             session_id: Uuid::new_v4().to_string(),
@@ -89,6 +91,9 @@ impl GrpcClient {
             metadata.insert("provider".to_string(), p.to_string());
         }
         metadata.insert("device_id".to_string(), self.device_id.clone());
+        if !self.hardware_id.is_empty() {
+            metadata.insert("hardware_id".to_string(), self.hardware_id.clone());
+        }
         metadata.insert("os_platform".to_string(), platform.to_string());
         metadata.insert("os_arch".to_string(), arch.to_string());
         metadata.insert("home_dir".to_string(), homedir.clone());

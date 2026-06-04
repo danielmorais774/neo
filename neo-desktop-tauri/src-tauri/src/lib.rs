@@ -4,6 +4,7 @@ mod notch_host;
 mod services;
 mod websocket;
 
+use crate::services::system_info::collect_system_info;
 use crate::websocket::DeviceWsManager;
 use log::info;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,7 @@ use crate::notch_host::{start_notch_host, stop_notch_host, NotchHostState};
 
 pub struct AppState {
     pub device_id: String,
+    pub hardware_id: String,
     pub user_id: String,
     pub session_id: Mutex<String>,
     pub ws_manager: Mutex<Option<Arc<DeviceWsManager>>>,
@@ -29,7 +31,61 @@ pub struct NotificationContext {
     pub active_tab: String,
 }
 
-fn get_or_create_device_id() -> String {
+#[derive(serde::Deserialize)]
+struct ResolveDeviceResponse {
+    device_id: Option<String>,
+    found: bool,
+}
+
+fn neo_core_http_url() -> String {
+    std::env::var("NEO_CORE_HTTP_URL")
+        .or_else(|_| std::env::var("NEO_CORE_API_URL"))
+        .ok()
+        .or_else(|| {
+            std::env::var("NEO_CORE_URL")
+                .ok()
+                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8000".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn resolve_existing_device_id(
+    user_id: &str,
+    hardware_id: &str,
+) -> Option<String> {
+    if hardware_id.is_empty() {
+        return None;
+    }
+
+    tauri::async_runtime::block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let response = client
+            .get(format!("{}/api/v1/devices/resolve", neo_core_http_url()))
+            .query(&[("user_id", user_id), ("hardware_id", hardware_id)])
+            .send()
+            .await
+            .ok()?;
+
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let payload = response.json::<ResolveDeviceResponse>().await.ok()?;
+        if payload.found {
+            payload.device_id.filter(|device_id| !device_id.trim().is_empty())
+        } else {
+            None
+        }
+    })
+}
+
+fn get_or_create_device_id(user_id: &str, hardware_id: &str) -> String {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("neo-desktop");
@@ -42,20 +98,32 @@ fn get_or_create_device_id() -> String {
         }
     }
 
-    let new_id = uuid::Uuid::new_v4().to_string();
     let _ = std::fs::create_dir_all(&config_dir);
+
+    if let Some(existing_device_id) = resolve_existing_device_id(user_id, hardware_id) {
+        info!("[Neo] Reusing existing device_id from hardware match");
+        let _ = std::fs::write(&id_path, &existing_device_id);
+        return existing_device_id;
+    }
+
+    let new_id = uuid::Uuid::new_v4().to_string();
     let _ = std::fs::write(&id_path, &new_id);
     new_id
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let device_id = get_or_create_device_id();
+    let system_info = collect_system_info();
+    let hardware_id = system_info.hardware_id.clone();
     let user_id = std::env::var("NEO_USER_ID")
         .unwrap_or_else(|_| "5a998544-c3f3-423f-bebb-1cc42fca6063".to_string());
+    let device_id = get_or_create_device_id(&user_id, &hardware_id);
     let session_id = uuid::Uuid::new_v4().to_string();
 
     info!("[Neo] Device ID: {}", device_id);
+    if !hardware_id.is_empty() {
+        info!("[Neo] Hardware ID detected");
+    }
 
     let mut builder = tauri::Builder::default()
         .plugin(
@@ -78,6 +146,7 @@ pub fn run() {
     builder
         .manage(AppState {
             device_id,
+            hardware_id,
             user_id,
             session_id: Mutex::new(session_id),
             ws_manager: Mutex::new(None),

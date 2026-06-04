@@ -44,6 +44,7 @@ pub async fn execute_with_loop(
     info!("[Neo] execute_with_loop: {} (model={:?})", message, model);
 
     let device_id = state.device_id.clone();
+    let hardware_id = state.hardware_id.clone();
     let user_id = state.user_id.clone();
     let session_id = state.session_id.lock().unwrap().clone();
     let neo_core_url =
@@ -52,7 +53,7 @@ pub async fn execute_with_loop(
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        let mut client = GrpcClient::new(&device_id, &user_id, &neo_core_url);
+        let mut client = GrpcClient::new(&device_id, &hardware_id, &user_id, &neo_core_url);
         client.set_session_id(&session_id);
 
         let result = client
