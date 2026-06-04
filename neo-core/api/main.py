@@ -39,10 +39,11 @@ for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         _uv_logger.addHandler(_file_handler)
         _uv_logger.setLevel(getattr(logging, _log_level, logging.INFO))
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta
+from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
     ContextCompactor,
@@ -56,6 +57,7 @@ from core import (
     ToolExecutor,
     ToolRegistry,
 )
+from core.agent.context_selector import PromptContextSelector
 from core.memory import SessionManager
 from core.pks import PKSService
 from core.skills.skill_executor import SkillExecutor
@@ -63,7 +65,9 @@ from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
 from core.notifications import NotificationBroker
 from db import AsyncPostgresClient
 from modules.desktop import AIService, DesktopService, DESKTOP_TOOLS
+from api.routes.devices import ws_router as devices_ws_router
 from modules.weather import WEATHER_TOOLS, WeatherExecutor
+from modules.devices import DEVICES_TOOLS, DevicesExecutor
 from observability.logger import ObservabilityLogger, set_obs
 from shared.config import Settings, get_settings
 
@@ -125,10 +129,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── Register tools ────────────────────────────────────────────
     _tool_registry.register_many(DESKTOP_TOOLS)      # client-side
     _tool_registry.register_many(WEATHER_TOOLS)       # server-side
+    _tool_registry.register_many(DEVICES_TOOLS)       # server-side
 
     # Register server-side module executors
     weather_executor = WeatherExecutor()
     _tool_executor.register_module_executor("weather", weather_executor)
+
+    # Default devices executor (no user scoping) — per-user scoping is injected
+    # per-request via DevicesContextExecutor in AIService._handle_server_tool.
+    devices_executor = DevicesExecutor(db=_db)
+    _tool_executor.register_module_executor("devices", devices_executor)
 
     # Register whatsapp_messaging tools in the global registry (for discovery / routing)
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
@@ -169,6 +179,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         f"(workspace={system_pks['workspace_id']}, agent={system_pks['agent_id']})"
     )
 
+    # ── Context Selector ─────────────────────────────────────────
+    context_selector = PromptContextSelector(
+        token_counter=token_counter,
+        settings=settings,
+        pks=_pks,
+        preference_extractor=preference_extractor,
+    )
+    print("✅ PromptContextSelector ready")
+    context.set_context_selector(context_selector)
+
     _ai_service = AIService(
         llm_router=_llm_router,
         intent_router=intent_router,
@@ -179,6 +199,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db=_db,
         preference_extractor=preference_extractor,
         pks=_pks,
+        context_selector=context_selector,
     )
 
     # ── Skills + Notifications ─────────────────────────────────────
@@ -284,13 +305,14 @@ app.add_middleware(
 # Register routers
 app.include_router(health.router)
 app.include_router(desktop.router, prefix="/api/v1")
-app.include_router(debug.router, prefix="/api/v1")
-app.include_router(session_logs.router, prefix="/api/v1")
+app.include_router(debug.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(session_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(context.router, prefix="/api/v1")
-app.include_router(knowledge_graph.router, prefix="/api/v1")
+app.include_router(knowledge_graph.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
-app.include_router(missions.router)
-app.include_router(devices.router, prefix="/api/v1")
-app.include_router(app_logs.router, prefix="/api/v1")
+app.include_router(missions.router, dependencies=[Depends(require_panel_jwt)])
+app.include_router(devices.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop, sem JWT
+app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(letta.router)

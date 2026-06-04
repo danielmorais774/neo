@@ -6,9 +6,10 @@ import hmac
 import hashlib
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from api.security import require_panel_jwt, verify_panel_token
 from core.skills.skill_executor import SkillExecutor
 from core.skills.whatsapp_messaging.gateway_client import WhatsAppGatewayClient
 from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline, get_mission_dev_logger
@@ -32,7 +33,7 @@ def set_dependencies(db: AsyncPostgresClient, skill_executor: SkillExecutor) -> 
 @router.post("/webhook")
 async def webhook(
     body: dict,
-    x_signature: str = Header(None, alias="X-Signature"),
+    x_signature: str | None = Header(default=None, alias="X-Signature"),
 ):
     """Receive inbound WhatsApp messages from neo-whatsapp service.
 
@@ -42,16 +43,18 @@ async def webhook(
     secret = settings.whatsapp_webhook_secret
 
     # 1. Validate HMAC
-    if x_signature:
-        payload_bytes = str(body).encode()
-        expected = hmac.new(
-            secret.encode(),
-            payload_bytes,
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(x_signature, expected):
-            logger.warning("Invalid webhook signature: got=%s", x_signature)
-            raise HTTPException(status_code=401, detail="Invalid signature")
+    if not x_signature:
+        raise HTTPException(status_code=401, detail="Missing signature")
+
+    payload_bytes = str(body).encode()
+    expected = hmac.new(
+        secret.encode(),
+        payload_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(x_signature, expected):
+        logger.warning("Invalid webhook signature: got=%s", x_signature)
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
     # 2. Parse event
     jid = body.get("jid", "")
@@ -285,7 +288,7 @@ async def _process_inbound(
 # ── Panel-facing endpoints ────────────────────────────────────────────────
 
 @router.get("/contacts")
-async def list_contacts(user_id: UUID) -> list[dict]:
+async def list_contacts(user_id: UUID, _: dict = Depends(require_panel_jwt)) -> list[dict]:
     """List WhatsApp contacts for a user (panel use)."""
     if not _db:
         raise HTTPException(status_code=500, detail="DB not initialized")
@@ -309,6 +312,7 @@ async def send_message(
     user_id: UUID | None = None,
     jid: str = "",
     text: str = "",
+    _: dict = Depends(require_panel_jwt),
 ) -> dict:
     """Send a WhatsApp message via neo-whatsapp gateway."""
     if not _db:
@@ -335,7 +339,7 @@ async def send_message(
 
 
 @router.get("/connection-status")
-async def connection_status() -> dict:
+async def connection_status(_: dict = Depends(require_panel_jwt)) -> dict:
     """Check neo-whatsapp gateway connectivity."""
     gateway = WhatsAppGatewayClient()
     try:
@@ -349,12 +353,13 @@ async def connection_status() -> dict:
 
 
 @router.websocket("/ws/qr-status")
-async def ws_qr_status(websocket: WebSocket) -> None:
+async def ws_qr_status(websocket: WebSocket, token: str = Query(default="")) -> None:
     """WebSocket endpoint for real-time QR status updates.
 
     Clients connect once and receive push updates whenever QR state changes.
     Eliminates polling /qr-status every 3 seconds.
     """
+    verify_panel_token(token)
     await websocket.accept()
     broadcaster = get_qr_broadcaster()
     try:
@@ -366,7 +371,7 @@ async def ws_qr_status(websocket: WebSocket) -> None:
 
 
 @router.get("/qr-status")
-async def qr_status() -> dict:
+async def qr_status(_: dict = Depends(require_panel_jwt)) -> dict:
     """Get current QR code and connection state from neo-whatsapp.
 
     Also pushes update to all WebSocket subscribers.
@@ -392,7 +397,7 @@ async def qr_status() -> dict:
 
 
 @router.get("/chats")
-async def list_chats() -> dict:
+async def list_chats(_: dict = Depends(require_panel_jwt)) -> dict:
     """List active WhatsApp chats from the connected phone."""
     gateway = WhatsAppGatewayClient()
     try:
@@ -406,7 +411,7 @@ async def list_chats() -> dict:
 
 
 @router.get("/chats/{jid}/messages")
-async def get_chat_messages(jid: str) -> dict:
+async def get_chat_messages(jid: str, _: dict = Depends(require_panel_jwt)) -> dict:
     """Get recent messages for a WhatsApp chat JID."""
     gateway = WhatsAppGatewayClient()
     try:
@@ -420,7 +425,7 @@ async def get_chat_messages(jid: str) -> dict:
 
 
 @router.get("/chats/{jid}/media/{msg_id}")
-async def get_chat_media(jid: str, msg_id: str) -> dict:
+async def get_chat_media(jid: str, msg_id: str, _: dict = Depends(require_panel_jwt)) -> dict:
     """Download media for a message from the WhatsApp gateway."""
     gateway = WhatsAppGatewayClient()
     try:
@@ -433,7 +438,7 @@ async def get_chat_media(jid: str, msg_id: str) -> dict:
 
 
 @router.post("/qr-refresh")
-async def qr_refresh() -> dict:
+async def qr_refresh(_: dict = Depends(require_panel_jwt)) -> dict:
     """Force neo-whatsapp to generate a new QR code."""
     broadcaster = get_qr_broadcaster()
     gateway = WhatsAppGatewayClient()

@@ -6,7 +6,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPExcept
 
 from db.async_client import AsyncPostgresClient
 
-router = APIRouter(tags=["devices"])
+router = APIRouter(tags=["devices"])          # HTTP — requer panel JWT
+ws_router = APIRouter(tags=["devices-ws"])   # WebSocket — desktop, sem auth
 
 _db: AsyncPostgresClient | None = None
 
@@ -20,13 +21,12 @@ def set_db(db: AsyncPostgresClient) -> None:
 async def list_connected_devices(user_id: str | None = None) -> dict:
     """Return list of devices from DB, with real-time online status from WS registry.
 
-    Online/offline is determined exclusively by the WebSocket registry:
-    - WS connected = online (device opened /ws/devices/online)
-    - WS disconnected = offline (registry entry removed immediately)
-    gRPC registry is no longer used for online status.
+    Online/offline is determined by merging the persisted device records with the
+    WebSocket registry (authoritative when a device has an active connection,
+    otherwise the DB value is trusted). Shared with the `list_connected_devices`
+    agent tool via `modules.devices.service.list_devices_with_status`.
     """
-    # Late import to avoid circular import issues
-    from grpc_server import _devices_ws_registry
+    from modules.devices.service import list_devices_with_status
 
     uid_uuid = None
     if user_id:
@@ -35,36 +35,33 @@ async def list_connected_devices(user_id: str | None = None) -> dict:
         except ValueError:
             pass
 
-    # Get devices from DB (persisted device records)
-    db_devices = await _db.get_connected_devices(uid_uuid) if _db else []
-
-    # Get real-time online set from WS registry
-    online_ws = await _devices_ws_registry.list_online()
-    ws_online_set = set(online_ws)
-
-    devices = []
-    for dev in db_devices:
-        # Use WS registry only when device has an active WS connection (authoritative).
-        # When no WS connection exists, trust the DB value (last known good state).
-        if dev.device_id in ws_online_set:
-            is_online = True
-        else:
-            is_online = dev.is_online
-        devices.append({
-            "device_id": dev.device_id,
-            "device_type": dev.device_type,
-            "model": dev.model,
-            "os_platform": dev.os_platform,
-            "os_version": dev.os_version,
-            "client_version": dev.client_version,
-            "ip_address": dev.ip_address,
-            "connected_at_unix": int(dev.created_at.timestamp()) if dev.created_at else 0,
-            "is_current_device": False,
-            "is_online": is_online,
-            "ws_connection_id": dev.ws_connection_id,
-        })
-
+    devices = await list_devices_with_status(_db, uid_uuid)
     return {"devices": devices}
+
+
+@router.get("/devices/resolve")
+async def resolve_device_by_hardware_id(
+    user_id: str,
+    hardware_id: str,
+) -> dict:
+    """Resolve the canonical device_id for a user/hardware_id pair."""
+    if not _db:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    try:
+        uid_uuid = UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    normalized_hardware_id = hardware_id.strip().upper()
+    if not normalized_hardware_id:
+        raise HTTPException(status_code=400, detail="hardware_id is required")
+
+    device = await _db.get_device_by_hardware_id(uid_uuid, normalized_hardware_id)
+    return {
+        "device_id": device.device_id if device else None,
+        "found": device is not None,
+    }
 
 
 @router.post("/devices/{device_id}/send-notification")
@@ -109,7 +106,7 @@ async def debug_send_notification(notification: dict) -> dict:
     return {"ok": True, "sent_to": device_id}
 
 
-@router.websocket("/ws/devices/online")
+@ws_router.websocket("/ws/devices/online")
 async def ws_device_online(websocket: WebSocket, device_id: str = Query(...)):
     """WebSocket endpoint for device online/offline signaling.
 
@@ -133,7 +130,7 @@ async def ws_device_online(websocket: WebSocket, device_id: str = Query(...)):
         await _devices_ws_registry.unregister(device_id)
 
 
-@router.websocket("/ws/devices/notifications/{device_id}")
+@ws_router.websocket("/ws/devices/notifications/{device_id}")
 async def ws_device_notifications(websocket: WebSocket, device_id: str):
     """WebSocket endpoint for receiving notifications on a device.
 

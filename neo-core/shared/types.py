@@ -1,5 +1,6 @@
 """Tipos e modelos base compartilhados."""
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
@@ -267,3 +268,36 @@ class CompactionResult(BaseModel):
     preserved_identifiers: list[str] = []
     original_token_count: int = 0
     compacted_token_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Context Selection
+# ---------------------------------------------------------------------------
+
+class ContextLayer(str, Enum):
+    """Camada de contexto no prompt do Neo."""
+
+    CORE            = "core"           # identidade, idioma, regras — pin=True sempre
+    RUNTIME         = "runtime"        # OS, paths, shell — pin=True
+    NEO_CORE_PINNED = "neo_core_pinned"  # personality, response-rules críticas — pin=True
+    NEO_CORE_CTX    = "neo_core_ctx"   # exemplos, lições, projetos — scored
+    USER_PREFS      = "user_prefs"     # preferências do usuário — scored
+    USER_PKS        = "user_pks"       # entidades PKS do usuário — scored
+    SESSION         = "session"        # histórico recente (gerenciado à parte)
+    RETRIEVED       = "retrieved"      # conversas anteriores — scored
+
+
+@dataclass
+class ContextCandidate:
+    """Candidato a inclusão no prompt, com score e trace de seleção."""
+
+    layer: ContextLayer
+    source: str        # "hardcoded" | "pks_system" | "pks_user" | "prefs" | "hybrid_search"
+    key: str           # rule_key / entity_id / "base" / "runtime" / etc.
+    pin: bool          # True = entra sempre, ignora score/budget
+    text: str
+    est_tokens: int    # estimativa de tokens antes de incluir
+    relevance: float   # 0..1
+    final_score: float = 0.0  # após ponderação
+    included: bool = False
+    skip_reason: str = ""

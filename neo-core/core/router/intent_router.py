@@ -26,6 +26,38 @@ logger = logging.getLogger(__name__)
 # Shared parser so bare instances (object.__new__) and the fallback path both work.
 _TRAINING_PARSER = TrainingEnvelopeParser()
 
+# Deterministic guard: explicit "remember/register in memory" directives must
+# always be a DIRECT_RESPONSE so the PKS write pipeline captures them. Without
+# this, a weak classifier maps "registra/lembra/salva" → write_file (CLIENT_TOOL)
+# and the request hangs waiting on the desktop. Patterns run on accent-stripped,
+# lowercased text and are scoped to avoid catching plain file operations.
+_MEMORY_DIRECTIVE_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"\bpks\b",
+        r"\bmemoriz",                                   # memoriza / memorize / memorização
+        r"\bna (minha )?memoria\b",                     # salva/guarda ... na memoria
+        r"\blembr\w*\s+(que|de que|do que|disso|disto)",  # lembra que / lembre disso
+        r"\bregistr\w*\s+(no pks|na memoria|que )",     # registra no pks / registra que
+        r"\banot[ae]\w*\s+(que|isso|ai|aqui)",          # anota que / anote isso
+        r"\bnao esquec",                                # nao esqueca / não esqueça
+        r"\b(remember|memorize|take note|keep in mind)\b",
+    )
+]
+
+
+def _strip_accents(text: str) -> str:
+    """Lowercase and remove PT accents for robust keyword matching."""
+    out = (text or "").lower()
+    for src, dst in {
+        "á": "a", "à": "a", "â": "a", "ã": "a",
+        "é": "e", "ê": "e", "í": "i",
+        "ó": "o", "ô": "o", "õ": "o",
+        "ú": "u", "ç": "c",
+    }.items():
+        out = out.replace(src, dst)
+    return out
+
 ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI assistant. Classify the user message into one execution path.
 
 ## Paths
@@ -58,6 +90,7 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 - **Conversation continuity**: if history shows an ongoing game/quiz/roleplay/creative task: DIRECT_RESPONSE
 - **Back-references** ("está errado", "refaz", "melhora isso"): DIRECT_RESPONSE
 - **Personal data** (treino, dieta, suplementos, rotina): DIRECT_RESPONSE (injected automatically, no file tools needed)
+- **Memory directives** ("lembra que...", "registra no PKS", "memoriza isso", "anota que...", "não esqueça que..."): DIRECT_RESPONSE — these are saved automatically to the knowledge store (PKS). NEVER route to `write_file` or any client tool.
 - **Explicit paths**: use absolute paths as-is; use folder hints from "Contexto do Sistema" (Documents, Downloads, Desktop)
 - `requires_approval=true` for destructive ops (delete, kill, format); `false` for read-only
 - `needs_memory=false` for greetings/acks ("oi", "ok", "valeu"); `true` for substantive topics
@@ -129,6 +162,12 @@ class IntentRouter:
         if self._is_training_message(user_message):
             logger.info("Intent: Neo training message → DIRECT_RESPONSE (router bypass)")
             return self._training_decision(user_message)
+
+        # Explicit memory directives ("lembra que...", "registra no PKS") are saved
+        # by the PKS pipeline on the DIRECT_RESPONSE path — never a tool/terminal call.
+        if self._is_memory_directive(user_message):
+            logger.info("Intent: memory directive → DIRECT_RESPONSE (router bypass)")
+            return self._memory_decision(user_message)
 
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
@@ -340,6 +379,25 @@ class IntentRouter:
         return decision
 
     @staticmethod
+    def _is_memory_directive(message: str) -> bool:
+        """True for explicit 'remember/register in memory' directives."""
+        normalized = _strip_accents(message)
+        return any(pattern.search(normalized) for pattern in _MEMORY_DIRECTIVE_PATTERNS)
+
+    def _memory_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision for an explicit memory directive (no tools)."""
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.95,
+            explanation="Diretiva de memória — resposta direta; gravação via pipeline do PKS",
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
+    @staticmethod
     def _token_hits(text: str, tokens: list[str]) -> int:
         """Count tokens present as whole words (avoids 'disco' in 'discordar')."""
         return sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text))
@@ -349,6 +407,10 @@ class IntentRouter:
         # Training messages are never a tool call, regardless of keywords.
         if self._is_training_message(message):
             return self._training_decision(message)
+
+        # Memory directives are never a tool call (they go to the PKS pipeline).
+        if self._is_memory_directive(message):
+            return self._memory_decision(message)
 
         text = (message or "").lower()
         # Normalize accents

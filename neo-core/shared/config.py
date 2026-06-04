@@ -96,6 +96,38 @@ class Settings(BaseSettings):
         default=5, ge=1, description="Max previous sessions to search for context recovery",
     )
 
+    # ── Context Selector budgets (tokens por camada) ──────────────
+    context_budget_neo_core_ctx: int = Field(
+        default=600, ge=0,
+        description="Token budget for contextual Neo core items (examples, lessons, projects)",
+    )
+    context_budget_user_prefs: int = Field(
+        default=500, ge=0,
+        description="Token budget for user preferences",
+    )
+    context_budget_user_pks: int = Field(
+        default=900, ge=0,
+        description="Token budget for user PKS knowledge entities",
+    )
+    context_budget_retrieved: int = Field(
+        default=1200, ge=0,
+        description="Token budget for cross-session retrieved memories",
+    )
+    context_relevance_threshold: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description="Minimum relevance score for non-pinned candidates to enter the prompt",
+    )
+
+    # Panel auth (temporary without login flow)
+    panel_jwt_secret: str = Field(
+        default="l5L0mJ30C7v10OTI4eEOvxShOGwhGkPSEst7eicOiFGq8qG6TgL9u4CQUr6mByjV",
+        description="Shared secret used to validate neo-panel JWT tokens (HS256)",
+    )
+    panel_jwt_subject: str = Field(
+        default="neo-panel",
+        description="Expected JWT subject for neo-panel bearer tokens",
+    )
+
     # ── Context Compaction ────────────────────────────────────────
     max_context_tokens: int = Field(
         default=120_000, ge=1000,

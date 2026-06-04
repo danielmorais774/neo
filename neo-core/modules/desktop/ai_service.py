@@ -14,11 +14,12 @@ import re
 import time
 import unicodedata
 from collections.abc import AsyncIterator
-from datetime import date
+from datetime import date  # kept for _build_legacy_prompt fallback
 from typing import Any
 from uuid import UUID, uuid4
 
 from core.agent.agent_executor import AgentExecutor
+from core.agent.context_selector import PromptContextSelector
 from core.llm.router import LLMRouter
 from core.pks import PKSService
 from core.planning.plan_manager import ExecutionPlan, PlanManager, PlanStep
@@ -251,6 +252,7 @@ class AIService:
         db: AsyncPostgresClient,
         preference_extractor: PreferenceExtractor | None = None,
         pks: PKSService | None = None,
+        context_selector: PromptContextSelector | None = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -262,6 +264,7 @@ class AIService:
         self.preferences = preference_extractor
         self.pks = pks
         self.settings = get_settings()
+        self.context_selector = context_selector
         self._pending_traces: dict[str, MessageTrace] = {}
         self._skill_executor: "SkillExecutor | None" = None
         self.planner = PlanManager(llm_router)
@@ -657,64 +660,6 @@ class AIService:
             recovered_context = await self.sessions.recover_context(user_message, user_id=user_id)
             recover_ms = round((time.monotonic() - t0_recover) * 1000, 1)
 
-        # Build messages
-        today = date.today()
-        weekday_names = [
-            "segunda-feira",
-            "terça-feira",
-            "quarta-feira",
-            "quinta-feira",
-            "sexta-feira",
-            "sábado",
-            "domingo",
-        ]
-        month_names = [
-            "janeiro",
-            "fevereiro",
-            "março",
-            "abril",
-            "maio",
-            "junho",
-            "julho",
-            "agosto",
-            "setembro",
-            "outubro",
-            "novembro",
-            "dezembro",
-        ]
-        formatted_date = (
-            f"{weekday_names[today.weekday()]}, "
-            f"{today.day} de {month_names[today.month - 1]} de {today.year}"
-        )
-
-        system_prompt = (
-            "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
-            "Você foi criado por Daniel Morais (seu desenvolvedor). "
-            "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
-            "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
-            "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora, e também só deve mencionar isso em um contexto relevante. "
-            "O nome e perfil do usuário atual estão na seção 'Usuário Atual' do contexto — use essas informações para saber com quem você está falando. "
-            f"A data de hoje é {formatted_date}. "
-            "Suas regras:\n"
-            "1. SEMPRE responda em português brasileiro.\n"
-            "2. NUNCA diga que não pode ajudar, que é uma IA com limitações, ou frases genéricas de recusa — sempre tente responder de forma útil.\n"
-            "3. Se a pergunta for ambígua, interprete da forma mais útil possível e responda diretamente.\n"
-            "4. Seja direto, claro e conciso. Evite disclaimers, avisos desnecessários e textos de rodeio.\n"
-            "5. Use o histórico da conversa para manter contexto entre mensagens. "
-            "O histórico pode conter mensagens de momentos diferentes — priorize as mais recentes para coerência.\n"
-            "6. Para perguntas técnicas, de programação ou conhecimento geral, responda com profundidade e exemplos práticos.\n"
-            "7. Para tarefas de automação ou desktop, explique o que está fazendo e por quê.\n"
-            "8. Você tem acesso ao terminal do usuário via ferramenta 'run_command'. "
-            "Se o usuário pedir algo que seria melhor respondido executando um comando (verificar versão, espaço em disco, processos, etc.), "
-            "informe que pode executar o comando se ele quiser.\n"
-            "9. Nunca afirme que salvou algo na memória sem confirmação explícita no contexto do sistema. "
-            "Se essa confirmação não existir, não diga que salvou."
-        )
-
-        # Inject OS/system context when provided by the desktop client
-        if system_context:
-            system_prompt += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
-
         prefs_ms = 0.0
 
         # Memory Pipeline v2: detect explicit Neo training to block parallel routes.
@@ -735,7 +680,6 @@ class AIService:
         if self.pks and user_id:
             try:
                 await self.pks.ensure_user_pks(user_id=user_id)
-                # Neo training is never a personal fact — skip the user-memory route.
                 if not is_neo_training:
                     pks_prewrite = await self.pks.learn_before_response(
                         user_id=user_id,
@@ -752,114 +696,64 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PKS] Failed pre-response bootstrap/write: {e}", exc_info=True)
 
-        # Load Neo's own identity before normal user knowledge retrieval.
-        if self.pks:
-            try:
-                system_memory_context = await self.pks.retrieve_system_context(user_message=user_message)
-                if system_memory_context:
-                    system_prompt += (
-                        "\n\n## Memória do Neo (Workspace do Sistema - Alta Prioridade)\n"
-                        "Use estas diretrizes como comportamento persistente do assistente:\n"
-                        f"{system_memory_context}"
-                    )
-            except Exception as e:
-                logger.warning(f"[PKS] Failed to retrieve system memory context: {e}", exc_info=True)
-
-        # Inject persistent user preferences after Neo's global behavior rules.
-        if self.preferences:
-            try:
-                t0_prefs = time.monotonic()
-                prefs_text = await self.preferences.get_preferences_text(user_id=user_id, service="neo-desktop")
-                prefs_ms = round((time.monotonic() - t0_prefs) * 1000, 1)
-                if prefs_text:
-                    system_prompt += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as quando não conflitarem com regras globais do Neo:{prefs_text}"
-                    logger.info(f"[PREF] Injected user preferences into system prompt")
-                    if slog:
-                        slog.log_event("Preferências Injetadas", f"```\n{prefs_text}\n```")
-            except Exception as e:
-                logger.warning(f"[PREF] Failed to load preferences: {e}")
-
-        # Inject PKS context
-        pks_ms = 0.0
-        pks_context = ""
-        pks_result: dict[str, Any] | None = None
-        if self.pks and user_id:
-            try:
-                t0_pks = time.monotonic()
-                pks_result, pks_context = await self.pks.retrieve_context(
-                    user_id=user_id,
-                    user_message=user_message,
-                    keywords=decision.knowledge_keywords,
-                )
-                pks_ms = round((time.monotonic() - t0_pks) * 1000, 1)
-                if pks_context:
-                    system_prompt += f"\n\n## Conhecimento do Usuário\n{pks_context}"
-                    meta = pks_result.get("metadata", {}) if pks_result else {}
-                    logger.info(
-                        "[PKS] Injected knowledge context: entities=%s neighborhoods=%s keywords=%s",
-                        meta.get("entities_matched"),
-                        meta.get("neighborhoods"),
-                        meta.get("keywords_extracted"),
-                    )
-                    if slog:
-                        kw_source = "intent" if decision.knowledge_keywords else "fallback"
-                        slog.log_event(
-                            "Contexto PKS Injetado",
-                            f"- **Keywords** (via {kw_source}): `{meta.get('keywords_extracted')}`\n"
-                            f"- **Entidades:** {meta.get('entities_matched')} "
-                            f"| **Neighborhoods:** {meta.get('neighborhoods')}\n\n"
-                            f"```\n{pks_context}\n```",
-                        )
-            except Exception as e:
-                logger.warning(f"[PKS] Failed to retrieve knowledge context: {e}", exc_info=True)
-        else:
-            logger.warning("[PKS] Skipped: service=%s, user_id=%s", "yes" if self.pks else "no", user_id)
-
-        logger.info(f"[HISTORY-DEBUG] recover_context returned {len(recovered_context) if recovered_context else 0} results")
-        # Filter out very short memories (game moves, numbers, etc.)
-        # if recovered_context:
-        #     before_count = len(recovered_context)
-        #     recovered_context = [ctx for ctx in recovered_context if len(ctx.content.strip()) >= 15]
-        #     filtered = before_count - len(recovered_context)
-        #     if filtered:
-        #         logger.info(f"[HISTORY-DEBUG] Filtered out {filtered} short memories (<15 chars)")
         if slog:
             slog.log_context_recovery(recovered_context or [])
-        # Record recovered memories in the trace for the debug panel
         if trace:
             trace.set_context_recovery(recovered_context or [])
-        if recovered_context:
-            context_text = "\n\n--- Contexto de conversas anteriores relevantes ---\n"
-            for ctx in recovered_context[:3]:
-                logger.info(f"[HISTORY-DEBUG]   memory: {ctx.content[:100]} (score={ctx.final_score:.3f})")
-                context_text += f"\n[memória] {ctx.content[:300]}\n"
-            system_prompt += context_text
+        logger.info(
+            "[HISTORY-DEBUG] recover_context returned %d results",
+            len(recovered_context) if recovered_context else 0,
+        )
+        for ctx in recovered_context or []:
+            logger.info(
+                "[HISTORY-DEBUG]   memory: %s (score=%.3f)",
+                ctx.content[:100],
+                ctx.final_score,
+            )
 
-        if pks_prewrite and pks_prewrite.get("confirm_profile_save") and pks_prewrite.get("saved_name"):
-            system_prompt += (
-                "\n\n## Escrita PKS Confirmada\n"
-                f"A informação de perfil do usuário foi persistida com sucesso agora mesmo: nome = {pks_prewrite['saved_name']}.\n"
-                "Na sua resposta, confirme isso de forma natural uma única vez, sem soar robótico. "
-                "Exemplo de tom: 'Olá, Daniel. Prazer em te conhecer, vou lembrar do seu nome.' "
-                "Não diga que salvou nada se esta seção não existir."
+        # Build system prompt via PromptContextSelector (scored, budget-aware)
+        pks_ms = 0.0
+        t0_ctx = time.monotonic()
+        if self.context_selector:
+            system_prompt, context_trace = await self.context_selector.build_prompt(
+                user_message=user_message,
+                user_id=user_id,
+                decision=decision,
+                system_context=system_context,
+                recovered_context=recovered_context or [],
+                is_neo_training=is_neo_training,
+                pks_prewrite=pks_prewrite,
+                pks_system_prewrite=pks_system_prewrite,
+                mission_context=None,
             )
-        if pks_system_prewrite and pks_system_prewrite.get("applied"):
-            saved_properties = pks_system_prewrite.get("properties") or {}
-            saved_ops = pks_system_prewrite.get("operations") or []
-            saved_entities = sorted(
-                {
-                    str(op.get("entity"))
-                    for op in saved_ops
-                    if isinstance(op, dict) and op.get("entity")
-                }
+            pks_ms = round((time.monotonic() - t0_ctx) * 1000, 1)
+            if slog:
+                included = [c for c in context_trace if c.included and not c.pin]
+                skipped = [c for c in context_trace if not c.included]
+                slog.log_event(
+                    "Context Selection",
+                    f"Incluídos (scored): {len(included)} | Pulados: {len(skipped)}\n"
+                    + "\n".join(
+                        f"- [{c.layer.value}] {c.key}: score={c.final_score:.2f}"
+                        + (f" ← {c.skip_reason}" if c.skip_reason else "")
+                        for c in context_trace
+                        if not c.pin
+                    ),
+                )
+        else:
+            # Fallback: legacy inline assembly (selector not wired)
+            system_prompt = self._build_legacy_prompt(
+                user_message=user_message,
+                user_id=user_id,
+                system_context=system_context,
+                decision=decision,
+                recovered_context=recovered_context or [],
+                is_neo_training=is_neo_training,
+                pks_prewrite=pks_prewrite,
+                pks_system_prewrite=pks_system_prewrite,
+                slog=slog,
             )
-            saved_entities_text = ", ".join(saved_entities) if saved_entities else "entidade de sistema"
-            system_prompt += (
-                "\n\n## Escrita PKS do Sistema Confirmada\n"
-                f"As entities de sistema persistidas neste turno: {saved_entities_text}.\n"
-                f"Properties atualizadas: {saved_properties}\n"
-                "Você pode confirmar que salvou apenas essa atualização de memória de sistema."
-            )
+            pks_ms = round((time.monotonic() - t0_ctx) * 1000, 1)
 
         messages: list[Message] = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -976,6 +870,18 @@ class AIService:
             iterations=1,
         )
 
+        # Context handed to the PKS memory planner. When the user talks about the
+        # current device ("esse dispositivo é um MacBook Air"), inject its real
+        # identity (device_id/hardware_id/model from the connection metadata) so
+        # the planner can link the stated facts to the canonical device entity.
+        pks_context = ""
+        if self._references_current_device(user_message):
+            device_note = self._build_current_device_context(metadata)
+            if device_note:
+                pks_context = device_note
+                if slog:
+                    slog.log_event("Dispositivo Atual (contexto PKS)", device_note)
+
         # True fire-and-forget: schedule as background tasks AFTER yielding the response
         async def _bg_prefs() -> None:
             if not self.preferences:
@@ -1061,6 +967,57 @@ class AIService:
 
         asyncio.create_task(_bg_prefs())
         asyncio.create_task(_bg_pks())
+
+    # Device nouns/pronoun-references that signal the user is talking about the
+    # machine they are connected from ("esse dispositivo", "este computador"…).
+    _DEVICE_REFERENCE_RE = re.compile(
+        r"\b(dispositivo|device|aparelho|maquina|computador|notebook|macbook|"
+        r"mac book|laptop|celular|telefone)\b"
+    )
+
+    @classmethod
+    def _references_current_device(cls, message: str) -> bool:
+        """True when the message refers to the user's current device."""
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFD", (message or "").lower())
+            if unicodedata.category(c) != "Mn"
+        )
+        return bool(cls._DEVICE_REFERENCE_RE.search(normalized))
+
+    @staticmethod
+    def _build_current_device_context(metadata: dict | None) -> str:
+        """Describe the current device from connection metadata for the PKS planner.
+
+        Returns an empty string when no device identity is available. The device_id
+        and hardware_id are the canonical identity assigned by neo-core on connect;
+        feeding them lets the planner attach stated facts (e.g. "is a MacBook Air")
+        to the right `device` entity instead of inventing a generic one.
+        """
+        md = metadata or {}
+        device_id = md.get("device_id")
+        hardware_id = md.get("hardware_id")
+        model = md.get("model")
+        os_platform = md.get("os_platform")
+        os_version = md.get("os_release") or md.get("os_version")
+
+        if not (device_id or hardware_id):
+            return ""
+
+        lines = ["[Dispositivo atual do usuário — identidade confirmada pela conexão]"]
+        if device_id:
+            lines.append(f"- device_id: {device_id}")
+        if hardware_id:
+            lines.append(f"- hardware_id: {hardware_id}")
+        if model and model != "unknown":
+            lines.append(f"- modelo reportado pelo SO: {model}")
+        if os_platform and os_platform != "unknown":
+            lines.append(f"- sistema: {os_platform} {os_version or ''}".strip())
+        lines.append(
+            "Quando o usuário disser 'esse dispositivo', 'este computador', 'essa "
+            "máquina' etc., refere-se a este device. Use device_id/hardware_id como "
+            "identidade canônica ao salvar fatos sobre ele (entity type 'device')."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _is_memory_confirmation(text: str) -> bool:
@@ -1175,10 +1132,21 @@ class AIService:
 
         t0 = time.monotonic()
         try:
+            # Per-request executor that scopes `list_connected_devices` to this
+            # user while delegating every other server tool to the global executor.
+            from modules.devices import DevicesExecutor, DevicesContextExecutor
+
+            ctx_executor = DevicesContextExecutor(
+                global_executor=self.agent.tool_executor,
+                devices_executor=DevicesExecutor(db=self.db),
+                user_id=user_id,
+            )
+
             # Use AgentExecutor for multi-step tool execution
             result = await self.agent.execute(
                 task=user_message,
                 session_id=session_id,
+                tool_executor=ctx_executor,
             )
 
             final_text = result.get("final_response", "Tarefa concluída.")
@@ -2765,6 +2733,76 @@ class AIService:
                     lines.append(f"  instrucoes_do_usuario={compact[:240]}")
         return "\n".join(lines)
 
+    async def _build_legacy_prompt(
+        self,
+        *,
+        user_message: str,
+        user_id: "UUID | None",
+        system_context: str | None,
+        decision: "RoutingDecision",
+        recovered_context: list,
+        is_neo_training: bool,
+        pks_prewrite: dict | None,
+        pks_system_prewrite: dict | None,
+        slog: Any,
+    ) -> str:
+        """Legacy inline prompt assembly used when context_selector is not wired."""
+        today = date.today()
+        weekday_names = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
+        month_names = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+        formatted_date = f"{weekday_names[today.weekday()]}, {today.day} de {month_names[today.month - 1]} de {today.year}"
+
+        sp = (
+            "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
+            "Você foi criado por Daniel Morais (seu desenvolvedor). "
+            "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
+            "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
+            "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora. "
+            "O nome e perfil do usuário atual estão na seção 'Usuário Atual' do contexto. "
+            f"A data de hoje é {formatted_date}. "
+            "Suas regras:\n"
+            "1. SEMPRE responda em português brasileiro.\n"
+            "2. NUNCA diga que não pode ajudar — sempre tente responder de forma útil.\n"
+            "3. Seja direto, claro e conciso. Evite disclaimers e textos de rodeio.\n"
+            "4. Use o histórico da conversa para manter contexto entre mensagens.\n"
+            "5. Para perguntas técnicas, responda com profundidade e exemplos práticos.\n"
+            "6. Nunca afirme que salvou algo na memória sem confirmação explícita no contexto."
+        )
+        if system_context:
+            sp += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
+        if self.pks:
+            try:
+                sys_mem = await self.pks.retrieve_system_context(user_message=user_message)
+                if sys_mem:
+                    sp += f"\n\n## Memória do Neo (Workspace do Sistema - Alta Prioridade)\nUse estas diretrizes como comportamento persistente do assistente:\n{sys_mem}"
+            except Exception as e:
+                logger.warning("[PKS][legacy] retrieve_system_context failed: %s", e)
+        if self.preferences and not is_neo_training:
+            try:
+                prefs = await self.preferences.get_preferences_text(user_id=user_id, service="neo-desktop")
+                if prefs:
+                    sp += f"\n\n## Preferências do Usuário\nO usuário tem as seguintes preferências salvas. Respeite-as quando não conflitarem com regras globais do Neo:{prefs}"
+            except Exception as e:
+                logger.warning("[PREF][legacy] get_preferences_text failed: %s", e)
+        if self.pks and user_id and not is_neo_training:
+            try:
+                _, pks_ctx = await self.pks.retrieve_context(user_id=user_id, user_message=user_message, keywords=decision.knowledge_keywords)
+                if pks_ctx:
+                    sp += f"\n\n## Conhecimento do Usuário\n{pks_ctx}"
+            except Exception as e:
+                logger.warning("[PKS][legacy] retrieve_context failed: %s", e)
+        if recovered_context:
+            sp += "\n\n--- Contexto de conversas anteriores relevantes ---\n"
+            for ctx in recovered_context[:3]:
+                sp += f"\n[memória] {ctx.content[:300]}\n"
+        if pks_prewrite and pks_prewrite.get("confirm_profile_save") and pks_prewrite.get("saved_name"):
+            sp += f"\n\n## Escrita PKS Confirmada\nA informação de perfil do usuário foi persistida: nome = {pks_prewrite['saved_name']}.\nConfirme de forma natural uma única vez."
+        if pks_system_prewrite and pks_system_prewrite.get("applied"):
+            saved_ops = pks_system_prewrite.get("operations") or []
+            saved_entities = sorted({str(op.get("entity")) for op in saved_ops if isinstance(op, dict) and op.get("entity")})
+            sp += f"\n\n## Escrita PKS do Sistema Confirmada\nEntities persistidas: {', '.join(saved_entities) or 'entidade de sistema'}."
+        return sp
+
     @staticmethod
     def _build_system_context(metadata: dict[str, Any] | None) -> str | None:
         """Build a compact system context string from metadata sent by the desktop client.
@@ -2787,13 +2825,19 @@ class AIService:
         documents = metadata.get("documents_dir", f"{home}/Documents")
         desktop_dir = metadata.get("desktop_dir", f"{home}/Desktop")
 
+        shell_default = (
+            "PowerShell/cmd.exe"
+            if platform == "win32"
+            else {"linux": "bash/zsh", "darwin": "zsh/bash"}.get(platform, "bash")
+        )
+
         return (
             f"Sistema operacional do usuário: {os_name} {release} ({arch}).\n"
             f"Diretório home: {home}\n"
             f"Diretório de documentos do usuário: {documents}\n"
             f"Diretório de downloads do usuário: {downloads}\n"
             f"Diretório desktop do usuário: {desktop_dir}\n"
-            f"Shell padrão: {'bash/zsh' if platform in ('linux', 'darwin') else 'PowerShell/cmd'}.\n"
+            f"Shell padrão: {shell_default}.\n"
             f"IMPORTANTE: Quando o usuário mencionar 'pasta de documentos', 'meus documentos' ou similar, "
             f"use SEMPRE o caminho '{documents}' como working_dir. "
             f"Quando mencionar 'downloads', use '{downloads}'. "

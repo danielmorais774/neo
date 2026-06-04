@@ -163,6 +163,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                             "device_id": device_id,
                             "device_type": metadata.get("client", "neo-desktop"),
                             "model": metadata.get("model", "unknown"),
+                            "hardware_id": metadata.get("hardware_id", ""),
                             "os_platform": metadata.get("os_platform", "unknown"),
                             "os_version": metadata.get("os_release", "unknown"),
                             "client_version": metadata.get("client_version", "unknown"),
@@ -179,6 +180,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                                         device_id=device_id,
                                         device_type=metadata.get("client", "neo-desktop") or "neo-desktop",
                                         model=metadata.get("model", "unknown"),
+                                        hardware_id=metadata.get("hardware_id", ""),
                                         os_platform=metadata.get("os_platform", "unknown"),
                                         os_version=metadata.get("os_release", "unknown"),
                                         client_version=metadata.get("client_version", "unknown"),
@@ -251,13 +253,26 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                 
         except Exception as e:
             logger.error(f"[gRPC] Error in ExecuteTask: {e}", exc_info=True)
+            # Always close the turn with a readable final message so the UI exits
+            # the "Executando" state instead of hanging. The raw error stays in logs.
             yield neo_desktop_pb2.CoreMessage(
                 session_id=session_id or "",
-                error=neo_desktop_pb2.ErrorMessage(error=str(e), details="Stream error"),
+                response=neo_desktop_pb2.AgentResponse(
+                    message=(
+                        "Não foi possível concluir a execução: ocorreu um erro interno. "
+                        "Pode tentar novamente?"
+                    ),
+                    is_final=True,
+                    total_iterations=1,
+                ),
             )
         finally:
-            if session_id:
-                self._pending.pop(session_id, None)
+            # If a client-tool flow was still awaiting the desktop when the stream
+            # ended (disconnect/crash), close the turn gracefully so it does not
+            # dangle as "Executando" — event-driven, no time limit.
+            pending = self._pending.pop(session_id, None) if session_id else None
+            if pending and pending.get("flow") in ("client_tool", "client_command"):
+                self._close_incomplete_tool_turn(pending)
             # Mark device offline when stream ends — this fires on graceful disconnect
             # AND when the connection drops (gRPC detects broken pipe/stream complete)
             if device_id:
@@ -267,6 +282,44 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         self.ai_service.db.mark_device_offline(device_id)
                     )
                 logger.info(f"[Devices] Stream ended, marked offline: {device_id}")
+
+    def _close_incomplete_tool_turn(self, pending: dict) -> None:
+        """Persist a failure message when a client-tool turn ends without a result.
+
+        Fires when the desktop stream drops while a tool/command request was still
+        awaiting its result. Saves a final assistant message so the conversation is
+        resolved (not left dangling) the next time the session is loaded.
+        """
+        if not (self.ai_service and getattr(self.ai_service, "sessions", None)):
+            return
+        raw_sid = pending.get("session_id")
+        if not raw_sid:
+            return
+        try:
+            sid_uuid = UUID(str(raw_sid))
+        except (ValueError, TypeError):
+            return
+
+        tool_label = pending.get("tool_name") or pending.get("command") or "a ação solicitada"
+        message = (
+            f"Não foi possível concluir {tool_label}: a conexão com o dispositivo foi "
+            "encerrada antes de a execução retornar um resultado."
+        )
+
+        async def _persist() -> None:
+            try:
+                await self.ai_service.sessions.add_message(
+                    session_id=sid_uuid,
+                    role="assistant",
+                    content=message,
+                    generate_embedding=False,
+                    user_id=None,
+                )
+                logger.info(f"[gRPC] Closed incomplete tool turn for session {sid_uuid}")
+            except Exception as exc:  # pragma: no cover - defensive, fire-and-forget
+                logger.warning(f"[gRPC] Failed to close incomplete tool turn: {exc}")
+
+        asyncio.create_task(_persist())
 
     # ---------------------------------------------------------------
     # AIServiceResponse → CoreMessage conversion
@@ -521,6 +574,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
             "device_id": device_id,
             "device_type": request.device_type or "neo-desktop",
             "model": request.model or "unknown",
+            "hardware_id": getattr(request, "hardware_id", ""),
             "os_platform": request.os_platform or "unknown",
             "os_version": request.os_version or "unknown",
             "client_version": request.client_version or "",
@@ -537,6 +591,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     device_id=device_id,
                     device_type=request.device_type or "neo-desktop",
                     model=request.model or "unknown",
+                    hardware_id=getattr(request, "hardware_id", ""),
                     os_platform=request.os_platform or "unknown",
                     os_version=request.os_version or "unknown",
                     client_version=request.client_version or "",

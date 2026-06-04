@@ -1367,6 +1367,7 @@ class AsyncPostgresClient:
         device_id: str,
         device_type: str,
         model: str,
+        hardware_id: str,
         os_platform: str,
         os_version: str,
         client_version: str = "",
@@ -1387,6 +1388,7 @@ class AsyncPostgresClient:
                 existing.user_id = user_id
                 existing.device_type = device_type
                 existing.model = model
+                existing.hardware_id = hardware_id
                 existing.os_platform = os_platform
                 existing.os_version = os_version
                 existing.client_version = client_version
@@ -1400,6 +1402,7 @@ class AsyncPostgresClient:
                     device_id=device_id,
                     device_type=device_type,
                     model=model,
+                    hardware_id=hardware_id,
                     os_platform=os_platform,
                     os_version=os_version,
                     client_version=client_version,
@@ -1447,6 +1450,22 @@ class AsyncPostgresClient:
         """Get a device by its device_id."""
         async with self.get_session() as db:
             stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def get_device_by_hardware_id(
+        self,
+        user_id: UUID,
+        hardware_id: str,
+    ) -> ConnectedDevice | None:
+        """Get the most recent device for a user/hardware_id pair."""
+        async with self.get_session() as db:
+            stmt = (
+                select(ConnectedDevice)
+                .where(ConnectedDevice.user_id == user_id)
+                .where(ConnectedDevice.hardware_id == hardware_id)
+                .order_by(ConnectedDevice.created_at.desc())
+            )
             result = await db.execute(stmt)
             return result.scalars().first()
 

@@ -21,6 +21,9 @@ class ConnectedDevice(SQLModel, table=True):
         sa_column=Column("device_type", String(64), nullable=False),
     )
     model: str = Field(sa_column=Column("model", String(128), nullable=False))
+    hardware_id: str = Field(
+        sa_column=Column("hardware_id", String(256), nullable=False, default=""),
+    )
     os_platform: str = Field(sa_column=Column("os_platform", String(64), nullable=False))
     os_version: str = Field(sa_column=Column("os_version", String(128), nullable=False))
     client_version: str = Field(sa_column=Column("client_version", String(32), nullable=False, default=""))

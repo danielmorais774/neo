@@ -84,11 +84,21 @@ class OntologyResolver:
         "trabalho": EntityType.COMPANY,
         "pc": EntityType.DEVICE,
         "notebook": EntityType.DEVICE,
+        "laptop": EntityType.DEVICE,
         "computador": EntityType.DEVICE,
+        "computer": EntityType.DEVICE,
         "desktop": EntityType.DEVICE,
         "celular": EntityType.DEVICE,
         "telefone": EntityType.DEVICE,
+        "phone": EntityType.DEVICE,
         "dispositivo": EntityType.DEVICE,
+        "device": EntityType.DEVICE,
+        "hardware": EntityType.DEVICE,
+        "maquina": EntityType.DEVICE,
+        "monitor": EntityType.DEVICE,
+        "teclado": EntityType.DEVICE,
+        "keyboard": EntityType.DEVICE,
+        "mouse": EntityType.DEVICE,
         "stack": EntityType.TECHNOLOGY,
         "framework": EntityType.TECHNOLOGY,
         "orm": EntityType.TECHNOLOGY,
@@ -99,13 +109,21 @@ class OntologyResolver:
         "documento": EntityType.DOCUMENT,
         "treino": EntityType.WORKOUT,
         "academia": EntityType.WORKOUT,
+        "workout": EntityType.WORKOUT,
+        "musculacao": EntityType.WORKOUT,
         "exercicio": EntityType.EXERCISE,
+        "exercise": EntityType.EXERCISE,
         "musculo": EntityType.MUSCLE_GROUP,
         "grupo muscular": EntityType.MUSCLE_GROUP,
         "refeicao": EntityType.MEAL,
+        "dieta": EntityType.MEAL,
+        "diet": EntityType.MEAL,
+        "alimentacao": EntityType.MEAL,
         "comida": EntityType.FOOD,
         "alimento": EntityType.FOOD,
+        "food": EntityType.FOOD,
         "suplemento": EntityType.SUPPLEMENT,
+        "supplement": EntityType.SUPPLEMENT,
         "saude": EntityType.HEALTH_STATE,
         "restricao": EntityType.RESTRICTION,
         "rotina": EntityType.ROUTINE,
@@ -179,14 +197,39 @@ class OntologyResolver:
         "frequência": "frequency",
     }
 
+    @staticmethod
+    def _depluralize(token: str) -> list[str]:
+        """Candidate singular forms for a (PT/EN) plural token, longest-strip first."""
+        forms: list[str] = []
+        if token.endswith("es") and len(token) > 4:
+            forms.append(token[:-2])  # monitores -> monitor, devices -> devic
+        if token.endswith("s") and len(token) > 3:
+            forms.append(token[:-1])  # dispositivos -> dispositivo, devices -> device
+        return forms
+
     def resolve_entity_type(self, value: str | None) -> EntityType | None:
-        token = normalize_token(value).replace(" ", "_")
-        if not token:
+        norm = normalize_token(value)
+        if not norm:
             return None
+        # 1. canonical type name ("device", "project", ...)
         try:
-            return EntityType(token)
+            return EntityType(norm.replace(" ", "_"))
         except ValueError:
-            return self.ENTITY_ALIASES.get(normalize_token(value))
+            pass
+        # 2. explicit PT/EN natural-language alias
+        alias = self.ENTITY_ALIASES.get(norm)
+        if alias:
+            return alias
+        # 3. plural fallback: "devices" -> "device", "metas" -> "meta"
+        for singular in self._depluralize(norm):
+            try:
+                return EntityType(singular.replace(" ", "_"))
+            except ValueError:
+                pass
+            alias = self.ENTITY_ALIASES.get(singular)
+            if alias:
+                return alias
+        return None
 
     def resolve_relation_type(self, value: str | None) -> RelationType | None:
         token = normalize_token(value).replace(" ", "_")
