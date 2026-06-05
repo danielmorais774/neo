@@ -2,15 +2,26 @@ import { useEffect, useState } from 'react';
 import { ChatPage, QuickHelpPage } from './pages';
 import { WindowService } from './lib';
 import { DevicesTab } from './components/DevicesTab';
+import SettingsModal from './components/SettingsModal';
+import { useTheme } from './themes/useTheme';
 import './App.css';
 import './index.css';
+import './styles/themes.css';
 
 const _urlMode = new URLSearchParams(window.location.search).get('mode');
 
 function App() {
   const [coreStatus, setCoreStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking');
   const [activeTab, setActiveTab] = useState<'chat' | 'devices'>('chat');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [rendered, setRendered] = useState(false);
+  const { theme, setTheme } = useTheme();
+
+  const handleWindowDragStart = (event: React.MouseEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    WindowService.startDragging();
+  };
 
   console.log('[Neo] App rendering, mode:', _urlMode);
 
@@ -67,8 +78,33 @@ function App() {
         <div className="orb orb-5"></div>
       </div>
 
+      <div className="window-titlebar" onMouseDown={handleWindowDragStart}>
+        <div className="window-controls" aria-label="Controles da janela" onMouseDown={(event) => event.stopPropagation()}>
+          <button
+            type="button"
+            className="window-control window-control-close"
+            onClick={() => WindowService.close()}
+            aria-label="Fechar"
+          />
+          <button
+            type="button"
+            className="window-control window-control-minimize"
+            onClick={() => WindowService.minimize()}
+            aria-label="Minimizar"
+          />
+          <button
+            type="button"
+            className="window-control window-control-maximize"
+            onClick={() => WindowService.toggleMaximize()}
+            aria-label="Maximizar ou restaurar"
+          />
+        </div>
+        <div className="window-title">Neo Assistant</div>
+        <div className="window-titlebar-spacer" />
+      </div>
+
       <div className="titlebar">
-        <div className="titlebar-drag">
+        <div className="titlebar-drag" onMouseDown={handleWindowDragStart}>
           <div className="header-left">
             <div className="header-avatar">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -124,17 +160,15 @@ function App() {
             </svg>
             Novo chat
           </button>
-          <button className="btn-settings-header" title="Configurações">
+          <button
+            className="btn-settings-header"
+            title="Configurações"
+            onClick={() => setSettingsOpen(true)}
+          >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
-          </button>
-          <button onClick={() => WindowService.minimize()} className="btn-minimize">
-            −
-          </button>
-          <button onClick={() => WindowService.close()} className="btn-close">
-            ×
           </button>
         </div>
       </div>
@@ -142,6 +176,14 @@ function App() {
       <div className="app-content">
         {activeTab === 'chat' ? <ChatPage /> : <DevicesTab />}
       </div>
+
+      {settingsOpen && (
+        <SettingsModal
+          theme={theme}
+          onThemeChange={setTheme}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }

@@ -1,0 +1,159 @@
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.36);
+  -webkit-app-region: no-drag;
+}
+
+.settings-modal {
+  width: min(420px, 100%);
+  color: var(--text-primary);
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 18px;
+  box-shadow: var(--modal-shadow);
+  backdrop-filter: blur(var(--modal-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--modal-blur)) saturate(150%);
+  overflow: hidden;
+}
+
+.settings-modal-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.settings-modal-header h2 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.settings-modal-header p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.settings-close {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 50%;
+  background: var(--control-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.settings-close:hover {
+  background: var(--control-bg-hover);
+  color: var(--text-primary);
+}
+
+.settings-section {
+  padding: 18px;
+}
+
+.settings-section-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 12px;
+}
+
+.settings-section-title span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.settings-section-title small {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.theme-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.theme-option {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 48px 1fr 20px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.theme-option:hover {
+  background: var(--surface-2);
+  border-color: var(--accent-border);
+}
+
+.theme-option.selected {
+  border-color: var(--accent-border-strong);
+  background: var(--selected-bg);
+}
+
+.theme-preview {
+  width: 48px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.theme-preview-default {
+  background:
+    radial-gradient(circle at 20% 20%, rgba(59, 130, 246, 0.75), transparent 35%),
+    linear-gradient(135deg, #0a0e1a, #111827);
+}
+
+.theme-preview-glassmorphism {
+  background:
+    radial-gradient(circle at 20% 25%, rgba(125, 211, 252, 0.62), transparent 34%),
+    radial-gradient(circle at 75% 70%, rgba(196, 181, 253, 0.46), transparent 36%),
+    rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+}
+
+.theme-option-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.theme-option-copy strong {
+  font-size: 13px;
+}
+
+.theme-option-copy small {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.theme-check {
+  color: var(--success);
+  font-size: 16px;
+  font-weight: 800;
+  text-align: center;
+}

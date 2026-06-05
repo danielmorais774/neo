@@ -138,6 +138,87 @@
 }
 
 /* ========================================
+   WINDOW TITLEBAR
+   ======================================== */
+
+.window-titlebar {
+  height: 32px;
+  display: grid;
+  grid-template-columns: 96px 1fr 96px;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--window-titlebar-bg);
+  border-bottom: 1px solid var(--window-titlebar-border);
+  -webkit-app-region: drag;
+  cursor: grab;
+  user-select: none;
+}
+
+.window-titlebar:active {
+  cursor: grabbing;
+}
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+  cursor: default;
+}
+
+.window-control {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18), 0 1px 4px rgba(0, 0, 0, 0.16);
+}
+
+.window-control::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.18);
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.window-controls:hover .window-control::after {
+  opacity: 1;
+}
+
+.window-control-close {
+  background: #ff5f57;
+}
+
+.window-control-minimize {
+  background: #febc2e;
+}
+
+.window-control-maximize {
+  background: #28c840;
+}
+
+.window-title {
+  justify-self: center;
+  color: var(--window-titlebar-text);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+
+.window-titlebar-spacer {
+  min-width: 0;
+}
+
+/* ========================================
    HEADER - WhatsApp Style
    ======================================== */
 
@@ -150,6 +231,7 @@
   border-bottom: 1px solid rgba(59, 130, 246, 0.12);
   padding: 0 12px;
   -webkit-app-region: drag;
+  user-select: none;
 }
 
 .titlebar-drag {
@@ -157,6 +239,12 @@
   align-items: center;
   gap: 12px;
   flex: 1;
+  cursor: grab;
+  user-select: none;
+}
+
+.titlebar-drag:active {
+  cursor: grabbing;
 }
 
 .header-left {
@@ -300,38 +388,6 @@
 .btn-settings-header:hover {
   background: rgba(255, 255, 255, 0.1);
   color: var(--text-primary);
-}
-
-/* Divider between header actions and window controls */
-.btn-settings-header + .btn-minimize {
-  margin-left: 4px;
-  border-left: 1px solid rgba(255, 255, 255, 0.06);
-  padding-left: 10px;
-}
-
-.titlebar-buttons button:not(.btn-new-chat-header):not(.btn-settings-header) {
-  width: 28px;
-  height: 28px;
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 18px;
-  cursor: pointer;
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.btn-minimize:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-primary);
-}
-
-.btn-close:hover {
-  background: var(--error);
-  color: white;
 }
 
 /* ========================================
