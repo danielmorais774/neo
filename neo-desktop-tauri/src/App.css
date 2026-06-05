@@ -7,6 +7,14 @@
   overflow: hidden;
   border: 1px solid rgba(59, 130, 246, 0.15);
   position: relative;
+  /* WebKit fix: force the rounded corners to be clipped on a stable
+     compositing layer. Without this, the backdrop-filter glass flickers
+     at the corners while the (transparent) window is dragged on macOS.
+     This does NOT remove glass/transparency — it only stabilises the
+     corner mask during compositing. */
+  -webkit-mask-image: -webkit-radial-gradient(white, black);
+  -webkit-mask-image: radial-gradient(white, black);
+  isolation: isolate;
 }
 
 /* ========================================
@@ -131,10 +139,84 @@
   border-radius: inherit;
 }
 
-/* All content above the glass layer */
-.app > *:not(.bg-orbs) {
+/* All content above the glass layer (resize handles keep their own
+   absolute positioning — including them here would force them into the
+   flex flow and push the titlebar down, creating a gap at the top). */
+.app > *:not(.bg-orbs):not(.resize-handle) {
   position: relative;
   z-index: 2;
+}
+
+.resize-handle {
+  position: absolute;
+  z-index: 50;
+  -webkit-app-region: no-drag;
+}
+
+.resize-handle-n,
+.resize-handle-s {
+  left: 12px;
+  right: 12px;
+  height: 8px;
+}
+
+.resize-handle-n {
+  top: 0;
+  cursor: ns-resize;
+}
+
+.resize-handle-s {
+  bottom: 0;
+  cursor: ns-resize;
+}
+
+.resize-handle-w,
+.resize-handle-e {
+  top: 12px;
+  bottom: 12px;
+  width: 8px;
+}
+
+.resize-handle-w {
+  left: 0;
+  cursor: ew-resize;
+}
+
+.resize-handle-e {
+  right: 0;
+  cursor: ew-resize;
+}
+
+.resize-handle-nw,
+.resize-handle-ne,
+.resize-handle-sw,
+.resize-handle-se {
+  width: 14px;
+  height: 14px;
+}
+
+.resize-handle-nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.resize-handle-ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.resize-handle-sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.resize-handle-se {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
 }
 
 /* ========================================
@@ -164,6 +246,7 @@
   gap: 8px;
   -webkit-app-region: no-drag;
   cursor: default;
+  flex-shrink: 0;
 }
 
 .window-control {
@@ -241,6 +324,7 @@
   flex: 1;
   cursor: grab;
   user-select: none;
+  min-width: 0;
 }
 
 .titlebar-drag:active {

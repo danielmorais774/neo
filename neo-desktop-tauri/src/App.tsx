@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ChatPage, QuickHelpPage } from './pages';
 import { WindowService } from './lib';
+import type { WindowResizeDirection } from './lib';
 import { DevicesTab } from './components/DevicesTab';
 import SettingsModal from './components/SettingsModal';
 import { useTheme } from './themes/useTheme';
@@ -9,6 +10,17 @@ import './index.css';
 import './styles/themes.css';
 
 const _urlMode = new URLSearchParams(window.location.search).get('mode');
+
+const RESIZE_HANDLES: { direction: WindowResizeDirection; className: string; label: string }[] = [
+  { direction: 'North', className: 'resize-handle-n', label: 'Redimensionar pelo topo' },
+  { direction: 'South', className: 'resize-handle-s', label: 'Redimensionar pela base' },
+  { direction: 'West', className: 'resize-handle-w', label: 'Redimensionar pela esquerda' },
+  { direction: 'East', className: 'resize-handle-e', label: 'Redimensionar pela direita' },
+  { direction: 'NorthWest', className: 'resize-handle-nw', label: 'Redimensionar pelo canto superior esquerdo' },
+  { direction: 'NorthEast', className: 'resize-handle-ne', label: 'Redimensionar pelo canto superior direito' },
+  { direction: 'SouthWest', className: 'resize-handle-sw', label: 'Redimensionar pelo canto inferior esquerdo' },
+  { direction: 'SouthEast', className: 'resize-handle-se', label: 'Redimensionar pelo canto inferior direito' },
+];
 
 function App() {
   const [coreStatus, setCoreStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking');
@@ -21,6 +33,13 @@ function App() {
     if (event.button !== 0) return;
     event.preventDefault();
     WindowService.startDragging();
+  };
+
+  const handleResizeStart = (direction: WindowResizeDirection) => (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    WindowService.startResizeDragging(direction);
   };
 
   console.log('[Neo] App rendering, mode:', _urlMode);
@@ -77,6 +96,16 @@ function App() {
         <div className="orb orb-4"></div>
         <div className="orb orb-5"></div>
       </div>
+
+      {RESIZE_HANDLES.map((handle) => (
+        <div
+          key={handle.direction}
+          className={`resize-handle ${handle.className}`}
+          role="presentation"
+          aria-label={handle.label}
+          onMouseDown={handleResizeStart(handle.direction)}
+        />
+      ))}
 
       <div className="window-titlebar" onMouseDown={handleWindowDragStart}>
         <div className="window-controls" aria-label="Controles da janela" onMouseDown={(event) => event.stopPropagation()}>

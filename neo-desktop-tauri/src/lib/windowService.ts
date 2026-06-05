@@ -1,5 +1,15 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
+export type WindowResizeDirection =
+  | 'East'
+  | 'North'
+  | 'NorthEast'
+  | 'NorthWest'
+  | 'South'
+  | 'SouthEast'
+  | 'SouthWest'
+  | 'West';
+
 export class WindowService {
   static minimize(): void {
     getCurrentWindow().minimize().catch((error) => {
@@ -16,6 +26,12 @@ export class WindowService {
   static async startDragging(): Promise<void> {
     await getCurrentWindow().startDragging().catch((error) => {
       console.warn('[Neo] Failed to start dragging window:', error);
+    });
+  }
+
+  static async startResizeDragging(direction: WindowResizeDirection): Promise<void> {
+    await getCurrentWindow().startResizeDragging(direction).catch((error) => {
+      console.warn('[Neo] Failed to start resizing window:', error);
     });
   }
 

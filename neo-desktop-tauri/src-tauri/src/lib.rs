@@ -187,6 +187,12 @@ pub fn run() {
 
             // Show the main window on startup
             if let Some(window) = app.get_webview_window("main") {
+                // Force a transparent webview background. Without this, macOS
+                // WKWebView defaults to white, which flashes through the rounded
+                // corners while the window is being dragged (same fix as the
+                // notification window below). This keeps the glass/transparent
+                // look intact — it only stops the opaque white repaint flicker.
+                let _ = window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
                 let _ = window.show();
                 let _ = window.set_focus();
             }
