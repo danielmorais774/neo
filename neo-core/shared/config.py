@@ -193,6 +193,20 @@ class Settings(BaseSettings):
         description="Webhook path for inbound WhatsApp messages",
     )
 
+    # Home Assistant
+    home_assistant_url: str = Field(
+        default="http://localhost:8123",
+        description="Base URL da instância Home Assistant",
+    )
+    home_assistant_token: str | None = Field(
+        default=None,
+        description="Long-lived access token do Home Assistant (Bearer)",
+    )
+    home_assistant_timeout: int = Field(
+        default=10,
+        description="Timeout HTTP (s) para chamadas ao Home Assistant",
+    )
+
     # Mission Settings
     mission_default_timeout_hours: int = Field(
         default=24, ge=1,

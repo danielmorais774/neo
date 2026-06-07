@@ -262,3 +262,65 @@ def test_global_types_only_health_and_restriction():
     assert "preference" not in GLOBAL_TYPES, "preference must not be global"
     assert "health_state" in GLOBAL_TYPES, "health_state should be global (safety context)"
     assert "restriction" in GLOBAL_TYPES, "restriction should be global (safety context)"
+
+
+# ── 5. USER_PKS threshold: type-synonym recall must enter the prompt ──────────
+# Regression for session 384236e9 — "quais os meus dispositivos?" retrieved the
+# device entity but it scored 0.18 (a weak name match) < 0.25 threshold, so the
+# PKS block was dropped and the model never saw the device knowledge. The
+# retriever now scores type-synonym recall at 0.6 (_TYPE_MATCH_SCORE), which must
+# clear the threshold here.
+
+@pytest.mark.asyncio
+async def test_user_pks_type_synonym_score_clears_threshold():
+    from core.pks.retriever import _TYPE_MATCH_SCORE
+
+    sel = _make_selector(threshold=0.25, budget_user_pks=9999)
+    pks_mock = AsyncMock()
+    pks_mock.retrieve_system_context = AsyncMock(return_value="")
+    pks_mock.retrieve_context = AsyncMock(
+        return_value=(
+            {"candidates": [{"score": _TYPE_MATCH_SCORE}], "metadata": {"entities_matched": 1}},
+            "### MacBook Air M4 [device]",
+        )
+    )
+    sel._pks = pks_mock
+
+    _, trace = await sel.build_prompt(
+        user_message="quais os meus dispositivos?",
+        user_id=uuid4(),
+        decision=_make_decision(knowledge_keywords=["dispositivo"]),
+        system_context=None,
+        recovered_context=[],
+        is_neo_training=False,
+    )
+
+    pks_candidates = [c for c in trace if c.layer == ContextLayer.USER_PKS]
+    assert pks_candidates, "USER_PKS candidate should exist"
+    assert pks_candidates[0].included, "type-synonym PKS (0.6) must clear the 0.25 threshold"
+
+
+@pytest.mark.asyncio
+async def test_user_pks_weak_match_below_threshold_documents_old_bug():
+    """A lone weak (0.18) match is dropped — the exact pre-fix failure mode."""
+    sel = _make_selector(threshold=0.25, budget_user_pks=9999)
+    pks_mock = AsyncMock()
+    pks_mock.retrieve_system_context = AsyncMock(return_value="")
+    pks_mock.retrieve_context = AsyncMock(
+        return_value=({"candidates": [{"score": 0.18}]}, "### MacBook Air M4 [device]")
+    )
+    sel._pks = pks_mock
+
+    _, trace = await sel.build_prompt(
+        user_message="quais os meus dispositivos?",
+        user_id=uuid4(),
+        decision=_make_decision(knowledge_keywords=["dispositivo"]),
+        system_context=None,
+        recovered_context=[],
+        is_neo_training=False,
+    )
+
+    pks_candidates = [c for c in trace if c.layer == ContextLayer.USER_PKS]
+    assert pks_candidates
+    assert not pks_candidates[0].included
+    assert pks_candidates[0].skip_reason == "below_threshold"

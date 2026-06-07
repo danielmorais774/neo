@@ -42,6 +42,11 @@ _TYPE_FAMILY: dict[str, tuple[str, ...]] = {
     "food": ("food", "meal"),
 }
 
+# Score assigned to an entity recalled because the query named its type
+# ("dispositivos" → all device entities). Must stay above
+# context_relevance_threshold (0.25) so the PKS block enters the prompt.
+_TYPE_MATCH_SCORE = 0.6
+
 
 class PKSRetriever:
     def __init__(
@@ -68,6 +73,7 @@ class PKSRetriever:
     ) -> tuple[RetrievalResult, str]:
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         search_terms = self._keywords(user_message, keywords)
+        synonym_types = self._synonym_types(search_terms)
 
         async with self.db.get_session() as session:
             candidates: list[EntityCandidate] = []
@@ -87,21 +93,33 @@ class PKSRetriever:
                 if len(candidates) >= max_candidates:
                     break
 
-            # Fallback: if name/alias search returned nothing, try type-synonym expansion.
-            # "quais dispositivos?" → no trigram match for "MacBook Air M4", but "dispositivos"
-            # maps to type "device" and we load all device entities by type.
-            if not candidates:
-                synonym_types = self._synonym_types(search_terms)
-                if synonym_types:
-                    type_entities = await self._entities_by_types(session, workspace_id, synonym_types)
-                    for entity in type_entities:
-                        if entity.id not in seen:
-                            candidates.append(EntityCandidate(
-                                entity=entity, score=0.6, matched_by="type_synonym", keyword="type"
-                            ))
-                            seen.add(entity.id)
-                        if len(candidates) >= max_candidates:
-                            break
+            # Type-synonym recall — runs whenever the query names an entity type
+            # ("quais dispositivos?" → type "device"), NOT only as a fallback.
+            # A weak, incidental trigram match (e.g. score 0.18 on a device name)
+            # used to suppress this and leave the PKS block below the relevance
+            # threshold, so the device knowledge never reached the LLM
+            # (session 384236e9). We now (a) load all entities of the type and
+            # (b) upgrade any already-collected entity of that type to the
+            # type-match score so the block clears the threshold.
+            if synonym_types:
+                type_set = set(synonym_types)
+                by_id = {c.entity.id: c for c in candidates}
+                # Upgrade weak matches that happen to be of the requested type.
+                for cand in candidates:
+                    if cand.entity.type in type_set and cand.score < _TYPE_MATCH_SCORE:
+                        cand.score = _TYPE_MATCH_SCORE
+                        cand.matched_by = "type_synonym"
+                type_cap = max(max_candidates, 10)
+                type_entities = await self._entities_by_types(session, workspace_id, synonym_types)
+                for entity in type_entities:
+                    if entity.id in by_id or entity.id in seen:
+                        continue
+                    candidates.append(EntityCandidate(
+                        entity=entity, score=_TYPE_MATCH_SCORE, matched_by="type_synonym", keyword="type"
+                    ))
+                    seen.add(entity.id)
+                    if len(candidates) >= type_cap:
+                        break
 
             global_entities = await self._global_entities(session, workspace_id)
             for entity in global_entities:

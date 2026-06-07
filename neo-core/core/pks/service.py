@@ -132,6 +132,32 @@ class PKSService:
             source_message_id=source_message_id,
         )
 
+    async def register_device(
+        self,
+        *,
+        user_id: UUID,
+        device_id: str,
+        hardware_id: str | None = None,
+        os_platform: str | None = None,
+        os_arch: str | None = None,
+        device_type: str | None = None,
+        label: str | None = None,
+        aliases: list[str] | None = None,
+        source_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically persist the current device's identity (no LLM)."""
+        return await self.writer.write_device_identity(
+            user_id=user_id,
+            device_id=device_id,
+            hardware_id=hardware_id,
+            os_platform=os_platform,
+            os_arch=os_arch,
+            device_type=device_type,
+            label=label,
+            aliases=aliases,
+            source_message_id=source_message_id,
+        )
+
     def parse_training_envelope(self, user_message: str):
         """Parse a message for an explicit Neo training envelope (no DB writes)."""
         return self.writer.envelope_parser.parse(user_message)

@@ -90,27 +90,28 @@ def test_build_current_device_context_includes_identity():
     note = AIService._build_current_device_context({
         "device_id": "dev-123",
         "hardware_id": "HW-ABC",
-        "model": "MacBookAir10,1",
-        "os_platform": "Darwin",
-        "os_release": "25.4.0",
+        "os_platform": "macos",
+        "os_arch": "aarch64",
+        "client": "neo-desktop-tauri",
+        "model": "deepseek-v4-flash",  # LLM model — must NOT appear
     })
     assert "dev-123" in note
     assert "HW-ABC" in note
-    assert "MacBookAir10,1" in note
+    assert "aarch64" in note
+    assert "deepseek-v4-flash" not in note
     assert "device" in note.lower()
 
 
 def test_build_current_device_context_empty_without_identity():
     assert AIService._build_current_device_context({}) == ""
     assert AIService._build_current_device_context(None) == ""
-    # model/os alone (no id/hardware_id) is not enough to anchor an entity.
-    assert AIService._build_current_device_context({"model": "unknown"}) == ""
+    # os alone (no id/hardware_id) is not enough to anchor an entity.
+    assert AIService._build_current_device_context({"os_platform": "macos"}) == ""
 
 
 def test_build_current_device_context_skips_unknown_values():
     note = AIService._build_current_device_context({
         "device_id": "dev-9",
-        "model": "unknown",
         "os_platform": "unknown",
     })
     assert "dev-9" in note

@@ -144,8 +144,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
     _tool_registry.register_many(WHATSAPP_MESSAGING_TOOLS)
 
+    # Register home_assistant tools in the global registry (for discovery / routing)
+    from core.skills.home_assistant.tools import HOME_ASSISTANT_TOOLS
+    _tool_registry.register_many(HOME_ASSISTANT_TOOLS)
+
     # Import skill manifests to register them in SkillManifest registry
     from core.skills.whatsapp_messaging import whatsapp_messaging_manifest  # noqa: F401
+    from core.skills.home_assistant import home_assistant_manifest  # noqa: F401
 
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
@@ -241,6 +246,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     print(f"   ├─ Desktop (client-side): {len(DESKTOP_TOOLS)}")
     print(f"   └─ Weather (server-side): {len(WEATHER_TOOLS)}")
     print(f"   └─ WhatsApp Messaging (server-side): {len(WHATSAPP_MESSAGING_TOOLS)}")
+    print(f"   └─ Home Assistant (server-side): {len(HOME_ASSISTANT_TOOLS)}")
     print(f"🌐 API ready on port {settings.api_port}")
 
     # ── Start gRPC server ─────────────────────────────────────────

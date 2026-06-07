@@ -251,6 +251,12 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                             self._pending[session_id] = {**pending, **resp.metadata}
 
                 
+        except asyncio.CancelledError:
+            # Client pressed Stop → it dropped the stream, which grpc.aio surfaces
+            # as cancellation of this handler. The in-flight work is already being
+            # torn down; just log and let it propagate (cleanup runs in `finally`).
+            logger.info(f"[gRPC] ExecuteTask cancelled by client (session={session_id})")
+            raise
         except Exception as e:
             logger.error(f"[gRPC] Error in ExecuteTask: {e}", exc_info=True)
             # Always close the turn with a readable final message so the UI exits

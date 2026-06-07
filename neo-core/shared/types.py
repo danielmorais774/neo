@@ -37,6 +37,7 @@ class IntentType(str, Enum):
     SERVER_TOOL = "server_tool"
     CLIENT_TOOL = "client_tool"
     WHATSAPP_MESSAGING = "whatsapp_messaging"
+    HOME_ASSISTANT = "home_assistant"
 
 
 class MissionStatus(str, Enum):

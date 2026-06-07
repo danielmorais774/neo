@@ -201,6 +201,91 @@ class PKSWriter:
         logger.info("[PKS][plan_memory] learn_complete path=planner applied=%d", len(applied))
         return applied
 
+    async def write_device_identity(
+        self,
+        *,
+        user_id: UUID,
+        device_id: str,
+        hardware_id: str | None = None,
+        os_platform: str | None = None,
+        os_arch: str | None = None,
+        device_type: str | None = None,
+        label: str | None = None,
+        aliases: list[str] | None = None,
+        source_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically write the current device's identity to the PKS.
+
+        Unlike the LLM planner, this never transcribes the values — the
+        device_id/hardware_id/OS come straight from the connection metadata, so a
+        weak chat model can no longer hallucinate the identifier. Human-provided
+        attributes (e.g. "MacBook Air") are still captured by the normal planner.
+        """
+        if not device_id:
+            return {}
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        name = (label or "Meu computador").strip() or "Meu computador"
+        alias_set = sorted({a.strip() for a in (aliases or []) if a and a.strip()})
+
+        ops: list[PKSOperation] = [
+            PKSOperation(
+                op="upsert_entity",
+                confidence=1.0,
+                reason="identidade do dispositivo atual (metadata da conexão)",
+                entity={
+                    "name": name,
+                    "type": "device",
+                    "aliases": alias_set,
+                    "metadata": {"device_id": device_id, "hardware_id": hardware_id or ""},
+                    "sensitivity": "private",
+                },
+            )
+        ]
+        for key, val in (
+            ("device_id", device_id),
+            ("hardware_id", hardware_id),
+            ("os_platform", os_platform),
+            ("os_arch", os_arch),
+            ("device_type", device_type),
+        ):
+            if val:
+                ops.append(
+                    PKSOperation(
+                        op="upsert_field",
+                        confidence=1.0,
+                        reason="identidade do dispositivo (determinística)",
+                        field={
+                            "entity": {"name": name, "type": "device"},
+                            "key": key,
+                            "value_type": "text",
+                            "value": str(val),
+                            "sensitivity": "private",
+                        },
+                    )
+                )
+
+        applied: list[dict[str, Any]] = []
+        async with self.db.get_session() as session:
+            for op in ops:
+                try:
+                    res = await self._apply_operation(
+                        session,
+                        workspace_id=workspace_id,
+                        op=op,
+                        source_message_id=source_message_id,
+                    )
+                    if res:
+                        applied.append(res)
+                except Exception as exc:
+                    logger.warning("[PKS] device identity op failed (%s): %s", op.op, exc)
+            await session.commit()
+
+        logger.info(
+            "[PKS] write_device_identity device_id=%s applied=%d", device_id, len(applied)
+        )
+        return {"name": name, "device_id": device_id, "applied": applied}
+
     async def learn_before_response(
         self,
         *,

@@ -31,6 +31,7 @@ from core.tools.registry import ToolRegistry
 from db.async_client import AsyncPostgresClient
 from observability.logger import get_obs, MessageTrace
 from observability.session_file_logger import get_session_logger
+from core.memory import ConversationMemory
 from shared import (
     IntentType,
     Message,
@@ -610,6 +611,21 @@ class AIService:
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
+
+            elif decision.intent == IntentType.HOME_ASSISTANT:
+                async for resp in self._handle_home_assistant(
+                    sid,
+                    user_message,
+                    history,
+                    decision,
+                    trace,
+                    slog=slog,
+                    user_id=user_id,
+                    metadata=metadata,
+                ):
+                    if resp.is_final:
+                        final_response = resp.message
+                    yield resp
         except Exception as e:
             dispatch_error = str(e)
             slog.log_event("Erro no Dispatch", f"```\n{dispatch_error}\n```")
@@ -758,6 +774,51 @@ class AIService:
         messages: list[Message] = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
         ]
+
+        # ── Device identity: deterministic registration (no LLM transcription) ──
+        # When the user explicitly asks to remember THIS device, persist its real
+        # identity (device_id/hardware_id/OS from connection metadata) ourselves —
+        # never relying on the weak chat model to copy a UUID — and feed those exact
+        # values into the prompt so the confirmation is truthful, not fabricated.
+        device_memory_handled = False
+        if (
+            self.pks
+            and user_id
+            and self._references_current_device(user_message)
+            and IntentRouter._is_memory_directive(user_message)
+        ):
+            device_ctx = self._build_current_device_context(metadata)
+            device_id = (metadata or {}).get("device_id")
+            if device_ctx and device_id:
+                label = self._extract_device_label(user_message)
+                aliases = [a for a in (label, "meu computador", "esse dispositivo") if a]
+                try:
+                    await self.pks.register_device(
+                        user_id=user_id,
+                        device_id=device_id,
+                        hardware_id=(metadata or {}).get("hardware_id"),
+                        os_platform=(metadata or {}).get("os_platform"),
+                        os_arch=(metadata or {}).get("os_arch"),
+                        device_type=(metadata or {}).get("client"),
+                        label=label,
+                        aliases=aliases,
+                        source_message_id=source_message_id,
+                    )
+                    device_memory_handled = True
+                    if slog:
+                        slog.log_event("Device registrado (PKS, determinístico)", device_ctx)
+                except Exception as e:
+                    logger.warning(f"[PKS] Deterministic device registration failed: {e}", exc_info=True)
+
+                instruction = (
+                    f"{device_ctx}\n"
+                    "Este dispositivo JÁ foi registrado no PKS com EXATAMENTE estes dados. "
+                    "Ao confirmar para o usuário, use estes valores reais (especialmente o "
+                    "device_id) e NÃO invente atributos que o usuário não informou "
+                    "(RAM, armazenamento, modelo exato). Se algum dado não foi informado, "
+                    "simplesmente não o cite."
+                )
+                messages.append(Message(role=MessageRole.SYSTEM, content=instruction))
 
         # Add conversation history (already includes current user message since
         # add_message is called before get_history)
@@ -926,8 +987,12 @@ class AIService:
 
                 # Neo training is routed only through the system/agent-training
                 # pipeline — never written as personal user memory.
+                # When this turn was a device-registration directive, the device
+                # identity was already written deterministically; skip the LLM
+                # planner so it can't re-ingest a hallucinated id/specs from the
+                # assistant's reply.
                 applied = []
-                if not is_neo_training:
+                if not is_neo_training and not device_memory_handled:
                     applied = await self.pks.learn(
                         user_id=user_id,
                         user_message=user_message,
@@ -984,21 +1049,50 @@ class AIService:
         )
         return bool(cls._DEVICE_REFERENCE_RE.search(normalized))
 
+    # Known device-model labels the user may mention (longest first so
+    # "macbook air" wins over "macbook"). Used to name the PKS device entity.
+    _DEVICE_LABEL_PATTERNS = [
+        (re.compile(r"\bmacbook\s*air\b"), "MacBook Air"),
+        (re.compile(r"\bmacbook\s*pro\b"), "MacBook Pro"),
+        (re.compile(r"\bmac\s*mini\b"), "Mac mini"),
+        (re.compile(r"\bmac\s*studio\b"), "Mac Studio"),
+        (re.compile(r"\bmacbook\b"), "MacBook"),
+        (re.compile(r"\bimac\b"), "iMac"),
+        (re.compile(r"\bnotebook\b"), "Notebook"),
+        (re.compile(r"\bdesktop\b"), "Desktop"),
+    ]
+
+    @classmethod
+    def _extract_device_label(cls, message: str) -> str | None:
+        """Best-effort device label from the user's words (e.g. 'MacBook Air').
+
+        Deterministic and conservative: returns None when nothing recognizable is
+        present, so we never invent a model the user did not state.
+        """
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFD", (message or "").lower())
+            if unicodedata.category(c) != "Mn"
+        )
+        for pattern, label in cls._DEVICE_LABEL_PATTERNS:
+            if pattern.search(normalized):
+                return label
+        return None
+
     @staticmethod
     def _build_current_device_context(metadata: dict | None) -> str:
-        """Describe the current device from connection metadata for the PKS planner.
+        """Describe the current device from connection metadata (real identity).
 
-        Returns an empty string when no device identity is available. The device_id
-        and hardware_id are the canonical identity assigned by neo-core on connect;
-        feeding them lets the planner attach stated facts (e.g. "is a MacBook Air")
-        to the right `device` entity instead of inventing a generic one.
+        Returns an empty string when no device identity is available. Only fields
+        that are actually reported by the desktop are included — note that
+        `metadata["model"]` is the *LLM* model (e.g. deepseek-v4-flash), NOT the
+        hardware model, so it is deliberately excluded.
         """
         md = metadata or {}
         device_id = md.get("device_id")
         hardware_id = md.get("hardware_id")
-        model = md.get("model")
         os_platform = md.get("os_platform")
-        os_version = md.get("os_release") or md.get("os_version")
+        os_arch = md.get("os_arch")
+        device_type = md.get("client")
 
         if not (device_id or hardware_id):
             return ""
@@ -1008,15 +1102,12 @@ class AIService:
             lines.append(f"- device_id: {device_id}")
         if hardware_id:
             lines.append(f"- hardware_id: {hardware_id}")
-        if model and model != "unknown":
-            lines.append(f"- modelo reportado pelo SO: {model}")
         if os_platform and os_platform != "unknown":
-            lines.append(f"- sistema: {os_platform} {os_version or ''}".strip())
-        lines.append(
-            "Quando o usuário disser 'esse dispositivo', 'este computador', 'essa "
-            "máquina' etc., refere-se a este device. Use device_id/hardware_id como "
-            "identidade canônica ao salvar fatos sobre ele (entity type 'device')."
-        )
+            lines.append(f"- sistema: {os_platform}")
+        if os_arch:
+            lines.append(f"- arquitetura: {os_arch}")
+        if device_type:
+            lines.append(f"- cliente: {device_type}")
         return "\n".join(lines)
 
     @staticmethod
@@ -1108,6 +1199,28 @@ class AIService:
     # Handler: SERVER_TOOL — tools running on neo-core host
     # ---------------------------------------------------------------
 
+    @staticmethod
+    def _build_server_tool_memory(
+        session_id: UUID,
+        history: list[dict[str, str]] | None,
+        user_message: str,
+    ) -> ConversationMemory | None:
+        """Seed agent memory with recent turns so corrections are understood.
+
+        The current user message is carried by `task`, so a trailing history
+        entry equal to it is dropped to avoid duplication.
+        """
+        if not history:
+            return None
+        memory = ConversationMemory(session_id=session_id)
+        recent = list(history[-6:])
+        if recent and recent[-1].get("role") == "user" and recent[-1].get("content") == user_message:
+            recent = recent[:-1]
+        for msg in recent:
+            role = MessageRole(msg["role"]) if msg.get("role") in ("user", "assistant") else MessageRole.USER
+            memory.add_message(Message(role=role, content=msg.get("content", "")))
+        return memory if memory.get_messages() else None
+
     async def _handle_server_tool(
         self,
         session_id: UUID,
@@ -1142,10 +1255,35 @@ class AIService:
                 user_id=user_id,
             )
 
+            # Safety net: don't let the server-tool agent run blind. Seed recent
+            # history (so a second-turn correction is understood) and, when the
+            # query depends on user knowledge, prepend PKS context to the task.
+            # The router now redirects knowledge-style device questions to
+            # DIRECT_RESPONSE, but this keeps SERVER_TOOL robust if a query still
+            # lands here. Context errors must never block tool execution.
+            task = user_message
+            memory = self._build_server_tool_memory(session_id, history, user_message)
+            try:
+                if decision.needs_memory and self.pks and user_id:
+                    _pks_result, pks_text = await self.pks.retrieve_context(
+                        user_id=user_id,
+                        keywords=decision.knowledge_keywords,
+                        user_message=user_message,
+                    )
+                    if pks_text:
+                        task = (
+                            f"## Conhecimento do Usuário (do PKS)\n{pks_text}\n\n"
+                            f"## Pedido do usuário\n{user_message}"
+                        )
+            except Exception:
+                logger.exception("SERVER_TOOL PKS enrichment failed; proceeding without it")
+                task = user_message
+
             # Use AgentExecutor for multi-step tool execution
             result = await self.agent.execute(
-                task=user_message,
+                task=task,
                 session_id=session_id,
+                memory=memory,
                 tool_executor=ctx_executor,
             )
 
@@ -1298,6 +1436,87 @@ class AIService:
 
         yield AIServiceResponse(
             intent=IntentType.WHATSAPP_MESSAGING,
+            session_id=session_id,
+            message=final_text,
+            is_final=True,
+            iterations=1,
+        )
+
+    # ---------------------------------------------------------------
+    # Handler: HOME_ASSISTANT — smart-home control/query via Home Assistant
+    # ---------------------------------------------------------------
+    async def _handle_home_assistant(
+        self,
+        session_id: UUID,
+        user_message: str,
+        history: list[dict[str, str]],
+        decision: RoutingDecision,
+        trace: MessageTrace | None = None,
+        slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Handle Home Assistant intent — delegates to SkillExecutor (immediate execution)."""
+
+        skill_name = decision.skill_name or "home_assistant"
+
+        if slog:
+            slog.log_event(
+                "Home Assistant",
+                f"Skill: {skill_name} | Mensagem: {user_message[:80]}",
+            )
+
+        yield AIServiceResponse(
+            intent=IntentType.HOME_ASSISTANT,
+            session_id=session_id,
+            message="Falando com o Home Assistant...",
+            is_final=False,
+        )
+
+        try:
+            skill_executor = self._skill_executor
+            if not skill_executor:
+                from core.skills.skill_executor import SkillExecutor
+                from core.notifications import NotificationBroker
+                broker = NotificationBroker()
+                skill_executor = SkillExecutor(
+                    agent_executor=self.agent,
+                    db=self.db,
+                    notification_broker=broker,
+                )
+                self._skill_executor = skill_executor
+
+            extra: dict[str, Any] = dict(metadata or {})
+            if decision.tool_arguments:
+                extra["tool_arguments"] = decision.tool_arguments
+            if decision.tool_name:
+                extra["router_tool_name"] = decision.tool_name
+
+            result = await skill_executor.execute(
+                skill_name=skill_name,
+                session_id=session_id,
+                user_message=user_message,
+                conversation_history=history,
+                user_id=user_id,
+                extra=extra,
+            )
+            final_text = result.message if result.ok else f"Erro no Home Assistant: {result.message}"
+        except Exception as e:
+            logger.exception("Home Assistant execution failed")
+            final_text = f"Erro ao processar pedido do Home Assistant: {str(e)}"
+
+        await self.sessions.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=final_text,
+            generate_embedding=False,
+            user_id=user_id,
+        )
+        if slog:
+            slog.log_final_response(final_text, "HOME_ASSISTANT", iterations=1)
+
+        yield AIServiceResponse(
+            intent=IntentType.HOME_ASSISTANT,
             session_id=session_id,
             message=final_text,
             is_final=True,

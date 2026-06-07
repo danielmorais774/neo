@@ -46,6 +46,34 @@ _MEMORY_DIRECTIVE_PATTERNS = [
 ]
 
 
+# Device questions are ambiguous: "dispositivos conectados agora" is a live
+# websocket query (SERVER_TOOL/list_connected_devices), but "dispositivos que
+# eu tenho/cadastrados/que você conhece" is a PKS-knowledge query that must go
+# to DIRECT_RESPONSE so the PKS context (which already loads device entities by
+# type) is injected. The classifier conflated the two (session e245da98), so we
+# disambiguate deterministically, mirroring the memory-directive guard above.
+#
+# Explicit device-listing nouns only — broad category words (computador/celular)
+# are left out to avoid hijacking action requests ("instala no meu notebook").
+_DEVICE_NOUNS = (
+    "dispositivo", "dispositivos", "device", "devices",
+    "aparelho", "aparelhos", "equipamento", "equipamentos",
+)
+# Live-connection qualifiers → keep on the SERVER_TOOL/list_connected_devices path.
+_DEVICE_LIVE_TERMS = (
+    "conectado", "conectados", "conectada", "conectadas",
+    "conectar", "conectando", "conexao", "online", "on line",
+    "tempo real", "agora", "neste momento", "ligado", "ligados",
+)
+# Knowledge qualifiers → the user wants what Neo *knows* (PKS), not live links.
+_DEVICE_KNOWLEDGE_TERMS = (
+    "conhecimento", "conhece", "conheco", "conhecid",
+    "cadastr", "registr", "sabe sobre", "que voce sabe",
+)
+# Back-reference pronouns for the correction turn ("quero os que você conhece").
+_BACKREF_PATTERN = re.compile(r"\b(os que|as que|aqueles|aquelas|esses|essas)\b")
+
+
 def _strip_accents(text: str) -> str:
     """Lowercase and remove PT accents for robust keyword matching."""
     out = (text or "").lower()
@@ -69,6 +97,7 @@ ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI ass
   - pedidos comerciais (pizza, delivery, farmácia, mercado, encomendas)
   - mensagens para JID/telefone direto ("manda 'oi' para 5511988217222").
   Sempre extraia em `tool_arguments` os campos `text` (texto da mensagem) e `recipient` (JID, telefone OU apelido como "minha mãe", "pai", "Ana"). NÃO interprete o apelido — passe-o cru, o pipeline resolve buscando na agenda.
+- **HOME_ASSISTANT**: controlar ou consultar a casa inteligente do usuário via Home Assistant — luzes, tomadas/interruptores, clima/termostato, persianas, cenas, scripts e automações. Ex: "acende a luz da sala", "desliga as luzes do quarto", "qual a temperatura do termostato?", "ativa o modo cinema", "abre a persiana". Use `skill_name="home_assistant"`. NÃO confundir com `list_connected_devices` (que lista os dispositivos do PRÓPRIO Neo — desktop/celular — não os aparelhos da casa).
 
 ## Server Tools
 {server_tools}
@@ -91,15 +120,17 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 - **Back-references** ("está errado", "refaz", "melhora isso"): DIRECT_RESPONSE
 - **Personal data** (treino, dieta, suplementos, rotina): DIRECT_RESPONSE (injected automatically, no file tools needed)
 - **Memory directives** ("lembra que...", "registra no PKS", "memoriza isso", "anota que...", "não esqueça que..."): DIRECT_RESPONSE — these are saved automatically to the knowledge store (PKS). NEVER route to `write_file` or any client tool.
+- **Devices**: "conectados/online/agora/em tempo real" → SERVER_TOOL `list_connected_devices` (WebSocket ao vivo). "que eu tenho/meus/cadastrados/registrados/que você conhece" → DIRECT_RESPONSE com `needs_memory=true` e `knowledge_keywords:["dispositivo"]` (vêm do PKS, injetados automaticamente). `list_connected_devices` é APENAS para conexões ativas no momento.
 - **Explicit paths**: use absolute paths as-is; use folder hints from "Contexto do Sistema" (Documents, Downloads, Desktop)
 - `requires_approval=true` for destructive ops (delete, kill, format); `false` for read-only
 - `needs_memory=false` for greetings/acks ("oi", "ok", "valeu"); `true` for substantive topics
 - `knowledge_keywords`: up to 6 singular PT nouns from user message (devices, health, food, finance, etc.); `[]` for greetings
-- `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL/WHATSAPP_MESSAGING
+- **Casa inteligente**: "acende/apaga/liga/desliga" luz/tomada, ajustar clima, ativar cena/script, abrir/fechar persiana → HOME_ASSISTANT (`skill_name="home_assistant"`). "dispositivos conectados/online" do Neo → SERVER_TOOL `list_connected_devices`. São coisas DIFERENTES.
+- `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL/WHATSAPP_MESSAGING/HOME_ASSISTANT
 
 ## Output — valid JSON only, no markdown:
 {{
-  "intent": "DIRECT_RESPONSE"|"SERVER_TOOL"|"CLIENT_TOOL"|"WHATSAPP_MESSAGING",
+  "intent": "DIRECT_RESPONSE"|"SERVER_TOOL"|"CLIENT_TOOL"|"WHATSAPP_MESSAGING"|"HOME_ASSISTANT",
   "confidence": 0.0-1.0,
   "tool_name": "tool name or null",
   "tool_arguments": {{}},
@@ -110,7 +141,7 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "knowledge_keywords": [],
   "needs_plan": false,
   "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
-  "skill_name": "whatsapp_messaging or null"
+  "skill_name": "whatsapp_messaging, home_assistant or null"
 }}
 
 ## WHATSAPP_MESSAGING — exemplos de extração
@@ -126,6 +157,14 @@ User: "manda whatsapp pro 5511988217222: oi tudo bem?"
 
 User: "pede uma pizza no Domino's"
 → tool_arguments: {{"text": "Olá, gostaria de fazer um pedido", "recipient": "Domino's"}}
+
+## HOME_ASSISTANT — exemplos
+
+User: "acende a luz da sala" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
+User: "desliga as luzes do quarto" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
+User: "qual a temperatura do termostato?" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
+User: "ativa o modo cinema" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
+User: "quais dispositivos estão conectados agora?" → intent: SERVER_TOOL, tool_name: "list_connected_devices" (NÃO é HOME_ASSISTANT)
 """
 
 
@@ -168,6 +207,13 @@ class IntentRouter:
         if self._is_memory_directive(user_message):
             logger.info("Intent: memory directive → DIRECT_RESPONSE (router bypass)")
             return self._memory_decision(user_message)
+
+        # "Devices I have / known / registered" is a PKS-knowledge question, not
+        # a live-connection query. Route it to DIRECT_RESPONSE so the PKS context
+        # is injected, instead of firing list_connected_devices (session e245da98).
+        if self._is_known_devices_query(user_message, conversation_history):
+            logger.info("Intent: known-devices query → DIRECT_RESPONSE (PKS, router bypass)")
+            return self._known_devices_decision(user_message)
 
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
@@ -302,6 +348,7 @@ class IntentRouter:
             "CLIENT_TOOL": IntentType.CLIENT_TOOL,
             "WHATSAPP_MESSAGING": IntentType.WHATSAPP_MESSAGING,
             "WHATSAPP_ORDER": IntentType.WHATSAPP_MESSAGING,
+            "HOME_ASSISTANT": IntentType.HOME_ASSISTANT,
         }
         intent = intent_map.get(intent_str, IntentType.DIRECT_RESPONSE)
 
@@ -384,6 +431,67 @@ class IntentRouter:
         normalized = _strip_accents(message)
         return any(pattern.search(normalized) for pattern in _MEMORY_DIRECTIVE_PATTERNS)
 
+    @staticmethod
+    def _history_mentions_device(conversation_history: list[dict[str, str]] | None) -> bool:
+        """True when a recent turn was about the user's devices."""
+        if not conversation_history:
+            return False
+        for msg in conversation_history[-4:]:
+            normalized = _strip_accents(msg.get("content", ""))
+            if any(noun in normalized for noun in _DEVICE_NOUNS):
+                return True
+        return False
+
+    @classmethod
+    def _is_known_devices_query(
+        cls,
+        message: str,
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> bool:
+        """True when the user asks about devices Neo *knows* (PKS), not live links.
+
+        Two cases:
+          (a) explicit device noun without a live qualifier
+              — "quais dispositivos eu tenho", "meus aparelhos";
+          (b) a knowledge/correction turn referencing devices, possibly only via
+              history — "não, quero os que você tem conhecimento".
+        "conectados/online/agora" keeps the message on the SERVER_TOOL path.
+        """
+        normalized = _strip_accents(message)
+        has_device = any(noun in normalized for noun in _DEVICE_NOUNS)
+        has_live = any(term in normalized for term in _DEVICE_LIVE_TERMS)
+        has_knowledge = any(term in normalized for term in _DEVICE_KNOWLEDGE_TERMS)
+
+        # (a) ownership/listing question, no real-time qualifier.
+        if has_device and not has_live:
+            return True
+
+        # (b) knowledge or back-reference correction pointing at devices.
+        if has_knowledge:
+            is_backref = bool(_BACKREF_PATTERN.search(normalized))
+            if has_device or (is_backref and cls._history_mentions_device(conversation_history)):
+                return True
+
+        return False
+
+    def _known_devices_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision for a known/registered-devices question.
+
+        PKS already loads device entities by type, so DIRECT_RESPONSE with
+        needs_memory=True surfaces them without any live-connection tool.
+        """
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.9,
+            explanation="Pergunta sobre dispositivos conhecidos — resposta direta com contexto do PKS",
+            needs_memory=True,
+            knowledge_keywords=["dispositivo"],
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
     def _memory_decision(self, message: str) -> RoutingDecision:
         """Direct-response decision for an explicit memory directive (no tools)."""
         decision = RoutingDecision(
@@ -411,6 +519,10 @@ class IntentRouter:
         # Memory directives are never a tool call (they go to the PKS pipeline).
         if self._is_memory_directive(message):
             return self._memory_decision(message)
+
+        # Known/registered-devices questions are a PKS query, not a live tool.
+        if self._is_known_devices_query(message):
+            return self._known_devices_decision(message)
 
         text = (message or "").lower()
         # Normalize accents
@@ -449,6 +561,30 @@ class IntentRouter:
                 raw_command='ls -la "$HOME"',
                 explanation="Fallback: detectado pedido de operação local",
                 requires_approval=True,
+            )
+
+        # Home Assistant indicators (smart-home control/query). Checked before
+        # the weather/server block so "qual a temperatura do termostato" and
+        # control phrases ("acende a luz") don't fall into weather.
+        ha_strong_nouns = [
+            "luz", "luzes", "lampada", "tomada", "interruptor", "termostato",
+            "persiana", "cortina", "cena", "cinema", "home assistant", "automacao", "script",
+        ]
+        ha_control_verbs = [
+            "acende", "acender", "apaga", "apagar", "liga", "ligar",
+            "desliga", "desligar", "ativa", "ativar", "abre", "abrir",
+            "fecha", "fechar", "ajusta", "ajustar",
+        ]
+        ha_rooms = ["sala", "quarto", "cozinha", "garagem", "casa", "banheiro", "escritorio"]
+        has_ha_noun = self._token_hits(text, ha_strong_nouns) >= 1
+        has_ha_verb = self._token_hits(text, ha_control_verbs) >= 1
+        has_room = self._token_hits(text, ha_rooms) >= 1
+        if has_ha_noun or (has_ha_verb and has_room):
+            return RoutingDecision(
+                intent=IntentType.HOME_ASSISTANT,
+                confidence=0.6,
+                skill_name="home_assistant",
+                explanation="Fallback: detectado controle/consulta da casa inteligente (Home Assistant)",
             )
 
         # Server-side indicators
@@ -523,6 +659,10 @@ class IntentRouter:
             "eu me chamo": "nome",
             "meu pc": "pc",
             "minha irma": "familia",
+            "dispositivo": "dispositivo",
+            "device": "dispositivo",
+            "aparelho": "dispositivo",
+            "equipamento": "dispositivo",
         }
         weekdays = ("segunda", "terca", "terça", "quarta", "quinta", "sexta", "sabado", "sábado", "domingo")
         has_numeric_training = bool(re.search(r"\b\d+\s*(kg|quilo|quilos|reps?|repeticoes|repetições|sessoes|sessões|series|séries)\b", normalized))
