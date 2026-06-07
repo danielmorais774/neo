@@ -11,6 +11,16 @@ class _FakeEmbeddings:
     available = False
 
 
+class _AvailableEmbeddings:
+    """Embeddings stub that reports available but is never reached when a
+    deterministic guard short-circuits rotation first."""
+
+    available = True
+
+    async def embed_batch(self, texts):  # pragma: no cover - guard returns first
+        raise AssertionError("embed_batch should not be called for referential follow-ups")
+
+
 class _FakeDB:
     def __init__(self, existing: ConversationSession | None = None) -> None:
         self.sessions: dict = {}
@@ -125,6 +135,87 @@ def test_detect_context_dependency_for_elliptical_followups():
     assert detector("Eu estava pensando e não gostei muito dessa forma como me passou")["is_context_dependent"] is True
     assert detector("voltando ao assunto, queria ajustar o pipeline")["kind"] == "explicit_return"
     assert detector("qual é a capital da França?")["is_context_dependent"] is False
+
+
+def test_detect_context_dependency_for_referential_questions():
+    detector = PersistentSessionManager.detect_context_dependency
+
+    # The exact bug from session 9d61bfba: a referential follow-up question.
+    res = detector("como tu chegou nessa conta de 22?")
+    assert res["is_context_dependent"] is True
+    assert res["kind"] == "referential_question"
+
+    assert detector("de onde veio isso?")["is_context_dependent"] is True
+    # A self-contained question must NOT be treated as context-dependent.
+    assert detector("como funciona um motor a diesel?")["is_context_dependent"] is False
+
+
+def test_detect_context_dependency_numeric_back_reference():
+    detector = PersistentSessionManager.detect_context_dependency
+
+    recent = "diminui o ar-condicionado do quarto para 22°C"
+    # "de quanto?" alone is generic, but "22" echoes the recent context.
+    res = detector("por que ficou em 22 mesmo?", recent_context=recent)
+    assert res["is_context_dependent"] is True
+    assert res["reason"] in ("numeric_back_reference", "referential_question_demonstrative")
+
+
+@pytest.mark.asyncio
+async def test_should_not_rotate_on_referential_followup():
+    session = ConversationSession(
+        id=uuid4(),
+        status="active",
+        message_count=8,
+        last_activity_at=datetime.utcnow(),
+    )
+    db = _FakeDB(session)
+    manager = PersistentSessionManager(
+        db=db,
+        embedding_service=_AvailableEmbeddings(),
+        hybrid_search=None,
+        token_counter=None,
+    )
+
+    result = await manager.should_rotate_session(
+        session, "como tu chegou nessa conta de 22 graus afinal?"
+    )
+
+    assert result["should_rotate"] is False
+    assert "follow-up dependente" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_rotated_session_continuity_injects_previous_history():
+    old_id = uuid4()
+    new_session = ConversationSession(
+        id=uuid4(),
+        status="active",
+        message_count=0,
+        extra_metadata={"created_after_rotated_session_id": str(old_id)},
+    )
+    old_session = ConversationSession(
+        id=old_id,
+        status="closed",
+        message_count=8,
+        last_activity_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    db = _FakeDB(old_session)
+    db.sessions[new_session.id] = new_session
+    db.histories[old_id] = [
+        {"role": "user", "content": "diminui 2 graus o ar do quarto", "token_count": 10},
+        {"role": "assistant", "content": "Pronto, diminui para 22°C.", "token_count": 8},
+    ]
+
+    result = await _manager(db).resolve_continuity_context(
+        session=new_session,
+        message="como tu chegou nessa conta de 22?",
+        user_id=None,
+        service="neo-desktop",
+    )
+
+    assert result["action"] == "inject"
+    assert result["source_session_id"] == str(old_id)
+    assert result["reason"] == "rotated_session_continuity"
 
 
 @pytest.mark.asyncio

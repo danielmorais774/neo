@@ -14,7 +14,7 @@ import re
 import time
 import unicodedata
 from collections.abc import AsyncIterator
-from datetime import date  # kept for _build_legacy_prompt fallback
+from datetime import date, datetime  # date kept for _build_legacy_prompt fallback
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -65,6 +65,41 @@ def _strip_mission_marker(text: str) -> tuple[str, dict[str, Any] | None]:
 
     clean_text = f"{text[:start]}{text[end:]}".strip()
     return clean_text, payload if isinstance(payload, dict) else None
+
+
+# Clarification loop: when the DIRECT_RESPONSE model lacks the information to
+# answer, it prefixes its output with this sentinel followed by ONE question.
+# The orchestrator detects it, persists a pending-clarification state on the
+# session, and on the user's next message runs a second LLM iteration that uses
+# the answer to produce the real response.
+NEED_CLARIFICATION_SENTINEL = "[[NEED_CLARIFICATION]]"
+MAX_CLARIFICATION_ROUNDS = 2
+
+_CLARIFICATION_INSTRUCTION = (
+    "## Esclarecimento quando faltar contexto\n"
+    "Se você NÃO tem informação suficiente para responder com confiança — a mensagem se "
+    "refere a algo (um valor, uma ação, um \"isso/aquilo\") que não está no histórico nem "
+    "no contexto fornecido — NÃO invente e NÃO diga apenas \"não sei\". Em vez disso, comece "
+    f"sua resposta com a linha `{NEED_CLARIFICATION_SENTINEL}` seguida de UMA pergunta curta e "
+    "objetiva que destrave a resposta. Use esse recurso só quando realmente faltar o essencial; "
+    "se der para responder com o que há, responda normalmente (sem o marcador)."
+)
+
+_CLARIFICATION_FINAL_ROUND = (
+    "## Importante\n"
+    f"NÃO use `{NEED_CLARIFICATION_SENTINEL}` desta vez. Você já pediu esclarecimento antes; "
+    "dê a melhor resposta definitiva possível com a informação disponível."
+)
+
+
+def _extract_clarification_question(text: str) -> str | None:
+    """Return the clarifying question if ``text`` carries the sentinel, else None."""
+    if not text or NEED_CLARIFICATION_SENTINEL not in text:
+        return None
+    after = text.split(NEED_CLARIFICATION_SENTINEL, 1)[1].strip()
+    # Drop a leading ":" or "-" the model might add after the marker.
+    after = after.lstrip(":- ").strip()
+    return after or None
 
 
 def _mission_chat_status(status: str | None) -> str:
@@ -345,6 +380,15 @@ class AIService:
                 session = await self.sessions.get_or_create_session(
                     session_id=None, user_id=user_id, service=service
                 )
+                # Record a continuity link so the next (possibly elliptical)
+                # follow-up can still recover the rotated-away conversation,
+                # instead of orphaning it forever.
+                session.extra_metadata = {
+                    **(session.extra_metadata or {}),
+                    "created_after_rotated_session_id": str(sid),
+                    "created_after_rotation_reason": "topic_change",
+                }
+                await self.db.update_session(session)
                 sid = session.id
                 rotated = True
                 # Switch to the new session's logger
@@ -482,13 +526,55 @@ class AIService:
         if _rotation_result is not None:
             trace.set_topic_rotation(_rotation_result)
 
+        # Clarification loop: if we previously asked the user for more info, this
+        # message is the answer. Skip classification and run a second
+        # DIRECT_RESPONSE iteration that uses the answer to produce the real reply.
+        clarification_round = 1
+        allow_clarification = True
+        forced_clarification = False
+        pending_clar = (session.extra_metadata or {}).get("pending_clarification")
+        if pending_clar:
+            prev_round = int(pending_clar.get("round", 1))
+            clarification_round = prev_round + 1
+            allow_clarification = prev_round < MAX_CLARIFICATION_ROUNDS
+            forced_clarification = True
+            # Clear the pending state up front so a failure can't trap the session.
+            session.extra_metadata = {
+                k: v for k, v in (session.extra_metadata or {}).items()
+                if k != "pending_clarification"
+            }
+            await self.db.update_session(session)
+            clar_note = (
+                "## Resolução de esclarecimento\n"
+                f"Você havia perguntado ao usuário: \"{pending_clar.get('clarifying_question', '')}\"\n"
+                f"A pergunta ORIGINAL do usuário foi: \"{pending_clar.get('original_message', '')}\"\n"
+                "A mensagem ATUAL é a resposta do usuário a esse esclarecimento. Use essa nova "
+                "informação somada ao histórico para responder à pergunta ORIGINAL agora."
+            )
+            sys_context = "\n\n".join(p for p in (sys_context, clar_note) if p)
+            if slog:
+                slog.log_event(
+                    "Loop de Clarificação",
+                    f"Round {clarification_round} — interpretando mensagem como resposta ao esclarecimento.",
+                )
+
         # 5. Classify intent — history já disponível do gather acima
         # Bypass: metadata["force_intent"] = "CLIENT_TOOL"|"DIRECT_RESPONSE"|"SERVER_TOOL"
         # útil para testes sem precisar aguardar o classificador.
         _force_intent = (metadata or {}).get("force_intent", "").upper()
         t0 = time.monotonic()
         active_whatsapp_mission = await self.db.find_active_whatsapp_mission_by_session(sid, user_id)
-        if active_whatsapp_mission and _looks_like_whatsapp_mission_followup(user_message):
+        if forced_clarification:
+            decision = RoutingDecision(
+                intent=IntentType.DIRECT_RESPONSE,
+                confidence=0.9,
+                needs_memory=True,
+                needs_plan=False,
+                requires_approval=False,
+                explanation=f"Resposta a esclarecimento pendente (round {clarification_round}).",
+            )
+            logger.info("[INTENT-OVERRIDE] pending clarification answer → DIRECT_RESPONSE")
+        elif active_whatsapp_mission and _looks_like_whatsapp_mission_followup(user_message):
             decision = RoutingDecision(
                 intent=IntentType.WHATSAPP_MESSAGING,
                 confidence=1.0,
@@ -581,6 +667,8 @@ class AIService:
                     user_id=user_id,
                     metadata=metadata,
                     source_message_id=str(saved_msg.id) if saved_msg else None,
+                    allow_clarification=allow_clarification,
+                    clarification_round=clarification_round,
                 ):
                     if resp.is_final:
                         final_response = resp.message
@@ -657,8 +745,17 @@ class AIService:
         user_id: UUID | None = None,
         metadata: dict | None = None,
         source_message_id: str | None = None,
+        allow_clarification: bool = True,
+        clarification_round: int = 1,
     ) -> AsyncIterator[AIServiceResponse]:
-        """Handle direct conversational response using LLM."""
+        """Handle direct conversational response using LLM.
+
+        ``allow_clarification`` lets the model ask the user ONE clarifying
+        question (via the ``[[NEED_CLARIFICATION]]`` sentinel) when it lacks the
+        context to answer; the pending state is stored on the session and the
+        next user message resolves it. ``clarification_round`` is the round this
+        response belongs to (for the round cap).
+        """
 
         # The intent classifier already decided whether cross-session memory is useful.
         # Skip recovery when needs_memory=False (greetings, acks, phatic expressions).
@@ -774,6 +871,13 @@ class AIService:
         messages: list[Message] = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
         ]
+
+        # Clarification loop: allow ONE clarifying question when context is missing,
+        # unless we already hit the round cap (then force a definitive answer).
+        if allow_clarification:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_CLARIFICATION_INSTRUCTION))
+        else:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_CLARIFICATION_FINAL_ROUND))
 
         # ── Device identity: deterministic registration (no LLM transcription) ──
         # When the user explicitly asks to remember THIS device, persist its real
@@ -901,6 +1005,56 @@ class AIService:
             full_response = f"Erro ao processar: {str(e)}"
             if slog:
                 slog.log_event("Erro LLM", f"```\n{str(e)}\n```")
+
+        # Clarification loop: the model signalled it lacks context and asked a
+        # question. Persist the pending state and return the question — the user's
+        # next message will resolve it in a second LLM iteration.
+        clar_question = _extract_clarification_question(full_response) if allow_clarification else None
+        if clar_question:
+            try:
+                sess = await self.db.get_conversation_session(session_id)
+                if sess is not None:
+                    sess.extra_metadata = {
+                        **(sess.extra_metadata or {}),
+                        "pending_clarification": {
+                            "original_message": user_message,
+                            "clarifying_question": clar_question,
+                            "round": clarification_round,
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
+                    }
+                    await self.db.update_session(sess)
+            except Exception as e:
+                logger.warning(f"[CLARIFY] Failed to persist pending clarification: {e}")
+            await self.sessions.add_message(
+                session_id=session_id,
+                role="assistant",
+                content=clar_question,
+                generate_embedding=False,
+                user_id=user_id,
+            )
+            if slog:
+                slog.log_event(
+                    "Loop de Clarificação",
+                    f"Round {clarification_round}: pedindo esclarecimento ao usuário.\n\n> {clar_question}",
+                )
+                slog.log_final_response(clar_question, "DIRECT_RESPONSE", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE,
+                session_id=session_id,
+                message=clar_question,
+                is_final=True,
+                iterations=1,
+                metadata={"needs_clarification": True, "round": clarification_round},
+            )
+            return
+
+        # Safety: never leak a raw sentinel to the user (e.g. the model emitted it
+        # on the final round, where clarification is disabled).
+        if NEED_CLARIFICATION_SENTINEL in full_response:
+            full_response = full_response.replace(NEED_CLARIFICATION_SENTINEL, "").lstrip(":- \n").strip()
+            if not full_response:
+                full_response = "Pode me dar um pouco mais de detalhe sobre o que você quer saber?"
 
         # Save assistant response
         t0_save = time.monotonic()
@@ -1500,28 +1654,73 @@ class AIService:
                 user_id=user_id,
                 extra=extra,
             )
-            final_text = result.message if result.ok else f"Erro no Home Assistant: {result.message}"
         except Exception as e:
             logger.exception("Home Assistant execution failed")
-            final_text = f"Erro ao processar pedido do Home Assistant: {str(e)}"
+            result = None
+            ha_error = str(e)
+        else:
+            ha_error = None
 
-        await self.sessions.add_message(
-            session_id=session_id,
-            role="assistant",
-            content=final_text,
-            generate_embedding=False,
-            user_id=user_id,
-        )
+        # Skill succeeded with an actionable command → persist the HA reply.
+        if result is not None and result.ok:
+            final_text = result.message
+            await self.sessions.add_message(
+                session_id=session_id,
+                role="assistant",
+                content=final_text,
+                generate_embedding=False,
+                user_id=user_id,
+            )
+            if slog:
+                slog.log_final_response(final_text, "HOME_ASSISTANT", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.HOME_ASSISTANT,
+                session_id=session_id,
+                message=final_text,
+                is_final=True,
+                iterations=1,
+            )
+            return
+
+        # No actionable command / all tools failed → don't dead-end and don't
+        # persist a raw "Erro no Home Assistant" turn (it poisons future context,
+        # cf. session 9d61bfba). Fall back to a normal conversational reply that
+        # can actually use the history to answer the user.
+        ha_outcome = ha_error or (result.message if result is not None else "sem resultado")
+        logger.info("[HA-FALLBACK] HA skill not actionable, delegating to direct_response: %s", ha_outcome)
         if slog:
-            slog.log_final_response(final_text, "HOME_ASSISTANT", iterations=1)
-
-        yield AIServiceResponse(
-            intent=IntentType.HOME_ASSISTANT,
-            session_id=session_id,
-            message=final_text,
-            is_final=True,
-            iterations=1,
+            slog.log_event(
+                "Home Assistant — fallback para resposta direta",
+                f"Resultado não acionável: {ha_outcome}",
+            )
+        ha_note = (
+            "## Contexto: tentativa de Home Assistant\n"
+            "A mensagem foi inicialmente roteada para o Home Assistant, mas não havia um "
+            "comando acionável (ou a ação não pôde ser executada). NÃO repita um erro genérico. "
+            "Responda à mensagem do usuário conversando normalmente e usando o histórico. "
+            "Se o usuário está perguntando sobre uma AÇÃO ANTERIOR (ex.: como você chegou a um "
+            "valor), explique com base no que aconteceu na conversa."
         )
+        fallback_decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.6,
+            explanation="Fallback de Home Assistant não acionável → resposta direta",
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        async for resp in self._handle_direct_response(
+            session_id,
+            user_message,
+            history,
+            fallback_decision,
+            trace,
+            system_context=ha_note,
+            slog=slog,
+            user_id=user_id,
+            metadata=metadata,
+        ):
+            yield resp
 
     # ---------------------------------------------------------------
     # Handler: CLIENT_TOOL — tools running on user's desktop

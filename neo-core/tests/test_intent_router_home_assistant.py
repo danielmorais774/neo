@@ -52,3 +52,19 @@ def test_parse_classification_maps_home_assistant_intent():
     decision = router._parse_classification(raw, user_message="acende a luz")
     assert decision.intent == IntentType.HOME_ASSISTANT
     assert decision.skill_name == "home_assistant"
+
+
+def test_referential_question_not_routed_to_home_assistant():
+    router = object.__new__(IntentRouter)
+    # Even with a fallback, a referential follow-up about a past HA action is a
+    # question, not a new command (session 9d61bfba misrouted this).
+    decision = router._fallback_classify("como tu chegou nessa conta de 22?")
+    assert decision.intent == IntentType.DIRECT_RESPONSE
+    assert decision.needs_memory is True
+
+
+def test_referential_question_detector():
+    assert IntentRouter._is_referential_question("como tu chegou nessa conta de 22?") is True
+    assert IntentRouter._is_referential_question("de onde veio isso?") is True
+    # A real HA command must not be caught by the referential guard.
+    assert IntentRouter._is_referential_question("acende a luz da sala") is False

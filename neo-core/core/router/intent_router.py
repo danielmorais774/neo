@@ -73,6 +73,23 @@ _DEVICE_KNOWLEDGE_TERMS = (
 # Back-reference pronouns for the correction turn ("quero os que você conhece").
 _BACKREF_PATTERN = re.compile(r"\b(os que|as que|aqueles|aquelas|esses|essas)\b")
 
+# Referential questions point back to an earlier turn via a demonstrative+
+# preposition contraction ("como tu chegou NESSA conta de 22?", "de onde veio
+# ISSO?"). The history may be full of HA/tool commands, but the user is *asking
+# about* a past action, not issuing a new one — so this must stay DIRECT_RESPONSE.
+_REFERENTIAL_DEMONSTRATIVES = (
+    "nessa", "nesse", "nesses", "nessas",
+    "desse", "dessa", "desses", "dessas", "disso", "disto",
+    "neste", "nesta", "nisto", "nisso",
+    "naquele", "naquela", "naquilo",
+    "porque disso", "por que disso", "pra que isso",
+    "de onde veio", "como voce chegou", "como tu chegou", "como chegou",
+)
+_INTERROGATIVE_STARTS = (
+    "como", "porque", "por que", "pq", "de onde", "quando",
+    "onde", "qual", "quanto", "quantos", "quanta", "quantas", "o que", "oq",
+)
+
 
 def _strip_accents(text: str) -> str:
     """Lowercase and remove PT accents for robust keyword matching."""
@@ -214,6 +231,14 @@ class IntentRouter:
         if self._is_known_devices_query(user_message, conversation_history):
             logger.info("Intent: known-devices query → DIRECT_RESPONSE (PKS, router bypass)")
             return self._known_devices_decision(user_message)
+
+        # Referential questions ("como tu chegou nessa conta de 22?") are asking
+        # ABOUT a past action, not requesting a new tool/HA action. Keep them on
+        # DIRECT_RESPONSE so context recovery runs, even when recent history is
+        # full of HA commands (session 9d61bfba misrouted this to HOME_ASSISTANT).
+        if self._is_referential_question(user_message):
+            logger.info("Intent: referential question → DIRECT_RESPONSE (router bypass)")
+            return self._referential_question_decision(user_message)
 
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
@@ -492,6 +517,31 @@ class IntentRouter:
         self._apply_memory_heuristics(decision, message)
         return decision
 
+    @staticmethod
+    def _is_referential_question(message: str) -> bool:
+        """True for an interrogative that points back to an earlier turn."""
+        normalized = _strip_accents(message)
+        compact = " ".join(normalized.split())
+        if not compact or len(compact) > 180:
+            return False
+        is_question = "?" in compact or compact.startswith(_INTERROGATIVE_STARTS)
+        if not is_question:
+            return False
+        return any(marker in compact for marker in _REFERENTIAL_DEMONSTRATIVES)
+
+    def _referential_question_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision for a referential follow-up question."""
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.85,
+            explanation="Pergunta referencial sobre algo anterior — resposta direta com contexto",
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
     def _memory_decision(self, message: str) -> RoutingDecision:
         """Direct-response decision for an explicit memory directive (no tools)."""
         decision = RoutingDecision(
@@ -523,6 +573,10 @@ class IntentRouter:
         # Known/registered-devices questions are a PKS query, not a live tool.
         if self._is_known_devices_query(message):
             return self._known_devices_decision(message)
+
+        # Referential follow-up questions stay on DIRECT_RESPONSE.
+        if self._is_referential_question(message):
+            return self._referential_question_decision(message)
 
         text = (message or "").lower()
         # Normalize accents

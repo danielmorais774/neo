@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any
 from uuid import UUID
 
@@ -276,8 +278,18 @@ class PKSService:
                                     )
                             examples_good = item.get("examples_good")
                             if isinstance(examples_good, list) and examples_good:
-                                preview = "; ".join(str(example) for example in examples_good[:3])
-                                lines.append(f"  - Exemplos bons: {preview}")
+                                # Verbatim examples are the main parroting hazard
+                                # (session 6794b3ba: the model copied the
+                                # "aspirador" example into an unrelated compliment
+                                # turn). Surface them ONLY when this rule's trigger
+                                # is contextually relevant, and label them as style
+                                # references — never scripts to repeat literally.
+                                if self._trigger_is_relevant(trigger, user_message):
+                                    preview = "; ".join(str(example) for example in examples_good[:3])
+                                    lines.append(
+                                        "  - Exemplos de TOM (referência de estilo — NÃO copie "
+                                        f"literalmente nem use fora do gatilho): {preview}"
+                                    )
                         continue
                     lines.append(f"- {key}: {item}")
                 continue
@@ -307,6 +319,47 @@ class PKSService:
             return True
         query_terms = {term for term in user_message.lower().split() if len(term) >= 4}
         return any(term in normalized for term in query_terms)
+
+    # Filler words carry no topical signal — excluded so a trigger's meta-words
+    # ("usuário", "frases", "quando"...) don't accidentally match any message.
+    _TRIGGER_STOPWORDS = frozenset(
+        {
+            "usuario", "usuarios", "frase", "frases", "quando", "como", "para",
+            "pelo", "pela", "uma", "uns", "umas", "com", "sem", "que", "isso",
+            "esse", "essa", "este", "esta", "mais", "menos", "meio", "fizer",
+            "fazer", "responder", "resposta", "respostas", "pedindo", "mandando",
+            "deve", "devem", "tratar", "entrar", "abrir", "seguida", "exemplo",
+            "exemplos", "etc", "ou", "e", "de", "do", "da", "no", "na", "em",
+            "ao", "os", "as", "um", "se", "por", "uma", "tipo", "algo", "mensagem",
+            "contexto", "contextual", "claramente", "especialmente", "geral",
+        }
+    )
+
+    @classmethod
+    def _trigger_is_relevant(cls, trigger: Any, user_message: str) -> bool:
+        """True when a trigger-rule's situation plausibly matches the message.
+
+        Trigger-specific verbatim examples must only surface when the current
+        message actually matches the trigger; otherwise the weak chat model
+        parrots them out of context. Errs toward withholding (precision): a
+        false negative just drops a canned example, while a false positive is
+        the exact bug we are fixing.
+        """
+        if not trigger:
+            return True  # no trigger → generally-applicable rule
+        if not user_message:
+            return False  # cannot confirm relevance → withhold verbatim examples
+        trigger_terms = cls._distinctive_terms(str(trigger))
+        message_terms = cls._distinctive_terms(user_message)
+        return bool(trigger_terms & message_terms)
+
+    @classmethod
+    def _distinctive_terms(cls, text: str) -> set[str]:
+        """Accent-stripped content words (len>=4, minus filler) from ``text``."""
+        normalized = unicodedata.normalize("NFD", text or "").lower()
+        normalized = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
+        terms = {t for t in re.findall(r"[a-z0-9]+", normalized) if len(t) >= 4}
+        return terms - cls._TRIGGER_STOPWORDS
 
     async def search_entities(self, *, user_id: UUID, query: str) -> list[dict[str, Any]]:
         workspace_id = await self.bootstrap.ensure_workspace(user_id)

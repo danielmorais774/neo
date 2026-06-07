@@ -10,6 +10,7 @@ Responsabilidades:
 from __future__ import annotations
 
 import logging
+import re
 import unicodedata
 from datetime import datetime, timedelta
 from typing import Any, TYPE_CHECKING
@@ -301,6 +302,21 @@ class PersistentSessionManager:
             base["duration_ms"] = (_time.monotonic() - t0) * 1000
             return base
 
+        # Referential follow-ups ("como tu chegou nessa conta de 22?") depend on
+        # the current topic — rotating would orphan the very context they need.
+        # Embeddings can't see this (low lexical overlap), so guard lexically.
+        recent_for_dep = await self.db.fetch_session_messages(session.id, limit=6)
+        recent_text = " ".join(
+            m.content for m in recent_for_dep if m.role in ("user", "assistant")
+        )
+        dependency = self.detect_context_dependency(new_message, recent_context=recent_text)
+        if dependency["is_context_dependent"]:
+            base["reason"] = (
+                f"follow-up dependente de contexto ({dependency['kind']}) — não rotacionar"
+            )
+            base["duration_ms"] = (_time.monotonic() - t0) * 1000
+            return base
+
         # Time-based cooldown: don't rotate if session was active recently.
         cooldown = base["cooldown_minutes"]
         if cooldown > 0 and session.last_activity_at:
@@ -441,19 +457,28 @@ class PersistentSessionManager:
         if not detection["is_context_dependent"]:
             return result
 
-        previous_session_id = (session.extra_metadata or {}).get(
-            "created_after_expired_session_id"
+        # A new session created by core (either inactivity expiration or a topic
+        # rotation) keeps a link to its predecessor. A context-dependent follow-up
+        # right after that boundary must inherit the previous conversation.
+        meta = session.extra_metadata or {}
+        previous_session_id = meta.get("created_after_expired_session_id") or meta.get(
+            "created_after_rotated_session_id"
         )
         if previous_session_id:
             history = await self._history_from_previous_session(previous_session_id)
             if history:
+                reason = (
+                    "rotated_session_continuity"
+                    if meta.get("created_after_rotated_session_id")
+                    else "expired_session_continuity"
+                )
                 result.update(
                     {
                         "action": "inject",
                         "confidence": max(0.9, float(detection["confidence"])),
                         "history": history,
                         "source_session_id": previous_session_id,
-                        "reason": "expired_session_continuity",
+                        "reason": reason,
                     }
                 )
                 return result
@@ -502,8 +527,18 @@ class PersistentSessionManager:
         return result
 
     @classmethod
-    def detect_context_dependency(cls, message: str) -> dict[str, Any]:
-        """Detect messages that cannot be answered safely without prior context."""
+    def detect_context_dependency(
+        cls,
+        message: str,
+        recent_context: str | None = None,
+    ) -> dict[str, Any]:
+        """Detect messages that cannot be answered safely without prior context.
+
+        ``recent_context`` (optional) is a concatenation of recent turns used to
+        spot numeric back-references (a number in the message that only makes
+        sense relative to something said earlier, e.g. "como chegou nessa conta
+        de 22?" after the A/C was set to 22°C).
+        """
         normalized = cls._normalize_context_text(message)
         compact = " ".join(normalized.split())
         if not compact:
@@ -583,6 +618,49 @@ class PersistentSessionManager:
                 "confidence": 0.74,
                 "reason": "referential_or_dissatisfaction_marker",
             }
+
+        # Referential questions: an interrogative that points back to an earlier
+        # turn via a demonstrative+preposition contraction ("como tu chegou
+        # NESSA conta de 22?", "de onde veio ISSO?", "por que DISSO?"). These have
+        # low embedding overlap with the prior turns, so they must be caught
+        # lexically — otherwise they get misread as a brand-new topic.
+        demonstrative_markers = (
+            "nessa", "nesse", "nesses", "nessas",
+            "desse", "dessa", "desses", "dessas", "disso", "disto",
+            "neste", "nesta", "nisto", "nisso",
+            "naquele", "naquela", "naquilo",
+            "porque disso", "por que disso", "pra que isso",
+            "de onde veio", "como voce chegou", "como tu chegou", "como chegou",
+        )
+        interrogative_starts = (
+            "como", "porque", "por que", "pq", "de onde", "quando",
+            "onde", "qual", "quanto", "quantos", "quanta", "quantas", "o que", "oq",
+        )
+        is_question = "?" in compact or compact.startswith(interrogative_starts)
+        if len(compact) <= 180 and is_question and any(
+            marker in compact for marker in demonstrative_markers
+        ):
+            return {
+                "is_context_dependent": True,
+                "kind": "referential_question",
+                "confidence": 0.78,
+                "reason": "referential_question_demonstrative",
+            }
+
+        # Numeric back-reference: a question that cites a number which already
+        # appeared in the recent conversation ("...conta de 22?" after 22°C).
+        if recent_context and len(compact) <= 180 and is_question:
+            msg_numbers = set(re.findall(r"\d+", compact))
+            ctx_numbers = set(
+                re.findall(r"\d+", cls._normalize_context_text(recent_context))
+            )
+            if msg_numbers and (msg_numbers & ctx_numbers):
+                return {
+                    "is_context_dependent": True,
+                    "kind": "referential_question",
+                    "confidence": 0.72,
+                    "reason": "numeric_back_reference",
+                }
 
         return {
             "is_context_dependent": False,
