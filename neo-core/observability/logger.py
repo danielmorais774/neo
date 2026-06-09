@@ -47,6 +47,7 @@ class MessageTrace:
         self.context_recovery: list[dict[str, Any]] = []
         self.llm_calls: list[dict[str, Any]] = []
         self.tool_calls: list[dict[str, Any]] = []
+        self.pipeline_steps: list[dict[str, Any]] = []
         self.final_response: str | None = None
         self.error: str | None = None
         self._finished = False
@@ -128,6 +129,26 @@ class MessageTrace:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+    def add_pipeline_step(
+        self,
+        index: int,
+        intent: str,
+        origin: str,
+        input_text: str,
+        final_text: str | None = None,
+        handoffs: list[str] | None = None,
+    ) -> None:
+        """Record one orchestrator step (chain element) for the debug panel."""
+        self.pipeline_steps.append({
+            "index": index,
+            "intent": intent,
+            "origin": origin,
+            "input": (input_text or "")[:500],
+            "final_text": (final_text or "")[:500] if final_text else None,
+            "handoffs": handoffs or [],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
     def add_tool_call(
         self,
         tool_name: str,
@@ -168,6 +189,8 @@ class MessageTrace:
             doc["topic_rotation"] = self.topic_rotation
         if self.context_recovery:
             doc["context_recovery"] = self.context_recovery
+        if self.pipeline_steps:
+            doc["pipeline_steps"] = self.pipeline_steps
         return doc
 
 

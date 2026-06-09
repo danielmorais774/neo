@@ -33,11 +33,21 @@ class MessageType(str, Enum):
 class IntentType(str, Enum):
     """Tipo de intenção classificada pelo router."""
 
-    DIRECT_RESPONSE = "direct_response"
+    # The cognitive core (the "cérebro"): the path that reasons over the
+    # PKS/context and may hand off to skills. Canonical name + value as of the
+    # Phase 5 migration.
+    COGNITIVE = "cognitive"
     SERVER_TOOL = "server_tool"
     CLIENT_TOOL = "client_tool"
     WHATSAPP_MESSAGING = "whatsapp_messaging"
     HOME_ASSISTANT = "home_assistant"
+
+    # Backward-compat alias: the old name/value was "direct_response". It now
+    # resolves to COGNITIVE (value "cognitive"), so the ~60 existing references and
+    # any client sending force_intent="DIRECT_RESPONSE" keep working. Historical
+    # trace/DB rows that stored the literal "direct_response" are display-only —
+    # nothing reconstructs IntentType from that string — so no data migration runs.
+    DIRECT_RESPONSE = "cognitive"
 
 
 class MissionStatus(str, Enum):
@@ -176,6 +186,19 @@ class AgentStep(BaseModel):
 # Router / Intent
 # ---------------------------------------------------------------------------
 
+class PipelineStepSpec(BaseModel):
+    """One step of a declared cascade (Phase 4 — Modo B).
+
+    The classifier emits a ``pipeline_plan`` of these when a message contains
+    multiple INDEPENDENT actions ("apaga as luzes E manda um whatsapp"). Each spec
+    is expanded into a ``PipelineStep`` by the orchestrator seed.
+    """
+
+    intent: IntentType
+    input_text: str
+    skill_name: str | None = None
+
+
 class RoutingDecision(BaseModel):
     """Decisão do IntentRouter sobre como processar uma mensagem.
 
@@ -197,6 +220,11 @@ class RoutingDecision(BaseModel):
     # --- complexity assessment (avoids separate should_create_plan LLM call) ---
     needs_plan: bool = False  # True when 2+ steps with dependencies are needed
     tipo_tarefa: str = "simples"  # simples | multi_etapas | analitica | criacao
+
+    # --- Phase 4: declared cascade (Modo B) ---
+    # When the message has 2+ INDEPENDENT actions, the classifier fills this with
+    # the ordered steps; the orchestrator runs them as a chain. None → single step.
+    pipeline_plan: list[PipelineStepSpec] | None = None
 
     # --- classifier observability (optional) ---
     classifier_raw: str | None = None  # raw LLM/text response from classifier

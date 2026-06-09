@@ -22,6 +22,10 @@ from core.agent.agent_executor import AgentExecutor
 from core.agent.context_selector import PromptContextSelector
 from core.llm.router import LLMRouter
 from core.pks import PKSService
+from core.pipeline.handoff_parser import extract_handoffs
+from core.pipeline.orchestrator import PipelineOrchestrator
+from core.pipeline.policy import handoff_requires_confirmation
+from core.pipeline.types import Handoff, PipelineStep, StepOutcome
 from core.planning.plan_manager import ExecutionPlan, PlanManager, PlanStep
 from core.router.intent_router import IntentRouter
 from core.session.session_manager import PersistentSessionManager
@@ -89,6 +93,28 @@ _CLARIFICATION_FINAL_ROUND = (
     "## Importante\n"
     f"NÃO use `{NEED_CLARIFICATION_SENTINEL}` desta vez. Você já pediu esclarecimento antes; "
     "dê a melhor resposta definitiva possível com a informação disponível."
+)
+
+
+# Pipeline handoff (Phase 2): the cognitive core may decide, after reasoning over
+# the PKS/context, that a concrete action must run via a skill. It appends a control
+# block that the user never sees; the orchestrator parses it and chains the skill.
+_HANDOFF_INSTRUCTION = (
+    "## Acionar uma skill (handoff)\n"
+    "Você é o núcleo cognitivo do Neo. Se, DEPOIS de analisar o contexto/PKS, você "
+    "concluir que uma AÇÃO concreta deve ser executada agora por uma skill, escreva "
+    "normalmente sua resposta ao usuário e, ao FINAL, adicione um bloco de controle "
+    "(que o usuário NÃO vê):\n"
+    "[[HANDOFF:home_assistant]]<ordem imperativa, limpa e auto-contida>[[/HANDOFF]]\n\n"
+    "Skills disponíveis:\n"
+    "- `home_assistant`: controlar a casa (luzes, tomadas, clima, persianas, cenas).\n"
+    "- `whatsapp_messaging`: enviar mensagem de WhatsApp (passa por confirmação).\n\n"
+    "Regras:\n"
+    "- O texto dentro do bloco deve ser uma ordem COMPLETA e sem ambiguidade "
+    "(ex.: \"ligar o ar-condicionado do quarto\"), porque a skill NÃO vê esta conversa.\n"
+    "- Só emita o bloco se a ação realmente deve acontecer agora — inclusive quando o "
+    "usuário condiciona (\"se eu costumo, pode ligar\") e o contexto confirma que sim.\n"
+    "- Se não há nada a executar, não escreva nenhum bloco."
 )
 
 
@@ -490,7 +516,7 @@ class AIService:
                 generate_embedding=False,
                 user_id=user_id,
             )
-            slog.log_final_response(clarification, "DIRECT_RESPONSE", iterations=1)
+            slog.log_final_response(clarification, "COGNITIVE", iterations=1)
             yield AIServiceResponse(
                 intent=IntentType.DIRECT_RESPONSE,
                 session_id=sid,
@@ -590,11 +616,12 @@ class AIService:
                 "[INTENT-OVERRIDE] active whatsapp mission follow-up mission=%s",
                 active_whatsapp_mission.id,
             )
-        elif _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "SERVER_TOOL"):
+        elif _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "COGNITIVE", "SERVER_TOOL"):
             from shared.types import RoutingDecision as _RD
             _intent_map = {
                 "CLIENT_TOOL": IntentType.CLIENT_TOOL,
-                "DIRECT_RESPONSE": IntentType.DIRECT_RESPONSE,
+                "DIRECT_RESPONSE": IntentType.DIRECT_RESPONSE,  # alias → COGNITIVE
+                "COGNITIVE": IntentType.COGNITIVE,
                 "SERVER_TOOL": IntentType.SERVER_TOOL,
             }
             decision = _RD(
@@ -655,7 +682,29 @@ class AIService:
         final_response: str | None = None
         dispatch_error: str | None = None
         try:
-            if decision.intent == IntentType.DIRECT_RESPONSE:
+            if self.settings.pipeline_orchestrator_enabled:
+                # Dispatch via PipelineOrchestrator. Phase 1: a single seeded step,
+                # no handoffs → identical behaviour to the legacy path below.
+                async for resp in self._run_pipeline(
+                    decision=decision,
+                    user_message=user_message,
+                    history=history,
+                    sid=sid,
+                    trace=trace,
+                    sys_context=sys_context,
+                    slog=slog,
+                    user_id=user_id,
+                    metadata=metadata,
+                    saved_msg=saved_msg,
+                    allow_clarification=allow_clarification,
+                    clarification_round=clarification_round,
+                ):
+                    if resp.is_final:
+                        final_response = resp.message
+                    yield resp
+
+            # --- Legacy inline dispatch (kept for instant rollback via flag) ---
+            elif decision.intent == IntentType.DIRECT_RESPONSE:
                 async for resp in self._handle_direct_response(
                     sid,
                     user_message,
@@ -730,6 +779,182 @@ class AIService:
                 obs.finish_trace(trace, response=final_response, error=dispatch_error)
 
     # ---------------------------------------------------------------
+    # Pipeline orchestration (Phase 1: single-step chains)
+    # ---------------------------------------------------------------
+
+    def _seed_steps(
+        self, decision: RoutingDecision, user_message: str
+    ) -> list[PipelineStep]:
+        """Build the initial step queue from a routing decision.
+
+        Single step mirroring the classified intent — unless the classifier
+        declared a cascade (Phase 4, ``pipeline_plan``), which expands into N
+        independent classifier-origin steps run in order.
+        """
+        plan = decision.pipeline_plan
+        if plan and len(plan) >= 2 and self.settings.pipeline_cascade_enabled:
+            steps: list[PipelineStep] = []
+            for spec in plan:
+                steps.append(
+                    PipelineStep(
+                        intent=spec.intent,
+                        input_text=spec.input_text,
+                        skill_name=spec.skill_name,
+                        decision=RoutingDecision(
+                            intent=spec.intent,
+                            confidence=decision.confidence,
+                            skill_name=spec.skill_name,
+                            needs_memory=True,
+                            needs_plan=False,
+                            requires_approval=False,
+                            explanation="Cascade step (plano declarado pelo router)",
+                        ),
+                        origin="classifier",
+                        depth=0,
+                    )
+                )
+            logger.info("[PIPELINE] seeding declared cascade with %d steps", len(steps))
+            return steps
+
+        return [
+            PipelineStep(
+                intent=decision.intent,
+                input_text=user_message,
+                skill_name=decision.skill_name,
+                decision=decision,
+                origin="classifier",
+                depth=0,
+            )
+        ]
+
+    async def _run_pipeline(
+        self,
+        *,
+        decision: RoutingDecision,
+        user_message: str,
+        history: list[dict[str, str]],
+        sid: UUID,
+        trace: "MessageTrace | None",
+        sys_context: str | None,
+        slog: "SessionFileLogger | None",
+        user_id: UUID | None,
+        metadata: dict[str, Any] | None,
+        saved_msg: Any,
+        allow_clarification: bool,
+        clarification_round: int,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Dispatch the turn through the PipelineOrchestrator.
+
+        The ``step_runner`` closure adapts each ``PipelineStep`` to the matching
+        ``_handle_*`` generator (whose signatures differ) and reports a
+        ``StepOutcome`` once the handler is exhausted. In Phase 1 no handoffs are
+        produced, so the orchestrator runs exactly one step.
+        """
+
+        handoff_enabled = self.settings.pipeline_handoff_enabled
+        pipeline_step_index = 0
+
+        async def _step_runner(
+            step: PipelineStep,
+        ) -> AsyncIterator[tuple[AIServiceResponse | None, StepOutcome | None]]:
+            nonlocal pipeline_step_index
+            # Branch on the STEP's intent (not the original decision): a handoff
+            # step targets a different pipeline than the classifier-seeded root.
+            intent = step.intent
+            msg = step.input_text
+            step_metadata = metadata
+
+            pipeline_step_index += 1
+            step_idx = pipeline_step_index
+            if slog:
+                slog.log_pipeline_step(step_idx, intent.value, step.origin, msg)
+
+            if step.decision is not None:
+                dec: RoutingDecision = step.decision  # classifier-seeded root
+            else:
+                # Synthesize a minimal decision for a handoff step + carry the
+                # original message in metadata for traceability (never for routing).
+                # Phase 6 safety gating: outward/irreversible targets (WhatsApp)
+                # must not auto-execute — flag for human confirmation. The skill's
+                # own mission flow enforces it; this makes the policy explicit.
+                gated = step.origin == "handoff" and handoff_requires_confirmation(intent)
+                dec = RoutingDecision(
+                    intent=intent,
+                    confidence=1.0,
+                    skill_name=step.skill_name,
+                    needs_memory=True,
+                    needs_plan=False,
+                    requires_approval=gated,
+                    explanation=f"Pipeline handoff step (origin={step.origin})",
+                )
+                step_metadata = {**(metadata or {}), "handoff_origin_message": user_message}
+                if gated and slog:
+                    slog.log_event(
+                        "Handoff — gating de segurança",
+                        f"Ação externa para `{intent.value}` exige confirmação humana "
+                        "(passa pelo fluxo de missão/confirmação da skill).",
+                    )
+
+            if intent == IntentType.DIRECT_RESPONSE:
+                gen = self._handle_direct_response(
+                    sid, msg, history, dec, trace, sys_context,
+                    slog=slog, user_id=user_id, metadata=step_metadata,
+                    source_message_id=str(saved_msg.id) if saved_msg else None,
+                    allow_clarification=allow_clarification,
+                    clarification_round=clarification_round,
+                    enable_handoff=handoff_enabled,
+                )
+            elif intent == IntentType.SERVER_TOOL:
+                gen = self._handle_server_tool(
+                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                )
+            elif intent == IntentType.CLIENT_TOOL:
+                gen = self._handle_client_tool(
+                    sid, msg, dec, trace, slog=slog, user_id=user_id, metadata=step_metadata,
+                )
+            elif intent == IntentType.WHATSAPP_MESSAGING:
+                gen = self._handle_whatsapp_messaging(
+                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    metadata=step_metadata,
+                    source_message_id=saved_msg.id if saved_msg else None,
+                )
+            elif intent == IntentType.HOME_ASSISTANT:
+                gen = self._handle_home_assistant(
+                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    metadata=step_metadata,
+                )
+            else:
+                yield None, StepOutcome(ok=True, final_text=None)
+                return
+
+            last_final: str | None = None
+            handoffs: list[Handoff] = []
+            async for resp in gen:
+                control = (resp.metadata or {}).get("__pipeline_handoffs__")
+                if control:
+                    # Internal control item — capture, never forward to the client.
+                    handoffs = control
+                    continue
+                if resp.is_final:
+                    last_final = resp.message
+                yield resp, None
+
+            if trace:
+                trace.add_pipeline_step(
+                    index=step_idx,
+                    intent=intent.value,
+                    origin=step.origin,
+                    input_text=msg,
+                    final_text=last_final,
+                    handoffs=[h.target_skill or h.target_intent.value for h in handoffs],
+                )
+            yield None, StepOutcome(ok=True, final_text=last_final, handoffs=handoffs)
+
+        orchestrator = PipelineOrchestrator(_step_runner)
+        async for resp in orchestrator.run(self._seed_steps(decision, user_message)):
+            yield resp
+
+    # ---------------------------------------------------------------
     # Handler: DIRECT_RESPONSE — conversational, no tools
     # ---------------------------------------------------------------
 
@@ -747,6 +972,7 @@ class AIService:
         source_message_id: str | None = None,
         allow_clarification: bool = True,
         clarification_round: int = 1,
+        enable_handoff: bool = False,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM.
 
@@ -879,6 +1105,11 @@ class AIService:
         else:
             messages.append(Message(role=MessageRole.SYSTEM, content=_CLARIFICATION_FINAL_ROUND))
 
+        # Phase 2: let the cognitive core hand off to a skill when it decides an
+        # action must run (e.g. "se eu costumo, pode ligar" → home_assistant).
+        if enable_handoff:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
+
         # ── Device identity: deterministic registration (no LLM transcription) ──
         # When the user explicitly asks to remember THIS device, persist its real
         # identity (device_id/hardware_id/OS from connection metadata) ourselves —
@@ -955,7 +1186,7 @@ class AIService:
             model_name = _req_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
 
             if slog:
-                slog.log_llm_request("DIRECT_RESPONSE", messages, model=model_name, provider=provider_name, temperature=0.9)
+                slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
 
             full_response = ""
             t0 = time.monotonic()
@@ -976,7 +1207,7 @@ class AIService:
                 full_response = "Desculpe, não consegui gerar uma resposta."
 
             if slog:
-                slog.log_llm_response("DIRECT_RESPONSE", full_response, duration_ms=llm_ms, model=model_name)
+                slog.log_llm_response("COGNITIVE", full_response, duration_ms=llm_ms, model=model_name)
 
             # Log to observability (fire-and-forget)
             if trace:
@@ -997,7 +1228,7 @@ class AIService:
                     response_text=(full_response or '')[:1000],
                     duration_ms=round(llm_ms, 2),
                     temperature=0.9,
-                    stage="direct_response",
+                    stage="cognitive",
                 )
 
         except Exception as e:
@@ -1038,7 +1269,7 @@ class AIService:
                     "Loop de Clarificação",
                     f"Round {clarification_round}: pedindo esclarecimento ao usuário.\n\n> {clar_question}",
                 )
-                slog.log_final_response(clar_question, "DIRECT_RESPONSE", iterations=1)
+                slog.log_final_response(clar_question, "COGNITIVE", iterations=1)
             yield AIServiceResponse(
                 intent=IntentType.DIRECT_RESPONSE,
                 session_id=session_id,
@@ -1055,6 +1286,28 @@ class AIService:
             full_response = full_response.replace(NEED_CLARIFICATION_SENTINEL, "").lstrip(":- \n").strip()
             if not full_response:
                 full_response = "Pode me dar um pouco mais de detalhe sobre o que você quer saber?"
+
+        # Pipeline handoff (Phase 2): pull any [[HANDOFF:skill]] block out of the
+        # reply. The block is always stripped (never leaks); the parsed handoffs are
+        # only acted on when this turn is allowed to chain. ``full_response`` is now
+        # the clean user-facing text — saved, yielded, and fed to the PKS planner.
+        pipeline_handoffs: list[Handoff] = []
+        if enable_handoff:
+            full_response, pipeline_handoffs = extract_handoffs(full_response)
+            if pipeline_handoffs and not full_response.strip():
+                # Model emitted only the directive — give a short acknowledgement.
+                full_response = "Ok, já cuido disso."
+            if pipeline_handoffs and slog:
+                slog.log_event(
+                    "Pipeline Handoff",
+                    "\n".join(
+                        f"- → {h.target_skill or h.target_intent.value}: {h.input_text}"
+                        for h in pipeline_handoffs
+                    ),
+                )
+        else:
+            # Defensive: strip a stray block even when handoffs are disabled.
+            full_response, _ = extract_handoffs(full_response)
 
         # Save assistant response
         t0_save = time.monotonic()
@@ -1074,7 +1327,7 @@ class AIService:
             slog.record_step_timing("LLM (resposta)", round(llm_ms, 1))
             slog.record_step_timing("Salvar resposta (DB)", save_ms)
             slog.log_message_saved("assistant", full_response, str(session_id))
-            slog.log_final_response(full_response, "DIRECT_RESPONSE", iterations=1)
+            slog.log_final_response(full_response, "COGNITIVE", iterations=1)
 
         # Yield final response FIRST — background tasks must never block the user-facing round-trip
         yield AIServiceResponse(
@@ -1186,6 +1439,18 @@ class AIService:
 
         asyncio.create_task(_bg_prefs())
         asyncio.create_task(_bg_pks())
+
+        # Internal control item: hand the parsed handoffs back to the orchestrator.
+        # ``message=None`` + the private metadata key make it non-user-facing; the
+        # step runner consumes it and never forwards it to the client.
+        if pipeline_handoffs:
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE,
+                session_id=session_id,
+                message=None,
+                is_final=False,
+                metadata={"__pipeline_handoffs__": pipeline_handoffs},
+            )
 
     # Device nouns/pronoun-references that signal the user is talking about the
     # machine they are connected from ("esse dispositivo", "este computador"…).

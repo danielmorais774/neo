@@ -18,6 +18,7 @@ from shared import (
     IntentType,
     Message,
     MessageRole,
+    PipelineStepSpec,
     RoutingDecision,
 )
 
@@ -90,6 +91,28 @@ _INTERROGATIVE_STARTS = (
     "onde", "qual", "quanto", "quantos", "quanta", "quantas", "o que", "oq",
 )
 
+# Skill requests that are CONDITIONAL on the user's own habits/preferences — or
+# that ASK about them — must go to the cognitive core (DIRECT_RESPONSE) so it can
+# read the PKS and decide whether to hand off to a skill, instead of the cheap
+# router firing the skill blindly. Without this, "se eu costumo, pode ligar" was
+# misrouted straight to HOME_ASSISTANT, skipping the brain + PKS (session 6bb1d340).
+# Patterns run on accent-stripped, lowercased, whitespace-collapsed text.
+_HABIT_SELF_REF = (
+    "eu costumo", "costumo", "eu uso", "eu gosto", "gosto de", "eu prefiro",
+    "prefiro", "eu sempre", "eu geralmente", "geralmente eu", "normalmente eu",
+    "eu costumava", "costumava",
+)
+_CONDITIONAL_MARKERS = (
+    "se eu", "se voce achar", "se voce acha", "se fizer sentido", "se valer",
+    "caso eu", "se ja", "se for o caso",
+)
+# Question explicitly about the user's own preference/habit ("como eu gosto…",
+# "qual eu costumo…"). Excludes bland how-to/state questions ("qual a temperatura").
+_PREFERENCE_QUESTION = re.compile(
+    r"\b(como|o que|qual|quando|sera que)\b.*"
+    r"\b(gosto|costumo|prefiro|gostaria|costumava)\b"
+)
+
 
 def _strip_accents(text: str) -> str:
     """Lowercase and remove PT accents for robust keyword matching."""
@@ -143,7 +166,9 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 - `needs_memory=false` for greetings/acks ("oi", "ok", "valeu"); `true` for substantive topics
 - `knowledge_keywords`: up to 6 singular PT nouns from user message (devices, health, food, finance, etc.); `[]` for greetings
 - **Casa inteligente**: "acende/apaga/liga/desliga" luz/tomada, ajustar clima, ativar cena/script, abrir/fechar persiana → HOME_ASSISTANT (`skill_name="home_assistant"`). "dispositivos conectados/online" do Neo → SERVER_TOOL `list_connected_devices`. São coisas DIFERENTES.
+- **Imperativo direto vs. condicional/preferência**: só use HOME_ASSISTANT (ou qualquer skill) direto quando o pedido é uma ORDEM imperativa e clara ("acende a luz", "desliga o ar do quarto"). Se a ação DEPENDE do que o usuário COSTUMA fazer / de uma PREFERÊNCIA dele, ou vem como PERGUNTA sobre o hábito ("como eu gosto de usar o ar?", "se eu costumo, pode ligar", "se fizer sentido, liga"), use **DIRECT_RESPONSE** — o núcleo cognitivo lê o PKS e decide a ação. NÃO invente entity_id a partir do texto.
 - `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL/WHATSAPP_MESSAGING/HOME_ASSISTANT
+- **Cascata (`pipeline_plan`)**: SOMENTE quando a mensagem tem 2+ ações CLARAMENTE INDEPENDENTES ligadas por "e"/"depois" ("apaga as luzes **e** manda um whatsapp pro porteiro"), preencha `pipeline_plan` com a lista ordenada de steps `{{intent, input, skill_name}}`, onde cada `input` é uma ordem imperativa, limpa e auto-contida. Em caso de UMA única ação, ou de ação condicional/baseada em hábito, **não** use `pipeline_plan` (deixe `null`). NÃO seja agressivo: na dúvida, `null`.
 
 ## Output — valid JSON only, no markdown:
 {{
@@ -158,8 +183,20 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "knowledge_keywords": [],
   "needs_plan": false,
   "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
-  "skill_name": "whatsapp_messaging, home_assistant or null"
+  "skill_name": "whatsapp_messaging, home_assistant or null",
+  "pipeline_plan": null
 }}
+
+## pipeline_plan — exemplo (cascata, 2+ ações independentes)
+
+User: "apaga todas as luzes da casa e manda um whatsapp pro porteiro avisando que vou dormir"
+→ intent: "HOME_ASSISTANT" (a primeira ação), e:
+  "pipeline_plan": [
+    {{"intent": "HOME_ASSISTANT", "input": "apagar todas as luzes da casa", "skill_name": "home_assistant"}},
+    {{"intent": "WHATSAPP_MESSAGING", "input": "avisar o porteiro que vou dormir", "skill_name": "whatsapp_messaging"}}
+  ]
+
+User: "acende a luz da sala" → "pipeline_plan": null (uma ação só)
 
 ## WHATSAPP_MESSAGING — exemplos de extração
 
@@ -182,6 +219,11 @@ User: "desliga as luzes do quarto" → intent: HOME_ASSISTANT, skill_name: "home
 User: "qual a temperatura do termostato?" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
 User: "ativa o modo cinema" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
 User: "quais dispositivos estão conectados agora?" → intent: SERVER_TOOL, tool_name: "list_connected_devices" (NÃO é HOME_ASSISTANT)
+
+# Condicional/baseado em hábito ou pergunta sobre preferência → DIRECT_RESPONSE (núcleo cognitivo)
+User: "se eu costumo usar o ar nas quintas, pode ligar" → intent: DIRECT_RESPONSE (ação condicional baseada em hábito → o cérebro lê o PKS e decide)
+User: "como eu gosto de deixar a temperatura do quarto à noite?" → intent: DIRECT_RESPONSE (pergunta sobre preferência)
+User: "se fizer sentido pra minha rotina, liga o ar" → intent: DIRECT_RESPONSE (depende do PKS)
 """
 
 
@@ -239,6 +281,13 @@ class IntentRouter:
         if self._is_referential_question(user_message):
             logger.info("Intent: referential question → DIRECT_RESPONSE (router bypass)")
             return self._referential_question_decision(user_message)
+
+        # Conditional/habit-based actions and preference questions go to the
+        # cognitive core so it can read the PKS and decide whether to hand off to
+        # a skill — instead of the cheap router firing the skill blindly.
+        if self._is_brain_reasoning_request(user_message):
+            logger.info("Intent: conditional/preference request → DIRECT_RESPONSE (cognitive core, router bypass)")
+            return self._brain_reasoning_decision(user_message)
 
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
@@ -369,6 +418,7 @@ class IntentRouter:
         intent_str = data.get("intent", "DIRECT_RESPONSE").upper()
         intent_map = {
             "DIRECT_RESPONSE": IntentType.DIRECT_RESPONSE,
+            "COGNITIVE": IntentType.COGNITIVE,
             "SERVER_TOOL": IntentType.SERVER_TOOL,
             "CLIENT_TOOL": IntentType.CLIENT_TOOL,
             "WHATSAPP_MESSAGING": IntentType.WHATSAPP_MESSAGING,
@@ -381,6 +431,8 @@ class IntentRouter:
         knowledge_keywords: list[str] | None = None
         if isinstance(raw_keywords, list):
             knowledge_keywords = [str(k).lower().strip() for k in raw_keywords if k] or None
+
+        pipeline_plan = self._parse_pipeline_plan(data.get("pipeline_plan"), intent_map)
 
         decision = RoutingDecision(
             intent=intent,
@@ -395,8 +447,42 @@ class IntentRouter:
             needs_plan=data.get("needs_plan", False),
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
             skill_name=data.get("skill_name"),
+            pipeline_plan=pipeline_plan,
         )
         return decision
+
+    @staticmethod
+    def _parse_pipeline_plan(
+        raw_plan: Any, intent_map: dict[str, IntentType]
+    ) -> list[PipelineStepSpec] | None:
+        """Validate a declared cascade (Phase 4). Conservative: needs 2+ valid steps.
+
+        Each entry must map to a known intent and carry a non-empty input. Anything
+        malformed is dropped; if fewer than 2 valid steps remain, the plan is
+        ignored entirely (falls back to the single classified intent).
+        """
+        if not isinstance(raw_plan, list) or len(raw_plan) < 2:
+            return None
+        specs: list[PipelineStepSpec] = []
+        for item in raw_plan:
+            if not isinstance(item, dict):
+                continue
+            step_intent = intent_map.get(str(item.get("intent", "")).upper())
+            input_text = str(item.get("input") or item.get("input_text") or "").strip()
+            if step_intent is None or not input_text:
+                continue
+            skill_name = item.get("skill_name") or None
+            specs.append(
+                PipelineStepSpec(
+                    intent=step_intent,
+                    input_text=input_text,
+                    skill_name=skill_name,
+                )
+            )
+        if len(specs) < 2:
+            return None
+        logger.info("Router: declared cascade with %d steps", len(specs))
+        return specs
 
     @staticmethod
     def _extract_embedded_json(text: str) -> str | None:
@@ -542,6 +628,50 @@ class IntentRouter:
         self._apply_memory_heuristics(decision, message)
         return decision
 
+    @classmethod
+    def _is_brain_reasoning_request(cls, message: str) -> bool:
+        """True when a request must go to the cognitive core (DIRECT_RESPONSE).
+
+        Two cases the cheap router otherwise mis-fires as a direct skill call:
+          (a) an action CONDITIONED on the user's own habit/preference
+              — "se eu costumo, pode ligar", "se eu uso, liga o ar";
+          (b) a QUESTION about the user's own preference/habit
+              — "como eu gosto de deixar a temperatura à noite?".
+        The brain then reads the PKS and decides whether to hand off to a skill.
+        """
+        normalized = _strip_accents(message)
+        compact = " ".join(normalized.split())
+        if not compact:
+            return False
+        # (a) conditional that depends on the user's own habit/preference.
+        has_conditional = any(m in compact for m in _CONDITIONAL_MARKERS)
+        has_self_habit = any(h in compact for h in _HABIT_SELF_REF)
+        if has_conditional and has_self_habit:
+            return True
+        # (b) explicit question about the user's own preference/habit.
+        if "?" in message and _PREFERENCE_QUESTION.search(compact):
+            return True
+        return False
+
+    def _brain_reasoning_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision so the cognitive core reasons over the PKS.
+
+        It may then emit a [[HANDOFF:skill]] block to run the actual action.
+        """
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.9,
+            explanation=(
+                "Ação condicional/baseada em hábito ou pergunta sobre preferência "
+                "→ núcleo cognitivo (lê o PKS e decide o handoff)"
+            ),
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
     def _memory_decision(self, message: str) -> RoutingDecision:
         """Direct-response decision for an explicit memory directive (no tools)."""
         decision = RoutingDecision(
@@ -577,6 +707,10 @@ class IntentRouter:
         # Referential follow-up questions stay on DIRECT_RESPONSE.
         if self._is_referential_question(message):
             return self._referential_question_decision(message)
+
+        # Conditional/habit-based actions and preference questions → cognitive core.
+        if self._is_brain_reasoning_request(message):
+            return self._brain_reasoning_decision(message)
 
         text = (message or "").lower()
         # Normalize accents

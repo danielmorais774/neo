@@ -379,6 +379,17 @@ class SessionFileLogger:
         self._write(f"- **Sessão:** `{session_id}`\n")
         self._write(f"- **Conteúdo:** {content_preview}\n\n")
 
+    def log_pipeline_step(
+        self,
+        index: int,
+        intent: str,
+        origin: str,
+        input_text: str,
+    ) -> None:
+        """Header marking the start of one orchestrator step (chain element)."""
+        self._write(f"### 🔗 Pipeline — Step {index} (`{intent}`, origem `{origin}`)\n\n")
+        self._write(f"- **Input do step:** {input_text}\n\n")
+
     def log_event(self, title: str, details: Any = "") -> None:
         """Log a generic event."""
         self._write(f"### {title}\n\n")

@@ -51,6 +51,24 @@ class Settings(BaseSettings):
         description="Global agent timeout in seconds",
     )
 
+    # Pipeline orchestrator (chaining of feature pipelines — cascade/handoff)
+    pipeline_orchestrator_enabled: bool = Field(
+        default=True,
+        description="Route intent dispatch through PipelineOrchestrator (Phase 1+). "
+        "Set false for instant rollback to the legacy inline if/elif dispatch.",
+    )
+    pipeline_handoff_enabled: bool = Field(
+        default=True,
+        description="Phase 2: let the cognitive core (DIRECT_RESPONSE) emit "
+        "[[HANDOFF:skill]] blocks that chain a follow-up pipeline. Requires "
+        "pipeline_orchestrator_enabled. Set false to disable runtime handoffs.",
+    )
+    pipeline_cascade_enabled: bool = Field(
+        default=True,
+        description="Phase 4: expand the classifier's declared pipeline_plan into "
+        "a multi-step cascade. Set false to ignore pipeline_plan (single step).",
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://neo:neo@localhost:5432/neodb",
