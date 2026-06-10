@@ -96,6 +96,47 @@ _CLARIFICATION_FINAL_ROUND = (
 )
 
 
+# Memory-verification questions ("tu salvou mesmo?", "tá no PKS?", "não parece que
+# foi incluído") must be answered from an ACTIVE PKS read, never from the chat
+# history (where the assistant may have wrongly claimed success). Detected
+# deterministically; the real search results are injected into the prompt.
+_MEMORY_VERIFICATION_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"\bsalvou\s+mesmo\b",
+        r"\b(ta|esta|estao|tao)\s+salv[oa]s?\b",
+        r"\bfoi\s+(salvo|salva|incluido|incluida|registrado|registrada|gravado|gravada)\b",
+        r"\bnao\s+(parece|foi|esta|ta)\s+.{0,30}(salv|inclu|registr|grav|anot)",
+        r"\b(verifica|olha|confere|checa|busca|procura)\w*\s+(no|na|o|a)?\s*\b(pks|memoria)\b",
+        r"\b(tem|ta|esta)\s+(no|na)\s+(pks|memoria|sua memoria)\b",
+        r"\btem\s+certeza\s+que\s+(salvou|registrou|anotou|gravou|guardou)\b",
+        r"\b(salvou|registrou|anotou|gravou|guardou)\s+(isso\s+)?(no|na)\s+(pks|memoria)\b\s*\?",
+    )
+]
+
+_MEMORY_VERIFICATION_NOTE_HEADER = "## Verificação ativa do PKS (search_pks)"
+
+# Words stripped from the user's question before using it as a search query.
+_VERIFICATION_STOPWORDS = frozenset({
+    "tu", "voce", "você", "salvou", "salvo", "salva", "mesmo", "mesma", "sera",
+    "que", "nao", "não", "parece", "foi", "incluido", "incluído", "inluido",
+    "pks", "memoria", "memória", "olha", "olhei", "dei", "uma", "olhada", "seu",
+    "sua", "no", "na", "o", "a", "de", "do", "da", "e", "eu", "verifica",
+    "confere", "checa", "tem", "certeza", "registrou", "anotou", "gravou",
+    "guardou", "isso", "aquilo", "la", "lá", "ta", "tá", "esta", "está",
+})
+
+
+def _is_memory_verification_request(text: str) -> bool:
+    """True when the user is questioning whether something was really saved."""
+    normalized = "".join(
+        c for c in unicodedata.normalize("NFD", (text or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    normalized = " ".join(normalized.split())
+    return any(p.search(normalized) for p in _MEMORY_VERIFICATION_PATTERNS)
+
+
 # Pipeline handoff (Phase 2): the cognitive core may decide, after reasoning over
 # the PKS/context, that a concrete action must run via a skill. It appends a control
 # block that the user never sees; the orchestrator parses it and chains the skill.
@@ -1035,6 +1076,19 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PKS] Failed pre-response bootstrap/write: {e}", exc_info=True)
 
+        # Active memory verification: when the user questions whether something was
+        # really saved, run search_pks NOW and inject the real results — the model
+        # must answer from them, never from its own prior "salvei" in the history.
+        verification_note: str | None = None
+        if self.pks and user_id and _is_memory_verification_request(user_message):
+            verification_note = await self._build_pks_verification_note(
+                user_message=user_message,
+                history=history,
+                decision=decision,
+                user_id=user_id,
+                slog=slog,
+            )
+
         if slog:
             slog.log_context_recovery(recovered_context or [])
         if trace:
@@ -1109,6 +1163,11 @@ class AIService:
         # action must run (e.g. "se eu costumo, pode ligar" → home_assistant).
         if enable_handoff:
             messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
+
+        # Active PKS verification results (real search output) — overrides any
+        # claim made earlier in the conversation history.
+        if verification_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=verification_note))
 
         # ── Device identity: deterministic registration (no LLM transcription) ──
         # When the user explicitly asks to remember THIS device, persist its real
@@ -1452,6 +1511,101 @@ class AIService:
                 metadata={"__pipeline_handoffs__": pipeline_handoffs},
             )
 
+    async def _build_pks_verification_note(
+        self,
+        *,
+        user_message: str,
+        history: list[dict[str, str]],
+        decision: RoutingDecision,
+        user_id: UUID,
+        slog: "SessionFileLogger | None",
+    ) -> str | None:
+        """Run search_pks for a memory-verification question and render the results.
+
+        Queries come from the classifier's knowledge_keywords plus the content
+        words of the question itself (and of the previous user turn, which usually
+        holds what was supposedly saved). Returns a system-prompt block with the
+        REAL results — or an explicit "nothing found" — that the model must answer
+        from. Errors degrade to None (never block the reply).
+        """
+        queries: list[str] = []
+        for kw in decision.knowledge_keywords or []:
+            if kw and kw not in queries:
+                queries.append(kw)
+
+        def _content_words(text: str) -> str:
+            words = [
+                w for w in re.findall(r"[\wÀ-ÿ-]+", (text or "").lower())
+                if len(w) > 2 and w not in _VERIFICATION_STOPWORDS
+            ]
+            return " ".join(words[:6])
+
+        own = _content_words(user_message)
+        if own and own not in queries:
+            queries.append(own)
+        # The previous user turn usually contains what was supposedly saved.
+        prev_user = next(
+            (m.get("content", "") for m in reversed(history[:-1] if history else [])
+             if m.get("role") == "user"),
+            "",
+        )
+        prev = _content_words(prev_user)
+        if prev and prev not in queries:
+            queries.append(prev)
+
+        # No extractable terms → we didn't actually search anything; claiming
+        # "nothing found" would be as dishonest as the bug being fixed.
+        if not queries:
+            return None
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            for query in queries[:4]:
+                rows = await self.pks.search_entities(user_id=user_id, query=query)
+                for row in rows[:8]:
+                    key = str(row.get("name") or "") + str(row.get("entity_type") or "")
+                    if key and key not in seen:
+                        seen.add(key)
+                        results.append(row)
+        except Exception as e:
+            logger.warning("[PKS-VERIFY] search_pks failed: %s", e, exc_info=True)
+            return None
+
+        if slog:
+            slog.log_event(
+                "Verificação ativa do PKS (search_pks)",
+                f"Queries: {queries[:4]}\nEncontrados: {len(results)}",
+            )
+
+        lines = [
+            _MEMORY_VERIFICATION_NOTE_HEADER,
+            "O usuário está questionando se algo foi REALMENTE salvo. Acabei de buscar",
+            f"no PKS dele (queries: {', '.join(queries[:4]) or '—'}). Resultado REAL:",
+            "",
+        ]
+        if results:
+            for row in results[:10]:
+                name = row.get("name") or "?"
+                etype = row.get("entity_type") or "?"
+                props = row.get("properties") or {}
+                prop_preview = ", ".join(
+                    f"{k}={v}" for k, v in list(props.items())[:4]
+                ) if isinstance(props, dict) else ""
+                lines.append(f"- [{etype}] {name}" + (f" ({prop_preview})" if prop_preview else ""))
+        else:
+            lines.append("- NENHUM resultado encontrado para essas buscas.")
+        lines += [
+            "",
+            "Responda APENAS com base nestes resultados:",
+            "- Se o que o usuário pergunta NÃO aparece acima, ADMITA que não está salvo",
+            "  (mesmo que você tenha dito antes que salvou — aquilo estava errado) e",
+            "  ofereça salvar agora.",
+            "- Se aparece, confirme citando o que está registrado.",
+            "- NUNCA confirme com base apenas no histórico da conversa.",
+        ]
+        return "\n".join(lines)
+
     # Device nouns/pronoun-references that signal the user is talking about the
     # machine they are connected from ("esse dispositivo", "este computador"…).
     _DEVICE_REFERENCE_RE = re.compile(
@@ -1673,6 +1827,17 @@ class AIService:
                 devices_executor=DevicesExecutor(db=self.db),
                 user_id=user_id,
             )
+
+            # Scope search_pks to this user too (same per-request seam): the global
+            # pks_search executor refuses to run without a user_id.
+            try:
+                pks_search_exec = getattr(
+                    self.agent.tool_executor, "_module_executors", {}
+                ).get("pks_search")
+                if pks_search_exec is not None:
+                    pks_search_exec.set_context(user_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("[PKS-SEARCH] failed to scope user context", exc_info=True)
 
             # Safety net: don't let the server-tool agent run blind. Seed recent
             # history (so a second-turn correction is understood) and, when the

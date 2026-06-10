@@ -217,6 +217,12 @@ class RoutingDecision(BaseModel):
     knowledge_keywords: list[str] | None = None  # keywords for KG retrieval (classified by intent LLM)
     skill_name: str | None = None  # qual skill dispara (quando intent é uma skill)
 
+    # --- speech act (Workstream B — bias to brain) ---
+    # imperative | question | conditional | definition | chitchat.
+    # A side-effecting skill (HA/WhatsApp) is only fired on a confident imperative;
+    # everything else routes to the cognitive core.
+    speech_act: str = "imperative"
+
     # --- complexity assessment (avoids separate should_create_plan LLM call) ---
     needs_plan: bool = False  # True when 2+ steps with dependencies are needed
     tipo_tarefa: str = "simples"  # simples | multi_etapas | analitica | criacao

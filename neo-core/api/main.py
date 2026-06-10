@@ -130,6 +130,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _tool_registry.register_many(DESKTOP_TOOLS)      # client-side
     _tool_registry.register_many(WEATHER_TOOLS)       # server-side
     _tool_registry.register_many(DEVICES_TOOLS)       # server-side
+    from modules.pks_search import PKS_SEARCH_TOOLS, PKSSearchExecutor
+    _tool_registry.register_many(PKS_SEARCH_TOOLS)    # server-side
 
     # Register server-side module executors
     weather_executor = WeatherExecutor()
@@ -177,6 +179,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _pks = PKSService(db=_db, llm_router=_llm_router)
     context.set_pks_service(_pks)
     knowledge_graph.set_pks_service(_pks)
+
+    # search_pks executor needs the PKS service, so it's registered here (after
+    # creation). Per-request user scoping happens via set_context in AIService.
+    pks_search_executor = PKSSearchExecutor(pks_service=_pks)
+    _tool_executor.register_module_executor("pks_search", pks_search_executor)
     print("✅ PKS ready")
     system_pks = await _pks.ensure_system_pks()
     print(

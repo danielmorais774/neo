@@ -113,6 +113,22 @@ _PREFERENCE_QUESTION = re.compile(
     r"\b(gosto|costumo|prefiro|gostaria|costumava)\b"
 )
 
+# Tools owned by a skill — excluded from the router's tool palette (Workstream A).
+# The router routes to the SKILL via skill_name; the skill picks its own tools.
+_SKILL_OWNED_TOOL_PREFIXES = ("ha_", "whatsapp_")
+
+# Skills whose actions have side effects: they may ONLY be fired on a clear,
+# confident imperative. Anything conditional/definitional/uncertain about them is
+# routed to the cognitive core instead (Workstream B — bias to brain).
+_SIDE_EFFECT_SKILL_INTENTS = frozenset({
+    IntentType.HOME_ASSISTANT,
+    IntentType.WHATSAPP_MESSAGING,
+})
+
+_SPEECH_ACTS = frozenset({
+    "imperative", "question", "conditional", "definition", "chitchat",
+})
+
 
 def _strip_accents(text: str) -> str:
     """Lowercase and remove PT accents for robust keyword matching."""
@@ -137,7 +153,17 @@ ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI ass
   - pedidos comerciais (pizza, delivery, farmácia, mercado, encomendas)
   - mensagens para JID/telefone direto ("manda 'oi' para 5511988217222").
   Sempre extraia em `tool_arguments` os campos `text` (texto da mensagem) e `recipient` (JID, telefone OU apelido como "minha mãe", "pai", "Ana"). NÃO interprete o apelido — passe-o cru, o pipeline resolve buscando na agenda.
-- **HOME_ASSISTANT**: controlar ou consultar a casa inteligente do usuário via Home Assistant — luzes, tomadas/interruptores, clima/termostato, persianas, cenas, scripts e automações. Ex: "acende a luz da sala", "desliga as luzes do quarto", "qual a temperatura do termostato?", "ativa o modo cinema", "abre a persiana". Use `skill_name="home_assistant"`. NÃO confundir com `list_connected_devices` (que lista os dispositivos do PRÓPRIO Neo — desktop/celular — não os aparelhos da casa).
+- **HOME_ASSISTANT**: controlar ou consultar a casa inteligente do usuário via Home Assistant — luzes, tomadas/interruptores, clima/termostato, persianas, cenas, scripts e automações. Ex: "acende a luz da sala", "desliga as luzes do quarto", "qual a temperatura do termostato?", "ativa o modo cinema", "abre a persiana". É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*` nem preencha `entity_id`/`tool_arguments`; a skill resolve o dispositivo sozinha. Nunca invente entity_id. NÃO confundir com `list_connected_devices` (dispositivos do PRÓPRIO Neo — desktop/celular).
+
+## Ato de fala (decida ANTES do intent)
+Classifique o **ato de fala** e preencha `speech_act`:
+- `imperative` — ordem para fazer AGORA ("acende a luz", "manda um oi pra mãe").
+- `question` — pergunta ("qual o clima?", "que dispositivos eu tenho?").
+- `conditional` — ação condicionada a algo do usuário ("se eu costumo, pode ligar").
+- `definition` — definir/cadastrar uma regra/brincadeira/comportamento ("cadastra uma brincadeira: se eu te provocar, você pode desligar a luz").
+- `chitchat` — conversa, sem ação.
+
+REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=imperative` E você tem ALTA confiança. `conditional`, `definition`, `question` sobre a ação, ou qualquer dúvida → **DIRECT_RESPONSE** (o núcleo cognitivo lê o PKS e decide; pode acionar a skill depois). Mencionar "luz/ar" dentro de uma hipótese ou regra NÃO é um comando.
 
 ## Server Tools
 {server_tools}
@@ -172,9 +198,10 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 
 ## Output — valid JSON only, no markdown:
 {{
+  "speech_act": "imperative"|"question"|"conditional"|"definition"|"chitchat",
   "intent": "DIRECT_RESPONSE"|"SERVER_TOOL"|"CLIENT_TOOL"|"WHATSAPP_MESSAGING"|"HOME_ASSISTANT",
   "confidence": 0.0-1.0,
-  "tool_name": "tool name or null",
+  "tool_name": "tool name or null (null para HOME_ASSISTANT)",
   "tool_arguments": {{}},
   "raw_command": "shell cmd or null",
   "explanation": "brief in Portuguese",
@@ -186,6 +213,17 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "skill_name": "whatsapp_messaging, home_assistant or null",
   "pipeline_plan": null
 }}
+
+## Ato de fala — exemplos que NÃO são comando (vão para DIRECT_RESPONSE)
+
+User: "cadastra uma brincadeira: se eu te provocar, você pode desligar a luz ou ameaçar desligar"
+→ speech_act: "definition", intent: "DIRECT_RESPONSE" (definir uma regra ≠ executar agora; NÃO invente entity_id)
+
+User: "se eu costumo usar o ar nas quintas, pode ligar"
+→ speech_act: "conditional", intent: "DIRECT_RESPONSE" (depende do hábito → o cérebro lê o PKS)
+
+User: "acende a luz da sala"
+→ speech_act: "imperative", intent: "HOME_ASSISTANT", skill_name: "home_assistant"
 
 ## pipeline_plan — exemplo (cascata, 2+ ações independentes)
 
@@ -254,6 +292,13 @@ class IntentRouter:
         Returns:
             RoutingDecision with intent, tool info, etc.
         """
+        # ── Deterministic guards (fast-path only) ─────────────────────────────
+        # GOLDEN RULE: do NOT add new per-phrase patterns here to fix a misroute
+        # toward the cognitive core — that is the job of the bias-to-brain step
+        # (_bias_to_brain, Workstream B). These guards exist only for (a) high-
+        # precision deterministic fast-paths and (b) safety bypasses; all of them
+        # fail safe to DIRECT_RESPONSE. See docs/intent-routing-redesign.md.
+
         # Neo training messages are always a direct response (Neo learns + acks).
         # Guard before the LLM so a long training prompt can never be misrouted
         # into a tool/terminal command.
@@ -365,8 +410,19 @@ class IntentRouter:
             return fallback
 
     def _format_tools(self, execution_type: str) -> str:
-        """Format tool list for the system prompt."""
-        tools = [t for t in self.tool_registry.get_all() if t.execution == execution_type]
+        """Format tool list for the system prompt.
+
+        Skill-owned tools (``ha_*``, ``whatsapp_*``) are excluded: the router routes
+        to the SKILL (``skill_name``), not to the skill's internal tools. Listing
+        them biased the classifier toward HA and invited ``entity_id`` hallucination
+        (Workstream A — see docs/intent-routing-redesign.md).
+        """
+        tools = [
+            t
+            for t in self.tool_registry.get_all()
+            if t.execution == execution_type
+            and not t.name.startswith(_SKILL_OWNED_TOOL_PREFIXES)
+        ]
         if not tools:
             return ""
         lines = []
@@ -434,20 +490,74 @@ class IntentRouter:
 
         pipeline_plan = self._parse_pipeline_plan(data.get("pipeline_plan"), intent_map)
 
+        speech_act = str(data.get("speech_act", "imperative")).lower().strip()
+        if speech_act not in _SPEECH_ACTS:
+            speech_act = "imperative"
+
+        # Workstream A: HA routing carries no execution details — the skill resolves
+        # its own entity. Discard anything the model emitted to kill hallucinations.
+        tool_name = data.get("tool_name")
+        tool_arguments = data.get("tool_arguments")
+        raw_command = data.get("raw_command")
+        if intent == IntentType.HOME_ASSISTANT:
+            tool_name = None
+            tool_arguments = None
+            raw_command = None
+
         decision = RoutingDecision(
             intent=intent,
             confidence=float(data.get("confidence", 0.8)),
-            tool_name=data.get("tool_name"),
-            tool_arguments=data.get("tool_arguments"),
+            tool_name=tool_name,
+            tool_arguments=tool_arguments,
             explanation=data.get("explanation"),
             requires_approval=data.get("requires_approval", intent == IntentType.CLIENT_TOOL),
-            raw_command=data.get("raw_command"),
+            raw_command=raw_command,
             needs_memory=data.get("needs_memory", True),
             knowledge_keywords=knowledge_keywords,
             needs_plan=data.get("needs_plan", False),
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
             skill_name=data.get("skill_name"),
             pipeline_plan=pipeline_plan,
+            speech_act=speech_act,
+        )
+        return self._bias_to_brain(decision)
+
+    def _bias_to_brain(self, decision: RoutingDecision) -> RoutingDecision:
+        """Fire a side-effecting skill only on a confident imperative (Workstream B).
+
+        Any conditional/definitional/uncertain request about HA/WhatsApp is routed
+        to the cognitive core (DIRECT_RESPONSE) instead — it has the PKS + the strong
+        model and can still trigger the skill via [[HANDOFF]]. This turns the open
+        set ("catch what should be cognitive") into a closed one ("only let clear
+        imperatives through") that fails safe. Read-only paths (SERVER_TOOL/
+        CLIENT_TOOL) are untouched — for them a question is the normal trigger.
+        """
+        from shared.config import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "router_bias_to_brain_enabled", True):
+            return decision
+        if decision.intent not in _SIDE_EFFECT_SKILL_INTENTS:
+            return decision
+
+        threshold = getattr(settings, "router_skill_confidence_threshold", 0.75)
+        if decision.speech_act == "imperative" and decision.confidence >= threshold:
+            return decision
+
+        logger.info(
+            "Intent: %s '%s' (conf=%.2f) → DIRECT_RESPONSE (bias-to-brain)",
+            decision.intent.value, decision.speech_act, decision.confidence,
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.skill_name = None
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.needs_memory = True
+        decision.explanation = (
+            f"Roteado ao núcleo cognitivo: ato de fala '{decision.speech_act}' não é "
+            "imperativo claro para uma skill com efeito colateral (o cérebro decide e "
+            "pode acionar via handoff)."
         )
         return decision
 

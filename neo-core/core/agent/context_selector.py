@@ -458,5 +458,11 @@ class PromptContextSelector:
             "Se o usuário pedir algo que seria melhor respondido executando um comando (verificar versão, espaço em disco, processos, etc.), "
             "informe que pode executar o comando se ele quiser.\n"
             "9. Nunca afirme que salvou algo na memória sem confirmação explícita no contexto do sistema. "
-            "Se essa confirmação não existir, não diga que salvou."
+            "Se essa confirmação não existir, não diga que salvou.\n"
+            "10. Se o usuário questionar se algo foi salvo ('salvou mesmo?', 'tá no PKS?', "
+            "'não parece que foi incluído'), responda APENAS com base no bloco "
+            "'## Verificação ativa do PKS (search_pks)' do contexto — ele contém o resultado "
+            "REAL de uma busca feita agora. Se o bloco indicar que nada foi encontrado, ADMITA "
+            "que não está salvo (mesmo que você tenha dito antes que salvou) e ofereça salvar "
+            "agora. NUNCA confirme um salvamento baseado apenas no histórico da conversa."
         )

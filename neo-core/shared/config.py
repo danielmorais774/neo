@@ -69,6 +69,19 @@ class Settings(BaseSettings):
         "a multi-step cascade. Set false to ignore pipeline_plan (single step).",
     )
 
+    # Intent routing — bias-to-brain (Workstream B, intent-routing-redesign.md)
+    router_bias_to_brain_enabled: bool = Field(
+        default=True,
+        description="Route a side-effecting skill (HA/WhatsApp) only on a confident "
+        "imperative; conditional/definition/uncertain → cognitive core. Set false "
+        "to trust the raw classifier intent.",
+    )
+    router_skill_confidence_threshold: float = Field(
+        default=0.75, ge=0.0, le=1.0,
+        description="Minimum confidence for the classifier to fire a side-effecting "
+        "skill directly; below it the turn goes to the cognitive core.",
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://neo:neo@localhost:5432/neodb",

@@ -5,11 +5,18 @@ from uuid import uuid4
 import httpx
 import pytest
 
+import core.skills.home_assistant.executor as _ha_executor
 from core.skills.home_assistant.adapter import HomeAssistantAdapter
 from core.skills.home_assistant.executor import HomeAssistantExecutor
 from core.skills.home_assistant.pipeline import HomeAssistantPipeline
 from core.skills.home_assistant.tools import HOME_ASSISTANT_TOOLS
 from shared import ToolCall
+
+
+@pytest.fixture(autouse=True)
+def _fast_ha_verify(monkeypatch):
+    """Zero the post-action verification poll delays so tests stay instant."""
+    monkeypatch.setattr(_ha_executor, "_VERIFY_DELAYS", (0.0, 0.0, 0.0))
 
 
 _FAKE_STATES = [
@@ -129,6 +136,63 @@ async def test_executor_call_service_merges_entity_id():
     )
     assert out["ok"] is True
     assert fake.calls == [("light", "turn_on", {"brightness_pct": 50, "entity_id": "light.sala"})]
+
+
+class _EventualAdapter:
+    """Device confirms state ASYNCHRONOUSLY: call_service returns an empty changed
+    list (the real-world bug that made the agent report a false failure), while the
+    entity's actual state is whatever ``resulting_state`` says."""
+
+    is_configured = True
+
+    def __init__(self, resulting_state: str):
+        self._state = resulting_state
+        self.calls: list = []
+
+    async def get_states(self):
+        return _FAKE_STATES
+
+    async def get_state(self, entity_id):
+        return {"entity_id": entity_id, "state": self._state, "attributes": {"friendly_name": "Luz do Quarto"}}
+
+    async def call_service(self, domain, service, data=None):
+        self.calls.append((domain, service, data))
+        return []  # empty changed → looked like nothing happened
+
+
+@pytest.mark.asyncio
+async def test_call_service_reports_success_from_real_state_despite_empty_changed():
+    # "não consegui" bug: command worked but changed list is empty → must verify on.
+    ex = HomeAssistantExecutor(_EventualAdapter("on"))
+    out = await ex.execute(
+        "ha_call_service", {"domain": "light", "service": "turn_on", "entity_id": "light.quarto"}
+    )
+    assert out["ok"] is True
+    assert out["changed_count"] == 0
+    assert out["resulting_state"] == "on"
+    assert out["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_service_flags_unverified_when_state_did_not_change():
+    # "diz que fez e não fez" bug: asked to turn OFF but the light stays on → verified False.
+    ex = HomeAssistantExecutor(_EventualAdapter("on"))
+    out = await ex.execute(
+        "ha_call_service", {"domain": "light", "service": "turn_off", "entity_id": "light.quarto"}
+    )
+    assert out["ok"] is True
+    assert out["verified"] is False
+    assert out["resulting_state"] == "on"
+
+
+@pytest.mark.asyncio
+async def test_call_service_without_entity_id_skips_verification():
+    # Scene/script with target in data → no single entity_id → no verify fields.
+    ex = HomeAssistantExecutor(_EventualAdapter("on"))
+    out = await ex.execute("ha_call_service", {"domain": "scene", "service": "turn_on"})
+    assert out["ok"] is True
+    assert "verified" not in out
+    assert "resulting_state" not in out
 
 
 @pytest.mark.asyncio
