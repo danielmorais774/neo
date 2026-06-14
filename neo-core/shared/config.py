@@ -82,6 +82,19 @@ class Settings(BaseSettings):
         "skill directly; below it the turn goes to the cognitive core.",
     )
 
+    # Cognitive core agentic read tools (docs/cognitive-agentic-tools.md)
+    cognitive_tools_enabled: bool = Field(
+        default=True,
+        description="Let the cognitive core call READ-only tools inline "
+        "(search_pks, list_connected_devices, get_weather). Set false to revert to "
+        "the tool-less streaming reply.",
+    )
+    cognitive_max_tool_rounds: int = Field(
+        default=3, ge=1, le=6,
+        description="Max tool-call rounds the cognitive core may run before it must "
+        "produce a final answer.",
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://neo:neo@localhost:5432/neodb",

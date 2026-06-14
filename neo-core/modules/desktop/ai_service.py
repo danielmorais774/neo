@@ -22,6 +22,7 @@ from core.agent.agent_executor import AgentExecutor
 from core.agent.context_selector import PromptContextSelector
 from core.llm.router import LLMRouter
 from core.pks import PKSService
+from core.cognitive import CognitiveReadExecutor, cognitive_tools_for
 from core.pipeline.handoff_parser import extract_handoffs
 from core.pipeline.orchestrator import PipelineOrchestrator
 from core.pipeline.policy import handoff_requires_confirmation
@@ -115,6 +116,17 @@ _MEMORY_VERIFICATION_PATTERNS = [
 ]
 
 _MEMORY_VERIFICATION_NOTE_HEADER = "## Verificação ativa do PKS (search_pks)"
+
+# When the cognitive core has tools, we don't inject results — we NUDGE it to call
+# search_pks itself (agency preserved; guaranteed for the honesty-critical case).
+_MEMORY_VERIFICATION_NUDGE = (
+    "## Verificação obrigatória de memória\n"
+    "O usuário está duvidando se algo foi REALMENTE salvo. ANTES de responder, chame "
+    "a tool `search_pks` para verificar no PKS de verdade (busque pelo que ele acha "
+    "que salvou). Responda APENAS com base no resultado real: se NÃO aparecer, admita "
+    "que não está salvo (mesmo que você tenha dito antes que salvou) e ofereça salvar "
+    "agora. NUNCA confirme um salvamento com base só no histórico da conversa."
+)
 
 # Words stripped from the user's question before using it as a search query.
 _VERIFICATION_STOPWORDS = frozenset({
@@ -1081,13 +1093,20 @@ class AIService:
         # must answer from them, never from its own prior "salvei" in the history.
         verification_note: str | None = None
         if self.pks and user_id and _is_memory_verification_request(user_message):
-            verification_note = await self._build_pks_verification_note(
-                user_message=user_message,
-                history=history,
-                decision=decision,
-                user_id=user_id,
-                slog=slog,
-            )
+            if self.settings.cognitive_tools_enabled:
+                # Agentic path: nudge the brain to call search_pks itself.
+                verification_note = _MEMORY_VERIFICATION_NUDGE
+                if slog:
+                    slog.log_event("Verificação de memória", "nudge → o cognitivo deve chamar `search_pks`")
+            else:
+                # Tool-less fallback: inject the real search results into the prompt.
+                verification_note = await self._build_pks_verification_note(
+                    user_message=user_message,
+                    history=history,
+                    decision=decision,
+                    user_id=user_id,
+                    slog=slog,
+                )
 
         if slog:
             slog.log_context_recovery(recovered_context or [])
@@ -1244,51 +1263,62 @@ class AIService:
             provider_name = type(provider).__name__.replace("Provider", "").lower()
             model_name = _req_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
 
-            if slog:
-                slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
-
-            full_response = ""
             t0 = time.monotonic()
+            # Cognitive core may read/verify ground truth inline (search_pks,
+            # devices, weather) via a bounded tool loop — never to act. Training
+            # turns never need tools.
+            use_tools = self.settings.cognitive_tools_enabled and not is_neo_training
+            if use_tools:
+                read_executor = CognitiveReadExecutor(
+                    global_executor=self.agent.tool_executor,
+                    db=self.db,
+                    pks_service=self.pks,
+                    user_id=user_id,
+                )
+                full_response = await self._run_cognitive_tool_loop(
+                    provider=provider,
+                    messages=messages,
+                    req_model=_req_model,
+                    model_name=model_name,
+                    provider_name=provider_name,
+                    tools=cognitive_tools_for(user_id),
+                    tool_executor=read_executor,
+                    slog=slog,
+                    trace=trace,
+                )
+                llm_ms = (time.monotonic() - t0) * 1000
+            else:
+                if slog:
+                    slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
+                full_response = ""
+                async for chunk in provider.stream_complete(
+                    messages=messages,
+                    model=_req_model or None,
+                    max_tokens=self.settings.default_max_tokens,
+                ):
+                    if chunk.event == StreamEventType.TOKEN and chunk.content:
+                        full_response += chunk.content
+                    elif chunk.event == StreamEventType.ERROR:
+                        logger.error(f"LLM stream error: {chunk.content}")
+                        break
+                llm_ms = (time.monotonic() - t0) * 1000
+                if slog:
+                    slog.log_llm_response("COGNITIVE", full_response, duration_ms=llm_ms, model=model_name)
+                if trace:
+                    messages_payload: list[dict] = []
+                    for m in messages:
+                        role_val = m.role.value if hasattr(m.role, 'value') else str(m.role)
+                        content = m.content if m.role == MessageRole.SYSTEM else (m.content or '')[:500]
+                        messages_payload.append({"role": role_val, "content": content})
+                    trace.add_llm_call(
+                        provider=provider_name, model=model_name,
+                        messages_sent=messages_payload,
+                        response_text=(full_response or '')[:1000],
+                        duration_ms=round(llm_ms, 2), temperature=0.9, stage="cognitive",
+                    )
 
-            async for chunk in provider.stream_complete(
-                messages=messages,
-                model=_req_model or None,
-                max_tokens=self.settings.default_max_tokens,
-            ):
-                if chunk.event == StreamEventType.TOKEN and chunk.content:
-                    full_response += chunk.content
-                elif chunk.event == StreamEventType.ERROR:
-                    logger.error(f"LLM stream error: {chunk.content}")
-                    break
-
-            llm_ms = (time.monotonic() - t0) * 1000
             if not full_response:
                 full_response = "Desculpe, não consegui gerar uma resposta."
-
-            if slog:
-                slog.log_llm_response("COGNITIVE", full_response, duration_ms=llm_ms, model=model_name)
-
-            # Log to observability (fire-and-forget)
-            if trace:
-                # Preserve full `system` messages for complete debugging; truncate other roles to keep documents small
-                messages_payload: list[dict] = []
-                for m in messages:
-                    role_val = m.role.value if hasattr(m.role, 'value') else str(m.role)
-                    if m.role == MessageRole.SYSTEM:
-                        content = m.content
-                    else:
-                        content = (m.content or '')[:500]
-                    messages_payload.append({"role": role_val, "content": content})
-
-                trace.add_llm_call(
-                    provider=provider_name,
-                    model=model_name,
-                    messages_sent=messages_payload,
-                    response_text=(full_response or '')[:1000],
-                    duration_ms=round(llm_ms, 2),
-                    temperature=0.9,
-                    stage="cognitive",
-                )
 
         except Exception as e:
             logger.exception("Direct response LLM call failed")
@@ -1510,6 +1540,87 @@ class AIService:
                 is_final=False,
                 metadata={"__pipeline_handoffs__": pipeline_handoffs},
             )
+
+    async def _run_cognitive_tool_loop(
+        self,
+        *,
+        provider: Any,
+        messages: list[Message],
+        req_model: str | None,
+        model_name: str,
+        provider_name: str,
+        tools: list[Any],
+        tool_executor: Any,
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> str:
+        """Bounded read-tool loop for the cognitive core.
+
+        Mirrors the text-based ReAct pattern of AgentExecutor (tool results fed back
+        as a user message). Returns the final answer text. Identical buffered output
+        to the legacy streaming path when the model calls no tools.
+        """
+        max_rounds = self.settings.cognitive_max_tool_rounds
+        seen: set[tuple[str, str]] = set()
+        final_text = ""
+
+        for round_idx in range(max_rounds + 1):
+            round_tools = tools if (tools and round_idx < max_rounds) else None
+            if slog:
+                slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
+            t0 = time.monotonic()
+            resp = await provider.complete(
+                messages=messages,
+                tools=round_tools,
+                model=req_model or None,
+                temperature=0.9,
+                max_tokens=self.settings.default_max_tokens,
+            )
+            llm_ms = (time.monotonic() - t0) * 1000
+            content = resp.get_content() or ""
+            tool_calls = resp.get_tool_calls() if round_tools else []
+
+            if trace:
+                payload = []
+                for m in messages:
+                    role_val = m.role.value if hasattr(m.role, 'value') else str(m.role)
+                    payload.append({"role": role_val, "content": m.content if m.role == MessageRole.SYSTEM else (m.content or '')[:500]})
+                trace.add_llm_call(
+                    provider=provider_name, model=model_name, messages_sent=payload,
+                    response_text=(content or '')[:1000], duration_ms=round(llm_ms, 2),
+                    temperature=0.9, stage="cognitive",
+                )
+
+            if not tool_calls:
+                final_text = content
+                if slog:
+                    slog.log_llm_response("COGNITIVE", final_text, duration_ms=llm_ms, model=model_name)
+                break
+
+            # Feed tool results back as a user message (text-based, like AgentExecutor).
+            messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+            result_lines: list[str] = []
+            for tc in tool_calls:
+                key = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False))
+                if key in seen:
+                    result_lines.append(f"Tool: {tc.name}\nResult: (já consultado neste turno — não repita; use o resultado anterior)")
+                    continue
+                seen.add(key)
+                if slog:
+                    slog.log_event("Cognitive Tool", f"→ `{tc.name}` {tc.arguments}")
+                tr = await tool_executor.execute_tool_call(tc)
+                if tr.error:
+                    result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
+                else:
+                    result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
+                if slog:
+                    slog.log_event(
+                        "Cognitive Tool Result",
+                        f"`{tc.name}` → " + (f"ERRO: {tr.error}" if tr.error else str(tr.result)[:600]),
+                    )
+            messages.append(Message(role=MessageRole.USER, content="\n\n".join(result_lines)))
+
+        return final_text
 
     async def _build_pks_verification_note(
         self,
