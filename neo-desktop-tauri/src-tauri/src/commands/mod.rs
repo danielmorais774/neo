@@ -271,7 +271,7 @@ pub struct NeoCoreStatus {
 
 #[tauri::command]
 pub async fn get_neo_core_status() -> Result<NeoCoreStatus, String> {
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+    let url = neo_core_http_url();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -307,7 +307,7 @@ pub fn get_window_mode() -> &'static str {
 pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(), String> {
     info!("[Neo] quick_help_ask_stream: {}", question);
 
-    let url = std::env::var("NEO_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+    let url = neo_core_http_url();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
