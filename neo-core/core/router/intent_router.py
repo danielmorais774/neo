@@ -146,7 +146,7 @@ ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI ass
 
 ## Paths
 - **DIRECT_RESPONSE**: conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **Default when in doubt.**
-- **SERVER_TOOL**: needs real-time external data (weather, web search, stock prices). Pick tool from server list.
+- **SERVER_TOOL**: needs real-time external data (weather, web search, stock prices) OR mudar/consultar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Pick tool from server list. Para MUDAR um ajuste use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: "usa/troca a voz do X" → `{{"setting":"tts.voice","value":"X"}}` (ex: "usa a voz do Jarvis" → value="jarvis"); "troca o engine/motor pra X" → `{{"setting":"tts.engine","value":"X"}}` (X ∈ qwen|coqui|dia). Para "quais vozes você tem?" use `voice_list`; para "o que dá pra configurar?" use `config_list`.
 - **CLIENT_TOOL**: explicitly needs the user's local machine (shell, files, system info, installs). Pick tool from client list.
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário. Inclui:
   - mensagens pessoais ("avisa minha mãe que vou chegar tarde", "manda um oi para Ana")
@@ -262,6 +262,15 @@ User: "quais dispositivos estão conectados agora?" → intent: SERVER_TOOL, too
 User: "se eu costumo usar o ar nas quintas, pode ligar" → intent: DIRECT_RESPONSE (ação condicional baseada em hábito → o cérebro lê o PKS e decide)
 User: "como eu gosto de deixar a temperatura do quarto à noite?" → intent: DIRECT_RESPONSE (pergunta sobre preferência)
 User: "se fizer sentido pra minha rotina, liga o ar" → intent: DIRECT_RESPONSE (depende do PKS)
+
+## CONFIG (voz/engine de TTS, etc.) — exemplos
+User: "usa a voz do Jarvis" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "jarvis"}}
+User: "fala com a voz do Ryan" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "Ryan"}}
+User: "troca a voz pra Vivian" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "Vivian"}}
+User: "troca o engine pra qwen" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.engine", "value": "qwen"}}
+User: "usa o motor coqui" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.engine", "value": "coqui"}}
+User: "quais vozes você tem?" → intent: SERVER_TOOL, tool_name: "voice_list"
+User: "o que dá pra configurar?" → intent: SERVER_TOOL, tool_name: "config_list"
 """
 
 
@@ -272,9 +281,41 @@ class IntentRouter:
         self,
         llm_router: LLMRouter,
         tool_registry: ToolRegistry,
+        db: Any | None = None,
     ) -> None:
         self.llm_router = llm_router
         self.tool_registry = tool_registry
+        # Optional DB handle used to resolve the configurable classifier
+        # provider/model (modules.intent_config). None → static default.
+        self.db = db
+
+    async def _resolve_classifier(self) -> tuple[str, str]:
+        """Resolve the (provider, model) used to classify intent.
+
+        The selection is configurable from the neo-panel and persisted via
+        ``modules.intent_config`` (read here, memoized in-process). Falls back to
+        the DeepSeek V4 Flash default when nothing is set, the DB is absent, or the
+        chosen provider isn't actually available (e.g. its API key is missing), so
+        classification never breaks because of a bad/incomplete config.
+        """
+        from modules.intent_config import DEFAULT_CLASSIFIER, get_classifier_config
+
+        db = getattr(self, "db", None)
+        config = await get_classifier_config(db)
+        provider_name = config.get("provider") or DEFAULT_CLASSIFIER["provider"]
+        model_name = config.get("model") or DEFAULT_CLASSIFIER["model"]
+
+        try:
+            available = self.llm_router.list_available_providers()
+        except Exception:  # pragma: no cover - defensive
+            available = []
+        if provider_name not in available:
+            logger.warning(
+                "Intent classifier provider '%s' unavailable; falling back to '%s'",
+                provider_name, DEFAULT_CLASSIFIER["provider"],
+            )
+            return DEFAULT_CLASSIFIER["provider"], DEFAULT_CLASSIFIER["model"]
+        return provider_name, model_name
 
     async def classify(
         self,
@@ -368,9 +409,10 @@ class IntentRouter:
             messages.append(Message(role=MessageRole.USER, content=user_message))
 
         try:
-            # Use groq for intent classification (fast inference)
-            provider_name = "groq"
-            model_name = "llama-3.3-70b-versatile"
+            # Classifier provider/model are configurable (neo-panel → intent
+            # config), persisted via modules.intent_config. Defaults to DeepSeek
+            # V4 Flash (fast, low-cost) when unset/unavailable.
+            provider_name, model_name = await self._resolve_classifier()
             provider = self.llm_router.get_provider(provider_name)
             response = await provider.complete(
                 messages=messages,

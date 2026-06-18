@@ -334,6 +334,7 @@ async def handle_desktop_chat_message(
     final_response: str | None = None
     final_session_id: str | None = str(request.session_id) if request.session_id else None
     iterations = 1
+    final_voice: dict[str, Any] | None = None
     metadata = {
         "client": "desktop-chat",
     }
@@ -354,12 +355,23 @@ async def handle_desktop_chat_message(
             final_response = resp.message
             iterations = resp.iterations
 
+    # Pattern A: carry the active TTS voice with the reply (so an HTTP renderer can
+    # speak it). The gRPC path stamps resp.voice; here we resolve it once for HTTP.
+    try:
+        from modules.voice import get_active_voice
+        final_voice = await get_active_voice(
+            ai_service.db, request.user_id, getattr(ai_service, "settings", None)
+        )
+    except Exception:  # pragma: no cover - defensive
+        final_voice = None
+
     return {
         "status": "completed",
         "final_response": final_response,
         "steps": [],
         "iterations": iterations,
         "session_id": final_session_id,
+        "voice": final_voice,
     }
 
 

@@ -135,6 +135,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         session_id: str | None = None
         device_id: str | None = None
         device_info: dict = {}
+        stream_user_id: UUID | None = None  # last known user on this stream (for voice stamping)
         _connected_devices_local = _connected_devices  # local ref for finally block
 
         try:
@@ -149,6 +150,8 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         uid_uuid = UUID(desktop_msg.user_id)
                     except ValueError:
                         logger.warning(f"[gRPC] Invalid user_id: {desktop_msg.user_id}")
+                if uid_uuid:
+                    stream_user_id = uid_uuid  # continuations (tool_result/approval) reuse it
 
                 if desktop_msg.HasField("user_input"):
                     msg = desktop_msg.user_input.message
@@ -197,6 +200,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         service=metadata.get("client", "neo-desktop"),
                         metadata=metadata,
                     ):
+                        await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
@@ -224,6 +228,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         _followup_count=pending.get("_followup_count", 0),
                         _has_plan=pending.get("_has_plan", False),
                     ):
+                        await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
@@ -243,6 +248,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         command=pending.get("command", ""),
                         user_message=pending.get("user_message", ""),
                     ):
+                        await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
@@ -331,6 +337,31 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
     # AIServiceResponse → CoreMessage conversion
     # ---------------------------------------------------------------
 
+    async def _stamp_voice(self, resp: AIServiceResponse, user_id: UUID | None) -> None:
+        """Pattern A: attach the active TTS voice to a FINAL reply so the desktop
+        speaks with the voice persisted in the DB. Never blocks a reply on a read miss."""
+        if not (resp.is_final and resp.message) or resp.voice is not None or not self.ai_service:
+            return
+        try:
+            from modules.voice import get_active_voice
+            resp.voice = await get_active_voice(
+                self.ai_service.db, user_id, getattr(self.ai_service, "settings", None)
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("[gRPC] voice stamp skipped", exc_info=True)
+
+    @staticmethod
+    def _voice_pb(voice: dict | None) -> "neo_desktop_pb2.VoiceSettings | None":
+        """Build a VoiceSettings proto from the active-voice dict (or None)."""
+        if not voice:
+            return None
+        return neo_desktop_pb2.VoiceSettings(
+            engine=voice.get("engine") or "",
+            voice=voice.get("voice") or "",
+            language=voice.get("language") or "",
+            label=voice.get("label") or "",
+        )
+
     @staticmethod
     def _to_core_message(session_id: str, resp: AIServiceResponse) -> neo_desktop_pb2.CoreMessage | None:
         """Convert an AIServiceResponse to a protobuf CoreMessage."""
@@ -405,6 +436,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     message=resp.message,
                     is_final=True,
                     total_iterations=resp.iterations,
+                    voice=NeoDesktopServicer._voice_pb(resp.voice),
                 ),
             )
 

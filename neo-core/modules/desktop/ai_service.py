@@ -80,6 +80,19 @@ def _strip_mission_marker(text: str) -> tuple[str, dict[str, Any] | None]:
 NEED_CLARIFICATION_SENTINEL = "[[NEED_CLARIFICATION]]"
 MAX_CLARIFICATION_ROUNDS = 2
 
+# Injetado no prompt da resposta final quando o turno vem do modo Live (voz):
+# o texto será FALADO por TTS e mostrado como legenda, então pedimos texto corrido
+# sem markdown/emojis (que soam mal falados e poluem a legenda). Ativado por
+# metadata["mode"] == "live" (enviado pelo neo-desktop-tauri).
+_LIVE_STYLE_INSTRUCTION = (
+    "## MODO VOZ (live)\n"
+    "Sua resposta será LIDA EM VOZ ALTA por TTS e exibida como legenda curta. "
+    "Responda em TEXTO CORRIDO, natural e direto, como se estivesse falando. "
+    "NÃO use markdown, títulos, listas/bullets, negrito, tabelas, blocos de código "
+    "ou emojis. Seja conciso, porém completo o suficiente para responder. "
+    "Evite ler em voz alta URLs longas, caminhos de arquivo e símbolos."
+)
+
 _CLARIFICATION_INSTRUCTION = (
     "## Esclarecimento quando faltar contexto\n"
     "Se você NÃO tem informação suficiente para responder com confiança — a mensagem se "
@@ -342,6 +355,7 @@ class AIServiceResponse:
         is_final: bool = True,
         iterations: int = 1,
         metadata: dict[str, Any] | None = None,
+        voice: dict[str, Any] | None = None,
     ) -> None:
         self.intent = intent
         self.session_id = session_id
@@ -351,6 +365,10 @@ class AIServiceResponse:
         self.is_final = is_final
         self.iterations = iterations
         self.metadata = metadata or {}
+        # Pattern A: active TTS voice carried with the FINAL reply so the renderer
+        # (desktop) speaks with the voice persisted in the DB. Filled at the
+        # transport boundary (gRPC/HTTP) via modules.voice.get_active_voice.
+        self.voice = voice
 
 
 class AIService:
@@ -381,6 +399,10 @@ class AIService:
         self.settings = get_settings()
         self.context_selector = context_selector
         self._pending_traces: dict[str, MessageTrace] = {}
+        # Sessões cujo último turno veio do modo Live — usado para estilizar a
+        # resposta de um client tool (process_tool_result), onde o metadata["mode"]
+        # original se perde no round-trip. Atualizado em process_user_input.
+        self._live_sessions: set[str] = set()
         self._skill_executor: "SkillExecutor | None" = None
         self.planner = PlanManager(llm_router)
 
@@ -532,6 +554,15 @@ class AIService:
         slog.log_message_saved("user", user_message, str(sid))
 
         sys_context = self._build_system_context(metadata)
+        # Modo Live (voz): a resposta final será falada por TTS. Injeta o estilo
+        # "texto corrido sem markdown" no contexto (chega ao DIRECT_RESPONSE via
+        # system_context) e marca a sessão para os caminhos que perdem o metadata.
+        live = (metadata or {}).get("mode") == "live"
+        if live:
+            self._live_sessions.add(str(sid))
+            sys_context = "\n\n".join(part for part in (sys_context, _LIVE_STYLE_INSTRUCTION) if part)
+        else:
+            self._live_sessions.discard(str(sid))
         mission_context = await self._build_recent_missions_context(sid, user_id)
         if mission_context:
             sys_context = "\n\n".join(part for part in (sys_context, mission_context) if part)
@@ -777,7 +808,7 @@ class AIService:
                     yield resp
 
             elif decision.intent == IntentType.SERVER_TOOL:
-                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id):
+                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, live=live):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
@@ -960,6 +991,7 @@ class AIService:
             elif intent == IntentType.SERVER_TOOL:
                 gen = self._handle_server_tool(
                     sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    live=(step_metadata or {}).get("mode") == "live",
                 )
             elif intent == IntentType.CLIENT_TOOL:
                 gen = self._handle_client_tool(
@@ -1914,8 +1946,13 @@ class AIService:
         trace: MessageTrace | None = None,
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
+        live: bool = False,
     ) -> AsyncIterator[AIServiceResponse]:
-        """Handle server-side tool execution using AgentExecutor."""
+        """Handle server-side tool execution using AgentExecutor.
+
+        ``live=True`` (turno do modo voz) anexa o estilo de fala ao task para o
+        agente responder em texto corrido sem markdown.
+        """
 
         if slog:
             slog.log_tool_request(decision.tool_name or "agent", arguments=decision.tool_arguments, execution="server-side")
@@ -1950,6 +1987,16 @@ class AIService:
             except Exception:  # pragma: no cover - defensive
                 logger.warning("[PKS-SEARCH] failed to scope user context", exc_info=True)
 
+            # Scope voice reads + config_set persistence to this user (same seam).
+            try:
+                module_execs = getattr(self.agent.tool_executor, "_module_executors", {})
+                for _name in ("voice", "config"):
+                    _exec = module_execs.get(_name)
+                    if _exec is not None:
+                        _exec.set_context(user_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("[VOICE/CONFIG] failed to scope user context", exc_info=True)
+
             # Safety net: don't let the server-tool agent run blind. Seed recent
             # history (so a second-turn correction is understood) and, when the
             # query depends on user knowledge, prepend PKS context to the task.
@@ -1973,6 +2020,11 @@ class AIService:
             except Exception:
                 logger.exception("SERVER_TOOL PKS enrichment failed; proceeding without it")
                 task = user_message
+
+            # Modo Live: pede resposta falada/sem markdown (anexa ao task em vez de
+            # sobrescrever o system prompt, preservando as instruções de tools do agente).
+            if live:
+                task = f"{task}\n\n{_LIVE_STYLE_INSTRUCTION}"
 
             # Use AgentExecutor for multi-step tool execution
             result = await self.agent.execute(
@@ -2818,6 +2870,7 @@ class AIService:
                 # Format with AI (trace is passed so the LLM call gets logged)
                 final_text = await self._format_tool_result(
                     user_message, command or tool_name, raw_output, trace=trace,
+                    live=str(session_id) in self._live_sessions,
                 )
 
             # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
@@ -3810,15 +3863,26 @@ class AIService:
         command: str,
         output: str,
         trace: MessageTrace | None = None,
+        live: bool = False,
     ) -> str:
-        """Use LLM to format tool output into a user-friendly response."""
+        """Use LLM to format tool output into a user-friendly response.
+
+        ``live=True`` (turno do modo voz) pede texto corrido sem markdown, já que a
+        resposta será falada por TTS.
+        """
+        format_rule = (
+            "Responda em TEXTO CORRIDO, natural e direto (será falado em voz alta): "
+            "sem markdown, listas, negrito, blocos de código ou emojis."
+            if live
+            else "Use markdown se necessário."
+        )
         prompt = (
             f'O usuário perguntou: "{user_message}"\n'
             f"Foi executado o comando: `{command}`\n"
             f"Saída do comando:\n```\n{output}\n```\n\n"
             "Formate uma resposta clara e amigável em português para o usuário, "
             "resumindo o resultado do comando de forma legível. "
-            "Use markdown se necessário. Não invente dados — use apenas o que está na saída."
+            f"{format_rule} Não invente dados — use apenas o que está na saída."
         )
 
         system_msg = "Você é Neo, um assistente de desktop. Responda de forma clara e concisa em português."

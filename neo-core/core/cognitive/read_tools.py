@@ -16,8 +16,10 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from modules.config.tools import CONFIG_TOOLS
 from modules.devices.tools import DEVICES_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
+from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
 from shared import ToolCall, ToolResult, ToolSchema
 
@@ -32,6 +34,14 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     _by_name(PKS_SEARCH_TOOLS, "search_pks"),
     _by_name(DEVICES_TOOLS, "list_connected_devices"),
     _by_name(WEATHER_TOOLS, "get_weather"),
+    # Read-only voice introspection (which voices exist / which is active). The
+    # side-effecting config_set stays out of the cognitive read set — it routes as
+    # a SERVER_TOOL action.
+    _by_name(VOICE_TOOLS, "voice_list"),
+    _by_name(VOICE_TOOLS, "voice_get"),
+    # Read-only config introspection (what's configurable / a setting's value).
+    _by_name(CONFIG_TOOLS, "config_get"),
+    _by_name(CONFIG_TOOLS, "config_list"),
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
@@ -61,6 +71,17 @@ class CognitiveReadExecutor:
         self._user_id = user_id
         self._devices: Any = None
         self._pks_search: Any = None
+        # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
+        # user-scoped executor avoids mutating the shared global one (no race).
+        from modules.voice import VoiceExecutor
+
+        self._voice = VoiceExecutor(db=db)
+        self._voice.set_context(user_id)
+        # Config reads (config_get/config_list) — fresh, user-scoped executor too.
+        from modules.config import ConfigExecutor, build_default_registry
+
+        self._config = ConfigExecutor(db=db, registry=build_default_registry())
+        self._config.set_context(user_id)
         if user_id is not None:
             from modules.devices import DevicesExecutor
             from modules.pks_search import PKSSearchExecutor
@@ -81,6 +102,10 @@ class CognitiveReadExecutor:
                 result = await self._devices.execute(name, tool_call.arguments)
             elif name == "search_pks" and self._pks_search is not None:
                 result = await self._pks_search.execute(name, tool_call.arguments)
+            elif name in ("voice_list", "voice_get"):
+                result = await self._voice.execute(name, tool_call.arguments)
+            elif name in ("config_get", "config_list"):
+                result = await self._config.execute(name, tool_call.arguments)
             else:
                 # Read-only globals (e.g. get_weather) go through the global executor.
                 return await self._global.execute_tool_call(tool_call)

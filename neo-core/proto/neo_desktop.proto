@@ -140,6 +140,16 @@ message AgentResponse {
   string message = 1;
   bool is_final = 2;
   int32 total_iterations = 3;
+  VoiceSettings voice = 4;  // active TTS voice/engine to render this reply (Pattern A)
+}
+
+// Active TTS voice the renderer (desktop) should use to speak the reply. Resolved
+// by neo-core from the persisted user preference (service="neo-voice").
+message VoiceSettings {
+  string engine = 1;    // qwen | coqui | dia
+  string voice = 2;     // speaker id / clone id sent to the engine
+  string language = 3;  // optional language hint
+  string label = 4;     // friendly name (ex: "Jarvis")
 }
 
 message ErrorMessage {

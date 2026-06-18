@@ -9,10 +9,13 @@ from core.llm.grok_provider import GrokProvider
 from core.llm.groq_provider import GroqProvider
 from core.llm.ollama_provider import OllamaProvider
 from core.llm.openai_provider import OpenAIProvider
+from core.llm.openrouter_provider import OpenRouterProvider
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, get_settings
 
-ProviderType = Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"]
+ProviderType = Literal[
+    "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter"
+]
 
 # Mapeamento de nome de modelo → provider
 _MODEL_TO_PROVIDER: dict[str, str] = {
@@ -59,7 +62,32 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "llama3-70b-8192": "groq",
     "mixtral-8x7b-32768": "groq",
     "gemma2-9b-it": "groq",
+    # OpenRouter (openrouter.ai) — gateway unificado (IDs no formato vendor/modelo)
+    "google/gemini-3.1-flash-lite": "openrouter",
+    "google/gemini-2.0-flash-001": "openrouter",
+    "anthropic/claude-3.5-sonnet": "openrouter",
+    "meta-llama/llama-3.3-70b-instruct": "openrouter",
 }
+
+
+def provider_for_model(model_name: str | None) -> str | None:
+    """Return the provider that owns ``model_name`` (or None if unknown)."""
+    if not model_name:
+        return None
+    return _MODEL_TO_PROVIDER.get(model_name)
+
+
+def models_by_provider() -> dict[str, list[str]]:
+    """Catalog of known model ids grouped by provider (for UI dropdowns).
+
+    Inverts :data:`_MODEL_TO_PROVIDER`. Order within each provider follows the
+    declaration order above. ``ollama`` models are local and depend on the host,
+    so they are advertised but never the safe default for intent classification.
+    """
+    catalog: dict[str, list[str]] = {}
+    for model, provider in _MODEL_TO_PROVIDER.items():
+        catalog.setdefault(provider, []).append(model)
+    return catalog
 
 
 class LLMRouter:
@@ -107,6 +135,13 @@ class LLMRouter:
         if self.settings.groq_api_key:
             self._providers["groq"] = GroqProvider(
                 api_key=self.settings.groq_api_key
+            )
+
+        # OpenRouter (openrouter.ai) — gateway unificado a vários vendors
+        if self.settings.openrouter_api_key:
+            self._providers["openrouter"] = OpenRouterProvider(
+                api_key=self.settings.openrouter_api_key,
+                base_url=self.settings.openrouter_base_url,
             )
 
         # Ollama — sempre disponível (não requer API key)
@@ -172,6 +207,9 @@ class LLMRouter:
             "ollama": "gemma4:e2b",
             "deepseek": "deepseek-chat",
             "gemini": "gemini-2.0-flash",
+            "grok": "grok-3-mini",
+            "groq": "llama-3.3-70b-versatile",
+            "openrouter": "google/gemini-3.1-flash-lite",
         }
 
         return defaults.get(name, self.settings.default_model)

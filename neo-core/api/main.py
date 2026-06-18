@@ -42,7 +42,7 @@ for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -68,6 +68,8 @@ from modules.desktop import AIService, DesktopService, DESKTOP_TOOLS
 from api.routes.devices import ws_router as devices_ws_router
 from modules.weather import WEATHER_TOOLS, WeatherExecutor
 from modules.devices import DEVICES_TOOLS, DevicesExecutor
+from modules.voice import VOICE_TOOLS, VoiceExecutor
+from modules.config import CONFIG_TOOLS, ConfigExecutor, build_default_registry
 from observability.logger import ObservabilityLogger, set_obs
 from shared.config import Settings, get_settings
 
@@ -142,6 +144,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     devices_executor = DevicesExecutor(db=_db)
     _tool_executor.register_module_executor("devices", devices_executor)
 
+    # Voice (TTS) introspection — server-side, READ-ONLY (voice_list/voice_get).
+    # Default (no user scoping); per-request user scoping via set_context in AIService.
+    _tool_registry.register_many(VOICE_TOOLS)
+    voice_executor = VoiceExecutor(db=_db)
+    _tool_executor.register_module_executor("voice", voice_executor)
+
+    # Generic config — server-side. Registry-driven settings (TTS voice/engine, …);
+    # config_set persists the active voice into the same row voice reads (Pattern A).
+    # Per-request user scoping via set_context in AIService (like voice/devices).
+    _tool_registry.register_many(CONFIG_TOOLS)
+    config_executor = ConfigExecutor(db=_db, registry=build_default_registry())
+    _tool_executor.register_module_executor("config", config_executor)
+
     # Register whatsapp_messaging tools in the global registry (for discovery / routing)
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
     _tool_registry.register_many(WHATSAPP_MESSAGING_TOOLS)
@@ -172,7 +187,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         hybrid_search=hybrid_search,
         token_counter=token_counter,
     )
-    intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry)
+    intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry, db=_db)
     preference_extractor = PreferenceExtractor(llm_router=_llm_router, db=_db)
 
     # ── Personal Knowledge Store ─────────────────────────────────
@@ -236,6 +251,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire devices route
     devices.set_db(_db)
+
+    # Wire intent classifier config route (neo-panel → Config page)
+    intent_config.set_dependencies(_db, _llm_router)
+
+    # Wire voice (TTS) config route (neo-panel → Settings page)
+    voice_config.set_dependencies(_db)
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
@@ -328,4 +349,6 @@ app.include_router(missions.router, dependencies=[Depends(require_panel_jwt)])
 app.include_router(devices.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop, sem JWT
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(letta.router)

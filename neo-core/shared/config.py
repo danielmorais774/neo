@@ -31,12 +31,21 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, description="Google Gemini API key")
     grok_api_key: str | None = Field(default=None, description="xAI Grok API key")
     groq_api_key: str | None = Field(default=None, description="Groq API key (groq.com)")
+    openrouter_api_key: str | None = Field(
+        default=None, description="OpenRouter API key (openrouter.ai) — acesso unificado a vários vendors"
+    )
+    openrouter_base_url: str = Field(
+        default="https://openrouter.ai/api/v1",
+        description="OpenRouter base URL (OpenAI-compatible)",
+    )
     ollama_base_url: str = Field(
         default="http://neo-ollama:11434", description="Ollama base URL"
     )
 
     # Default LLM Settings
-    default_provider: Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"] = Field(
+    default_provider: Literal[
+        "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter"
+    ] = Field(
         default="openai", description="Default LLM provider"
     )
     default_model: str = Field(default="gpt-4-turbo-preview", description="Default model")
@@ -249,6 +258,22 @@ class Settings(BaseSettings):
     home_assistant_timeout: int = Field(
         default=10,
         description="Timeout HTTP (s) para chamadas ao Home Assistant",
+    )
+
+    # neo-voice (TTS/STT gateway) — fonte do catálogo de vozes para o módulo `voice`
+    neo_voice_url: str = Field(
+        default="http://127.0.0.1:5002",
+        description="Base URL do serviço neo-voice (proxy STT/TTS). Usado para listar "
+        "o catálogo de vozes (GET /voices) ao resolver 'usa a voz do X'.",
+    )
+    neo_voice_timeout: int = Field(
+        default=10,
+        description="Timeout HTTP (s) para chamadas ao neo-voice",
+    )
+    neo_voice_default_engine: str = Field(
+        default="coqui",
+        description="Engine de TTS default quando não há voz persistida no banco "
+        "(espelha o default do neo-desktop-tauri).",
     )
 
     # Mission Settings
