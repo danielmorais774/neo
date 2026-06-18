@@ -14,7 +14,7 @@ const NeoLogsPanel = () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`http://192.168.4.175:8000/api/v1/app-logs?tail=${tail}`);
+      const response = await fetch(`http://127.0.0.1:8000/api/v1/app-logs?tail=${tail}`);
       if (response.ok) {
         const content = await response.text();
         setLogContent(content);

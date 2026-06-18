@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 
-const API = 'http://192.168.4.175:8000/api/v1/knowledge-graph'
+const API = 'http://127.0.0.1:8000/api/v1/knowledge-graph'
 
 // ── Cores por tipo de entidade ────────────────────────────────────────────────
 const TYPE_COLORS: Record<string, string> = {

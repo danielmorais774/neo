@@ -7,8 +7,14 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://192.168.4.175:8000',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+      },
+      // catálogo de vozes vem direto do neo-voice (Mac), não do neo-core (VPS)
+      '/neo-voice': {
+        target: 'http://127.0.0.1:5002',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/neo-voice/, ''),
       },
     },
   },

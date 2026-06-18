@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-const NEO_VISION_API = 'http://localhost:5011'
+const NEO_VISION_API = 'http://127.0.0.1:5011'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

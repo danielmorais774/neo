@@ -57,7 +57,7 @@ async function executeMissionCommand(
   command: 'approve' | 'cancel' | 'edit' | 'retry',
   editedText?: string,
 ) {
-  const res = await fetch(`http://192.168.4.175:8000/api/v1/missions/${missionId}/command`, {
+  const res = await fetch(`http://127.0.0.1:8000/api/v1/missions/${missionId}/command`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(editedText ? { command, edited_text: editedText } : { command }),
@@ -82,7 +82,7 @@ export default function MissionsPanel() {
       const params = new URLSearchParams();
       if (statusFilter) params.set('status', statusFilter);
       params.set('limit', '100');
-      const res = await fetch(`http://192.168.4.175:8000/api/v1/missions?${params}`);
+      const res = await fetch(`http://127.0.0.1:8000/api/v1/missions?${params}`);
       if (!res.ok) throw new Error('Failed to fetch');
       const data = await res.json();
       setMissions(Array.isArray(data) ? data : []);

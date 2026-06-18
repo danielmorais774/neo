@@ -20,6 +20,8 @@ const NAV_ITEMS: NavItem[] = [
   { path: '/logs', label: 'Logs', icon: '📋' },
   { path: '/letta', label: 'Letta', icon: '🤖' },
   { path: '/pks', label: 'PKS', icon: '🧠' },
+  { path: '/pks-context', label: 'PKS Context', icon: '🔍' },
+  { path: '/settings', label: 'Config', icon: '⚙️' },
 ];
 
 const Sidebar = () => {

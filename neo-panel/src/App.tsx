@@ -11,6 +11,8 @@ import ConnectedDevicesPanel from './ConnectedDevicesPanel';
 import NeoLogsPanel from './NeoLogsPanel';
 import LettaPanel from './LettaPanel';
 import PKSPanel from './PKSPanel';
+import PKSContextDebugPanel from './PKSContextDebugPanel';
+import SettingsPanel from './SettingsPanel';
 import Sidebar from './Sidebar';
 import { ToastContainer, useToast } from './ToastNotification';
 
@@ -44,6 +46,8 @@ function App() {
               <Route path="/logs" element={<NeoLogsPanel />} />
               <Route path="/letta" element={<LettaPanel />} />
               <Route path="/pks" element={<PKSPanel />} />
+              <Route path="/pks-context" element={<PKSContextDebugPanel />} />
+              <Route path="/settings" element={<SettingsPanel />} />
             </Routes>
           </main>
         </div>

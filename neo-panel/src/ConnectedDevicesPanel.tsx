@@ -4,6 +4,7 @@ interface DeviceInfo {
   device_id: string;
   device_type: string;
   model: string;
+  hardware_id: string;
   os_platform: string;
   os_version: string;
   client_version: string;
@@ -137,7 +138,7 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
         })),
       };
 
-      const response = await fetch('http://192.168.4.175:8000/api/v1/debug/test-notification', {
+      const response = await fetch('http://127.0.0.1:8000/api/v1/debug/test-notification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -186,6 +187,7 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 20 }}>
           <InfoRow label="Device ID" value={device.device_id} mono />
+          <InfoRow label="Hardware ID" value={device.hardware_id || '-'} mono />
           <InfoRow label="Platform" value={`${device.os_platform} ${device.os_version}`} />
           <InfoRow label="Client" value={device.client_version || '-'} />
           <InfoRow label="IP" value={device.ip_address || '-'} />
@@ -557,7 +559,7 @@ export default function ConnectedDevicesPanel() {
 
   const fetchDevices = async () => {
     try {
-      const response = await fetch('http://192.168.4.175:8000/api/v1/devices');
+      const response = await fetch('http://127.0.0.1:8000/api/v1/devices');
       if (response.ok) {
         const data = await response.json();
         setDevices(data.devices || []);

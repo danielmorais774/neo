@@ -228,7 +228,9 @@
   white-space: nowrap;
   flex-shrink: 0;
 }
-.intent-DIRECT_RESPONSE { background: #042f2e; color: #2dd4bf; }
+.intent-DIRECT_RESPONSE { background: #042f2e; color: #2dd4bf; }  /* legacy traces */
+.intent-cognitive       { background: #042f2e; color: #2dd4bf; }  /* cognitive core (renamed) */
+.intent-COGNITIVE       { background: #042f2e; color: #2dd4bf; }
 .intent-SERVER_TOOL     { background: #1c1917; color: #f59e0b; }
 .intent-CLIENT_TOOL     { background: #1e1b4b; color: #818cf8; }
 .intent-UNKNOWN         { background: #2d1f1f; color: #f87171; }

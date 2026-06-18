@@ -1,8 +1,10 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import QRCode from 'qrcode'
 
-const WS_URL = 'ws://192.168.4.175:8000/api/v1/whatsapp/ws/qr-status'
-const REST_URL = 'http://192.168.4.175:8000/api/v1/whatsapp'
+const WS_URL = 'ws://127.0.0.1:8000/api/v1/whatsapp/ws/qr-status'
+const REST_URL = 'http://127.0.0.1:8000/api/v1/whatsapp'
+const PANEL_JWT =
+  '***REMOVED***'
 
 interface QrStatus {
   qr: string | null
@@ -31,7 +33,7 @@ export default function WhatsAppStatus() {
 
     const connect = () => {
       if (!mounted) return
-      const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(PANEL_JWT)}`)
 
       ws.onopen = () => {
         wsConnectedRef.current = true

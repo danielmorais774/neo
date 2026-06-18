@@ -114,7 +114,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
   const loadPipelineLog = async () => {
     setLoadingPipelineLog(true);
     try {
-      const res = await fetch(`http://192.168.4.175:8000/api/v1/missions/${missionId}/pipeline-log`);
+      const res = await fetch(`http://127.0.0.1:8000/api/v1/missions/${missionId}/pipeline-log`);
       setPipelineLog(res.ok ? await res.json() : null);
     } finally {
       setLoadingPipelineLog(false);
@@ -123,7 +123,7 @@ export default function MissionDetailPanel({ missionId, onClose }: MissionDetail
 
   const load = async () => {
     try {
-      const base = `http://192.168.4.175:8000/api/v1/missions/${missionId}`;
+      const base = `http://127.0.0.1:8000/api/v1/missions/${missionId}`;
       const [mRes, msgRes, notifRes, tlRes, logRes] = await Promise.all([
         fetch(base),
         fetch(`${base}/messages?limit=500`),
