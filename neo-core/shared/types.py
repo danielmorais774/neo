@@ -41,6 +41,10 @@ class IntentType(str, Enum):
     CLIENT_TOOL = "client_tool"
     WHATSAPP_MESSAGING = "whatsapp_messaging"
     HOME_ASSISTANT = "home_assistant"
+    # Music playback (Spotify/YouTube). NOT a router fast-path target: music
+    # requests route to COGNITIVE, and the cognitive core hands off here so PKS
+    # behavioral rules (taste, refusals) always apply. See neo-music-feature.
+    MUSIC = "music"
 
     # Backward-compat alias: the old name/value was "direct_response". It now
     # resolves to COGNITIVE (value "cognitive"), so the ~60 existing references and
@@ -216,6 +220,12 @@ class RoutingDecision(BaseModel):
     needs_memory: bool = True  # whether cross-session memory recovery is useful
     knowledge_keywords: list[str] | None = None  # keywords for KG retrieval (classified by intent LLM)
     skill_name: str | None = None  # qual skill dispara (quando intent é uma skill)
+
+    # Hint for the cognitive core: a deterministic guard detected that this turn is
+    # about a skill the brain should CONSIDER handing off to (e.g. "music"), but the
+    # decision stays with the cognitive core (it reads the PKS and may refuse). Unlike
+    # ``skill_name``, this never fires a skill directly. See neo-music-feature.
+    skill_hint: str | None = None
 
     # --- speech act (Workstream B — bias to brain) ---
     # imperative | question | conditional | definition | chitchat.

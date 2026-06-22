@@ -25,7 +25,12 @@ echo "🔍 Checking installation..."
 python -c "import api.main; print('✅ api.main import OK')" || echo "❌ api.main import FAILED"
 
 echo "🚀 Starting uvicorn with hot-reload..."
+# --timeout-graceful-shutdown: without it the reload HANGS at "Waiting for background
+# tasks to complete" (the in-process gRPC server + open desktop streams never finish),
+# leaving neo-core down on every code change. Bounding it to 5s makes --reload actually
+# apply edits without a manual `docker restart`. See neo-music-feature.
 exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
+  --timeout-graceful-shutdown 5 \
   --reload-dir /app/api \
   --reload-dir /app/core \
   --reload-dir /app/shared \

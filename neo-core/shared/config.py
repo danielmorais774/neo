@@ -260,6 +260,42 @@ class Settings(BaseSettings):
         description="Timeout HTTP (s) para chamadas ao Home Assistant",
     )
 
+    # ── Music skill (Spotify / YouTube) — see neo-music-feature ──
+    music_enabled: bool = Field(
+        default=True,
+        description="Master flag da skill de música (Spotify/YouTube).",
+    )
+    music_handoff_verifier_enabled: bool = Field(
+        default=True,
+        description="Rede de segurança: se o turno de música não emitir nem "
+        "[[HANDOFF:music]] nem [[NO_MUSIC]], roda uma checagem estruturada barata "
+        "que sintetiza o handoff quando a intenção era tocar.",
+    )
+    music_default_service: str = Field(
+        default="youtube",
+        description="Serviço padrão quando o usuário NÃO diz Spotify/YouTube "
+        "explicitamente ('coloca um rock pra tocar'). 'youtube' ou 'spotify'.",
+    )
+    spotify_client_id: str | None = Field(
+        default=None, description="Spotify app client_id (App settings no dashboard)."
+    )
+    spotify_client_secret: str | None = Field(
+        default=None, description="Spotify app client_secret."
+    )
+    spotify_redirect_uri: str = Field(
+        default="http://127.0.0.1:8000/api/v1/spotify/callback",
+        description="Redirect URI registrado no dashboard do Spotify (OAuth callback).",
+    )
+    spotify_timeout: int = Field(
+        default=10, description="Timeout HTTP (s) para chamadas à API do Spotify."
+    )
+    youtube_api_key: str | None = Field(
+        default=None, description="YouTube Data API v3 key (busca de vídeos)."
+    )
+    youtube_timeout: int = Field(
+        default=10, description="Timeout HTTP (s) para chamadas à YouTube Data API."
+    )
+
     # neo-voice (TTS/STT gateway) — fonte do catálogo de vozes para o módulo `voice`
     neo_voice_url: str = Field(
         default="http://127.0.0.1:5002",

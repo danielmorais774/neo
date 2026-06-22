@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _SKILL_TO_INTENT: dict[str, IntentType] = {
     "home_assistant": IntentType.HOME_ASSISTANT,
     "whatsapp_messaging": IntentType.WHATSAPP_MESSAGING,
+    "music": IntentType.MUSIC,
 }
 
 _HANDOFF_RE = re.compile(
@@ -32,6 +33,21 @@ _HANDOFF_RE = re.compile(
 
 # Defensive cleanup for malformed/partial tags the model might emit.
 _STRAY_TAG_RE = re.compile(r"\[\[\s*/?\s*HANDOFF[^\]]*\]\]", re.IGNORECASE)
+
+# Some models copy the prompt's placeholder literally, e.g. emitting
+# ``<ordem concreta: AC/DC no YouTube>`` instead of just ``AC/DC no YouTube``.
+# Strip a wrapping ``<...>`` and a leading ``ordem ...:`` label so the skill gets
+# the real order, not the template. Model-agnostic safety net.
+_ORDER_LABEL_RE = re.compile(r"^\s*ordem\b[^:>]{0,80}:\s*", re.IGNORECASE)
+
+
+def _clean_order(raw: str) -> str:
+    """Strip a leaked prompt placeholder (``<ordem concreta: ...>``) from an order."""
+    s = (raw or "").strip()
+    if s.startswith("<") and s.endswith(">"):
+        s = s[1:-1].strip()
+    s = _ORDER_LABEL_RE.sub("", s).strip()
+    return s.strip("<>").strip()
 
 
 def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
@@ -46,7 +62,7 @@ def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
     handoffs: list[Handoff] = []
     for match in _HANDOFF_RE.finditer(text):
         skill = match.group(1).strip().lower()
-        input_text = (match.group(2) or "").strip()
+        input_text = _clean_order(match.group(2) or "")
         intent = _SKILL_TO_INTENT.get(skill)
         if intent is None:
             logger.warning("[HANDOFF] unknown skill in block, dropping: %r", skill)

@@ -440,6 +440,25 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                 ),
             )
 
+        # Persistent intermediate reply: the cognitive's user-facing answer that
+        # precedes a client-actuating handoff (music). Sent as a NON-final
+        # AgentResponse so the desktop renders it as its own chat message instead of
+        # a transient "thinking" — the real final ("🎵 …") follows after the play.
+        if (
+            resp.message
+            and not resp.is_final
+            and resp.metadata
+            and resp.metadata.get("persist_reply")
+        ):
+            return neo_desktop_pb2.CoreMessage(
+                session_id=sid,
+                response=neo_desktop_pb2.AgentResponse(
+                    message=resp.message,
+                    is_final=False,
+                    total_iterations=resp.iterations,
+                ),
+            )
+
         # Thinking / intermediate
         if resp.message and not resp.is_final:
             return neo_desktop_pb2.CoreMessage(

@@ -168,3 +168,10 @@ DESKTOP_TOOLS: list[ToolSchema] = [
         },
     ),
 ]
+
+# Media actuation tools (open_url / launch_uri / media_command) are intentionally
+# NOT in DESKTOP_TOOLS: they must never be agent-selectable, or the LLM picks
+# launch_uri and INVENTS a spotify: URI (→ "música não encontrada"). They are
+# dispatched ONLY by _handle_music after a real Spotify/YouTube search, executed by
+# name on the desktop (neo-desktop-tauri: is_media_tool) and confirmed by name in
+# process_tool_result (_MUSIC_ACTUATION_TOOLS). See neo-music-feature.

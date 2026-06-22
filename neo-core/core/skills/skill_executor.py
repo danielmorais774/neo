@@ -109,6 +109,13 @@ class SkillExecutor:
                 db=self.db,
                 broker=self.broker,
             )
+        if skill_name == "music":
+            from core.skills.music.pipeline import MusicPipeline
+            return MusicPipeline(
+                agent_executor=self.agent_executor,
+                db=self.db,
+                broker=self.broker,
+            )
         raise KeyError(f"No pipeline found for skill '{skill_name}'")
 
 

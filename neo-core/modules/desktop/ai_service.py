@@ -170,11 +170,14 @@ _HANDOFF_INSTRUCTION = (
     "Você é o núcleo cognitivo do Neo. Se, DEPOIS de analisar o contexto/PKS, você "
     "concluir que uma AÇÃO concreta deve ser executada agora por uma skill, escreva "
     "normalmente sua resposta ao usuário e, ao FINAL, adicione um bloco de controle "
-    "(que o usuário NÃO vê):\n"
-    "[[HANDOFF:home_assistant]]<ordem imperativa, limpa e auto-contida>[[/HANDOFF]]\n\n"
+    "(que o usuário NÃO vê), com a ORDEM REAL escrita dentro — por exemplo:\n"
+    "[[HANDOFF:home_assistant]]ligar o ar-condicionado do quarto[[/HANDOFF]]\n"
+    "NUNCA escreva a palavra \"ordem\" nem os sinais `< >` dentro do bloco — vá a ação "
+    "de verdade.\n\n"
     "Skills disponíveis:\n"
     "- `home_assistant`: controlar a casa (luzes, tomadas, clima, persianas, cenas).\n"
-    "- `whatsapp_messaging`: enviar mensagem de WhatsApp (passa por confirmação).\n\n"
+    "- `whatsapp_messaging`: enviar mensagem de WhatsApp (passa por confirmação).\n"
+    "- `music`: tocar música no Spotify/YouTube (passe a faixa/artista concretos).\n\n"
     "Regras:\n"
     "- O texto dentro do bloco deve ser uma ordem COMPLETA e sem ambiguidade "
     "(ex.: \"ligar o ar-condicionado do quarto\"), porque a skill NÃO vê esta conversa.\n"
@@ -182,6 +185,42 @@ _HANDOFF_INSTRUCTION = (
     "usuário condiciona (\"se eu costumo, pode ligar\") e o contexto confirma que sim.\n"
     "- Se não há nada a executar, não escreva nenhum bloco."
 )
+
+# Music turns (decision.skill_hint == "music") get a STRICTER handoff contract so the
+# play never silently no-ops: the reply must end with exactly one control token —
+# [[HANDOFF:music]] to play, or [[NO_MUSIC]] to refuse/clarify/chat. If neither is
+# emitted, a cheap verifier (_verify_music_decision) decides. See neo-music-feature.
+_MUSIC_HANDOFF_INSTRUCTION = (
+    "## Música — decisão OBRIGATÓRIA\n"
+    "O usuário pediu algo sobre TOCAR música. Você é o núcleo cognitivo: leia o "
+    "contexto/PKS (o GOSTO dele e qualquer REGRA de comportamento) e decida. AO FINAL "
+    "da resposta, emita EXATAMENTE UM bloco de controle (o usuário NÃO vê):\n"
+    "- Para TOCAR: ao final escreva o bloco com a FAIXA/ARTISTA real e buscável (+ o "
+    "serviço se ele disse). Exemplo literal: [[HANDOFF:music]]AC/DC no YouTube[[/HANDOFF]]. "
+    "NUNCA escreva a palavra \"ordem\" nem os sinais `< >` dentro do bloco — vá só a "
+    "música de verdade.\n"
+    "- Para CONTROLAR o que já está tocando, ponha a PALAVRA da ação no bloco: "
+    "[[HANDOFF:music]]pausar[[/HANDOFF]], [[HANDOFF:music]]retomar[[/HANDOFF]], "
+    "[[HANDOFF:music]]próxima[[/HANDOFF]], [[HANDOFF:music]]anterior[[/HANDOFF]], "
+    "[[HANDOFF:music]]mudo[[/HANDOFF]], [[HANDOFF:music]]aumentar volume[[/HANDOFF]] ou "
+    "[[HANDOFF:music]]abaixar volume[[/HANDOFF]]. Olhe as abas de mídia abertas no "
+    "contexto pra saber o que está tocando.\n"
+    "- Para NÃO tocar (recusa, brincadeira, dúvida, ou só conversar sobre música): "
+    "[[NO_MUSIC]]\n\n"
+    "Regras:\n"
+    "- Se o PKS tem uma REGRA sobre esse pedido (ex.: recusar um gênero e zoar o usuário), "
+    "SIGA a regra: escreva a resposta no personagem e use [[NO_MUSIC]] — NÃO toque.\n"
+    "- TOCAR **ou CONTROLAR** (pausar/retomar/próxima/anterior/mudo/volume) SEMPRE exige "
+    "o bloco [[HANDOFF:music]] — é ELE que executa de verdade. NUNCA diga que pausou, "
+    "tocou ou pulou SEM emitir o bloco; senão NADA acontece e você fica mentindo. "
+    "Resolva pedidos vagos ('aquela que eu curto') usando o gosto do PKS e ponha algo "
+    "concreto/buscável (ou a palavra exata da ação) dentro do bloco.\n"
+    "- Responda curto e natural; a mecânica dos blocos fica invisível ao usuário."
+)
+
+# Client tools the music skill dispatches to the desktop (Etapa 2). process_tool_result
+# confirms these truthfully and skips the generic recovery flow.
+_MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
 
 
 def _extract_clarification_question(text: str) -> str | None:
@@ -1008,6 +1047,11 @@ class AIService:
                     sid, msg, history, dec, trace, slog=slog, user_id=user_id,
                     metadata=step_metadata,
                 )
+            elif intent == IntentType.MUSIC:
+                gen = self._handle_music(
+                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    metadata=step_metadata,
+                )
             else:
                 yield None, StepOutcome(ok=True, final_text=None)
                 return
@@ -1212,8 +1256,20 @@ class AIService:
 
         # Phase 2: let the cognitive core hand off to a skill when it decides an
         # action must run (e.g. "se eu costumo, pode ligar" → home_assistant).
+        # Music turns get the stricter music contract (token-or-NO_MUSIC) instead.
         if enable_handoff:
-            messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
+            if decision.skill_hint == "music":
+                messages.append(Message(role=MessageRole.SYSTEM, content=_MUSIC_HANDOFF_INSTRUCTION))
+            else:
+                messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
+
+        # Real-time view of what's open/playing — injected on ANY cognitive turn when
+        # media is open, so the brain can control it ("pausa", "próxima") AND answer
+        # status questions ("o que tá tocando?", "como tá o YouTube?") that don't route
+        # to the music skill. Empty when nothing is open. See neo-music-feature.
+        _media_note = self._build_media_context_note(metadata)
+        if _media_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_media_note))
 
         # Active PKS verification results (real search output) — overrides any
         # claim made earlier in the conversation history.
@@ -1296,6 +1352,7 @@ class AIService:
             model_name = _req_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
 
             t0 = time.monotonic()
+            llm_ms = 0.0  # defined up front so a failed/caught LLM call can't crash the timing log
             # Cognitive core may read/verify ground truth inline (search_pks,
             # devices, weather) via a bounded tool loop — never to act. Training
             # turns never need tools.
@@ -1430,6 +1487,26 @@ class AIService:
             # Defensive: strip a stray block even when handoffs are disabled.
             full_response, _ = extract_handoffs(full_response)
 
+        # Music reliability (neo-music-feature): a music turn must resolve to either a
+        # [[HANDOFF:music]] (already extracted above) or an explicit [[NO_MUSIC]]. Strip
+        # the NO_MUSIC token; if NEITHER was emitted, a cheap verifier decides whether
+        # the reply intended to play and synthesizes the handoff so it never no-ops.
+        if decision.skill_hint == "music" and enable_handoff:
+            had_no_music = "[[NO_MUSIC]]" in full_response or "[[NO MUSIC]]" in full_response
+            full_response = full_response.replace("[[NO_MUSIC]]", "").replace("[[NO MUSIC]]", "").strip()
+            already_music = any(
+                h.target_skill == "music" or h.target_intent == IntentType.MUSIC
+                for h in pipeline_handoffs
+            )
+            if not already_music and not had_no_music and self.settings.music_handoff_verifier_enabled:
+                synth = await self._verify_music_decision(user_message, full_response)
+                if synth is not None:
+                    pipeline_handoffs.append(synth)
+                    if slog:
+                        slog.log_event("Music Handoff (verifier)", f"→ music: {synth.input_text}")
+            if not full_response.strip():
+                full_response = "Ok 🎵"
+
         # Save assistant response
         t0_save = time.monotonic()
         await self.sessions.add_message(
@@ -1450,13 +1527,27 @@ class AIService:
             slog.log_message_saved("assistant", full_response, str(session_id))
             slog.log_final_response(full_response, "COGNITIVE", iterations=1)
 
-        # Yield final response FIRST — background tasks must never block the user-facing round-trip
+        # A handoff to a CLIENT-actuating skill (music: media_command/open_url/launch_uri)
+        # needs a DESKTOP round-trip AFTER this reply. If we mark this reply is_final, the
+        # desktop closes the gRPC stream and the play never reaches it ("cancelled by
+        # client"). So keep the stream open for such handoffs — the skill step's tool +
+        # its result deliver the real final. Server-side handoffs (home_assistant/
+        # whatsapp) act on neo-core, so their reply stays final. See neo-music-feature.
+        _client_handoff = any(
+            h.target_intent == IntentType.MUSIC for h in pipeline_handoffs
+        )
+
+        # Yield final response FIRST — background tasks must never block the user-facing round-trip.
+        # On a music handoff this reply isn't the stream's final (the play follows), but it IS a
+        # real user-facing message — tag it persist_reply so the desktop renders it as its own chat
+        # bubble (not a transient "thinking"), then shows "🎵 …" as a second message.
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
             message=full_response,
-            is_final=True,
+            is_final=not _client_handoff,
             iterations=1,
+            metadata={"persist_reply": True} if _client_handoff else None,
         )
 
         # Context handed to the PKS memory planner. When the user talks about the
@@ -1793,6 +1884,40 @@ class AIService:
             if pattern.search(normalized):
                 return label
         return None
+
+    @staticmethod
+    def _build_media_context_note(metadata: dict | None) -> str | None:
+        """Summarize the browser media tabs (from the extension) for the brain.
+
+        Reads ``metadata['media_context']['browser_tabs']`` (the snapshot the desktop
+        sends every turn) into a short, readable note so the cognitive core knows what
+        is open/playing and can control it or answer "o que tá tocando?".
+        """
+        from core.skills.music.service import parse_media_context
+
+        tabs = (parse_media_context(metadata) or {}).get("browser_tabs") or []
+        lines = []
+        for t in tabs:
+            if not isinstance(t, dict):
+                continue
+            site = t.get("site") or "?"
+            title = (t.get("title") or t.get("url") or "").strip()
+            playing = " (tocando)" if t.get("playing") else ""
+            lines.append(f"- {site}: {title}{playing}".rstrip())
+        if not lines:
+            return None
+        return (
+            "## Mídia aberta no navegador (tempo real)\n"
+            "Abas de música/vídeo abertas agora:\n"
+            + "\n".join(lines)
+            + "\nSe o usuário pedir pra PAUSAR, RETOMAR/dar play, PULAR, VOLTAR ou mudar "
+            "VOLUME dessa mídia, você DEVE emitir ao final o bloco "
+            "[[HANDOFF:music]]<ação>[[/HANDOFF]] (ação = pausar | retomar | próxima | "
+            "anterior | mudo | aumentar volume | abaixar volume) — é ELE que executa de "
+            "verdade. NUNCA diga que pausou/voltou/pulou SEM emitir o bloco. Use também "
+            "estas abas pra responder o que está tocando. Se nada estiver tocando, diga "
+            "isso em vez de fingir que controlou."
+        )
 
     @staticmethod
     def _build_current_device_context(metadata: dict | None) -> str:
@@ -2316,6 +2441,214 @@ class AIService:
             yield resp
 
     # ---------------------------------------------------------------
+    # Handler: MUSIC — play via the music skill (Spotify/YouTube)
+    # ---------------------------------------------------------------
+
+    async def _handle_music(
+        self,
+        session_id: UUID,
+        user_message: str,
+        history: list[dict[str, str]],
+        decision: RoutingDecision,
+        trace: MessageTrace | None = None,
+        slog: "SessionFileLogger | None" = None,
+        user_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Handle a MUSIC handoff — runs the music skill, then actuates.
+
+        The skill resolves the track + decides the channel:
+          - ``spotify_connect``: already played server-side → confirm here.
+          - ``desktop``/``browser``: emit a client tool (open_url/launch_uri/
+            media_command) to the desktop; ``process_tool_result`` confirms on the
+            actual outcome (see the music branch there). See neo-music-feature.
+        """
+        skill_name = decision.skill_name or "music"
+        if slog:
+            slog.log_event("Music", f"Skill: {skill_name} | Ordem: {user_message[:80]}")
+
+        yield AIServiceResponse(
+            intent=IntentType.MUSIC,
+            session_id=session_id,
+            message="Buscando a música...",
+            is_final=False,
+        )
+
+        try:
+            skill_executor = self._skill_executor
+            if not skill_executor:
+                from core.skills.skill_executor import SkillExecutor
+                from core.notifications import NotificationBroker
+                broker = NotificationBroker()
+                skill_executor = SkillExecutor(
+                    agent_executor=self.agent,
+                    db=self.db,
+                    notification_broker=broker,
+                )
+                self._skill_executor = skill_executor
+
+            result = await skill_executor.execute(
+                skill_name=skill_name,
+                session_id=session_id,
+                user_message=user_message,
+                conversation_history=history,
+                user_id=user_id,
+                extra=dict(metadata or {}),
+            )
+        except Exception as e:
+            logger.exception("Music execution failed")
+            result = None
+            music_error = str(e)
+        else:
+            music_error = None
+
+        # Not actionable (not configured / not found / error) → speak it as final.
+        if result is None or not result.ok:
+            final_text = (result.message if result is not None else None) or (
+                f"Não consegui tocar agora: {music_error or 'erro desconhecido'}."
+            )
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text,
+                generate_embedding=False, user_id=user_id,
+            )
+            if slog:
+                slog.log_final_response(final_text, "MUSIC", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.MUSIC, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        actuation = (result.extra or {}).get("actuation") or {}
+        channel = actuation.get("channel")
+        summary = actuation.get("summary") or "a música"
+        tool_name = actuation.get("tool")
+        args = actuation.get("args") or {}
+
+        # spotify_connect (already played) or nothing to dispatch → confirm now.
+        if channel in (None, "spotify_connect") or not tool_name:
+            final_text = result.message or f"Tocando {summary} 🎵"
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text,
+                generate_embedding=False, user_id=user_id,
+            )
+            if slog:
+                slog.log_final_response(final_text, "MUSIC", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.MUSIC, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        # desktop/browser → dispatch a client tool; the final confirmation comes from
+        # process_tool_result (flow="music_actuation"), truthful to the real outcome.
+        tool_call_id = str(uuid4())
+        if slog:
+            slog.log_tool_request(tool_name, arguments=args, requires_approval=False, execution="client-side")
+        yield AIServiceResponse(
+            intent=IntentType.MUSIC, session_id=session_id,
+            message=result.message or f"Abrindo {summary}...", is_final=False,
+        )
+        yield AIServiceResponse(
+            intent=IntentType.MUSIC,
+            session_id=session_id,
+            tool_request={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+                "requires_approval": False,
+            },
+            is_final=False,
+            metadata={
+                "flow": "music_actuation",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "user_message": user_message,
+                "tool_arguments": args,
+                "command": summary,  # carried to process_tool_result for the confirmation
+            },
+        )
+
+    async def _verify_music_decision(
+        self, user_message: str, reply_text: str
+    ) -> "Handoff | None":
+        """Safety net: when a music turn emitted neither token, decide via a cheap call.
+
+        Returns a synthesized ``Handoff`` to the music skill when the reply intended
+        to play, else None. Fails safe to None (no play) on any error — never plays
+        against a refusal. See neo-music-feature.
+        """
+        try:
+            from modules.intent_config import get_classifier_config
+            cfg = await get_classifier_config(self.db)
+            provider = self.llm.get_provider(cfg["provider"])
+            model = cfg["model"]
+        except Exception:
+            try:
+                provider = self.llm.get_provider()
+                model = None
+            except Exception:
+                return None
+
+        sys = (
+            "Você decide o que a resposta do assistente PRETENDE fazer com a música AGORA. "
+            "Responda SÓ com JSON válido, sem markdown: "
+            '{"action":"play|pause|resume|next|previous|mute|volume_up|volume_down|refuse|clarify",'
+            '"query":"faixa/artista a buscar (só p/ play) ou \\"\\"","service_hint":"spotify|youtube|null"}. '
+            "play = a resposta diz que vai/está tocando algo concreto. "
+            "pause/resume/next/previous/mute/volume_* = a resposta diz que vai pausar/retomar/"
+            "pular/voltar/mutar/mudar volume do que já está tocando. "
+            "Recusa, zoeira, dúvida ou só conversa = refuse/clarify."
+        )
+        try:
+            resp = await provider.complete(
+                messages=[
+                    Message(role=MessageRole.SYSTEM, content=sys),
+                    Message(role=MessageRole.USER, content=f"Pedido: {user_message}\nResposta do Neo: {reply_text}"),
+                ],
+                tools=None,
+                model=model,
+                temperature=0.0,
+                max_tokens=120,
+            )
+            raw = (resp.get_content() or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning("Music verifier failed (no synthetic play): %s", e)
+            return None
+
+        action = str(data.get("action", "")).lower()
+        # Control actions → synthesize a handoff carrying the action WORD (the skill's
+        # detect_action picks it up). Covers "vou pausar" said without the token.
+        _control_word = {
+            "pause": "pausar", "resume": "retomar", "next": "próxima",
+            "previous": "anterior", "mute": "mudo",
+            "volume_up": "aumentar volume", "volume_down": "abaixar volume",
+        }
+        if action in _control_word:
+            return Handoff(
+                target_intent=IntentType.MUSIC,
+                input_text=_control_word[action],
+                target_skill="music",
+                reason="music_verifier_control",
+            )
+        if action != "play":
+            return None
+        query = str(data.get("query") or "").strip()
+        if not query:
+            return None
+        hint = str(data.get("service_hint") or "").lower()
+        order = query + (f" no {hint}" if hint in ("spotify", "youtube") else "")
+        return Handoff(
+            target_intent=IntentType.MUSIC,
+            input_text=order,
+            target_skill="music",
+            reason="music_verifier",
+        )
+
+    # ---------------------------------------------------------------
     # Handler: CLIENT_TOOL — tools running on user's desktop
     # ---------------------------------------------------------------
 
@@ -2511,6 +2844,27 @@ class AIService:
 
         t0_tool = time.monotonic()
         slog.log_tool_result(tool_name, success=success, result=result, error=error, duration_ms=0, execution="client-side")
+
+        # ── MUSIC ACTUATION RESULT (neo-music-feature) ──
+        # The tool was a desktop/browser play command dispatched by _handle_music.
+        # Confirm truthfully on the real outcome and stop — none of the generic
+        # retry/diagnostic/plan recovery below applies to "open a URL / play a track".
+        if tool_name in _MUSIC_ACTUATION_TOOLS:
+            summary = command or "a música"
+            if success:
+                final_text = f"🎵 {summary}"
+            else:
+                final_text = f"Tentei tocar {summary}, mas não consegui: {error or 'o player não respondeu'}."
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text,
+                generate_embedding=False,
+            )
+            slog.log_final_response(final_text, "MUSIC", iterations=1)
+            yield AIServiceResponse(
+                intent=IntentType.MUSIC, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
 
         # ── DIAGNOSTIC RESULT: this was an auto-diagnostic command ──
         if _is_diagnostic:
@@ -3044,6 +3398,27 @@ class AIService:
                     action=recovery.get("action", "?") if recovery else "none",
                     details=recovery,
                 )
+
+                # Guard against the approval-gated retry LOOP: a fresh command_request
+                # that needs the user to approve is offered at most once. If a real
+                # attempt already failed (≥1 retry), stop inventing variations and
+                # report honestly instead of chaining approval prompts. (Diagnostics —
+                # read-only, no approval — are exempt.) See neo-music-feature.
+                if (
+                    recovery
+                    and recovery.get("action") == "retry"
+                    and recovery.get("raw_command")
+                    and not recovery.get("_is_diagnostic", False)
+                    and _retry_count >= 1
+                ):
+                    logger.info("[RECOVERY] suppressing chained approval-gated retry; reporting honestly")
+                    recovery = {
+                        "action": "respond",
+                        "message": (
+                            f"Não consegui fazer isso — o comando falhou: "
+                            f"{error or 'erro desconhecido'}."
+                        ),
+                    }
 
                 if recovery and recovery.get("action") == "retry":
                     new_tool = recovery.get("tool_name", "run_command")

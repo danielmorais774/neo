@@ -42,7 +42,7 @@ for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config
+from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -168,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Import skill manifests to register them in SkillManifest registry
     from core.skills.whatsapp_messaging import whatsapp_messaging_manifest  # noqa: F401
     from core.skills.home_assistant import home_assistant_manifest  # noqa: F401
+    from core.skills.music import music_manifest  # noqa: F401
 
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
@@ -257,6 +258,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire voice (TTS) config route (neo-panel → Settings page)
     voice_config.set_dependencies(_db)
+
+    # Wire Spotify OAuth route (neo-panel → Music page)
+    spotify.set_dependencies(_db)
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
@@ -351,4 +355,7 @@ app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+# Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
+# identity is bound via a signed `state`. See api/routes/spotify.py.
+app.include_router(spotify.router, prefix="/api/v1")
 app.include_router(letta.router)

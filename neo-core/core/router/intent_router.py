@@ -113,9 +113,76 @@ _PREFERENCE_QUESTION = re.compile(
     r"\b(gosto|costumo|prefiro|gostaria|costumava)\b"
 )
 
+# Music requests must go to the COGNITIVE core, never fast-path to a skill: the
+# brain reads the PKS (taste + behavioral rules like "refuse sertanejo and tease")
+# and decides whether to hand off to the `music` skill. The cheap router has no PKS
+# access, so a confident imperative like "toca um sertanejo" would otherwise fire
+# the skill blindly. This guard sets skill_hint="music" so the cognitive core knows
+# to offer the strict music handoff. See neo-music-feature.
+_MUSIC_PLAY_VERBS = (
+    "toca", "tocar", "toque", "coloca", "colocar", "bota", "botar",
+    "poe", "poem", "reproduz", "reproduzir", "ouvir", "escutar",
+)
+# Media-control verbs: pause/resume/next/previous/volume/mute. Routed to the music
+# skill (same handoff path as play) so "pausa a música" never falls to run_command
+# and improvises a terminal command. See neo-music-feature.
+_MUSIC_CONTROL_VERBS = (
+    "pausa", "pausar", "pause", "para", "parar", "pare",
+    "retoma", "retomar", "continua", "continuar", "continue", "despausa", "despausar",
+    "play",  # "dá play", "play a música" — resume/start; English verb common in PT-BR.
+    "proxima", "proximo", "pula", "pular", "avanca", "avancar", "passa", "passar",
+    "anterior", "volta", "voltar", "retrocede",
+    "aumenta", "aumentar", "abaixa", "abaixar", "diminui", "diminuir", "baixa", "baixar",
+    "muta", "mutar", "silencia", "silenciar",
+)
+# Unambiguous media-control verbs. These refer to the media ALREADY playing, so
+# they route to the music skill even WITHOUT a media noun — anaphoric follow-ups
+# like "pausa aí de novo", "dá um play nela", "pula essa" otherwise fall to
+# run_command and improvise an AppleScript (session-…, osascript key code 179).
+# Music routes to the COGNITIVE core (not the skill directly), so a rare false
+# positive (e.g. "pula essa pergunta" in a quiz) is safe: the brain decides and
+# can emit [[NO_MUSIC]]. Ambiguous verbs (para/passa/volta/continua/aumenta/…)
+# stay in _MUSIC_CONTROL_VERBS and still require a noun. See neo-music-feature.
+_MUSIC_STRONG_CONTROL_VERBS = (
+    "pausa", "pausar", "despausa", "despausar",
+    "retoma", "retomar", "pula", "pular", "play",
+)
+# Unambiguous "resume what's playing" phrases. These route to the music skill even
+# WITHOUT a media noun (so "dá play de novo" / "volta a tocar" don't fall to
+# run_command and improvise an AppleScript). Matched as substrings on accent-
+# stripped, whitespace-collapsed text. See neo-music-feature.
+_MUSIC_RESUME_PHRASES = (
+    "da play", "dar play", "de play", "da o play", "de o play", "play de novo",
+    "volta a tocar", "voltar a tocar", "volta a musica", "volta a tocar a musica",
+    "continua a musica", "continua tocando", "continuar tocando",
+    "poe pra tocar de novo", "bota pra tocar de novo", "manda ver de novo",
+)
+_MUSIC_NOUNS = (
+    "musica", "musicas", "som", "playlist", "album", "albuns", "banda",
+    "cantor", "cantora", "sertanejo", "pagode", "rock", "funk", "mpb", "rap",
+    "samba", "forro", "reggae", "jazz", "blues", "trap", "lofi", "gospel",
+    "eletronica", "axe", "piseiro", "arrocha", "bossa", "hip hop",
+    "volume", "video",
+)
+_MUSIC_SERVICES = ("spotify", "youtube", "deezer", "soundcloud", "yt music")
+
+# Media-STATUS questions ("quais abas do YouTube estão abertas?", "o que tá
+# tocando?", "como tá o YouTube?") must go to the cognitive core, which gets a
+# real-time media_context note (the open browser tabs). The cheap classifier
+# otherwise sends "quais abas abertas" to run_command (osascript inspecting
+# Chrome) — the exact misroute seen in the screenshot. Patterns run on accent-
+# stripped, whitespace-collapsed text. See neo-music-feature.
+_MEDIA_TAB_NOUNS = ("aba", "abas", "guia", "guias")
+_MEDIA_STATUS_CTX = (
+    "youtube", "you tube", "spotify", "navegador", "chrome", "edge",
+    "musica", "video", "tocando", "aberta", "abertas", "aberto", "abertos", "player",
+)
+_MEDIA_PLAYING_QUERY = re.compile(r"\b(o que|que|qual|quais)\b.*\b(tocando|toca|rolando)\b")
+_MEDIA_QUESTION_STARTS = ("tem ", "tem alguma", "existe ", "ta aberta", "tao aberta")
+
 # Tools owned by a skill — excluded from the router's tool palette (Workstream A).
 # The router routes to the SKILL via skill_name; the skill picks its own tools.
-_SKILL_OWNED_TOOL_PREFIXES = ("ha_", "whatsapp_")
+_SKILL_OWNED_TOOL_PREFIXES = ("ha_", "whatsapp_", "spotify_", "youtube_")
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
 # confident imperative. Anything conditional/definitional/uncertain about them is
@@ -375,6 +442,21 @@ class IntentRouter:
             logger.info("Intent: conditional/preference request → DIRECT_RESPONSE (cognitive core, router bypass)")
             return self._brain_reasoning_decision(user_message)
 
+        # Music requests go to the cognitive core (which reads the PKS) and never
+        # fast-path to the skill — so behavioral rules like "refuse sertanejo" win.
+        from shared.config import get_settings as _get_settings
+        if _get_settings().music_enabled:
+            # Status questions ("quais abas do YouTube estão abertas?", "o que tá
+            # tocando?") are answered from the live media_context note — never a
+            # terminal command (classifier otherwise emits osascript). Checked
+            # before the play/control guard since these carry no action verb.
+            if self._is_media_status_query(user_message):
+                logger.info("Intent: media-status query → DIRECT_RESPONSE (media_context, router bypass)")
+                return self._media_status_decision(user_message)
+            if self._is_music_request(user_message):
+                logger.info("Intent: music request → DIRECT_RESPONSE (cognitive core handoff, router bypass)")
+                return self._music_decision(user_message)
+
         # Build tool descriptions for the prompt
         server_tools_desc = self._format_tools("server-side")
         client_tools_desc = self._format_tools("client-side")
@@ -522,6 +604,7 @@ class IntentRouter:
             "WHATSAPP_MESSAGING": IntentType.WHATSAPP_MESSAGING,
             "WHATSAPP_ORDER": IntentType.WHATSAPP_MESSAGING,
             "HOME_ASSISTANT": IntentType.HOME_ASSISTANT,
+            "MUSIC": IntentType.MUSIC,
         }
         intent = intent_map.get(intent_str, IntentType.DIRECT_RESPONSE)
 
@@ -824,6 +907,115 @@ class IntentRouter:
         self._apply_memory_heuristics(decision, message)
         return decision
 
+    @classmethod
+    def _is_music_request(cls, message: str) -> bool:
+        """True when the user is asking to PLAY or CONTROL music (Spotify/YouTube).
+
+        Precision-oriented: requires a play OR control verb AND (a music noun OR a
+        service), so "toca no assunto" / "coloca uma roupa" / "para de falar" don't
+        match. Misses (e.g. "toca aquela do Queen", bare "pausa") fall through to
+        normal classification → still COGNITIVE, which can hand off via the generic
+        block. Control verbs (pausa/próxima/...) route here so "pausa a música" never
+        improvises a terminal command. See neo-music-feature.
+        """
+        normalized = _strip_accents(message)
+        compact = " ".join(normalized.split())
+        if not compact:
+            return False
+        # Unambiguous resume phrases ("dá play de novo", "volta a tocar") → music
+        # even without a media noun, so they reach the cognitive music handoff
+        # instead of run_command (session-e54f, "Da play de novo" → osascript).
+        if any(p in compact for p in _MUSIC_RESUME_PHRASES):
+            return True
+        # Unambiguous control verbs (pausa/pula/play/retoma) refer to the media
+        # already playing — anaphoric follow-ups ("pausa aí de novo", "dá um play
+        # nela") carry no noun, so route them to music here. See neo-music-feature.
+        if cls._token_hits(compact, list(_MUSIC_STRONG_CONTROL_VERBS)) >= 1:
+            return True
+        has_verb = (
+            cls._token_hits(compact, list(_MUSIC_PLAY_VERBS)) >= 1
+            or cls._token_hits(compact, list(_MUSIC_CONTROL_VERBS)) >= 1
+        )
+        if not has_verb:
+            return False
+        has_noun = cls._token_hits(compact, list(_MUSIC_NOUNS)) >= 1
+        has_service = any(svc in compact for svc in _MUSIC_SERVICES)
+        return has_noun or has_service
+
+    def _music_decision(self, message: str) -> RoutingDecision:
+        """Route a music request to the cognitive core with a music handoff hint."""
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.9,
+            explanation=(
+                "Pedido de tocar música → núcleo cognitivo (lê o PKS — gosto e regras "
+                "— e decide o handoff para a skill de música)"
+            ),
+            needs_memory=True,
+            knowledge_keywords=["musica"],
+            requires_approval=False,
+            needs_plan=False,
+            skill_hint="music",
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
+    @classmethod
+    def _is_media_status_query(cls, message: str) -> bool:
+        """True for a QUESTION about open media tabs / what's playing.
+
+        These are answered by the cognitive core from its injected media_context
+        note (the live browser tabs), never by a terminal command. Precision-
+        oriented: the tab-listing case requires an interrogative framing so
+        imperatives like "fecha as abas abertas" don't get hijacked.
+        """
+        normalized = _strip_accents(message)
+        compact = " ".join(normalized.split())
+        if not compact:
+            return False
+
+        is_question = (
+            "?" in message
+            or compact.startswith(_INTERROGATIVE_STARTS)
+            or compact.startswith(("quais", "que ", "quantas", "quantos"))
+            or compact.startswith(_MEDIA_QUESTION_STARTS)
+            or any(v in compact for v in ("mostra", "lista", "me diz", "me fala", "ver as aba", "ver aba"))
+        )
+
+        # "quais abas do youtube estão abertas?", "tem aba do youtube aberta?"
+        has_tab = any(re.search(rf"\b{t}\b", compact) for t in _MEDIA_TAB_NOUNS)
+        has_ctx = any(c in compact for c in _MEDIA_STATUS_CTX)
+        if has_tab and has_ctx and is_question:
+            return True
+
+        # "o que tá tocando?", "que música está tocando agora?"
+        if _MEDIA_PLAYING_QUERY.search(compact):
+            return True
+
+        # "como tá o YouTube?", "status do YouTube/player/navegador"
+        if ("status" in compact or "como esta" in compact or "como ta " in compact) and any(
+            s in compact for s in ("youtube", "musica", "player", "spotify", "navegador")
+        ):
+            return True
+
+        return False
+
+    def _media_status_decision(self, message: str) -> RoutingDecision:
+        """Route a media-status question to the cognitive core (media_context note)."""
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.9,
+            explanation=(
+                "Pergunta sobre abas/mídia aberta → núcleo cognitivo (lê o "
+                "media_context em tempo real e responde, sem comando de terminal)"
+            ),
+            needs_memory=False,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
     def _memory_decision(self, message: str) -> RoutingDecision:
         """Direct-response decision for an explicit memory directive (no tools)."""
         decision = RoutingDecision(
@@ -863,6 +1055,14 @@ class IntentRouter:
         # Conditional/habit-based actions and preference questions → cognitive core.
         if self._is_brain_reasoning_request(message):
             return self._brain_reasoning_decision(message)
+
+        # Media-status questions → cognitive core (answered from media_context note).
+        if self._is_media_status_query(message):
+            return self._media_status_decision(message)
+
+        # Music requests → cognitive core (handoff to the music skill).
+        if self._is_music_request(message):
+            return self._music_decision(message)
 
         text = (message or "").lower()
         # Normalize accents

@@ -17,6 +17,8 @@ from shared.types import IntentType
 HANDOFF_EXECUTION_POLICY: dict[IntentType, str] = {
     IntentType.HOME_ASSISTANT: "auto",
     IntentType.WHATSAPP_MESSAGING: "confirm",
+    # Playing music is reversible/low-risk → no confirmation gate.
+    IntentType.MUSIC: "auto",
 }
 
 
