@@ -1,12 +1,14 @@
 import { useCallback, useState, useEffect } from 'react';
 import Chat from '../components/Chat';
+import LiveOverlay from '../components/LiveOverlay';
 import PasswordModal from '../components/PasswordModal';
 import type { Message } from '../types';
-import { 
-  useMessages, 
-  useAgentState, 
+import {
+  useMessages,
+  useAgentState,
   useAgentEvents,
-  useAppStartup 
+  useAppStartup,
+  useLiveMode
 } from '../hooks';
 import {
   HistoryService,
@@ -231,7 +233,7 @@ export const ChatPage = () => {
   });
 
   // Handlers
-  const handleSendMessage = async (content: string) => {
+  const handleSendMessage = async (content: string, modeOverride?: string) => {
     addMessage({
       role: 'user',
       content,
@@ -240,9 +242,10 @@ export const ChatPage = () => {
 
     setIsExecuting(true);
     setCurrentIteration(0);
-    
+
+    // modeOverride vem do Live (="live") p/ resposta falada/compacta; senão usa chatMode.
     try {
-      await AgentService.executeWithLoop(content, selectedModel, chatMode, selectedProvider);
+      await AgentService.executeWithLoop(content, selectedModel, modeOverride ?? chatMode, selectedProvider);
     } catch (error: any) {
       console.error('Erro:', error);
       addMessage({
@@ -253,6 +256,12 @@ export const ChatPage = () => {
       setIsExecuting(false);
     }
   };
+
+  // Modo Live (voz): captura mic → STT (neo-voice) → mesmo pipeline de texto;
+  // resposta final do agente é falada de volta via TTS (neo-voice).
+  const { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive } = useLiveMode({
+    onSendMessage: handleSendMessage,
+  });
 
   const handleStop = () => {
     AgentService.stopExecution();
@@ -364,7 +373,23 @@ export const ChatPage = () => {
         selectedProvider={selectedProvider}
         windowMode={windowMode}
         initialInput={`manda uma mensagem para minha irmã avisando que vou chegar mais tarde`}
+        isLive={isLive}
+        liveState={liveState}
+        livePartialText={partialText}
+        liveMicLevel={micLevel}
+        liveError={liveError}
+        onToggleLive={toggleLive}
       />
+
+      {isLive && (
+        <LiveOverlay
+          liveState={liveState}
+          partialText={partialText}
+          spokenText={spokenText}
+          micLevel={micLevel}
+          onClose={toggleLive}
+        />
+      )}
     </>
   );
 };

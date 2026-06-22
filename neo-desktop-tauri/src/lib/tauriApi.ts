@@ -62,6 +62,35 @@ export interface NotificationActionEvent {
   action_payload?: Record<string, unknown>;
 }
 
+export interface VoiceConfig {
+  wsBaseUrl: string;
+  apiKey: string | null;
+  voice: string | null;
+  backend: string;
+  language: string | null;
+}
+
+// Engine de voz (STT/TTS) controlável no PC gamer via os scripts engine_ctl.
+export interface VoiceEngine {
+  key: string;
+  label: string;
+  kind: string; // "Windows" | "WSL2"
+  port: number;
+  backend: string | null; // id do backend no neo-voice (null p/ o STT)
+}
+
+export type VoiceEngineAction = 'start' | 'stop' | 'restart' | 'status';
+
+// Active voice resolved by neo-core (from the DB) and carried on the agent's
+// final reply (Pattern A). When present it overrides the static VoiceConfig for
+// that utterance. `engine` maps to the neo-voice `backend` field.
+export interface VoiceOverride {
+  engine?: string | null;
+  voice?: string | null;
+  language?: string | null;
+  label?: string | null;
+}
+
 export interface ElectronAPI {
   sendMessage: (message: string, model?: string, mode?: string) => Promise<unknown>;
   executeWithLoop: (message: string, model?: string, mode?: string, provider?: string) => Promise<void>;
@@ -98,6 +127,11 @@ export interface ElectronAPI {
   onNotificationAction: (callback: (event: NotificationActionEvent) => void) => UnlistenFn;
   listConnectedDevices: () => Promise<DeviceInfo[]>;
   setNotificationContext: (activeTab: 'chat' | 'devices') => Promise<void>;
+  getVoiceConfig: () => Promise<VoiceConfig>;
+  // Motores de voz no PC gamer (subir/baixar via engine_ctl por SSH).
+  listVoiceEngines: () => Promise<VoiceEngine[]>;
+  voiceEngineHealth: (key: string) => Promise<boolean>;
+  voiceEngineAction: (key: string, action: VoiceEngineAction) => Promise<string>;
 }
 
 let passwordRequestUnlisten: UnlistenFn | null = null;
@@ -162,8 +196,12 @@ export const electronAPI: ElectronAPI = {
     };
   },
 
-  respondToPermission: (_requestId: string, _approved: boolean) => {
-    // In Tauri this would be handled differently
+  respondToPermission: (requestId: string, approved: boolean) => {
+    // Push the approval/rejection into the live agent stream. Without this the
+    // run hangs at "Aguardando permissão" until the 300s timeout.
+    invoke('respond_to_command', { commandId: requestId, approved }).catch((e) => {
+      console.error('[tauriApi] respond_to_command failed:', e);
+    });
   },
 
   onPasswordRequest: (callback: (prompt: string) => void) => {
@@ -332,4 +370,11 @@ export const electronAPI: ElectronAPI = {
   listConnectedDevices: () => invoke('list_connected_devices'),
   setNotificationContext: (activeTab: 'chat' | 'devices') =>
     invoke('set_notification_context', { activeTab }),
+
+  getVoiceConfig: () => invoke('get_voice_config'),
+
+  listVoiceEngines: () => invoke('list_voice_engines'),
+  voiceEngineHealth: (key: string) => invoke('voice_engine_health', { key }),
+  voiceEngineAction: (key: string, action: VoiceEngineAction) =>
+    invoke('voice_engine_action', { key, action }),
 };

@@ -58,6 +58,9 @@
     "icon": [
       "icons/icon.png"
     ],
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    },
     "linux": {
       "appimage": {
         "bundleMediaFramework": false

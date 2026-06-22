@@ -1,4 +1,5 @@
 mod commands;
+mod ext_bridge;
 mod grpc_gen;
 mod notch_host;
 mod notifications;
@@ -27,6 +28,11 @@ pub struct AppState {
     pub notification_context: Mutex<NotificationContext>,
     /// Signalled by `stop_execution` to cancel the in-flight agent run.
     pub cancel_notify: Arc<tokio::sync::Notify>,
+    /// Sender into the active agent stream, so `respond_to_command` can inject a
+    /// command approval/rejection from the UI. Set/cleared by `execute_task`.
+    pub stream_tx: crate::services::ai_agent::StreamTxSlot,
+    /// Bridge to the browser extension (music tabs + play commands, Etapa 3).
+    pub ext_bridge: crate::ext_bridge::ExtBridge,
 }
 
 #[derive(Debug, Clone)]
@@ -157,16 +163,23 @@ pub fn run() {
                 active_tab: "chat".to_string(),
             }),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            stream_tx: Arc::new(Mutex::new(None)),
+            ext_bridge: crate::ext_bridge::ExtBridge::new(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
             commands::stop_execution,
+            commands::respond_to_command,
             commands::reset_agent,
             commands::execute_command,
             commands::get_history,
             commands::clear_history,
             commands::get_neo_core_status,
             commands::get_window_mode,
+            commands::get_voice_config,
+            commands::list_voice_engines,
+            commands::voice_engine_health,
+            commands::voice_engine_action,
             commands::get_conversation_history,
             commands::clear_conversation_history,
             commands::save_conversation_history,
@@ -184,6 +197,13 @@ pub fn run() {
         .setup(|app| {
             info!("[Neo] Desktop initialized!");
             notifications::init(&app.handle().clone());
+
+            // Start the local WebSocket bridge for the browser extension
+            // (music tabs + play commands, Etapa 3). Must use the Tauri async
+            // runtime — a bare tokio::spawn here panics (no runtime in setup).
+            tauri::async_runtime::spawn(ext_bridge::run(
+                app.state::<AppState>().ext_bridge.clone(),
+            ));
 
             // Show the main window on startup
             if let Some(window) = app.get_webview_window("main") {

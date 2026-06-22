@@ -40,6 +40,22 @@ export const useAgentEvents = ({
           });
           break;
 
+        case 'assistant_message':
+          // Persistent reply that precedes a client actuation (e.g. the witty answer
+          // before a music play). Keep it as its own chat bubble — the "🎵 …"
+          // confirmation arrives later as a separate message. Drop any thinking bubble.
+          setMessages(prev => {
+            const filtered = prev.filter(m => m.messageType !== 'thinking');
+            return [...filtered, {
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: event.data.content,
+              messageType: 'text',
+              timestamp: new Date()
+            }];
+          });
+          break;
+
         case 'plan':
           setMessages(prev => [...prev, {
             id: Date.now().toString(),
@@ -181,7 +197,8 @@ export const useAgentEvents = ({
             role: 'assistant',
             content: `Comando: ${event.data.explanation}`,
             messageType: 'command',
-            command: event.data,
+            // requestId carries the command_id back to respond_to_command on approve/reject.
+            command: { ...event.data, requestId: event.data.id },
             timestamp: new Date()
           }]);
           break;

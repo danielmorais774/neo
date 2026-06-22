@@ -1,3 +1,4 @@
+use crate::grpc_gen::neo_desktop::{desktop_message, CommandApproval, DesktopMessage};
 use crate::services::ai_agent::GrpcClient;
 use crate::AppState;
 use log::{error, info, warn};
@@ -38,10 +39,10 @@ pub async fn execute_with_loop(
     state: State<'_, AppState>,
     message: String,
     model: Option<String>,
-    _mode: Option<String>,
+    mode: Option<String>,
     provider: Option<String>,
 ) -> Result<(), String> {
-    info!("[Neo] execute_with_loop: {} (model={:?})", message, model);
+    info!("[Neo] execute_with_loop: {} (model={:?}, mode={:?})", message, model, mode);
 
     let device_id = state.device_id.clone();
     let hardware_id = state.hardware_id.clone();
@@ -52,6 +53,8 @@ pub async fn execute_with_loop(
 
     let app_handle = app.clone();
     let cancel_notify = state.cancel_notify.clone();
+    let stream_tx_slot = state.stream_tx.clone();
+    let ext_bridge = state.ext_bridge.clone();
 
     tokio::spawn(async move {
         let mut client = GrpcClient::new(&device_id, &hardware_id, &user_id, &neo_core_url);
@@ -63,7 +66,10 @@ pub async fn execute_with_loop(
                 message,
                 model.as_deref(),
                 provider.as_deref(),
+                mode.as_deref(),
                 cancel_notify,
+                stream_tx_slot,
+                ext_bridge,
             )
             .await;
 
@@ -93,6 +99,50 @@ pub fn stop_execution(state: State<'_, AppState>) -> Result<(), String> {
     // cancels the server-side RPC (grpc.aio cancels the handler on client abort).
     state.cancel_notify.notify_waiters();
     Ok(())
+}
+
+/// Approve or reject a pending command (the agent's `command_request`). Pushes a
+/// CommandApproval into the in-flight stream so neo-core can continue: on approve it
+/// replies with an `execute_command` tool request that this client runs inline; on
+/// reject it closes the turn. Without this the run hangs until the 300s timeout.
+#[tauri::command]
+pub async fn respond_to_command(
+    state: State<'_, AppState>,
+    command_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    info!(
+        "[Neo] respond_to_command: id={} approved={}",
+        command_id, approved
+    );
+
+    let sender = {
+        state
+            .stream_tx
+            .lock()
+            .map_err(|_| "stream sender lock poisoned".to_string())?
+            .clone()
+    };
+    let Some(sender) = sender else {
+        return Err("nenhuma execução ativa para aprovar".to_string());
+    };
+
+    let session_id = state.session_id.lock().unwrap().clone();
+    let user_id = state.user_id.clone();
+
+    let msg = DesktopMessage {
+        session_id,
+        user_id,
+        content: Some(desktop_message::Content::CommandApproval(CommandApproval {
+            command_id,
+            approved,
+        })),
+    };
+
+    sender
+        .send(msg)
+        .await
+        .map_err(|e| format!("falha ao enviar aprovação do comando: {}", e))
 }
 
 #[tauri::command]
@@ -299,6 +349,258 @@ pub async fn get_neo_core_status() -> Result<NeoCoreStatus, String> {
 #[tauri::command]
 pub fn get_window_mode() -> &'static str {
     "tooltip"
+}
+
+// ============ VOICE (LIVE MODE) CONFIG ============
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfig {
+    /// WebSocket base URL of the neo-voice service (no trailing slash),
+    /// e.g. ws://127.0.0.1:5002. The frontend appends /ws/panel and /ws/tts.
+    pub ws_base_url: String,
+    /// Optional API key forwarded as ?api_key= on the STT websocket.
+    pub api_key: Option<String>,
+    /// Default TTS voice name; None lets the engine pick its default.
+    pub voice: Option<String>,
+    /// TTS backend: qwen | coqui | dia.
+    pub backend: String,
+    /// Optional TTS language override. None deixa cada engine usar seu default
+    /// (Qwen="Portuguese", Coqui="pt"), evitando acoplar idioma ao backend.
+    pub language: Option<String>,
+}
+
+/// Returns neo-voice connection settings for the Live (voice) mode, read from
+/// env with sensible defaults (neo-voice runs on the same Mac at :5002).
+#[tauri::command]
+pub fn get_voice_config() -> VoiceConfig {
+    let ws_base_url = std::env::var("NEO_VOICE_WS_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "ws://127.0.0.1:5002".to_string());
+    let api_key = std::env::var("NEO_VOICE_APIKEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let voice = std::env::var("NEO_VOICE_TTS_VOICE")
+        .ok()
+        .filter(|v| !v.is_empty());
+    // Coqui (XTTS-v2) é o motor mais rápido (~0.9s p/ o 1º som, rtf ~0.14),
+    // ideal para conversa ao vivo. Sobrescreva com NEO_VOICE_TTS_BACKEND.
+    let backend = std::env::var("NEO_VOICE_TTS_BACKEND")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "coqui".to_string());
+    let language = std::env::var("NEO_VOICE_TTS_LANGUAGE")
+        .ok()
+        .filter(|v| !v.is_empty());
+    VoiceConfig {
+        ws_base_url,
+        api_key,
+        voice,
+        backend,
+        language,
+    }
+}
+
+// ============ VOICE ENGINES (PC gamer) ============
+//
+// Sobe/baixa os engines de STT/TTS que rodam na GPU do PC gamer (RTX 5070 Ti)
+// pelos scripts `engine_ctl*.ps1`, executados via SSH. O status é checado direto
+// por HTTP em /health de cada porta — reflete a alcançabilidade real pela LAN
+// (inclui o portproxy da WSL). Assim o usuário liga os motores sem abrir o SSH
+// na mão. Caminhos/portas conferidos no PC gamer (memórias neo-voice /
+// pcgamer-engine-scripts / neo-voice-fish-s2-feasibility).
+
+const PC_GAMER_HOST: &str = "192.168.4.185";
+const PC_GAMER_USER: &str = "dmdan";
+
+struct EngineDef {
+    key: &'static str,
+    label: &'static str,
+    /// "Windows" (nativo) ou "WSL2".
+    kind: &'static str,
+    port: u16,
+    /// id do backend no neo-voice (None para o STT).
+    backend: Option<&'static str>,
+    /// Caminho do engine_ctl*.ps1 no PC gamer.
+    script: &'static str,
+}
+
+const VOICE_ENGINES: &[EngineDef] = &[
+    EngineDef {
+        key: "stt",
+        label: "STT · Parakeet TDT",
+        kind: "Windows",
+        port: 5005,
+        backend: None,
+        script: r"C:\Users\dmdan\neo-stt-engine\engine_ctl.ps1",
+    },
+    EngineDef {
+        key: "qwen",
+        label: "TTS · Qwen3-TTS",
+        kind: "WSL2",
+        port: 5006,
+        backend: Some("qwen"),
+        script: r"C:\Users\dmdan\engine_ctl_wsl.ps1",
+    },
+    EngineDef {
+        key: "coqui",
+        label: "TTS · Coqui XTTS-v2",
+        kind: "WSL2",
+        port: 5007,
+        backend: Some("coqui"),
+        script: r"C:\Users\dmdan\engine_ctl_coqui_wsl.ps1",
+    },
+    EngineDef {
+        key: "cosyvoice",
+        label: "TTS · CosyVoice3",
+        kind: "WSL2",
+        port: 5009,
+        backend: Some("cosyvoice"),
+        script: r"C:\Users\dmdan\engine_ctl_cosyvoice_wsl.ps1",
+    },
+    EngineDef {
+        key: "f5",
+        label: "TTS · F5-TTS (PT-BR)",
+        kind: "WSL2",
+        port: 5010,
+        backend: Some("f5"),
+        script: r"C:\Users\dmdan\engine_ctl_f5_wsl.ps1",
+    },
+    EngineDef {
+        key: "chatterbox",
+        label: "TTS · Chatterbox",
+        kind: "WSL2",
+        port: 5011,
+        backend: Some("chatterbox"),
+        script: r"C:\Users\dmdan\engine_ctl_chatterbox_wsl.ps1",
+    },
+];
+
+fn find_engine(key: &str) -> Option<&'static EngineDef> {
+    VOICE_ENGINES.iter().find(|e| e.key == key)
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceEngine {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub port: u16,
+    pub backend: Option<String>,
+}
+
+/// Lista os engines de voz controláveis no PC gamer (metadados para a UI).
+#[tauri::command]
+pub fn list_voice_engines() -> Vec<VoiceEngine> {
+    VOICE_ENGINES
+        .iter()
+        .map(|e| VoiceEngine {
+            key: e.key.to_string(),
+            label: e.label.to_string(),
+            kind: e.kind.to_string(),
+            port: e.port,
+            backend: e.backend.map(|b| b.to_string()),
+        })
+        .collect()
+}
+
+/// `true` se o engine responde em http://<pc-gamer>:<porta>/health. Falhas de
+/// rede (motor parado, portproxy ausente) viram `false`, não erro — a UI só
+/// quer saber se está online.
+#[tauri::command]
+pub async fn voice_engine_health(key: String) -> Result<bool, String> {
+    let def = find_engine(&key).ok_or_else(|| format!("Engine desconhecido: {}", key))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("Falha ao criar HTTP client: {}", e))?;
+    let url = format!("http://{}:{}/health", PC_GAMER_HOST, def.port);
+    match client.get(&url).send().await {
+        Ok(resp) => Ok(resp.status().is_success()),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Executa `engine_ctl*.ps1 <action>` no PC gamer via SSH. `action` ∈
+/// {start, stop, restart, status}. O script recria portproxy/firewall e sobe o
+/// processo destacado via WMI (sobrevive ao fim do SSH). Retorna a saída
+/// combinada do script (stdout+stderr).
+#[tauri::command]
+pub async fn voice_engine_action(key: String, action: String) -> Result<String, String> {
+    let action = match action.as_str() {
+        "start" | "stop" | "restart" | "status" => action,
+        other => return Err(format!("Ação inválida: {}", other)),
+    };
+    let def = find_engine(&key).ok_or_else(|| format!("Engine desconhecido: {}", key))?;
+
+    let key_path = dirs::home_dir()
+        .ok_or_else(|| "Não foi possível resolver o HOME para a chave SSH".to_string())?
+        .join(".ssh")
+        .join("pc_gamer");
+
+    let remote = format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -File {} {}",
+        def.script, action
+    );
+
+    info!("[Neo] voice_engine_action: {} {} ({})", key, action, def.script);
+
+    let fut = tokio::process::Command::new("ssh")
+        .arg("-i")
+        .arg(&key_path)
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("{}@{}", PC_GAMER_USER, PC_GAMER_HOST))
+        .arg(&remote)
+        .output();
+
+    // `start` retorna rápido (cria o processo via WMI e volta). Folga p/ o
+    // `status`, que sobe um `wsl tail` e pode levar alguns segundos.
+    let output = tokio::time::timeout(std::time::Duration::from_secs(75), fut)
+        .await
+        .map_err(|_| format!("Tempo esgotado ao executar '{}' em {}", action, key))?
+        .map_err(|e| {
+            format!(
+                "Falha ao iniciar o ssh: {} — confira o cliente SSH e a chave ~/.ssh/pc_gamer",
+                e
+            )
+        })?;
+
+    // WSL emite erros em UTF-16 LE → \x00 entre os caracteres; limpa p/ exibir.
+    let clean = |b: &[u8]| String::from_utf8_lossy(b).replace('\u{0}', "");
+    let stdout = clean(&output.stdout);
+    let stderr = clean(&output.stderr);
+    let mut parts: Vec<&str> = Vec::new();
+    let so = stdout.trim();
+    let se = stderr.trim();
+    if !so.is_empty() {
+        parts.push(so);
+    }
+    if !se.is_empty() {
+        parts.push(se);
+    }
+    let combined = parts.join("\n");
+
+    if output.status.success() {
+        Ok(if combined.is_empty() {
+            "(sem saída)".to_string()
+        } else {
+            combined
+        })
+    } else {
+        Err(if combined.is_empty() {
+            format!("ssh saiu com erro ({})", output.status)
+        } else {
+            combined
+        })
+    }
 }
 
 // ============ QUICK HELP ============

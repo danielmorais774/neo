@@ -177,6 +177,19 @@ pub struct AgentResponse {
     pub is_final: bool,
     #[prost(int32, tag = "3")]
     pub total_iterations: i32,
+    #[prost(message, optional, tag = "4")]
+    pub voice: ::core::option::Option<VoiceSettings>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VoiceSettings {
+    #[prost(string, tag = "1")]
+    pub engine: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub voice: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub language: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub label: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorMessage {

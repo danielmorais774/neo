@@ -1,0 +1,212 @@
+/* ============================================================
+   Modo Live — tela cheia de voz (estilo Gemini Live)
+   ============================================================ */
+.live-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background:
+    radial-gradient(120% 90% at 50% 12%, rgba(59, 130, 246, 0.16), transparent 60%),
+    radial-gradient(120% 90% at 50% 100%, rgba(139, 92, 246, 0.14), transparent 55%),
+    rgba(8, 11, 20, 0.92);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  animation: live-overlay-in 0.28s ease;
+}
+
+@keyframes live-overlay-in {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.live-overlay-header {
+  padding: 18px 0 4px;
+  flex-shrink: 0;
+}
+
+.live-overlay-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.live-overlay-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  width: 100%;
+  padding: 0 28px;
+  min-height: 0;
+}
+
+/* ---- orbe + anéis ---- */
+.live-orb-wrap {
+  position: relative;
+  width: 168px;
+  height: 168px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.live-orb {
+  width: 116px;
+  height: 116px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 28%, #93c5fd 0%, #3b82f6 38%, #6366f1 70%, #7c3aed 100%);
+  box-shadow:
+    0 0 36px rgba(59, 130, 246, 0.55),
+    0 0 80px rgba(124, 58, 237, 0.35),
+    inset 0 0 30px rgba(255, 255, 255, 0.25);
+  transition: transform 0.09s ease-out;
+  animation: orb-glow 3.4s ease-in-out infinite;
+}
+
+@keyframes orb-glow {
+  0%, 100% { box-shadow: 0 0 32px rgba(59, 130, 246, 0.5), 0 0 70px rgba(124, 58, 237, 0.3), inset 0 0 30px rgba(255, 255, 255, 0.22); }
+  50% { box-shadow: 0 0 48px rgba(59, 130, 246, 0.7), 0 0 110px rgba(124, 58, 237, 0.45), inset 0 0 36px rgba(255, 255, 255, 0.3); }
+}
+
+.live-orb-ring {
+  position: absolute;
+  inset: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(96, 165, 250, 0.5);
+  opacity: 0;
+  animation: ring-pulse 2.8s ease-out infinite;
+}
+.live-orb-ring.ring2 { animation-delay: 0.9s; }
+.live-orb-ring.ring3 { animation-delay: 1.8s; }
+
+@keyframes ring-pulse {
+  0% { transform: scale(0.7); opacity: 0.55; }
+  100% { transform: scale(1.7); opacity: 0; }
+}
+
+/* listening — orbe respira (escala inline) + anéis verdes mais vivos */
+.live-overlay.live-listening .live-orb-ring { border-color: rgba(74, 222, 128, 0.5); }
+
+/* thinking — calmo, sem anéis, orbe âmbar girando */
+.live-overlay.live-thinking .live-orb-ring { animation: none; opacity: 0; }
+.live-overlay.live-thinking .live-orb {
+  background: radial-gradient(circle at 32% 28%, #fde68a 0%, #f59e0b 42%, #d97706 100%);
+  animation: orb-glow 1.4s ease-in-out infinite, orb-spin 6s linear infinite;
+}
+
+@keyframes orb-spin {
+  from { rotate: 0deg; }
+  to { rotate: 360deg; }
+}
+
+/* speaking — anéis rápidos */
+.live-overlay.live-speaking .live-orb-ring { animation-duration: 1.6s; }
+.live-overlay.live-speaking .live-orb { animation-duration: 1.6s; }
+
+/* ---- status + legenda ---- */
+.live-overlay-status {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.02em;
+}
+
+.live-overlay-caption {
+  max-width: 440px;
+  min-height: 48px;
+  text-align: center;
+  font-size: 17px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  opacity: 0.95;
+  overflow-y: auto;
+  max-height: 38vh;
+}
+
+.live-overlay-caption.from-neo {
+  color: #bfdbfe;
+}
+
+.live-overlay-hint {
+  color: var(--text-secondary);
+  opacity: 0.55;
+  font-size: 15px;
+  font-style: italic;
+}
+
+.live-thinking-dots {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+}
+.live-thinking-dots span {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #f59e0b;
+  animation: thinking-bounce 1.2s ease-in-out infinite;
+}
+.live-thinking-dots span:nth-child(2) { animation-delay: 0.18s; }
+.live-thinking-dots span:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes thinking-bounce {
+  0%, 100% { transform: translateY(0); opacity: 0.4; }
+  50% { transform: translateY(-7px); opacity: 1; }
+}
+
+/* ---- controles ---- */
+.live-overlay-controls {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0 30px;
+}
+
+.live-end-btn {
+  width: 60px;
+  height: 60px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.92);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 24px rgba(239, 68, 68, 0.35);
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.live-end-btn:hover {
+  background: #ef4444;
+  transform: scale(1.06);
+}
+.live-end-btn:active {
+  transform: scale(0.96);
+}
+
+.live-end-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  letter-spacing: 0.04em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-orb,
+  .live-orb-ring,
+  .live-thinking-dots span,
+  .live-overlay {
+    animation: none;
+  }
+}

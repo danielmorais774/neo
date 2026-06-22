@@ -1,5 +1,6 @@
 import { useCallback, useState, useRef, useEffect } from 'react';
 import type { Message } from '../types';
+import type { LiveState } from '../hooks/useLiveMode';
 import MessageBubble from './MessageBubble';
 import GlassSelect from './GlassSelect';
 import './Chat.css';
@@ -24,7 +25,21 @@ interface ChatProps {
   selectedProvider: string;
   windowMode: 'tooltip' | 'agent';
   initialInput?: string;
+  // Modo Live (voz)
+  isLive?: boolean;
+  liveState?: LiveState;
+  livePartialText?: string;
+  liveMicLevel?: number;
+  liveError?: string | null;
+  onToggleLive?: () => void;
 }
+
+const LIVE_LABELS: Record<LiveState, string> = {
+  idle: '',
+  listening: 'Ouvindo…',
+  thinking: 'Pensando…',
+  speaking: 'Falando…',
+};
 
 type ChatMode = 'agent' | 'plan' | 'ask';
 type ProviderType = 'openai' | 'groq' | 'grok' | 'deepseek' | 'anthropic' | 'gemini' | 'ollama';
@@ -97,11 +112,17 @@ function Chat({
   onModelChange, 
   onModeChange,
   onProviderChange,
-  selectedModel, 
+  selectedModel,
   selectedMode,
   selectedProvider,
   windowMode,
   initialInput,
+  isLive = false,
+  liveState = 'idle',
+  livePartialText = '',
+  liveMicLevel = 0,
+  liveError = null,
+  onToggleLive,
 }: ChatProps) {
   const [input, setInput] = useState(initialInput || '');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -272,6 +293,26 @@ function Chat({
       </div>
 
       <form className="input-container" onSubmit={handleSubmit}>
+        {isLive && (
+          <div className={`live-bar live-${liveState}`} role="status">
+            <span className="live-dot" />
+            <span className="live-label">{LIVE_LABELS[liveState]}</span>
+            {liveState === 'listening' && (
+              <span className="live-meter">
+                <span
+                  className="live-meter-fill"
+                  style={{ width: `${Math.min(100, Math.round(liveMicLevel * 100))}%` }}
+                />
+              </span>
+            )}
+            {livePartialText && <span className="live-partial">{livePartialText}</span>}
+          </div>
+        )}
+        {liveError && !isLive && (
+          <div className="live-bar live-error" role="alert">
+            <span className="live-label">🎙️ {liveError}</span>
+          </div>
+        )}
         <div className="input-wrapper">
           <button type="button" className="btn-attachment" title="Anexar arquivo">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -287,7 +328,13 @@ function Chat({
             rows={1}
             disabled={isLoading || isExecuting}
           />
-          <button type="button" className="btn-mic" title="Gravação de voz">
+          <button
+            type="button"
+            className={`btn-mic${isLive ? ' live-active' : ''}`}
+            title={isLive ? 'Encerrar Modo Live' : 'Modo Live (voz)'}
+            aria-pressed={isLive}
+            onClick={() => onToggleLive?.()}
+          >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
               <path d="M19 10v2a7 7 0 0 1-14 0v-2" />

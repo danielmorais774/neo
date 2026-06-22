@@ -1,16 +1,35 @@
 // AI Agent service - communicates with Neo Core via gRPC bidirectional streaming
 
 use crate::grpc_gen::neo_desktop::neo_desktop_service_client::NeoDesktopServiceClient;
+use crate::ext_bridge::ExtBridge;
 use crate::grpc_gen::neo_desktop::{
-    core_message, desktop_message, CoreMessage, DesktopMessage, UserInput,
+    core_message, desktop_message, CoreMessage, DesktopMessage, ToolResult, UserInput,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use uuid::Uuid;
+
+/// Shared handle to the active bidi stream's input sender. Lets UI-driven actions
+/// (command approval/rejection via `respond_to_command`) inject a message into the
+/// in-flight task from outside `execute_task`. Set when a task starts, cleared on
+/// any exit path via `SlotGuard`.
+pub type StreamTxSlot = Arc<Mutex<Option<mpsc::Sender<DesktopMessage>>>>;
+
+/// Clears the shared stream-sender slot when the task ends (any return/panic).
+struct SlotGuard(StreamTxSlot);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentEvent {
@@ -53,7 +72,10 @@ impl GrpcClient {
         message: String,
         model: Option<&str>,
         provider: Option<&str>,
+        mode: Option<&str>,
         cancel: std::sync::Arc<tokio::sync::Notify>,
+        stream_tx_slot: StreamTxSlot,
+        ext_bridge: ExtBridge,
     ) -> Result<(), String> {
         info!(
             "[GrpcClient] execute_task: {} (session={})",
@@ -91,6 +113,10 @@ impl GrpcClient {
         if let Some(p) = provider {
             metadata.insert("provider".to_string(), p.to_string());
         }
+        // Origem do turno; "live" faz o neo-core responder em texto falado/compacto.
+        if let Some(md) = mode {
+            metadata.insert("mode".to_string(), md.to_string());
+        }
         metadata.insert("device_id".to_string(), self.device_id.clone());
         if !self.hardware_id.is_empty() {
             metadata.insert("hardware_id".to_string(), self.hardware_id.clone());
@@ -108,6 +134,13 @@ impl GrpcClient {
         );
         metadata.insert("desktop_dir".to_string(), format!("{}/Desktop", homedir));
 
+        // Snapshot of open music tabs from the browser extension (Etapa 3). Lets the
+        // music skill reuse an existing YouTube/Spotify tab via media_context.browser_tabs
+        // instead of opening a new one. Always sent (cheap; empty when nothing connected).
+        let media_context =
+            serde_json::json!({ "browser_tabs": ext_bridge.snapshot() }).to_string();
+        metadata.insert("media_context".to_string(), media_context);
+
         let user_input = UserInput { message, metadata };
 
         let desktop_msg = DesktopMessage {
@@ -120,6 +153,13 @@ impl GrpcClient {
         // stays alive until we explicitly drop it after the loop ends —
         // that's what cleanly closes our side of the stream.
         let (tx, rx) = mpsc::channel::<DesktopMessage>(16);
+
+        // Expose this task's sender so `respond_to_command` (UI approval) can push a
+        // CommandApproval into the live stream. The guard clears it on any exit path.
+        if let Ok(mut slot) = stream_tx_slot.lock() {
+            *slot = Some(tx.clone());
+        }
+        let _slot_guard = SlotGuard(stream_tx_slot.clone());
 
         // Push the initial message into the channel BEFORE calling
         // execute_task. Tonic awaits response headers from the server, and
@@ -150,6 +190,8 @@ impl GrpcClient {
         let mut got_final = false;
         let mut last_response_message: Option<String> = None;
         let mut last_total_iterations: i32 = 0;
+        // Pattern A: active TTS voice carried with the final reply (engine/voice/language/label).
+        let mut last_voice_json: Option<serde_json::Value> = None;
         let mut active_session_id = self.session_id.clone();
 
         loop {
@@ -198,6 +240,103 @@ impl GrpcClient {
                         }
                     }
 
+                    // Music actuation (neo-music-feature): the generic client-tool
+                    // round-trip isn't wired in this client, so we execute the media
+                    // tools (open_url / launch_uri / media_command) inline here and
+                    // send the ToolResult back so neo-core can confirm the playback.
+                    if let Some(core_message::Content::ToolRequest(t)) = &core_msg.content {
+                        if t.tool_name == "media_command" {
+                            // Browser-tab control via the extension bridge (Etapa 3):
+                            // round-trips to the extension (focus tab + play videoId).
+                            // Run off the read loop so streaming events keep flowing.
+                            let bridge = ext_bridge.clone();
+                            let tx2 = tx.clone();
+                            let arguments = t.arguments.clone();
+                            let tool_call_id = t.tool_call_id.clone();
+                            let tool_name = t.tool_name.clone();
+                            let sid = active_session_id.clone();
+                            let uid = self.user_id.clone();
+                            tokio::spawn(async move {
+                                let (success, result_text, error_text) =
+                                    run_media_command(&bridge, &arguments).await;
+                                let tr = DesktopMessage {
+                                    session_id: sid,
+                                    user_id: uid,
+                                    content: Some(desktop_message::Content::ToolResult(
+                                        ToolResult {
+                                            tool_call_id,
+                                            tool_name,
+                                            success,
+                                            result: result_text,
+                                            error: error_text,
+                                        },
+                                    )),
+                                };
+                                if let Err(e) = tx2.send(tr).await {
+                                    warn!("[GrpcClient] failed to send media_command result: {}", e);
+                                }
+                            });
+                        } else if is_media_tool(&t.tool_name) {
+                            let (success, result_text, error_text) =
+                                run_media_tool(&t.tool_name, &t.arguments);
+                            let tr = DesktopMessage {
+                                session_id: active_session_id.clone(),
+                                user_id: self.user_id.clone(),
+                                content: Some(desktop_message::Content::ToolResult(ToolResult {
+                                    tool_call_id: t.tool_call_id.clone(),
+                                    tool_name: t.tool_name.clone(),
+                                    success,
+                                    result: result_text,
+                                    error: error_text,
+                                })),
+                            };
+                            if let Err(e) = tx.send(tr).await {
+                                warn!("[GrpcClient] failed to send media tool result: {}", e);
+                            }
+                        } else if t.tool_name == "execute_command" {
+                            // Post-approval shell execution: the agent's command went
+                            // through CommandRequest → user approval → neo-core now asks
+                            // us to actually run it. Execute OFF the read loop (in a
+                            // spawned task) so streaming events keep flowing, then send
+                            // the ToolResult back. Without this the stream would hang
+                            // waiting for a result that never comes.
+                            let tx2 = tx.clone();
+                            let arguments = t.arguments.clone();
+                            let tool_call_id = t.tool_call_id.clone();
+                            let tool_name = t.tool_name.clone();
+                            let sid = active_session_id.clone();
+                            let uid = self.user_id.clone();
+                            tokio::spawn(async move {
+                                let (success, result_text, error_text) =
+                                    tokio::task::spawn_blocking(move || {
+                                        run_command_blocking(&arguments)
+                                    })
+                                    .await
+                                    .unwrap_or((
+                                        false,
+                                        String::new(),
+                                        "falha ao executar o comando".to_string(),
+                                    ));
+                                let tr = DesktopMessage {
+                                    session_id: sid,
+                                    user_id: uid,
+                                    content: Some(desktop_message::Content::ToolResult(
+                                        ToolResult {
+                                            tool_call_id,
+                                            tool_name,
+                                            success,
+                                            result: result_text,
+                                            error: error_text,
+                                        },
+                                    )),
+                                };
+                                if let Err(e) = tx2.send(tr).await {
+                                    warn!("[GrpcClient] failed to send command result: {}", e);
+                                }
+                            });
+                        }
+                    }
+
                     // Detect terminal conditions.
                     if let Some(content) = &core_msg.content {
                         match content {
@@ -206,6 +345,14 @@ impl GrpcClient {
                                     got_final = true;
                                     last_response_message = Some(r.message.clone());
                                     last_total_iterations = r.total_iterations;
+                                    last_voice_json = r.voice.as_ref().map(|v| {
+                                        serde_json::json!({
+                                            "engine": v.engine,
+                                            "voice": v.voice,
+                                            "language": v.language,
+                                            "label": v.label,
+                                        })
+                                    });
                                     break;
                                 }
                             }
@@ -256,6 +403,7 @@ impl GrpcClient {
                     "iterations": last_total_iterations,
                     "durationMs": duration_ms,
                     "sessionId": active_session_id.clone(),
+                    "voice": last_voice_json,
                 }),
                 timestamp: chrono::Utc::now().to_rfc3339(),
             };
@@ -323,11 +471,14 @@ impl GrpcClient {
                         timestamp,
                     }
                 } else {
+                    // Non-final AgentResponse = a persistent user-facing reply that
+                    // precedes a client actuation (e.g. the witty answer before a music
+                    // play). Render it as its own chat message, not a transient thinking
+                    // bubble; the real final ("🎵 …") arrives afterwards.
                     AgentEvent {
-                        event_type: "thinking".to_string(),
+                        event_type: "assistant_message".to_string(),
                         data: serde_json::json!({
                             "sessionId": msg.session_id,
-                            "type": "response",
                             "content": r.message,
                         }),
                         timestamp,
@@ -377,5 +528,94 @@ impl GrpcClient {
         };
 
         Some(evt)
+    }
+}
+
+// ── Media actuation helpers (neo-music-feature, Etapa 2) ────────────────────
+
+/// Tools opened directly via the OS handler (default browser/app). `media_command`
+/// is NOT here — it goes through the extension bridge (`run_media_command`).
+fn is_media_tool(name: &str) -> bool {
+    matches!(name, "open_url" | "launch_uri")
+}
+
+/// Dispatch a `media_command` (browser-tab play) to the extension bridge and map
+/// the outcome to ``(success, result, error)`` for the ToolResult.
+async fn run_media_command(bridge: &ExtBridge, arguments: &str) -> (bool, String, String) {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("play");
+    let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("youtube");
+    let video_id = args.get("videoId").and_then(|v| v.as_str()).unwrap_or("");
+    match bridge.send_command(action, target, video_id).await {
+        Ok(()) => (true, "comando enviado à extensão".to_string(), String::new()),
+        Err(e) => (false, String::new(), e),
+    }
+}
+
+/// Run a shell command from an `execute_command` tool request (already approved by
+/// the user via the CommandRequest flow). Returns ``(success, result, error)`` for
+/// the ToolResult sent back to neo-core. Blocking — call inside `spawn_blocking`.
+fn run_command_blocking(arguments: &str) -> (bool, String, String) {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    if command.is_empty() {
+        return (false, String::new(), "comando ausente".to_string());
+    }
+
+    match std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(command)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                (true, if stdout.is_empty() { stderr } else { stdout }, String::new())
+            } else {
+                (false, String::new(), if stderr.is_empty() { stdout } else { stderr })
+            }
+        }
+        Err(e) => (false, String::new(), e.to_string()),
+    }
+}
+
+/// Open a URL or app URI with the OS default handler (non-blocking).
+fn open_target(target: &str) -> Result<(), String> {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(target).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(target).spawn()
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Execute a media tool request; returns ``(success, result, error)`` for the
+/// ToolResult sent back to neo-core.
+fn run_media_tool(tool_name: &str, arguments: &str) -> (bool, String, String) {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+
+    let open_with = |key: &str| -> (bool, String, String) {
+        let target = args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        if target.is_empty() {
+            return (false, String::new(), format!("{} ausente", key));
+        }
+        match open_target(target) {
+            Ok(()) => (true, format!("abriu {}", target), String::new()),
+            Err(e) => (false, String::new(), e),
+        }
+    };
+
+    match tool_name {
+        "open_url" => open_with("url"),
+        "launch_uri" => open_with("uri"),
+        other => (false, String::new(), format!("tool de mídia desconhecida: {}", other)),
     }
 }

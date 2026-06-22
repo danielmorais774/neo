@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required so macOS/WKWebView can prompt for and grant microphone access
+	     used by the Live (voice) mode. Tauri v2 merges this into the generated
+	     Info.plist for both dev and bundled builds. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>O Neo usa o microfone no Modo Live para transcrever sua fala e conversar por voz.</string>
+</dict>
+</plist>
