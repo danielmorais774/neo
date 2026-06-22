@@ -81,6 +81,31 @@ export interface VoiceEngine {
 
 export type VoiceEngineAction = 'start' | 'stop' | 'restart' | 'status';
 
+// Estado do detector de wake word local (Estágio 1 do Modo Live).
+export interface WakeStatus {
+  running: boolean;
+  python: string;
+  script: string;
+  refsDir: string;
+  threshold: number;
+  cooldownMs: number;
+}
+
+// Evento `wake-detected`: o sidecar reconheceu a palavra-gatilho.
+export interface WakeDetected {
+  model: string;
+  score: number;
+}
+
+// Frase-gatilho cadastrada (few-shot pela voz do usuário).
+export interface WakePhrase {
+  slug: string;
+  label: string;
+  sampleCount: number;
+  enrolled: boolean; // referência (embeddings) já gerada
+  minSamples: number; // mínimo exigido p/ gerar a referência
+}
+
 // Active voice resolved by neo-core (from the DB) and carried on the agent's
 // final reply (Pattern A). When present it overrides the static VoiceConfig for
 // that utterance. `engine` maps to the neo-voice `backend` field.
@@ -132,6 +157,16 @@ export interface ElectronAPI {
   listVoiceEngines: () => Promise<VoiceEngine[]>;
   voiceEngineHealth: (key: string) => Promise<boolean>;
   voiceEngineAction: (key: string, action: VoiceEngineAction) => Promise<string>;
+  // Wake word local (Estágio 1 do Modo Live).
+  wakeStart: () => Promise<WakeStatus>;
+  wakeStop: () => Promise<WakeStatus>;
+  wakeStatus: () => Promise<WakeStatus>;
+  onWakeDetected: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // Cadastro de frases-gatilho (few-shot pela voz).
+  wakePhrases: () => Promise<WakePhrase[]>;
+  wakeAddSample: (label: string, samples: number[]) => Promise<WakePhrase>;
+  wakeDeletePhrase: (slug: string) => Promise<void>;
+  wakeEnroll: (slug: string) => Promise<WakePhrase>;
 }
 
 let passwordRequestUnlisten: UnlistenFn | null = null;
@@ -377,4 +412,35 @@ export const electronAPI: ElectronAPI = {
   voiceEngineHealth: (key: string) => invoke('voice_engine_health', { key }),
   voiceEngineAction: (key: string, action: VoiceEngineAction) =>
     invoke('voice_engine_action', { key, action }),
+
+  wakeStart: () => invoke('wake_start'),
+  wakeStop: () => invoke('wake_stop'),
+  wakeStatus: () => invoke('wake_status'),
+
+  onWakeDetected: (callback: (detected: WakeDetected) => void) => {
+    // Cada assinante tem seu próprio unlisten (igual onAgentEvent) p/ não vazar
+    // listeners no StrictMode/double-mount.
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<WakeDetected>('wake-detected', (event) => callback(event.payload)).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
+  wakePhrases: () => invoke('wake_phrases'),
+  wakeAddSample: (label: string, samples: number[]) =>
+    invoke('wake_add_sample', { label, samples }),
+  wakeDeletePhrase: (slug: string) => invoke('wake_delete_phrase', { slug }),
+  wakeEnroll: (slug: string) => invoke('wake_enroll', { slug }),
 };

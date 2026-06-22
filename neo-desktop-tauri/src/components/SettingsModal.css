@@ -166,3 +166,73 @@
   font-weight: 800;
   text-align: center;
 }
+
+/* Toggle da palavra de despertar (wake word) */
+.wake-toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.wake-toggle:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.wake-toggle.on {
+  border-color: var(--success, #34d399);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.wake-toggle-track {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  position: relative;
+  transition: background 0.15s ease;
+}
+
+.wake-toggle.on .wake-toggle-track {
+  background: var(--success, #34d399);
+}
+
+.wake-toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+
+.wake-toggle.on .wake-toggle-thumb {
+  transform: translateX(18px);
+}
+
+.wake-toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wake-toggle-copy strong {
+  font-size: 13px;
+}
+
+.wake-toggle-copy small {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.25;
+}

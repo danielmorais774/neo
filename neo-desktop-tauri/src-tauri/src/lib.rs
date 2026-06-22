@@ -33,6 +33,8 @@ pub struct AppState {
     pub stream_tx: crate::services::ai_agent::StreamTxSlot,
     /// Bridge to the browser extension (music tabs + play commands, Etapa 3).
     pub ext_bridge: crate::ext_bridge::ExtBridge,
+    /// Supervisor do sidecar de wake word (Estagio 1 do Modo Live).
+    pub wake: crate::services::wake::WakeManager,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +167,7 @@ pub fn run() {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             stream_tx: Arc::new(Mutex::new(None)),
             ext_bridge: crate::ext_bridge::ExtBridge::new(),
+            wake: crate::services::wake::WakeManager::new(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
@@ -180,6 +183,13 @@ pub fn run() {
             commands::list_voice_engines,
             commands::voice_engine_health,
             commands::voice_engine_action,
+            commands::wake_start,
+            commands::wake_stop,
+            commands::wake_status,
+            commands::wake_phrases,
+            commands::wake_add_sample,
+            commands::wake_delete_phrase,
+            commands::wake_enroll,
             commands::get_conversation_history,
             commands::clear_conversation_history,
             commands::save_conversation_history,
@@ -204,6 +214,13 @@ pub fn run() {
             tauri::async_runtime::spawn(ext_bridge::run(
                 app.state::<AppState>().ext_bridge.clone(),
             ));
+
+            // Wake word (Estagio 1 do Modo Live): sobe o sidecar local se o
+            // ambiente pedir (NEO_WAKE_ENABLED=1). A UI tambem pode ligar/desligar
+            // depois via wake_start/wake_stop. Ver services/wake.rs.
+            if crate::services::wake::WakeManager::autostart_requested() {
+                app.state::<AppState>().wake.start(app.handle().clone());
+            }
 
             // Show the main window on startup
             if let Some(window) = app.get_webview_window("main") {

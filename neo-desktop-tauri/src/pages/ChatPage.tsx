@@ -1,4 +1,4 @@
-import { useCallback, useState, useEffect } from 'react';
+import { useCallback, useState, useEffect, useRef } from 'react';
 import Chat from '../components/Chat';
 import LiveOverlay from '../components/LiveOverlay';
 import PasswordModal from '../components/PasswordModal';
@@ -8,7 +8,9 @@ import {
   useAgentState,
   useAgentEvents,
   useAppStartup,
-  useLiveMode
+  useLiveMode,
+  useWakeWord,
+  useWakeEnabled
 } from '../hooks';
 import {
   HistoryService,
@@ -262,6 +264,18 @@ export const ChatPage = () => {
   const { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive } = useLiveMode({
     onSendMessage: handleSendMessage,
   });
+
+  // Wake word (Estágio 1): "Ei Neo" reconhecido localmente → acende o Modo Live.
+  // Usa um ref de isLive p/ o callback não capturar um valor velho.
+  const isLiveRef = useRef(isLive);
+  useEffect(() => {
+    isLiveRef.current = isLive;
+  }, [isLive]);
+  const [wakeEnabled] = useWakeEnabled();
+  const handleWake = useCallback(() => {
+    if (!isLiveRef.current) toggleLive();
+  }, [toggleLive]);
+  useWakeWord({ enabled: wakeEnabled, onWake: handleWake });
 
   const handleStop = () => {
     AgentService.stopExecution();

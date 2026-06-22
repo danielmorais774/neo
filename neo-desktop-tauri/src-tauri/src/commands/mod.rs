@@ -403,6 +403,71 @@ pub fn get_voice_config() -> VoiceConfig {
     }
 }
 
+// ============ WAKE WORD (local, sempre ligado) ============
+//
+// Liga/desliga o sidecar de wake word (Estagio 1 do Modo Live). O sidecar roda
+// LOCAL no Mac e offline (openWakeWord); ao ouvir o gatilho, o Rust emite o
+// evento `wake-detected` e o frontend acende o Modo Live. Ver services/wake.rs.
+
+use crate::services::wake::{WakePhrase, WakeStatus};
+
+#[tauri::command]
+pub fn wake_start(app: AppHandle, state: State<'_, AppState>) -> WakeStatus {
+    state.wake.start(app);
+    state.wake.status()
+}
+
+#[tauri::command]
+pub fn wake_stop(state: State<'_, AppState>) -> WakeStatus {
+    state.wake.stop();
+    state.wake.status()
+}
+
+#[tauri::command]
+pub fn wake_status(state: State<'_, AppState>) -> WakeStatus {
+    state.wake.status()
+}
+
+/// Lista as frases-gatilho cadastradas (com contagem de amostras e status de ref).
+#[tauri::command]
+pub fn wake_phrases(state: State<'_, AppState>) -> Vec<WakePhrase> {
+    state.wake.list_phrases()
+}
+
+/// Salva uma amostra gravada (PCM mono 16kHz int16) de uma frase.
+#[tauri::command]
+pub fn wake_add_sample(
+    state: State<'_, AppState>,
+    label: String,
+    samples: Vec<i16>,
+) -> Result<WakePhrase, String> {
+    state.wake.add_sample(label, samples)
+}
+
+/// Apaga uma frase inteira (amostras + referencia).
+#[tauri::command]
+pub fn wake_delete_phrase(state: State<'_, AppState>, slug: String) -> Result<(), String> {
+    state.wake.delete_phrase(&slug)
+}
+
+/// Gera a referencia da frase (few-shot). Se o detector estiver rodando,
+/// reinicia para recarregar as refs.
+#[tauri::command]
+pub async fn wake_enroll(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    slug: String,
+) -> Result<WakePhrase, String> {
+    // WakeManager e Clone; nao seguramos o State<'_> atraves do await.
+    let wake = state.wake.clone();
+    let phrase = wake.enroll(&slug).await?;
+    if wake.status().running {
+        wake.stop();
+        wake.start(app);
+    }
+    Ok(phrase)
+}
+
 // ============ VOICE ENGINES (PC gamer) ============
 //
 // Sobe/baixa os engines de STT/TTS que rodam na GPU do PC gamer (RTX 5070 Ti)

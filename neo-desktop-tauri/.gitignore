@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Wake word sidecar (Python venv + caches)
+sidecar/wake/.venv*
+sidecar/**/__pycache__

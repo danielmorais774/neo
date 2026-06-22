@@ -1,6 +1,8 @@
 import type { AppTheme } from '../themes/themeTypes';
 import { APP_THEMES, THEME_LABELS } from '../themes/themeTypes';
 import VoiceEnginesPanel from './VoiceEnginesPanel';
+import WakeWordPanel from './WakeWordPanel';
+import { useWakeEnabled } from '../hooks';
 import './SettingsModal.css';
 
 interface SettingsModalProps {
@@ -10,6 +12,7 @@ interface SettingsModalProps {
 }
 
 export default function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalProps) {
+  const [wakeEnabled, setWakeEnabled] = useWakeEnabled();
   return (
     <div className="settings-backdrop" role="presentation" onMouseDown={onClose}>
       <section
@@ -70,6 +73,33 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
               <small>Ligar/desligar STT e TTS na GPU do PC gamer</small>
             </div>
             <VoiceEnginesPanel />
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <span>Palavra de despertar</span>
+              <small>Diga "Ei Neo" para acender o Modo Live (mic local sempre ligado)</small>
+            </div>
+            <button
+              type="button"
+              className={`wake-toggle ${wakeEnabled ? 'on' : ''}`}
+              role="switch"
+              aria-checked={wakeEnabled}
+              onClick={() => setWakeEnabled(!wakeEnabled)}
+            >
+              <span className="wake-toggle-track" aria-hidden="true">
+                <span className="wake-toggle-thumb" />
+              </span>
+              <span className="wake-toggle-copy">
+                <strong>{wakeEnabled ? 'Ativado' : 'Desativado'}</strong>
+                <small>
+                  {wakeEnabled
+                    ? 'Escutando o gatilho. O ponto laranja do macOS fica aceso.'
+                    : 'O microfone só liga ao entrar no Modo Live manualmente.'}
+                </small>
+              </span>
+            </button>
+            <WakeWordPanel />
           </div>
         </div>
       </section>
