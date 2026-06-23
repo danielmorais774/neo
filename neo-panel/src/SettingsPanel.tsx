@@ -39,6 +39,27 @@ interface VoiceEntry { name: string; voice: string; engine: string; is_clone: bo
 interface VoiceCurrent { engine: string; voice: string | null; language: string | null; label: string | null; }
 interface VoiceConfigData { current: VoiceCurrent; voices: VoiceEntry[]; engines: string[]; }
 
+interface FallbackState {
+  enabled: boolean;        // o toggle (env default ou override do painel)
+  available: boolean;      // toggle E chave OpenRouter presente
+  openrouter_key: boolean;
+  model: string;
+  env_default: boolean;
+  runtime_override: boolean | null;
+  engine_down: boolean;
+}
+
+interface TtsFallbackState {
+  enabled: boolean;        // toggle do fallback de TTS
+  available: boolean;      // toggle E pacote kokoro carregavel
+  kokoro_ok: boolean;
+  voice: string;
+  lang: string;
+  env_default: boolean;
+  runtime_override: boolean | null;
+  engine_down: boolean;
+}
+
 const card: React.CSSProperties = {
   background: '#13161f',
   border: '1px solid #1e2235',
@@ -86,9 +107,65 @@ const SettingsPanel = () => {
   const [vError, setVError] = useState<string | null>(null);
   const [vSuccess, setVSuccess] = useState<string | null>(null);
 
+  // --- Fallback de STT (OpenRouter): controle live via neo-voice (proxy /neo-voice) ---
+  const [fb, setFb] = useState<FallbackState | null>(null);
+  const [fbSaving, setFbSaving] = useState(false);
+  const [fbError, setFbError] = useState<string | null>(null);
+
+  // --- Fallback de TTS (Kokoro local) ---
+  const [fbTts, setFbTts] = useState<TtsFallbackState | null>(null);
+  const [fbTtsSaving, setFbTtsSaving] = useState(false);
+  const [fbTtsError, setFbTtsError] = useState<string | null>(null);
+
+  const fetchFallback = async () => {
+    try {
+      const res = await fetch('/neo-voice/stt/fallback');
+      if (!res.ok) { setFb(null); return; }
+      setFb((await res.json()) as FallbackState);
+    } catch { setFb(null); /* neo-voice indisponível */ }
+  };
+
+  const toggleFallback = async (next: boolean) => {
+    setFbSaving(true); setFbError(null);
+    try {
+      const res = await fetch('/neo-voice/stt/fallback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) { setFbError(`HTTP ${res.status}`); return; }
+      setFb((await res.json()) as FallbackState);
+    } catch { setFbError('Falha ao falar com o neo-voice'); }
+    finally { setFbSaving(false); }
+  };
+
+  const fetchTtsFallback = async () => {
+    try {
+      const res = await fetch('/neo-voice/tts/fallback');
+      if (!res.ok) { setFbTts(null); return; }
+      setFbTts((await res.json()) as TtsFallbackState);
+    } catch { setFbTts(null); /* neo-voice indisponível */ }
+  };
+
+  const toggleTtsFallback = async (next: boolean) => {
+    setFbTtsSaving(true); setFbTtsError(null);
+    try {
+      const res = await fetch('/neo-voice/tts/fallback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) { setFbTtsError(`HTTP ${res.status}`); return; }
+      setFbTts((await res.json()) as TtsFallbackState);
+    } catch { setFbTtsError('Falha ao falar com o neo-voice'); }
+    finally { setFbTtsSaving(false); }
+  };
+
   useEffect(() => {
     void fetchConfig();
     void fetchVoiceConfig();
+    void fetchFallback();
+    void fetchTtsFallback();
   }, []);
 
   const fetchConfig = async () => {
@@ -277,7 +354,7 @@ const SettingsPanel = () => {
           ⚙️ Configurações
         </span>
         <button
-          onClick={() => { void fetchConfig(); void fetchVoiceConfig(); }}
+          onClick={() => { void fetchConfig(); void fetchVoiceConfig(); void fetchFallback(); void fetchTtsFallback(); }}
           style={{
             background: '#1e2235',
             border: '1px solid #2d3348',
@@ -456,6 +533,140 @@ const SettingsPanel = () => {
 
           {vError && <div style={{ color: '#ef4444', fontSize: 13, marginTop: 14 }}>Erro: {vError}</div>}
           {vSuccess && <div style={{ color: '#34d399', fontSize: 13, marginTop: 14 }}>✓ {vSuccess}</div>}
+        </div>
+
+        {/* ── Fallback de STT (OpenRouter) ── */}
+        <div>
+          <h2 style={{ color: '#e2e8f0', fontSize: 18, margin: '0 0 4px' }}>STT — Fallback OpenRouter</h2>
+          <p style={{ color: '#64748b', fontSize: 13, margin: 0, maxWidth: 640 }}>
+            Por padrão o STT usa o Parakeet local (PC gamer). Se ele cair, o neo-voice pode
+            transcrever pela nuvem (OpenRouter). Desligue aqui pra impedir qualquer uso do
+            OpenRouter — mesmo com o PC gamer offline.
+          </p>
+        </div>
+        <div style={card}>
+          {!fb ? (
+            <div style={{ color: '#64748b', fontSize: 13 }}>
+              neo-voice indisponível (não foi possível ler o estado do fallback).
+            </div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+                <div style={{ fontSize: 13, color: '#94a3b8' }}>
+                  Fallback OpenRouter:{' '}
+                  <span style={{ color: fb.enabled ? '#34d399' : '#ef4444', fontWeight: 600 }}>
+                    {fb.enabled ? 'LIGADO' : 'DESLIGADO'}
+                  </span>
+                  {fb.enabled && fb.engine_down && fb.available && (
+                    <span style={{ color: '#f59e0b', marginLeft: 8 }}>● em uso agora (PC gamer offline)</span>
+                  )}
+                </div>
+                <button
+                  onClick={() => void toggleFallback(!fb.enabled)}
+                  disabled={fbSaving}
+                  style={{
+                    background: fb.enabled ? '#065f46' : '#3f1d1d',
+                    border: `1px solid ${fb.enabled ? '#10b981' : '#ef4444'}`,
+                    borderRadius: 999, padding: '6px 16px', minWidth: 120,
+                    color: fb.enabled ? '#6ee7b7' : '#fca5a5', fontSize: 13, fontWeight: 700,
+                    cursor: fbSaving ? 'wait' : 'pointer',
+                  }}
+                >
+                  {fbSaving ? '...' : fb.enabled ? '● LIGADO' : '○ DESLIGADO'}
+                </button>
+              </div>
+
+              <div style={{ marginTop: 14, fontSize: 12, color: '#64748b', lineHeight: 1.6 }}>
+                <div>Modelo: <span style={{ color: '#94a3b8' }}>{fb.model}</span></div>
+                <div>
+                  Chave OpenRouter:{' '}
+                  <span style={{ color: fb.openrouter_key ? '#34d399' : '#ef4444' }}>
+                    {fb.openrouter_key ? 'configurada' : 'ausente'}
+                  </span>
+                </div>
+                {fb.enabled && !fb.openrouter_key && (
+                  <div style={{ color: '#f59e0b', marginTop: 6 }}>
+                    ⚠ Ligado, mas sem chave: o fallback não funciona até definir OPENROUTER_API_KEY no neo-voice.
+                  </div>
+                )}
+                <div style={{ color: '#475569', marginTop: 6 }}>
+                  Override do painel:{' '}
+                  {fb.runtime_override === null
+                    ? `— (usando env: ${fb.env_default ? 'on' : 'off'})`
+                    : (fb.runtime_override ? 'on' : 'off')}
+                </div>
+              </div>
+
+              {fbError && <div style={{ color: '#ef4444', fontSize: 13, marginTop: 14 }}>Erro: {fbError}</div>}
+            </>
+          )}
+        </div>
+
+        {/* ── Fallback de TTS (Kokoro local) ── */}
+        <div>
+          <h2 style={{ color: '#e2e8f0', fontSize: 18, margin: '0 0 4px' }}>TTS — Fallback Kokoro</h2>
+          <p style={{ color: '#64748b', fontSize: 13, margin: 0, maxWidth: 640 }}>
+            Por padrão o neo fala pelos motores do PC gamer (Qwen/Coqui/F5…). Se eles caírem,
+            o neo-voice sintetiza localmente com o Kokoro (roda na CPU do container). Desligue
+            aqui pra impedir o uso do Kokoro — mesmo com os motores offline.
+          </p>
+        </div>
+        <div style={card}>
+          {!fbTts ? (
+            <div style={{ color: '#64748b', fontSize: 13 }}>
+              neo-voice indisponível (não foi possível ler o estado do fallback de TTS).
+            </div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+                <div style={{ fontSize: 13, color: '#94a3b8' }}>
+                  Fallback Kokoro:{' '}
+                  <span style={{ color: fbTts.enabled ? '#34d399' : '#ef4444', fontWeight: 600 }}>
+                    {fbTts.enabled ? 'LIGADO' : 'DESLIGADO'}
+                  </span>
+                  {fbTts.enabled && fbTts.engine_down && fbTts.available && (
+                    <span style={{ color: '#f59e0b', marginLeft: 8 }}>● em uso agora (motores offline)</span>
+                  )}
+                </div>
+                <button
+                  onClick={() => void toggleTtsFallback(!fbTts.enabled)}
+                  disabled={fbTtsSaving}
+                  style={{
+                    background: fbTts.enabled ? '#065f46' : '#3f1d1d',
+                    border: `1px solid ${fbTts.enabled ? '#10b981' : '#ef4444'}`,
+                    borderRadius: 999, padding: '6px 16px', minWidth: 120,
+                    color: fbTts.enabled ? '#6ee7b7' : '#fca5a5', fontSize: 13, fontWeight: 700,
+                    cursor: fbTtsSaving ? 'wait' : 'pointer',
+                  }}
+                >
+                  {fbTtsSaving ? '...' : fbTts.enabled ? '● LIGADO' : '○ DESLIGADO'}
+                </button>
+              </div>
+
+              <div style={{ marginTop: 14, fontSize: 12, color: '#64748b', lineHeight: 1.6 }}>
+                <div>Voz: <span style={{ color: '#94a3b8' }}>{fbTts.voice} ({fbTts.lang})</span></div>
+                <div>
+                  Kokoro:{' '}
+                  <span style={{ color: fbTts.kokoro_ok ? '#34d399' : '#ef4444' }}>
+                    {fbTts.kokoro_ok ? 'carregado' : 'indisponível'}
+                  </span>
+                </div>
+                {fbTts.enabled && !fbTts.kokoro_ok && (
+                  <div style={{ color: '#f59e0b', marginTop: 6 }}>
+                    ⚠ Ligado, mas o pacote kokoro não carregou no neo-voice.
+                  </div>
+                )}
+                <div style={{ color: '#475569', marginTop: 6 }}>
+                  Override do painel:{' '}
+                  {fbTts.runtime_override === null
+                    ? `— (usando env: ${fbTts.env_default ? 'on' : 'off'})`
+                    : (fbTts.runtime_override ? 'on' : 'off')}
+                </div>
+              </div>
+
+              {fbTtsError && <div style={{ color: '#ef4444', fontSize: 13, marginTop: 14 }}>Erro: {fbTtsError}</div>}
+            </>
+          )}
         </div>
       </div>
     </div>
