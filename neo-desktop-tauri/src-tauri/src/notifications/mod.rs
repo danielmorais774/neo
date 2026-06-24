@@ -65,6 +65,11 @@ pub fn shutdown() {}
 
 impl NotificationRouter {
     fn show(&self, notification: &NeoNotification) {
+        // Mirror every real notification into the native notch island's
+        // expanded list (independent of the toast surface below).
+        #[cfg(target_os = "macos")]
+        crate::notch_host::forward_notification(notification);
+
         #[cfg(target_os = "macos")]
         {
             if self.show_via_macos_host(notification) {

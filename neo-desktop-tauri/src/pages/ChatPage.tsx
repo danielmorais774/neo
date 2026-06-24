@@ -272,9 +272,12 @@ export const ChatPage = () => {
     isLiveRef.current = isLive;
   }, [isLive]);
   const [wakeEnabled] = useWakeEnabled();
+  // A wake word "Ei Neo" agora dispara o Modo Live NATIVO (chip Swift abaixo da
+  // notch, via Rust no evento `wake-detected`) — funciona mesmo com a janela
+  // minimizada. Mantemos o listener aqui só para não competir pelo microfone.
   const handleWake = useCallback(() => {
-    if (!isLiveRef.current) toggleLive();
-  }, [toggleLive]);
+    /* no-op: Live Mode hands-free é nativo agora */
+  }, []);
   useWakeWord({ enabled: wakeEnabled, onWake: handleWake });
 
   const handleStop = () => {

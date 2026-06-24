@@ -36,14 +36,31 @@ lazy_static::lazy_static! {
 #[tauri::command]
 pub async fn execute_with_loop(
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     message: String,
     model: Option<String>,
     mode: Option<String>,
     provider: Option<String>,
 ) -> Result<(), String> {
     info!("[Neo] execute_with_loop: {} (model={:?}, mode={:?})", message, model, mode);
+    run_agent_message(app, message, model, mode, provider);
+    Ok(())
+}
 
+/// Runs an agent turn against neo-core and streams `agent-event`s back to the
+/// app. Factored out of `execute_with_loop` so non-command callers (e.g. the
+/// native notch host's prompt field) can trigger the same full-agent pipeline.
+///
+/// Safe to call from any thread: it pulls everything it needs out of `AppState`
+/// synchronously and then spawns the work on Tauri's async runtime.
+pub fn run_agent_message(
+    app: AppHandle,
+    message: String,
+    model: Option<String>,
+    mode: Option<String>,
+    provider: Option<String>,
+) {
+    let state = app.state::<AppState>();
     let device_id = state.device_id.clone();
     let hardware_id = state.hardware_id.clone();
     let user_id = state.user_id.clone();
@@ -55,8 +72,9 @@ pub async fn execute_with_loop(
     let cancel_notify = state.cancel_notify.clone();
     let stream_tx_slot = state.stream_tx.clone();
     let ext_bridge = state.ext_bridge.clone();
+    drop(state);
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut client = GrpcClient::new(&device_id, &hardware_id, &user_id, &neo_core_url);
         client.set_session_id(&session_id);
 
@@ -75,10 +93,10 @@ pub async fn execute_with_loop(
 
         match result {
             Ok(()) => {
-                info!("[Neo] execute_with_loop completed");
+                info!("[Neo] run_agent_message completed");
             }
             Err(e) => {
-                error!("[Neo] execute_with_loop error: {}", e);
+                error!("[Neo] run_agent_message error: {}", e);
                 let error_event = AgentEvent {
                     event_type: "error".to_string(),
                     data: serde_json::json!({ "message": e }),
@@ -88,8 +106,6 @@ pub async fn execute_with_loop(
             }
         }
     });
-
-    Ok(())
 }
 
 #[tauri::command]

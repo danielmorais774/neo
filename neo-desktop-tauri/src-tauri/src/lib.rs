@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager, RunEvent,
+    Listener, Manager, RunEvent,
 };
 
 #[cfg(target_os = "macos")]
@@ -330,8 +330,31 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             {
+                let app_handle = app.handle().clone();
                 let notch_state = app.state::<NotchHostState>();
-                start_notch_host(&notch_state);
+                start_notch_host(app_handle, &notch_state);
+
+                // Forward terminal agent-events to the native notch host so its
+                // prompt field can render the answer (and speak it). The notch
+                // module ignores events outside of a notch-initiated turn.
+                app.listen("agent-event", |event| {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                        let event_type = value
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if let Some(data) = value.get("data") {
+                            crate::notch_host::forward_agent_event(event_type, data);
+                        }
+                    }
+                });
+
+                // Wake word ("Ei Neo") triggers native, hands-free Live Mode in
+                // the notch host. Native capture keeps working even when the main
+                // window is minimized (the webview would be throttled).
+                app.listen("wake-detected", |_event| {
+                    crate::notch_host::live_start();
+                });
             }
 
             info!("[Neo] WebSocket connections initiated");

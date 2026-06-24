@@ -77,7 +77,9 @@ fn build_macos_notch_host() {
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let source = manifest_dir.join("macos").join("NeoNotchHost.swift");
+    let info_plist = manifest_dir.join("macos").join("NeoNotchHost-Info.plist");
     println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", info_plist.display());
     let output = manifest_dir
         .join("target")
         .join(&profile)
@@ -93,14 +95,31 @@ fn build_macos_notch_host() {
         return;
     }
 
-    let output_result = std::process::Command::new("xcrun")
+    let mut command = std::process::Command::new("xcrun");
+    command
         .arg("swiftc")
         .arg(&source)
         .arg("-O")
         .arg("-o")
-        .arg(&output)
-        .env("CLANG_MODULE_CACHE_PATH", &clang_cache)
-        .output();
+        .arg(&output);
+
+    // Embed Info.plist into the binary's __TEXT,__info_plist section so TCC can
+    // read NSMicrophoneUsageDescription — required for native mic capture (Live
+    // Mode) to work from this standalone (unbundled) helper, even when the main
+    // app window is minimized.
+    if info_plist.exists() {
+        command
+            .arg("-Xlinker")
+            .arg("-sectcreate")
+            .arg("-Xlinker")
+            .arg("__TEXT")
+            .arg("-Xlinker")
+            .arg("__info_plist")
+            .arg("-Xlinker")
+            .arg(&info_plist);
+    }
+
+    let output_result = command.env("CLANG_MODULE_CACHE_PATH", &clang_cache).output();
 
     match output_result {
         Ok(output_result) if output_result.status.success() => {
