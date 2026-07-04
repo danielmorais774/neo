@@ -104,6 +104,7 @@ export interface WakePhrase {
   sampleCount: number;
   enrolled: boolean; // referência (embeddings) já gerada
   minSamples: number; // mínimo exigido p/ gerar a referência
+  role: 'wake' | 'stop'; // "wake" acende o Live; "stop" ("pare") interrompe
 }
 
 // Active voice resolved by neo-core (from the DB) and carried on the agent's
@@ -162,9 +163,11 @@ export interface ElectronAPI {
   wakeStop: () => Promise<WakeStatus>;
   wakeStatus: () => Promise<WakeStatus>;
   onWakeDetected: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // Palavra "pare" (papel "stop"): interrompe a fala/o turno no Modo Live.
+  onWakeInterrupt: (callback: (detected: WakeDetected) => void) => UnlistenFn;
   // Cadastro de frases-gatilho (few-shot pela voz).
   wakePhrases: () => Promise<WakePhrase[]>;
-  wakeAddSample: (label: string, samples: number[]) => Promise<WakePhrase>;
+  wakeAddSample: (label: string, samples: number[], role?: 'wake' | 'stop') => Promise<WakePhrase>;
   wakeDeletePhrase: (slug: string) => Promise<void>;
   wakeEnroll: (slug: string) => Promise<WakePhrase>;
 }
@@ -438,9 +441,28 @@ export const electronAPI: ElectronAPI = {
     };
   },
 
+  onWakeInterrupt: (callback: (detected: WakeDetected) => void) => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<WakeDetected>('wake-interrupt', (event) => callback(event.payload)).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
   wakePhrases: () => invoke('wake_phrases'),
-  wakeAddSample: (label: string, samples: number[]) =>
-    invoke('wake_add_sample', { label, samples }),
+  wakeAddSample: (label: string, samples: number[], role: 'wake' | 'stop' = 'wake') =>
+    invoke('wake_add_sample', { label, samples, role }),
   wakeDeletePhrase: (slug: string) => invoke('wake_delete_phrase', { slug }),
   wakeEnroll: (slug: string) => invoke('wake_enroll', { slug }),
 };

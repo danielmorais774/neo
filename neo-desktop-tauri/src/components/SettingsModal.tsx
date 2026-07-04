@@ -1,6 +1,8 @@
+import { createPortal } from 'react-dom';
 import type { AppTheme } from '../themes/themeTypes';
 import { APP_THEMES, THEME_LABELS } from '../themes/themeTypes';
 import VoiceEnginesPanel from './VoiceEnginesPanel';
+import AudioDevicesPanel from './AudioDevicesPanel';
 import WakeWordPanel from './WakeWordPanel';
 import { useWakeEnabled } from '../hooks';
 import './SettingsModal.css';
@@ -13,7 +15,10 @@ interface SettingsModalProps {
 
 export default function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalProps) {
   const [wakeEnabled, setWakeEnabled] = useWakeEnabled();
-  return (
+  // Portal para document.body: escapa do `.app`, que tem `overflow:hidden` e uma
+  // -webkit-mask radial (desbota as bordas) e, no WebKit, vira containing block
+  // do position:fixed — o que recortava/esmaecia o topo e o rodapé do modal.
+  return createPortal(
     <div className="settings-backdrop" role="presentation" onMouseDown={onClose}>
       <section
         className="settings-modal"
@@ -77,6 +82,14 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
 
           <div className="settings-section">
             <div className="settings-section-title">
+              <span>Dispositivos de áudio</span>
+              <small>Microfone e alto-falante usados no Modo Live</small>
+            </div>
+            <AudioDevicesPanel />
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
               <span>Palavra de despertar</span>
               <small>Diga "Ei Neo" para acender o Modo Live (mic local sempre ligado)</small>
             </div>
@@ -103,6 +116,7 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
           </div>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

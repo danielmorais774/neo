@@ -387,14 +387,16 @@ pub struct VoiceConfig {
 }
 
 /// Returns neo-voice connection settings for the Live (voice) mode, read from
-/// env with sensible defaults (neo-voice runs on the same Mac at :5002).
+/// env with sensible defaults. O neo-voice roda no neo-host (LXC do Proxmox) na
+/// LAN em 192.168.4.210:5002, alcancavel direto pelo desktop (sem Core Tunnel).
+/// Sobrescreva com NEO_VOICE_WS_URL (ex.: ws://127.0.0.1:5002 p/ um tunnel local).
 #[tauri::command]
 pub fn get_voice_config() -> VoiceConfig {
     let ws_base_url = std::env::var("NEO_VOICE_WS_URL")
         .ok()
         .filter(|v| !v.is_empty())
         .map(|v| v.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "ws://127.0.0.1:5002".to_string());
+        .unwrap_or_else(|| "ws://192.168.4.210:5002".to_string());
     let api_key = std::env::var("NEO_VOICE_APIKEY")
         .ok()
         .filter(|v| !v.is_empty());
@@ -451,13 +453,17 @@ pub fn wake_phrases(state: State<'_, AppState>) -> Vec<WakePhrase> {
 }
 
 /// Salva uma amostra gravada (PCM mono 16kHz int16) de uma frase.
+/// `role`: `"wake"` (acende o Live) ou `"stop"` (interrompe a fala/o turno).
 #[tauri::command]
 pub fn wake_add_sample(
     state: State<'_, AppState>,
     label: String,
     samples: Vec<i16>,
+    role: Option<String>,
 ) -> Result<WakePhrase, String> {
-    state.wake.add_sample(label, samples)
+    state
+        .wake
+        .add_sample(label, samples, role.unwrap_or_else(|| "wake".to_string()))
 }
 
 /// Apaga uma frase inteira (amostras + referencia).

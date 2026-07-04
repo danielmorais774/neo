@@ -48,6 +48,12 @@ interface UseWakeWordArgs {
   enabled: boolean;
   /** Chamado quando a palavra-gatilho é reconhecida. */
   onWake: (detected: WakeDetected) => void;
+  /**
+   * Chamado quando a palavra "pare" (papel "stop") é reconhecida — interrompe
+   * a fala/o turno do Modo Live. Sem cooldown JS (precisa ser responsivo e
+   * poder repetir; o sidecar já tem o seu cooldown curto).
+   */
+  onInterrupt?: (detected: WakeDetected) => void;
   /** Janela mínima entre dois disparos aceitos, em ms (default 2500). */
   cooldownMs?: number;
 }
@@ -59,15 +65,19 @@ interface UseWakeWordResult {
   wakeError: string | null;
 }
 
-export function useWakeWord({ enabled, onWake, cooldownMs = 2500 }: UseWakeWordArgs): UseWakeWordResult {
+export function useWakeWord({ enabled, onWake, onInterrupt, cooldownMs = 2500 }: UseWakeWordArgs): UseWakeWordResult {
   const [lastDetected, setLastDetected] = useState<WakeDetected | null>(null);
   const [wakeError, setWakeError] = useState<string | null>(null);
 
-  // Mantém o callback atual sem re-assinar o listener a cada render.
+  // Mantém os callbacks atuais sem re-assinar os listeners a cada render.
   const onWakeRef = useRef(onWake);
   useEffect(() => {
     onWakeRef.current = onWake;
   }, [onWake]);
+  const onInterruptRef = useRef(onInterrupt);
+  useEffect(() => {
+    onInterruptRef.current = onInterrupt;
+  }, [onInterrupt]);
 
   const lastFireRef = useRef(0);
 
@@ -93,9 +103,15 @@ export function useWakeWord({ enabled, onWake, cooldownMs = 2500 }: UseWakeWordA
       onWakeRef.current(detected);
     });
 
+    // "pare" (interrupção): sem cooldown JS — responsivo e repetível.
+    const unlistenInterrupt = window.electronAPI?.onWakeInterrupt((detected) => {
+      onInterruptRef.current?.(detected);
+    });
+
     return () => {
       disposed = true;
       unlistenWake?.();
+      unlistenInterrupt?.();
       // Para o sidecar ao desligar/desmontar — libera o microfone (ponto laranja).
       window.electronAPI?.wakeStop().catch(() => {
         /* noop */

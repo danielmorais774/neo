@@ -5,6 +5,8 @@
 // com resampler de fallback caso o contexto não honre 16kHz. Retorna number[]
 // (int16) pronto pra mandar no comando Tauri `wake_add_sample`.
 
+import { micConstraints } from './audioDevices';
+
 const TARGET_SR = 16000;
 
 const WORKLET_SRC = `
@@ -55,7 +57,12 @@ export async function recordPcm16k(durationMs = 1500): Promise<number[]> {
     throw new Error('Navegador sem getUserMedia (microfone indisponível).');
   }
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: micConstraints({
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    }),
   });
 
   const ctx = newAudioContext({ sampleRate: TARGET_SR });

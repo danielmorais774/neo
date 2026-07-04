@@ -19,7 +19,9 @@ func logErr(_ message: String) {
 }
 
 struct VoiceConfig {
-    var wsBaseUrl: String = "ws://127.0.0.1:5002"
+    // Fallback ate o Rust mandar o config por IPC (get_voice_config). neo-voice
+    // roda no neo-host (LXC) da LAN; o Rust sobrescreve com NEO_VOICE_WS_URL.
+    var wsBaseUrl: String = "ws://192.168.4.210:5002"
     var apiKey: String?
     var voice: String?
     var backend: String = "coqui"
@@ -127,6 +129,20 @@ final class VoiceController {
         receiveSTT()
 
         let input = captureEngine.inputNode
+
+        // Voice Processing I/O da Apple: cancelamento de eco + supressao de ruido
+        // + ganho automatico (AGC) no mic nativo. E o equivalente ao
+        // echoCancellation/noiseSuppression/autoGainControl que o caminho webview
+        // (getUserMedia) tinha; sem isso a captura era crua e o STT perdia precisao
+        // (sinal fraco/ruidoso chegando ao Parakeet). Falha -> cai p/ captura crua.
+        do {
+            try input.setVoiceProcessingEnabled(true)
+        } catch {
+            logErr("[NeoNotch] voice processing indisponivel (\(error.localizedDescription)); captura crua")
+        }
+
+        // IMPORTANTE: ler o formato DEPOIS de habilitar o VPIO — ele troca a saida
+        // do input node (passa a entregar Float32 ja processado, no rate do HW).
         let inFormat = input.outputFormat(forBus: 0)
         guard inFormat.sampleRate > 0 else {
             onError?("Microfone indisponível.")
@@ -142,7 +158,10 @@ final class VoiceController {
             return
         }
         outFormat = target
-        converter = AVAudioConverter(from: inFormat, to: target)
+        let conv = AVAudioConverter(from: inFormat, to: target)
+        // Reamostragem HW(48k)->16k com qualidade maxima (menos aliasing).
+        conv?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+        converter = conv
 
         input.installTap(onBus: 0, bufferSize: 1600, format: inFormat) { [weak self] buffer, _ in
             self?.processCaptured(buffer)
@@ -446,7 +465,6 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     private let promptField = NSTextField(frame: .zero)
     private let horizontalPadding: CGFloat = 24
-    private let interItemSpacing: CGFloat = 10
 
     private var pulsePhase: CGFloat = 0
     private var pulseTimer: Timer?
@@ -506,7 +524,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     // --------------------------------------------------------------- layout
     override func layout() {
         super.layout()
-        let promptCardY: CGFloat = 122
+        let promptCardY: CGFloat = 136
         let promptCardHeight: CGFloat = 46
         let leftInset: CGFloat = 44
         let rightInset: CGFloat = 92
@@ -584,7 +602,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         drawHeaderCard()
         drawPromptCard()
 
-        let stageTop: CGFloat = 188
+        let stageTop: CGFloat = 202
         let stageBottom = bounds.height - 44
         let stage = NSRect(x: horizontalPadding, y: stageTop, width: bounds.width - horizontalPadding * 2, height: stageBottom - stageTop)
 
@@ -609,7 +627,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawHeaderCard() {
-        let card = NSRect(x: horizontalPadding, y: 30, width: bounds.width - horizontalPadding * 2, height: 72)
+        let card = NSRect(x: horizontalPadding, y: 44, width: bounds.width - horizontalPadding * 2, height: 72)
         fillRoundedCard(card, radius: 20, alpha: 0.22)
         let avatarRect = NSRect(x: card.minX + 18, y: card.minY + 18, width: 34, height: 34)
         drawBotIcon(in: avatarRect)
@@ -637,7 +655,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         }
         drawMicGlyph(in: mic, scale: 0.34)
 
-        let textX = avatarRect.maxX + interItemSpacing
+        let textX = avatarRect.maxX + 22
         let textMaxWidth = max(120, mic.minX - textX - 14)
         let greeting: String
         switch activity {
@@ -656,7 +674,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawPromptCard() {
-        let card = NSRect(x: horizontalPadding, y: 122, width: bounds.width - horizontalPadding * 2, height: 46)
+        let card = NSRect(x: horizontalPadding, y: 136, width: bounds.width - horizontalPadding * 2, height: 46)
         fillRoundedCard(card, radius: 14, alpha: 0.32)
         let searchRect = NSRect(x: card.minX + 16, y: card.minY + 14, width: 18, height: 18)
         drawSearchGlyph(in: searchRect)
@@ -984,7 +1002,7 @@ final class NotchController {
 
     private let idleSize = NSSize(width: 138, height: 30)
     private let peekSize = NSSize(width: 460, height: 46)
-    private let expandedSize = NSSize(width: 560, height: 524)
+    private let expandedSize = NSSize(width: 560, height: 538)
     private let movementTolerance: CGFloat = 8
     private let peekIntentDelay: TimeInterval = 0.14
     private let expandIntentDelay: TimeInterval = 0.72
@@ -1310,60 +1328,60 @@ final class LiveChipView: NSView {
 
     // listening pill
     private func drawListening() {
-        let avatar = NSRect(x: 16, y: bounds.midY - 20, width: 40, height: 40)
+        let avatar = NSRect(x: 13, y: bounds.midY - 15, width: 30, height: 30)
         drawNeoFace(in: avatar, glow: true)
 
-        let leftmost = drawControls(centerY: bounds.midY, rightEdge: bounds.maxX - 18, showAbort: false)
+        let leftmost = drawControls(centerY: bounds.midY, rightEdge: bounds.maxX - 15, showAbort: false)
 
-        let waveX = avatar.maxX + 16
-        let waveW = leftmost - 14 - waveX
-        drawWaveform(x: waveX, y: bounds.midY - 11, width: waveW, height: 22)
+        let waveX = avatar.maxX + 13
+        let waveW = leftmost - 11 - waveX
+        drawWaveform(x: waveX, y: bounds.midY - 8, width: waveW, height: 16)
     }
 
     // thinking / transition card
     private func drawThinking() {
-        let avatar = NSRect(x: 18, y: bounds.midY - 22, width: 44, height: 44)
+        let avatar = NSRect(x: 14, y: bounds.midY - 16, width: 32, height: 32)
         drawNeoFace(in: avatar, glow: true)
 
-        _ = drawControls(centerY: 22, rightEdge: bounds.maxX - 18, showAbort: true)
+        _ = drawControls(centerY: 19, rightEdge: bounds.maxX - 15, showAbort: true)
 
-        let textX = avatar.maxX + 14
-        drawText("Deixa comigo", in: NSRect(x: textX, y: bounds.minY + 18, width: 200, height: 22), size: 16, weight: .semibold, color: .white, alignment: .left)
-        drawThinkingDots(at: NSPoint(x: textX + 124, y: bounds.minY + 27))
+        let textX = avatar.maxX + 12
+        drawText("Deixa comigo", in: NSRect(x: textX, y: bounds.minY + 13, width: 200, height: 18), size: 13, weight: .semibold, color: .white, alignment: .left)
+        drawThinkingDots(at: NSPoint(x: textX + 104, y: bounds.minY + 21))
 
         // indeterminate progress bar
-        let track = NSRect(x: textX, y: bounds.maxY - 24, width: bounds.maxX - 22 - textX, height: 4)
+        let track = NSRect(x: textX, y: bounds.maxY - 20, width: bounds.maxX - 18 - textX, height: 3)
         NSColor.white.withAlphaComponent(0.10).setFill()
-        NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2).fill()
+        NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
         let segW = track.width * 0.32
         let travel = track.width + segW
         let x = track.minX - segW + travel * progressPhase
         let clampedX = max(track.minX, x)
         let clampedMax = min(track.maxX, x + segW)
         if clampedMax > clampedX {
-            let seg = NSRect(x: clampedX, y: track.minY, width: clampedMax - clampedX, height: 4)
+            let seg = NSRect(x: clampedX, y: track.minY, width: clampedMax - clampedX, height: 3)
             NSColor(calibratedRed: 0.45, green: 0.58, blue: 1.0, alpha: 0.95).setFill()
-            NSBezierPath(roundedRect: seg, xRadius: 2, yRadius: 2).fill()
+            NSBezierPath(roundedRect: seg, xRadius: 1.5, yRadius: 1.5).fill()
         }
     }
 
     // speaking / response card
     private func drawSpeaking() {
-        let avatar = NSRect(x: 18, y: 16, width: 36, height: 36)
+        let avatar = NSRect(x: 15, y: 13, width: 26, height: 26)
         drawNeoFace(in: avatar, glow: false)
-        drawText("Neo", in: NSRect(x: avatar.maxX + 12, y: 22, width: 60, height: 22), size: 15, weight: .bold, color: .white, alignment: .left)
-        drawMiniBars(x: avatar.maxX + 58, y: 26, active: true)
+        drawText("Neo", in: NSRect(x: avatar.maxX + 9, y: 17, width: 48, height: 18), size: 13, weight: .bold, color: .white, alignment: .left)
+        drawMiniBars(x: avatar.maxX + 44, y: 20, active: true)
 
-        let leftmost = drawControls(centerY: 30, rightEdge: bounds.maxX - 18, showAbort: true)
+        let leftmost = drawControls(centerY: 24, rightEdge: bounds.maxX - 15, showAbort: true)
         // "⌥ falar" hint, left of the controls
-        drawText("⌥ falar", in: NSRect(x: leftmost - 76, y: 22, width: 64, height: 18), size: 12, weight: .semibold, color: NSColor.white.withAlphaComponent(0.5), alignment: .right)
+        drawText("⌥ falar", in: NSRect(x: leftmost - 66, y: 17, width: 56, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.5), alignment: .right)
 
-        let body = NSRect(x: 22, y: 58, width: bounds.width - 44, height: bounds.height - 70)
+        let body = NSRect(x: 18, y: 48, width: bounds.width - 36, height: bounds.height - 58)
         let p = NSMutableParagraphStyle()
         p.lineBreakMode = .byWordWrapping
-        p.lineSpacing = 4
+        p.lineSpacing = 3
         (spoken as NSString).draw(in: body, withAttributes: [
-            .font: NSFont.systemFont(ofSize: 16, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
             .foregroundColor: NSColor.white.withAlphaComponent(0.92),
             .paragraphStyle: p
         ])
@@ -1576,7 +1594,7 @@ final class LiveChipController {
     private func resize(for state: String, spoken: String) {
         guard let screen = NSScreen.main else { return }
         let size = Self.size(for: state, spoken: spoken)
-        let radius: CGFloat = state == "listening" ? size.height / 2 : 26
+        let radius: CGFloat = state == "listening" ? size.height / 2 : 20
         container.layer?.cornerRadius = radius
         blur.layer?.cornerRadius = radius
 
@@ -1601,20 +1619,20 @@ final class LiveChipController {
     private static func size(for state: String, spoken: String) -> NSSize {
         switch state {
         case "listening":
-            return NSSize(width: 320, height: 64)
+            return NSSize(width: 268, height: 52)
         case "thinking":
-            return NSSize(width: 460, height: 84)
+            return NSSize(width: 360, height: 64)
         case "speaking":
-            let width: CGFloat = 600
-            let bodyWidth = width - 44
+            let width: CGFloat = 440
+            let bodyWidth = width - 36
             let attr = NSAttributedString(string: spoken.isEmpty ? " " : spoken, attributes: [
-                .font: NSFont.systemFont(ofSize: 16, weight: .regular)
+                .font: NSFont.systemFont(ofSize: 13.5, weight: .regular)
             ])
             let bounding = attr.boundingRect(with: NSSize(width: bodyWidth, height: 600), options: [.usesLineFragmentOrigin, .usesFontLeading])
-            let textHeight = min(220, max(24, ceil(bounding.height)))
-            return NSSize(width: width, height: 58 + textHeight + 22)
+            let textHeight = min(180, max(20, ceil(bounding.height)))
+            return NSSize(width: width, height: 48 + textHeight + 16)
         default:
-            return NSSize(width: 320, height: 64)
+            return NSSize(width: 268, height: 52)
         }
     }
 }
@@ -1631,6 +1649,9 @@ final class LiveSession {
     /// The answer card lingers after TTS ends; it only collapses back to
     /// "listening" once the user actually speaks again (a partial arrives).
     private var showingAnswer = false
+    /// True between sending a prompt and the agent answering — used by the
+    /// "pare" interrupt to know there's an in-flight turn worth cancelling.
+    private var thinking = false
 
     init(chip: LiveChipController) {
         self.chip = chip
@@ -1644,6 +1665,7 @@ final class LiveSession {
         if active { return }
         active = true
         showingAnswer = false
+        thinking = false
         chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
         voice.toggleListening()
     }
@@ -1652,6 +1674,7 @@ final class LiveSession {
         if !active { return }
         active = false
         showingAnswer = false
+        thinking = false
         voice.dispose()
         chip.hideChip()
     }
@@ -1661,13 +1684,22 @@ final class LiveSession {
         guard active else { return }
         voice.cancelSpeak()
         showingAnswer = false
+        thinking = false
         chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
         emitEvent(["type": "live_abort"])
+    }
+
+    /// Voice-triggered interrupt ("pare"): only act when there's something to
+    /// stop (Neo is speaking or still thinking), otherwise leave listening as-is.
+    func interrupt() {
+        guard active, voice.speaking || thinking else { return }
+        abort()
     }
 
     func agentComplete(text: String, voice voiceOverride: [String: Any]?) {
         guard active else { return }
         showingAnswer = true
+        thinking = false
         chip.update(active: true, state: "speaking", partial: "", spoken: text, level: 0)
         let v = voiceOverride?["voice"] as? String
         let lang = voiceOverride?["language"] as? String
@@ -1678,6 +1710,7 @@ final class LiveSession {
     func agentError(_ message: String) {
         guard active else { return }
         showingAnswer = true
+        thinking = false
         chip.update(active: true, state: "speaking", partial: "", spoken: "⚠ " + message, level: 0)
     }
 
@@ -1703,6 +1736,7 @@ final class LiveSession {
         voice.onFinal = { [weak self] text in
             guard let self, self.active else { return }
             self.showingAnswer = false
+            self.thinking = true
             self.chip.update(active: true, state: "thinking", partial: "", spoken: "", level: 0)
             self.onPrompt?(text)
         }
@@ -1804,6 +1838,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             liveSession?.start()
         case "live_stop":
             liveSession?.stop()
+        case "live_interrupt":
+            liveSession?.interrupt()
         default:
             break
         }

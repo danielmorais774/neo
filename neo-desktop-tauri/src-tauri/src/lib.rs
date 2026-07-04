@@ -355,6 +355,12 @@ pub fn run() {
                 app.listen("wake-detected", |_event| {
                     crate::notch_host::live_start();
                 });
+
+                // The "stop" word ("pare") interrupts the in-flight Live turn:
+                // stop the TTS / cancel the agent and return to listening.
+                app.listen("wake-interrupt", |_event| {
+                    crate::notch_host::live_interrupt();
+                });
             }
 
             info!("[Neo] WebSocket connections initiated");

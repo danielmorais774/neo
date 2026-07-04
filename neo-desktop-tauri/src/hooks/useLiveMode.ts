@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LiveVoiceSession } from '../lib/liveVoiceService';
+import { AgentService } from '../lib';
 import type { VoiceOverride } from '../lib/tauriApi';
 
 export type LiveState = 'idle' | 'listening' | 'thinking' | 'speaking';
@@ -35,6 +36,8 @@ interface UseLiveModeResult {
   micLevel: number;
   liveError: string | null;
   toggleLive: () => void;
+  /** Interrompe a fala (TTS) ou o turno em andamento e volta a ouvir. */
+  interrupt: () => void;
 }
 
 /** Remove o marcador [MISSION:{...}] e símbolos de markdown antes de falar. */
@@ -205,6 +208,24 @@ export function useLiveMode({ onSendMessage }: UseLiveModeArgs): UseLiveModeResu
     else void start();
   }, [start, stop]);
 
+  // Interrupção por voz ("pare") ou externa: corta o que está em andamento.
+  //  - speaking → cancelSpeak() resolve o speak() pendente; o próprio speakAnswer
+  //    chama resumeListening() em seguida.
+  //  - thinking → cancela o turno (emite complete{stopped} → resumeListening()).
+  const interrupt = useCallback(() => {
+    // DIAG (barge-in "pare"): mostra se o evento chegou no overlay webview e em
+    // que estado — o interrupt só age em speaking/thinking. Remover após depurar.
+    console.warn(
+      `[useLiveMode] interrupt() chamado — isLive=${isLiveRef.current} state=${stateRef.current}`,
+    );
+    if (!isLiveRef.current) return;
+    if (stateRef.current === 'speaking') {
+      sessionRef.current?.cancelSpeak();
+    } else if (stateRef.current === 'thinking') {
+      AgentService.stopExecution();
+    }
+  }, []);
+
   // Limpeza ao desmontar.
   useEffect(() => {
     return () => {
@@ -214,5 +235,5 @@ export function useLiveMode({ onSendMessage }: UseLiveModeArgs): UseLiveModeResu
     };
   }, []);
 
-  return { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive };
+  return { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive, interrupt };
 }

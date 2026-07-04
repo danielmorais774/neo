@@ -1,7 +1,21 @@
 .wake-panel {
   display: flex;
   flex-direction: column;
+  gap: 16px;
+}
+
+.wake-section {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
+}
+
+.wake-section-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary, rgba(255, 255, 255, 0.72));
 }
 
 .wake-newrow {

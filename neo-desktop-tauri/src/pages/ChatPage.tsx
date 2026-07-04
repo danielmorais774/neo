@@ -261,7 +261,7 @@ export const ChatPage = () => {
 
   // Modo Live (voz): captura mic → STT (neo-voice) → mesmo pipeline de texto;
   // resposta final do agente é falada de volta via TTS (neo-voice).
-  const { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive } = useLiveMode({
+  const { isLive, liveState, partialText, spokenText, micLevel, liveError, toggleLive, interrupt } = useLiveMode({
     onSendMessage: handleSendMessage,
   });
 
@@ -278,7 +278,10 @@ export const ChatPage = () => {
   const handleWake = useCallback(() => {
     /* no-op: Live Mode hands-free é nativo agora */
   }, []);
-  useWakeWord({ enabled: wakeEnabled, onWake: handleWake });
+  // "pare": interrompe o overlay Live in-app (webview). O chip nativo trata a
+  // mesma interrupção pelo caminho Rust; `interrupt()` é no-op se o overlay não
+  // estiver ativo, então não há conflito entre as duas sessões.
+  useWakeWord({ enabled: wakeEnabled, onWake: handleWake, onInterrupt: interrupt });
 
   const handleStop = () => {
     AgentService.stopExecution();

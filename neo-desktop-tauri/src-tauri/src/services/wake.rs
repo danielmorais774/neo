@@ -52,6 +52,9 @@ struct WakeConfig {
     refs_dir: String,
     threshold: f64,
     cooldown_ms: u64,
+    /// Cooldown proprio (curto) dos slugs de interrupcao ("pare"). Separado do
+    /// wake p/ um "Ei Neo" recente nao bloquear o "pare".
+    stop_cooldown_ms: u64,
 }
 
 impl WakeConfig {
@@ -80,12 +83,18 @@ impl WakeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
+        // Interrupcao precisa ser responsiva e poder repetir: cooldown curto.
+        let stop_cooldown_ms = std::env::var("NEO_WAKE_STOP_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(800);
         Self {
             python,
             script,
             refs_dir,
             threshold,
             cooldown_ms,
+            stop_cooldown_ms,
         }
     }
 }
@@ -112,12 +121,22 @@ pub struct WakePhrase {
     /// `true` quando a referencia (`<slug>_ref.json`) ja foi gerada.
     pub enrolled: bool,
     pub min_samples: usize,
+    /// Papel da frase: `"wake"` (acende o Modo Live) ou `"stop"` (interrompe a
+    /// fala/o turno em andamento). Default `"wake"` p/ compat.
+    pub role: String,
+}
+
+/// Papel padrao de uma frase quando o manifest e antigo (sem o campo `role`).
+fn default_role() -> String {
+    "wake".to_string()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     slug: String,
     label: String,
+    #[serde(default = "default_role")]
+    role: String,
 }
 
 fn base_dir() -> PathBuf {
@@ -197,7 +216,19 @@ fn phrase_status(entry: &ManifestEntry) -> WakePhrase {
         sample_count,
         enrolled,
         min_samples: WAKE_MIN_SAMPLES,
+        role: entry.role.clone(),
     }
+}
+
+/// Slugs das frases com papel `stop` ja cadastradas (ref gerada). Passados ao
+/// sidecar p/ ele emitir `interrupt` (em vez de `wake`) quando casarem.
+fn stop_slugs() -> Vec<String> {
+    read_manifest()
+        .into_iter()
+        .filter(|e| e.role == "stop")
+        .filter(|e| refs_dir().join(format!("{}_ref.json", e.slug)).is_file())
+        .map(|e| e.slug)
+        .collect()
 }
 
 /// Escreve um WAV PCM 16-bit mono 16kHz (header de 44 bytes + amostras).
@@ -338,8 +369,9 @@ impl WakeManager {
     }
 
     /// Salva uma amostra (PCM mono 16kHz int16, vinda do frontend) de uma frase.
-    /// Cria a entrada no manifest na primeira amostra. Retorna o estado da frase.
-    pub fn add_sample(&self, label: String, pcm: Vec<i16>) -> Result<WakePhrase, String> {
+    /// Cria a entrada no manifest na primeira amostra. `role` define se a frase
+    /// acende o Live (`"wake"`) ou interrompe (`"stop"`). Retorna o estado da frase.
+    pub fn add_sample(&self, label: String, pcm: Vec<i16>, role: String) -> Result<WakePhrase, String> {
         let label = label.trim().to_string();
         if label.is_empty() {
             return Err("rotulo da frase vazio".into());
@@ -347,6 +379,10 @@ impl WakeManager {
         if pcm.is_empty() {
             return Err("amostra de audio vazia".into());
         }
+        let role = match role.trim() {
+            "stop" => "stop".to_string(),
+            _ => "wake".to_string(),
+        };
         let slug = slugify(&label);
 
         let mut manifest = read_manifest();
@@ -354,6 +390,7 @@ impl WakeManager {
             manifest.push(ManifestEntry {
                 slug: slug.clone(),
                 label: label.clone(),
+                role,
             });
             write_manifest(&manifest)?;
         }
@@ -372,7 +409,11 @@ impl WakeManager {
             .iter()
             .find(|e| e.slug == slug)
             .cloned()
-            .unwrap_or(ManifestEntry { slug, label });
+            .unwrap_or(ManifestEntry {
+                slug,
+                label,
+                role: default_role(),
+            });
         Ok(phrase_status(&entry))
     }
 
@@ -547,6 +588,10 @@ fn spawn_sidecar(cfg: &WakeConfig) -> std::io::Result<Child> {
         .env("NEO_WAKE_REFS_DIR", &cfg.refs_dir)
         .env("NEO_WAKE_THRESHOLD", cfg.threshold.to_string())
         .env("NEO_WAKE_COOLDOWN_MS", cfg.cooldown_ms.to_string())
+        // Slugs de interrupcao ("pare"): o sidecar emite `interrupt` (nao `wake`)
+        // quando casarem, e os scoreia com cooldown proprio + unsafe=True.
+        .env("NEO_WAKE_STOP_SLUGS", stop_slugs().join(","))
+        .env("NEO_WAKE_STOP_COOLDOWN_MS", cfg.stop_cooldown_ms.to_string())
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -574,6 +619,14 @@ fn handle_line(app: &AppHandle, line: &str) {
             info!("[Wake] disparo: model={} score={:.3}", model, score);
             if let Err(e) = app.emit("wake-detected", WakeDetected { model, score }) {
                 warn!("[Wake] falha ao emitir wake-detected: {}", e);
+            }
+        }
+        Some("interrupt") => {
+            let model = val.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let score = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            info!("[Wake] interrupcao: model={} score={:.3}", model, score);
+            if let Err(e) = app.emit("wake-interrupt", WakeDetected { model, score }) {
+                warn!("[Wake] falha ao emitir wake-interrupt: {}", e);
             }
         }
         Some("ready") => info!("[Wake] sidecar pronto: {}", val),

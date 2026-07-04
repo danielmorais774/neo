@@ -127,6 +127,13 @@ mod imp {
         send_to_notch(&serde_json::json!({ "type": "live_start" }));
     }
 
+    /// Tell the native host to interrupt the current Live turn (stop the TTS
+    /// playback / cancel the in-flight agent turn) and go back to listening.
+    /// Triggered by the "stop" word ("pare").
+    pub fn live_interrupt() {
+        send_to_notch(&serde_json::json!({ "type": "live_interrupt" }));
+    }
+
     fn send_config() {
         let cfg = commands::get_voice_config();
         send_to_notch(&serde_json::json!({
@@ -323,5 +330,6 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    forward_agent_event, forward_notification, live_start, start_notch_host, stop_notch_host,
+    forward_agent_event, forward_notification, live_interrupt, live_start, start_notch_host,
+    stop_notch_host,
 };

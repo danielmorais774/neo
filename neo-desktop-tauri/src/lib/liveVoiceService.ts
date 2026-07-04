@@ -12,6 +12,7 @@
 // neo-voice/service/web/index.html (classe PCMCapture, makeResampler, ttsPlayChunk).
 
 import type { VoiceConfig, VoiceOverride } from './tauriApi';
+import { OutputRouter, micConstraints } from './audioDevices';
 
 const TARGET_SR = 16000;
 const CHUNK = 1600; // 100ms @ 16kHz — frames PCM int16 enviados ao neo-voice
@@ -103,6 +104,12 @@ export class LiveVoiceSession {
   private ttsWs: WebSocket | null = null;
   private activeSources: AudioBufferSourceNode[] = [];
   private ttsFinish: (() => void) | null = null;
+  // Destino onde as fontes de TTS se conectam. Começa no ctx.destination e o
+  // OutputRouter troca p/ um MediaStreamDestination quando roteamos p/ um
+  // alto-falante específico (WebKit). O router resolve antes do 1º chunk chegar
+  // (há a ida-e-volta do WebSocket de TTS no meio), então não há glitch.
+  private ttsSink: AudioNode | null = null;
+  private ttsRouter: OutputRouter | null = null;
 
   constructor(cfg: VoiceConfig, cb: LiveVoiceCallbacks) {
     this.cfg = cfg;
@@ -118,7 +125,12 @@ export class LiveVoiceSession {
     // 1) microfone
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: micConstraints({
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }),
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -283,6 +295,14 @@ export class LiveVoiceSession {
   private ttsEnsureCtx(): AudioContext {
     if (!this.ttsCtx || this.ttsCtx.state === 'closed') {
       this.ttsCtx = newAudioContext();
+      this.ttsSink = this.ttsCtx.destination; // padrão até o router resolver
+      this.ttsRouter?.dispose();
+      this.ttsRouter = new OutputRouter();
+      // Roteia a fala p/ o alto-falante escolhido (best-effort). Async: as fontes
+      // usam ttsSink, que passa a apontar p/ o destino roteado quando resolver.
+      void this.ttsRouter.attach(this.ttsCtx).then((node) => {
+        this.ttsSink = node;
+      });
     }
     return this.ttsCtx;
   }
@@ -295,7 +315,7 @@ export class LiveVoiceSession {
     buf.copyToChannel(f32, 0);
     const s = ctx.createBufferSource();
     s.buffer = buf;
-    s.connect(ctx.destination);
+    s.connect(this.ttsSink ?? ctx.destination);
     const t = Math.max(ctx.currentTime + 0.03, this.ttsPlayhead);
     s.start(t);
     this.ttsPlayhead = t + buf.duration;
@@ -428,6 +448,9 @@ export class LiveVoiceSession {
       }
     });
     this.activeSources = [];
+    this.ttsRouter?.dispose();
+    this.ttsRouter = null;
+    this.ttsSink = null;
     if (this.ttsCtx) {
       try {
         this.ttsCtx.close();

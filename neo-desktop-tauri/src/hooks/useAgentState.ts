@@ -7,8 +7,8 @@ export const useAgentState = () => {
   const [currentIteration, setCurrentIteration] = useState(0);
   const [maxIterations, setMaxIterations] = useState(10);
   const [windowMode, setWindowMode] = useState<WindowMode>('tooltip');
-  const [selectedModel, setSelectedModel] = useState('llama-3.3-70b-versatile');
-  const [selectedProvider, setSelectedProvider] = useState('groq');
+  const [selectedModel, setSelectedModel] = useState('gpt-4.1');
+  const [selectedProvider, setSelectedProvider] = useState('openai');
   const [chatMode, setChatMode] = useState<ChatMode>('agent');
   const [startupNotification, setStartupNotification] = useState<string | null>(null);
 
