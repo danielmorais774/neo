@@ -195,6 +195,169 @@ async def test_call_service_without_entity_id_skips_verification():
     assert "resulting_state" not in out
 
 
+class _ClimateAdapter:
+    """Climate device: call_service returns empty changed; get_state reports the
+    resulting hvac_mode + attributes (mirrors HA's async confirmation)."""
+
+    is_configured = True
+
+    def __init__(self, state: str, attributes: dict | None = None):
+        self._state = state
+        self._attrs = attributes or {}
+        self.calls: list = []
+
+    async def get_states(self):
+        return _FAKE_STATES
+
+    async def get_state(self, entity_id):
+        return {"entity_id": entity_id, "state": self._state,
+                "attributes": {"friendly_name": "Ar do Quarto", **self._attrs}}
+
+    async def call_service(self, domain, service, data=None):
+        self.calls.append((domain, service, data))
+        return []
+
+
+@pytest.mark.asyncio
+async def test_climate_turn_on_verified_by_active_mode():
+    # "deu erro mas funcionou": climate.turn_on → estado vira um modo (cool), não "on".
+    ex = HomeAssistantExecutor(_ClimateAdapter("cool"))
+    out = await ex.execute(
+        "ha_call_service", {"domain": "climate", "service": "turn_on", "entity_id": "climate.quarto"}
+    )
+    assert out["ok"] is True
+    assert out["resulting_state"] == "cool"
+    assert out["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_climate_set_temperature_verified_by_attribute():
+    ex = HomeAssistantExecutor(_ClimateAdapter("cool", {"temperature": 22}))
+    out = await ex.execute(
+        "ha_call_service",
+        {"domain": "climate", "service": "set_temperature",
+         "entity_id": "climate.quarto", "data": {"temperature": 22}},
+    )
+    assert out["ok"] is True
+    assert out["verified"] is True
+    assert out["expected"] == {"kind": "attr_eq:temperature", "target": 22}
+
+
+@pytest.mark.asyncio
+async def test_climate_turn_off_flags_unverified_when_still_active():
+    ex = HomeAssistantExecutor(_ClimateAdapter("cool"))
+    out = await ex.execute(
+        "ha_call_service", {"domain": "climate", "service": "turn_off", "entity_id": "climate.quarto"}
+    )
+    assert out["ok"] is True
+    assert out["verified"] is False  # asked off, still cool
+
+
+# ── Adapter caches (snapshot injection) ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_states_cached_hits_ha_once_within_ttl():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=_FAKE_STATES)
+
+    adapter = _adapter_with_handler(handler)
+    a = await adapter.get_states_cached(60)
+    b = await adapter.get_states_cached(60)
+    assert a == b
+    assert calls["n"] == 1  # second call served from cache
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_get_device_index_reuses_states_cache():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=_FAKE_STATES)
+
+    adapter = _adapter_with_handler(handler)
+    await adapter.get_states_cached(300)        # 1 fetch
+    index = await adapter.get_device_index(300)  # reuses the fresh states cache
+    assert calls["n"] == 1
+    assert {e["entity_id"] for e in index} == {"light.sala", "switch.tomada"}
+    await adapter.close()
+
+
+# ── Cognitive-core snapshot note (relevance gate) ────────────────────────────
+
+class _SnapshotAdapter:
+    is_configured = True
+
+    def __init__(self):
+        self.states_fetched = 0
+
+    async def get_device_index(self, ttl):
+        from core.skills.home_assistant.service import build_device_index
+        return build_device_index([
+            {"entity_id": "climate.quarto", "state": "off",
+             "attributes": {"friendly_name": "Ar do Quarto", "temperature": 22}},
+            {"entity_id": "light.sala", "state": "on", "attributes": {"friendly_name": "Luz da Sala"}},
+        ])
+
+    async def get_states_cached(self, ttl):
+        self.states_fetched += 1
+        return [
+            {"entity_id": "climate.quarto", "state": "cool",
+             "attributes": {"friendly_name": "Ar do Quarto", "temperature": 22, "current_temperature": 24}},
+        ]
+
+
+def _fake_ai_service(adapter):
+    from types import SimpleNamespace
+    from modules.desktop.ai_service import AIService
+    self = SimpleNamespace(
+        settings=SimpleNamespace(
+            home_assistant_context_injection_enabled=True,
+            home_assistant_device_index_ttl=300,
+            home_assistant_snapshot_cache_ttl=8,
+        ),
+        _get_ha_adapter=lambda: adapter,
+    )
+    return AIService._build_home_assistant_context_note.__get__(self, AIService)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_note_injected_for_known_device():
+    adapter = _SnapshotAdapter()
+    build_note = _fake_ai_service(adapter)
+    note = await build_note("como está o ar-condicionado do quarto?")
+    assert note is not None
+    assert "Ar do Quarto" in note and "cool" in note
+    assert "NUNCA responda" in note  # hard rule present
+    assert adapter.states_fetched == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_note_skipped_for_unknown_device():
+    adapter = _SnapshotAdapter()
+    build_note = _fake_ai_service(adapter)
+    note = await build_note("liga o meu computador")
+    assert note is None
+    assert adapter.states_fetched == 0  # never touched HA states
+
+
+@pytest.mark.asyncio
+async def test_snapshot_note_disabled_by_flag():
+    from types import SimpleNamespace
+    from modules.desktop.ai_service import AIService
+    adapter = _SnapshotAdapter()
+    self = SimpleNamespace(
+        settings=SimpleNamespace(home_assistant_context_injection_enabled=False),
+        _get_ha_adapter=lambda: adapter,
+    )
+    build_note = AIService._build_home_assistant_context_note.__get__(self, AIService)
+    assert await build_note("como está o ar do quarto?") is None
+
+
 @pytest.mark.asyncio
 async def test_executor_rename_entity_dispatch():
     fake = _FakeAdapter()

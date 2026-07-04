@@ -1,4 +1,10 @@
-"""Weather tool executor — uses Open-Meteo free API (no API key needed)."""
+"""Weather tool executor — uses Open-Meteo free API (no API key needed).
+
+No hardcoded cities and no guessing: a city is geocoded on demand (works
+worldwide), or precise ``lat``/``lon`` (e.g. from device GPS) are used directly.
+When neither is given, the tool signals ``needs_city`` so the caller resolves the
+user's location (PKS → GPS → ask) instead of defaulting to some random city.
+"""
 
 import logging
 from typing import Any
@@ -6,33 +12,6 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
-
-# City → (lat, lon) lookup for common Brazilian cities
-CITY_COORDS: dict[str, tuple[float, float]] = {
-    "brasilia": (-15.7801, -47.9292),
-    "sao paulo": (-23.5505, -46.6333),
-    "rio de janeiro": (-22.9068, -43.1729),
-    "belo horizonte": (-19.9167, -43.9345),
-    "salvador": (-12.9714, -38.5014),
-    "curitiba": (-25.4284, -49.2733),
-    "fortaleza": (-3.7172, -38.5433),
-    "recife": (-8.0476, -34.8770),
-    "porto alegre": (-30.0346, -51.2177),
-    "manaus": (-3.1190, -60.0217),
-    "goiania": (-16.6869, -49.2648),
-    "campinas": (-22.9099, -47.0626),
-    "florianopolis": (-27.5954, -48.5480),
-    "vitoria": (-20.3155, -40.3128),
-    "natal": (-5.7945, -35.2110),
-    "londrina": (-23.3103, -51.1628),
-    "new york": (40.7128, -74.0060),
-    "london": (51.5074, -0.1278),
-    "tokyo": (35.6762, 139.6503),
-    "paris": (48.8566, 2.3522),
-    "berlin": (52.5200, 13.4050),
-    "lisbon": (38.7223, -9.1393),
-    "lisboa": (38.7223, -9.1393),
-}
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -46,45 +25,66 @@ class WeatherExecutor:
 
         Args:
             tool_name: Tool name (currently only 'get_weather').
-            arguments: Tool arguments (must contain 'city').
+            arguments: ``city`` and/or ``lat``/``lon``.
 
         Returns:
-            Weather data dict.
+            Weather data dict, or ``{"error": ..., "needs_city": True}`` when the
+            location is unknown.
         """
         if tool_name != "get_weather":
             raise ValueError(f"Unknown weather tool: {tool_name}")
 
-        city = arguments.get("city", "")
-        return await self._get_weather(city)
+        city = str(arguments.get("city") or "").strip()
+        lat = arguments.get("lat", arguments.get("latitude"))
+        lon = arguments.get("lon", arguments.get("longitude"))
 
-    async def _get_weather(self, city: str) -> dict[str, Any]:
-        """Get weather for a city."""
-        city_lower = city.lower().strip()
+        # 1. Precise coordinates (e.g. device GPS) win — no geocoding needed.
+        coords: tuple[float, float] | None = None
+        label = city
+        if lat is not None and lon is not None:
+            try:
+                coords = (float(lat), float(lon))
+                label = city or "sua localização"
+            except (TypeError, ValueError):
+                coords = None
 
-        # Try local lookup first
-        coords = CITY_COORDS.get(city_lower)
+        # 2. Geocode the city name (any city worldwide).
+        if coords is None:
+            if not city:
+                return {
+                    "error": "needs_city",
+                    "needs_city": True,
+                    "message": (
+                        "Nenhuma cidade informada. Resolva a localização do usuário "
+                        "(get_user_location) ou pergunte de qual cidade ele quer o clima."
+                    ),
+                }
+            geocoded = await self._geocode(city)
+            if not geocoded:
+                return {
+                    "error": "city_not_found",
+                    "needs_city": True,
+                    "message": f"Não encontrei a cidade '{city}'. Confirme o nome com o usuário.",
+                }
+            coords, label = geocoded
 
-        if not coords:
-            # Use geocoding API
-            coords = await self._geocode(city)
-
-        if not coords:
-            return {"error": f"Cidade '{city}' não encontrada"}
-
-        lat, lon = coords
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                WEATHER_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code",
-                    "timezone": "auto",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        lat_f, lon_f = coords
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    WEATHER_URL,
+                    params={
+                        "latitude": lat_f,
+                        "longitude": lon_f,
+                        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code",
+                        "timezone": "auto",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:  # network/timeout/HTTP error → report, don't crash the agent
+            logger.warning(f"Weather fetch failed for '{label}' ({lat_f},{lon_f}): {e}")
+            return {"error": f"Falha ao consultar o clima: {e}"}
 
         current = data.get("current", {})
         units = data.get("current_units", {})
@@ -93,7 +93,7 @@ class WeatherExecutor:
         description = self._weather_code_to_description(weather_code)
 
         return {
-            "city": city,
+            "city": label,
             "temperature": f"{current.get('temperature_2m', 'N/A')}{units.get('temperature_2m', '°C')}",
             "feels_like": f"{current.get('apparent_temperature', 'N/A')}{units.get('apparent_temperature', '°C')}",
             "humidity": f"{current.get('relative_humidity_2m', 'N/A')}{units.get('relative_humidity_2m', '%')}",
@@ -101,8 +101,8 @@ class WeatherExecutor:
             "condition": description,
         }
 
-    async def _geocode(self, city: str) -> tuple[float, float] | None:
-        """Geocode a city name using Open-Meteo."""
+    async def _geocode(self, city: str) -> tuple[tuple[float, float], str] | None:
+        """Geocode a city name using Open-Meteo. Returns (coords, label) or None."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(
@@ -114,7 +114,13 @@ class WeatherExecutor:
 
             results = data.get("results", [])
             if results:
-                return (results[0]["latitude"], results[0]["longitude"])
+                top = results[0]
+                label_parts = [top.get("name", city)]
+                if top.get("admin1"):
+                    label_parts.append(str(top["admin1"]))
+                if top.get("country"):
+                    label_parts.append(str(top["country"]))
+                return (top["latitude"], top["longitude"]), ", ".join(label_parts)
             return None
         except Exception as e:
             logger.warning(f"Geocoding failed for '{city}': {e}")

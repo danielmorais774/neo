@@ -15,6 +15,7 @@ from core.pks.entity_resolver import EntityResolver
 from core.pks.ontology import OntologyResolver, OntologyValidator
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
+from core.pks.schemas import UpsertEntityInput, UpsertRelationInput
 from core.pks.system_bootstrap import (
     NeoSystemBootstrap,
     SYSTEM_COMMUNICATION_PREFS_NAME,
@@ -373,3 +374,98 @@ class PKSService:
                 }
                 for entity, score, matched_by in rows
             ]
+
+    async def get_user_location(self, *, user_id: UUID) -> dict[str, Any] | None:
+        """Resolve the user's home city from the PKS graph.
+
+        Follows the primary user's ``located_in`` relation to a ``place`` entity
+        and returns it as a geocodable location, or ``None`` when unknown. This is
+        the authoritative source for "where is the user" — no guessing, no defaults.
+        """
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            relations = await self.repository.get_relations(session, primary.id)
+            for rel in relations:
+                if (
+                    rel.relation_type == "located_in"
+                    and rel.from_entity_id == primary.id
+                    and rel.to_type == "place"
+                ):
+                    place = await self.repository.get_entity(session, rel.to_entity_id)
+                    if place is None:
+                        continue
+                    return self._format_place(place)
+        return None
+
+    async def remember_user_city(
+        self,
+        *,
+        user_id: UUID,
+        city: str,
+        state: str | None = None,
+        country: str | None = None,
+        source_message_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist the user's city: upsert a ``place`` entity + ``located_in`` relation.
+
+        Used when the user is asked for their city and answers — so Neo learns it
+        once and never asks again. Returns the stored location, or ``None`` if there
+        is no primary user to link.
+        """
+        name = (city or "").strip()
+        if not name:
+            return None
+        meta: dict[str, Any] = {}
+        if state:
+            meta["state"] = state.strip()
+        if country:
+            meta["country"] = country.strip()
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            place, _ = await self.repository.upsert_entity(
+                session,
+                UpsertEntityInput(
+                    workspace_id=workspace_id,
+                    name=name,
+                    type="place",
+                    metadata=meta,
+                    source="conversation",
+                    source_message_id=source_message_id,
+                ),
+            )
+            await self.repository.upsert_relation(
+                session,
+                UpsertRelationInput(
+                    workspace_id=workspace_id,
+                    from_entity_id=primary.id,
+                    relation_type="located_in",
+                    to_entity_id=place.id,
+                    source="conversation",
+                    source_message_id=source_message_id,
+                ),
+            )
+            await session.commit()
+            return self._format_place(place)
+
+    @staticmethod
+    def _format_place(place: Any) -> dict[str, Any]:
+        meta = place.metadata or {}
+        parts = [place.name]
+        if meta.get("state"):
+            parts.append(str(meta["state"]))
+        if meta.get("country"):
+            parts.append(str(meta["country"]))
+        return {
+            "city": place.name,
+            "full": ", ".join(parts),
+            "state": meta.get("state"),
+            "country": meta.get("country"),
+            "source": "pks",
+        }

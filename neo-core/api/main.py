@@ -200,6 +200,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # creation). Per-request user scoping happens via set_context in AIService.
     pks_search_executor = PKSSearchExecutor(pks_service=_pks)
     _tool_executor.register_module_executor("pks_search", pks_search_executor)
+
+    # get_user_location resolves the user's city (PKS → device GPS → ask) and also
+    # persists it (save_city). Needs the PKS service; per-request user + GPS scoping
+    # happens via set_context in AIService._handle_server_tool.
+    from modules.location import LOCATION_TOOLS, LocationExecutor
+    _tool_registry.register_many(LOCATION_TOOLS)
+    location_executor = LocationExecutor(pks_service=_pks)
+    _tool_executor.register_module_executor("location", location_executor)
     print("✅ PKS ready")
     system_pks = await _pks.ensure_system_pks()
     print(

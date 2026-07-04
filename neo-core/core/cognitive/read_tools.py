@@ -18,6 +18,7 @@ from uuid import UUID
 
 from modules.config.tools import CONFIG_TOOLS
 from modules.devices.tools import DEVICES_TOOLS
+from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
 from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
@@ -33,6 +34,7 @@ def _by_name(tools: list[ToolSchema], name: str) -> ToolSchema:
 COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     _by_name(PKS_SEARCH_TOOLS, "search_pks"),
     _by_name(DEVICES_TOOLS, "list_connected_devices"),
+    _by_name(LOCATION_TOOLS, "get_user_location"),
     _by_name(WEATHER_TOOLS, "get_weather"),
     # Read-only voice introspection (which voices exist / which is active). The
     # side-effecting config_set stays out of the cognitive read set — it routes as
@@ -45,7 +47,7 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
-_USER_SCOPED = frozenset({"search_pks", "list_connected_devices"})
+_USER_SCOPED = frozenset({"search_pks", "list_connected_devices", "get_user_location"})
 
 
 def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
@@ -71,6 +73,7 @@ class CognitiveReadExecutor:
         self._user_id = user_id
         self._devices: Any = None
         self._pks_search: Any = None
+        self._location: Any = None
         # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
         # user-scoped executor avoids mutating the shared global one (no race).
         from modules.voice import VoiceExecutor
@@ -91,6 +94,10 @@ class CognitiveReadExecutor:
             if pks_service is not None:
                 self._pks_search = PKSSearchExecutor(pks_service=pks_service)
                 self._pks_search.set_context(user_id)
+                from modules.location import LocationExecutor
+
+                self._location = LocationExecutor(pks_service=pks_service)
+                self._location.set_context(user_id)
 
     async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         start = asyncio.get_event_loop().time()
@@ -102,6 +109,8 @@ class CognitiveReadExecutor:
                 result = await self._devices.execute(name, tool_call.arguments)
             elif name == "search_pks" and self._pks_search is not None:
                 result = await self._pks_search.execute(name, tool_call.arguments)
+            elif name == "get_user_location" and self._location is not None:
+                result = await self._location.execute(name, tool_call.arguments)
             elif name in ("voice_list", "voice_get"):
                 result = await self._voice.execute(name, tool_call.arguments)
             elif name in ("config_get", "config_list"):

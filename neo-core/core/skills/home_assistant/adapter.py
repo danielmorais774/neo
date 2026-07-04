@@ -38,6 +38,10 @@ class HomeAssistantAdapter:
         self._token = settings.home_assistant_token
         self._timeout = settings.home_assistant_timeout
         self._client: httpx.AsyncClient | None = None
+        # Process caches for the cognitive-core snapshot injection: a short-TTL
+        # states cache and a long-TTL device-name index (the roster changes rarely).
+        self._states_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._index_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     @property
     def is_configured(self) -> bool:
@@ -95,6 +99,54 @@ class HomeAssistantAdapter:
         """Return all entity states."""
         response = await self._request("GET", "/api/states")
         return response.json()
+
+    async def get_states_cached(self, ttl: float) -> list[dict[str, Any]]:
+        """Return all entity states, cached for ``ttl`` seconds.
+
+        Used by the cognitive-core snapshot injection so consecutive turns don't
+        each hit ``/api/states``. Falls back to the last good snapshot if a refresh
+        fails (better a few-seconds-stale snapshot than no snapshot).
+        """
+        import time
+
+        now = time.monotonic()
+        if self._states_cache and (now - self._states_cache[0]) < ttl:
+            return self._states_cache[1]
+        try:
+            states = await self.get_states()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("HA get_states_cached refresh failed: %s", e)
+            return self._states_cache[1] if self._states_cache else []
+        self._states_cache = (now, states)
+        return states
+
+    async def get_device_index(self, ttl: float) -> list[dict[str, Any]]:
+        """Return the compact device roster (entity_id/friendly_name/domain), cached.
+
+        Long TTL: the roster changes rarely, so the relevance gate can match against
+        it in-memory on every message without an HA round-trip. Reuses the states
+        cache when it is fresher than the index, avoiding a duplicate fetch.
+        """
+        import time
+
+        from core.skills.home_assistant.service import build_device_index
+
+        now = time.monotonic()
+        if self._index_cache and (now - self._index_cache[0]) < ttl:
+            return self._index_cache[1]
+        # Reuse a recently fetched states snapshot when available.
+        if self._states_cache and (now - self._states_cache[0]) < ttl:
+            states = self._states_cache[1]
+        else:
+            try:
+                states = await self.get_states()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("HA get_device_index refresh failed: %s", e)
+                return self._index_cache[1] if self._index_cache else []
+            self._states_cache = (now, states)
+        index = build_device_index(states)
+        self._index_cache = (now, index)
+        return index
 
     async def get_state(self, entity_id: str) -> dict[str, Any]:
         """Return the state of a single entity."""

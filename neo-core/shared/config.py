@@ -259,6 +259,25 @@ class Settings(BaseSettings):
         default=10,
         description="Timeout HTTP (s) para chamadas ao Home Assistant",
     )
+    home_assistant_context_injection_enabled: bool = Field(
+        default=True,
+        description=(
+            "Injeta um snapshot vivo dos dispositivos do HA no núcleo cognitivo "
+            "quando a mensagem casa um device conhecido. Desligar volta ao "
+            "comportamento antigo (responde só pelo PKS)."
+        ),
+    )
+    home_assistant_snapshot_cache_ttl: int = Field(
+        default=8,
+        description="TTL (s) do cache de ESTADOS do HA (snapshot injetado no prompt).",
+    )
+    home_assistant_device_index_ttl: int = Field(
+        default=300,
+        description=(
+            "TTL (s) do cache do ÍNDICE de nomes/apelidos de devices do HA "
+            "(usado pelo gate de relevância, consultado em memória a cada mensagem)."
+        ),
+    )
 
     # ── Music skill (Spotify / YouTube) — see neo-music-feature ──
     music_enabled: bool = Field(

@@ -443,6 +443,8 @@ class AIService:
         # original se perde no round-trip. Atualizado em process_user_input.
         self._live_sessions: set[str] = set()
         self._skill_executor: "SkillExecutor | None" = None
+        # Lazily-built HA adapter for the cognitive-core live snapshot injection.
+        self._ha_adapter: "HomeAssistantAdapter | None" = None
         self.planner = PlanManager(llm_router)
 
     # ---------------------------------------------------------------
@@ -847,7 +849,7 @@ class AIService:
                     yield resp
 
             elif decision.intent == IntentType.SERVER_TOOL:
-                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, live=live):
+                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, live=live, metadata=metadata):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
@@ -1031,6 +1033,7 @@ class AIService:
                 gen = self._handle_server_tool(
                     sid, msg, history, dec, trace, slog=slog, user_id=user_id,
                     live=(step_metadata or {}).get("mode") == "live",
+                    metadata=step_metadata,
                 )
             elif intent == IntentType.CLIENT_TOOL:
                 gen = self._handle_client_tool(
@@ -1270,6 +1273,15 @@ class AIService:
         _media_note = self._build_media_context_note(metadata)
         if _media_note:
             messages.append(Message(role=MessageRole.SYSTEM, content=_media_note))
+
+        # Real-time Home Assistant snapshot — injected ONLY when the message refers
+        # to a known HA device (matched against a cached device-name index), so the
+        # brain answers device status from live ground-truth instead of the stale
+        # PKS "devices" rows, and never touches HA for unrelated turns ("liga o
+        # computador"). See plan: shimmying-growing-turing.
+        _ha_note = await self._build_home_assistant_context_note(user_message)
+        if _ha_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_ha_note))
 
         # Active PKS verification results (real search output) — overrides any
         # claim made earlier in the conversation history.
@@ -1919,6 +1931,67 @@ class AIService:
             "isso em vez de fingir que controlou."
         )
 
+    def _get_ha_adapter(self) -> "HomeAssistantAdapter | None":
+        """Lazily build and memoize a single HA adapter for snapshot injection.
+
+        Memoized so the device-index/states caches it holds survive across turns
+        (the skill pipeline builds its own adapter per call; this one is dedicated
+        to the read-only snapshot path).
+        """
+        if self._ha_adapter is not None:
+            return self._ha_adapter
+        try:
+            from core.skills.home_assistant.adapter import HomeAssistantAdapter
+            self._ha_adapter = HomeAssistantAdapter()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not build HA adapter for snapshot injection: %s", e)
+            return None
+        return self._ha_adapter
+
+    async def _build_home_assistant_context_note(self, user_message: str) -> str | None:
+        """Live HA snapshot for the cognitive core, gated by a device-name match.
+
+        The relevance gate matches the message against a cached device-name index
+        (no HA call on the hot path). Only when a known device is referenced do we
+        fetch the current states and inject them — so the brain answers status from
+        live ground-truth (never the stale PKS "devices" rows), and unrelated turns
+        ("liga o computador") neither inject nor touch HA. See neo-core HA plan.
+        """
+        if not getattr(self.settings, "home_assistant_context_injection_enabled", True):
+            return None
+        adapter = self._get_ha_adapter()
+        if adapter is None or not adapter.is_configured:
+            return None
+
+        from core.skills.home_assistant.service import match_known_device, render_snapshot
+
+        try:
+            index = await adapter.get_device_index(
+                float(getattr(self.settings, "home_assistant_device_index_ttl", 300))
+            )
+            if not match_known_device(user_message, index):
+                return None  # no known device referenced → skip (no states fetch)
+            states = await adapter.get_states_cached(
+                float(getattr(self.settings, "home_assistant_snapshot_cache_ttl", 8))
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("HA snapshot injection failed: %s", e)
+            return None
+
+        snapshot = render_snapshot(states, query=user_message)
+        if not snapshot.strip():
+            return None
+        return (
+            "## Casa inteligente (Home Assistant — tempo real)\n"
+            f"{snapshot}\n"
+            "Estes são os estados REAIS e ATUAIS dos dispositivos. NUNCA responda o "
+            "estado de um dispositivo pela memória/PKS/histórico — use SÓ esta lista. "
+            "Se a informação pedida não estiver aqui, diga que não tem esse dado. "
+            "Para AGIR (ligar/desligar/ajustar), escreva a resposta e ao FINAL emita o "
+            "bloco [[HANDOFF:home_assistant]]<ordem completa>[[/HANDOFF]] — é ele que "
+            "executa de verdade; nunca diga que fez sem emitir o bloco."
+        )
+
     @staticmethod
     def _build_current_device_context(metadata: dict | None) -> str:
         """Describe the current device from connection metadata (real identity).
@@ -2062,6 +2135,35 @@ class AIService:
             memory.add_message(Message(role=role, content=msg.get("content", "")))
         return memory if memory.get_messages() else None
 
+    @staticmethod
+    def _extract_geo(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Normalize device GPS from client metadata into ``{lat, lon[, city]}``.
+
+        Looks under ``geo``/``gps``/``location``. GPS is the only auto-detect
+        source for location (no IP/timezone). Returns ``None`` when absent/invalid.
+        """
+        if not isinstance(metadata, dict):
+            return None
+        for key in ("geo", "gps", "location"):
+            raw = metadata.get(key)
+            if not isinstance(raw, dict):
+                continue
+            lat = raw.get("lat", raw.get("latitude"))
+            lon = raw.get("lon", raw.get("longitude"))
+            try:
+                out: dict[str, Any] = {"lat": float(lat), "lon": float(lon)}
+            except (TypeError, ValueError):
+                continue
+            if raw.get("city"):
+                out["city"] = str(raw["city"])
+            return out
+        return None
+
+    @staticmethod
+    def _is_location_relevant(decision: "RoutingDecision") -> bool:
+        """Whether this turn may need the user's location (e.g. weather)."""
+        return (decision.tool_name or "") == "get_weather"
+
     async def _handle_server_tool(
         self,
         session_id: UUID,
@@ -2072,11 +2174,13 @@ class AIService:
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
         live: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle server-side tool execution using AgentExecutor.
 
         ``live=True`` (turno do modo voz) anexa o estilo de fala ao task para o
-        agente responder em texto corrido sem markdown.
+        agente responder em texto corrido sem markdown. ``metadata`` carrega
+        sinais do cliente (ex: GPS do dispositivo em ``metadata["geo"]``).
         """
 
         if slog:
@@ -2122,6 +2226,18 @@ class AIService:
             except Exception:  # pragma: no cover - defensive
                 logger.warning("[VOICE/CONFIG] failed to scope user context", exc_info=True)
 
+            # Scope location resolution to this user + carry device GPS (if any),
+            # so get_user_location reads the right PKS and can use GPS.
+            geo = self._extract_geo(metadata)
+            try:
+                loc_exec = getattr(
+                    self.agent.tool_executor, "_module_executors", {}
+                ).get("location")
+                if loc_exec is not None:
+                    loc_exec.set_context(user_id, geo)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("[LOCATION] failed to scope user context", exc_info=True)
+
             # Safety net: don't let the server-tool agent run blind. Seed recent
             # history (so a second-turn correction is understood) and, when the
             # query depends on user knowledge, prepend PKS context to the task.
@@ -2145,6 +2261,36 @@ class AIService:
             except Exception:
                 logger.exception("SERVER_TOOL PKS enrichment failed; proceeding without it")
                 task = user_message
+
+            # Location grounding: NEVER guess a city. If this turn may depend on the
+            # user's location (e.g. weather) and the user didn't name a city, resolve
+            # it (PKS authoritative home → device GPS) and tell the agent; if unknown,
+            # instruct it to ASK (and learn). Best-effort — must not block execution.
+            if user_id and self.pks and self._is_location_relevant(decision):
+                try:
+                    has_city = bool(str((decision.tool_arguments or {}).get("city") or "").strip())
+                    if not has_city:
+                        loc = await self.pks.get_user_location(user_id=user_id)
+                        if loc:
+                            task = (
+                                f"{task}\n\n[Localização do usuário: {loc['full']} (fonte: PKS). "
+                                f"Se o usuário não especificar outra cidade, use "
+                                f"get_weather(city='{loc['city']}').]"
+                            )
+                        elif geo:
+                            task = (
+                                f"{task}\n\n[Localização do usuário por GPS: lat={geo['lat']}, "
+                                f"lon={geo['lon']}. Se o usuário não especificar uma cidade, use "
+                                f"get_weather(lat={geo['lat']}, lon={geo['lon']}).]"
+                            )
+                        else:
+                            task = (
+                                f"{task}\n\n[Localização do usuário desconhecida. Se o pedido "
+                                f"depender de localização, PERGUNTE de qual cidade — não invente. "
+                                f"Quando ele responder, grave com get_user_location(save_city=...).]"
+                            )
+                except Exception:
+                    logger.exception("SERVER_TOOL location grounding failed; proceeding without it")
 
             # Modo Live: pede resposta falada/sem markdown (anexa ao task em vez de
             # sobrescrever o system prompt, preservando as instruções de tools do agente).
@@ -2414,10 +2560,11 @@ class AIService:
         ha_note = (
             "## Contexto: tentativa de Home Assistant\n"
             "A mensagem foi inicialmente roteada para o Home Assistant, mas não havia um "
-            "comando acionável (ou a ação não pôde ser executada). NÃO repita um erro genérico. "
-            "Responda à mensagem do usuário conversando normalmente e usando o histórico. "
-            "Se o usuário está perguntando sobre uma AÇÃO ANTERIOR (ex.: como você chegou a um "
-            "valor), explique com base no que aconteceu na conversa."
+            "comando acionável claro. NÃO afirme que uma ação FALHOU nem invente um erro: "
+            "não houve comando para executar (≠ ação que deu erro). Se houver um snapshot de "
+            "'Casa inteligente (tempo real)' acima, responda o estado a partir dele; senão, "
+            "converse normalmente usando o histórico. Se o usuário pergunta sobre uma AÇÃO "
+            "ANTERIOR (ex.: como você chegou a um valor), explique com base na conversa."
         )
         fallback_decision = RoutingDecision(
             intent=IntentType.DIRECT_RESPONSE,

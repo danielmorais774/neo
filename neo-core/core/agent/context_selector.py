@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -38,6 +38,7 @@ _MONTH_NAMES = [
     "janeiro", "fevereiro", "março", "abril", "maio", "junho",
     "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
 ]
+_BRAZIL_TZ = timezone(timedelta(hours=-3))  # horário de Brasília (UTC-3, sem DST desde 2019)
 
 
 class PromptContextSelector:
@@ -432,11 +433,12 @@ class PromptContextSelector:
     # ── Base prompt ───────────────────────────────────────────────────────
 
     def _build_core_prompt(self) -> str:
-        today = date.today()
+        now = datetime.now(_BRAZIL_TZ)
         formatted_date = (
-            f"{_WEEKDAY_NAMES[today.weekday()]}, "
-            f"{today.day} de {_MONTH_NAMES[today.month - 1]} de {today.year}"
+            f"{_WEEKDAY_NAMES[now.weekday()]}, "
+            f"{now.day} de {_MONTH_NAMES[now.month - 1]} de {now.year}"
         )
+        formatted_time = now.strftime("%H:%M")
         return (
             "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
             "Você foi criado por Daniel Morais (seu desenvolvedor). "
@@ -444,7 +446,7 @@ class PromptContextSelector:
             "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "
             "ATENÇÃO: Daniel Morais é o seu CRIADOR (desenvolvedor), não necessariamente a pessoa com quem você está conversando agora, e também só deve mencionar isso em um contexto relevante. "
             "O nome e perfil do usuário atual estão na seção 'Usuário Atual' do contexto — use essas informações para saber com quem você está falando. "
-            f"A data de hoje é {formatted_date}. "
+            f"A data de hoje é {formatted_date} e a hora atual é {formatted_time} (horário de Brasília, UTC-3). "
             "Suas regras:\n"
             "1. SEMPRE responda em português brasileiro.\n"
             "2. NUNCA diga que não pode ajudar, que é uma IA com limitações, ou frases genéricas de recusa — sempre tente responder de forma útil.\n"

@@ -16,7 +16,9 @@ from core.skills.home_assistant.service import (
     compact_entity,
     filter_entities,
     resolve_entity,
+    state_satisfies_spec,
     summarize_state,
+    verify_spec,
 )
 from shared import ToolCall, ToolResult
 
@@ -25,23 +27,12 @@ logger = logging.getLogger(__name__)
 # Cap on entities returned to the LLM to keep the context small.
 _MAX_ENTITIES = 40
 
-# Expected resulting state per (domain, service) for on/off-style actions, used to
-# VERIFY the action after calling it. HA's service-call response only lists states
-# that changed synchronously — devices that confirm asynchronously return an empty
-# list even on success, which made the agent report a false failure. We re-read the
-# entity instead and report the real resulting state.
-_EXPECTED_STATE: dict[tuple[str, str], str] = {
-    ("light", "turn_on"): "on",
-    ("light", "turn_off"): "off",
-    ("switch", "turn_on"): "on",
-    ("switch", "turn_off"): "off",
-    ("fan", "turn_on"): "on",
-    ("fan", "turn_off"): "off",
-    ("input_boolean", "turn_on"): "on",
-    ("input_boolean", "turn_off"): "off",
-    ("cover", "open_cover"): "open",
-    ("cover", "close_cover"): "closed",
-}
+# Verification is driven by ``verify_spec`` (core/skills/home_assistant/service.py):
+# HA's service-call response only lists states that changed synchronously — devices
+# that confirm asynchronously return an empty list even on success, which made the
+# agent report a false failure. We re-read the entity instead and confirm against
+# the spec (including non-"on/off" states like climate hvac_mode and attribute
+# targets like the requested temperature).
 
 # Poll schedule (seconds) for the post-action state read. Early-exits as soon as
 # the expected state is observed; total budget ~1.8s for the worst case. Module-level
@@ -151,24 +142,26 @@ class HomeAssistantExecutor:
             "changed_count": len(changed),
         }
         if isinstance(entity_id, str) and entity_id:
-            expected = _EXPECTED_STATE.get((domain, service))
-            state, summary = await self._verify_resulting_state(entity_id, expected)
+            spec = verify_spec(domain, service, payload)
+            state, summary, verified = await self._verify_resulting_state(entity_id, spec)
             result["resulting_state"] = state
             result["resulting_summary"] = summary
-            if expected is not None:
-                result["expected_state"] = expected
-                result["verified"] = (state == expected)
+            if spec is not None:
+                result["expected"] = {"kind": spec[0], "target": spec[1]}
+                result["verified"] = verified
         return result
 
     async def _verify_resulting_state(
-        self, entity_id: str, expected: str | None
-    ) -> tuple[str | None, str | None]:
+        self, entity_id: str, spec: tuple[str, Any] | None
+    ) -> tuple[str | None, str | None, bool | None]:
         """Re-read ``entity_id`` after an action, polling to absorb HA's eventual
-        consistency. Returns ``(state, human_summary)``. Early-exits once the
-        expected state is observed (or after one read when there is no expectation).
+        consistency. Returns ``(state, human_summary, verified)``. Early-exits once
+        the spec is satisfied (or after one read when there is no spec). ``verified``
+        is ``None`` when there is no spec to check.
         """
         state: str | None = None
         summary: str | None = None
+        verified: bool | None = None
         for delay in _VERIFY_DELAYS:
             if delay:
                 await asyncio.sleep(delay)
@@ -179,9 +172,12 @@ class HomeAssistantExecutor:
                 break
             state = entity.get("state")
             summary = summarize_state(entity)
-            if expected is None or state == expected:
+            if spec is None:
                 break
-        return state, summary
+            verified = state_satisfies_spec(entity, spec)
+            if verified:
+                break
+        return state, summary, verified
 
     async def _rename_entity(self, entity_id: str, name: str) -> dict[str, Any]:
         entry = await self.adapter.rename_entity(entity_id, name)
