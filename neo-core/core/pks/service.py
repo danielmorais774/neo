@@ -15,7 +15,7 @@ from core.pks.entity_resolver import EntityResolver
 from core.pks.ontology import OntologyResolver, OntologyValidator
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
-from core.pks.schemas import UpsertEntityInput, UpsertRelationInput
+from core.pks.schemas import UpsertEntityInput, UpsertFieldInput, UpsertRelationInput
 from core.pks.system_bootstrap import (
     NeoSystemBootstrap,
     SYSTEM_COMMUNICATION_PREFS_NAME,
@@ -399,6 +399,92 @@ class PKSService:
                         continue
                     return self._format_place(place)
         return None
+
+    # ── Neo affect (per-user cortisol) ────────────────────────────────────
+    async def get_user_affect(self, *, user_id: UUID):
+        """Read Neo's stored emotional state toward this user (no decay applied).
+
+        Returns a fresh calm :class:`AffectState` when nothing is stored yet or
+        there is no primary user entity. Decay is the caller's job at read time,
+        since it depends on the configured half-life.
+        """
+        from core.agent.affect import AFFECT_FIELD_KEY, AffectState
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return AffectState()
+            field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
+            return AffectState.from_field(field.value if field else None)
+
+    async def update_user_affect(
+        self,
+        *,
+        user_id: UUID,
+        signal,
+        wrong_name: bool = False,
+        source_message_id: str | None = None,
+    ):
+        """Merge one turn's appraised affect into the stored state and persist it.
+
+        Read-modify-write in a single session (atomic across concurrent turns):
+        the stored state is first decayed to *now*, then the bounded ``signal`` is
+        applied. When ``wrong_name`` is set, a deterministic cortisol floor is
+        enforced so the reaction fires even if the appraiser under-rated it.
+        Returns the new :class:`AffectState`, or ``None`` if there is no user.
+        """
+        from core.agent.affect import (
+            AFFECT_FIELD_KEY,
+            AffectSignal,
+            AffectState,
+            apply_decay,
+            merge_signal,
+        )
+
+        settings = get_settings()
+        if not isinstance(signal, AffectSignal):
+            signal = AffectSignal.model_validate(signal)
+        if wrong_name:
+            floor = settings.neo_affect_wrong_name_floor
+            escalations = {"insult", "teasing", "rude"}
+            signal = signal.model_copy(
+                update={
+                    "cortisol_delta": max(signal.cortisol_delta, floor),
+                    "trigger": signal.trigger if signal.trigger in escalations else "wrong_name",
+                    "why": signal.why or "chamou o Neo por nome de outra IA",
+                }
+            )
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
+            current: AffectState = AffectState.from_field(field.value if field else None)
+            decayed = apply_decay(current, half_life_min=settings.neo_affect_half_life_min)
+            merged = merge_signal(
+                decayed,
+                signal,
+                max_up=settings.neo_affect_max_delta_up,
+                max_down=settings.neo_affect_max_delta_down,
+                recent_max=settings.neo_affect_recent_max,
+            )
+            await self.repository.upsert_field(
+                session,
+                UpsertFieldInput(
+                    entity_id=primary.id,
+                    key=AFFECT_FIELD_KEY,
+                    value_type="json",
+                    value=merged.to_field(),
+                    source="affect",
+                    source_message_id=source_message_id,
+                    actor="system",
+                ),
+            )
+            await session.commit()
+            return merged
 
     # Relation types that describe a person's relationship to the user, mapped to a
     # display label. Coarse (gender-neutral); a free-text ``relationship`` field on

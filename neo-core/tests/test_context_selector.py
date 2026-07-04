@@ -32,6 +32,7 @@ def _make_selector(
     settings.context_budget_user_pks = budget_user_pks
     settings.context_budget_retrieved = budget_retrieved
     settings.context_relevance_threshold = threshold
+    settings.neo_affect_enabled = False  # affect off in these tests
 
     return PromptContextSelector(
         token_counter=token_counter,
@@ -178,7 +179,7 @@ async def test_render_ordering_core_before_runtime_before_neo_core():
         recovered_context=[],
     )
 
-    core_pos = system_prompt.find("Você é Neo")
+    core_pos = system_prompt.find("Você é o Neo")
     runtime_pos = system_prompt.find("OS: macOS")
     neo_core_pos = system_prompt.find("Memória do Neo")
 

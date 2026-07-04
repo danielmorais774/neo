@@ -107,11 +107,14 @@ class PromptContextSelector:
             ))
 
         # ── 3. Fetch async sources in parallel ────────────────────────────
-        neo_core_text, prefs_text, pks_result, pks_context = await self._fetch_parallel(
-            user_message=user_message,
-            user_id=user_id,
-            decision=decision,
-            is_neo_training=is_neo_training,
+        (neo_core_text, prefs_text, pks_result, pks_context), affect_state = await asyncio.gather(
+            self._fetch_parallel(
+                user_message=user_message,
+                user_id=user_id,
+                decision=decision,
+                is_neo_training=is_neo_training,
+            ),
+            self._fetch_affect(user_id=user_id),
         )
 
         # ── 4. NEO_CORE_PINNED — always pinned ───────────────────────────
@@ -132,6 +135,32 @@ class PromptContextSelector:
                 final_score=1.0,
                 included=True,
             ))
+
+        # ── 4b. NEO_AFFECT — pinned tone directive (cortisol) ─────────────
+        if affect_state is not None:
+            from core.agent.affect import render_directive
+
+            directive = render_directive(
+                affect_state,
+                irritated=self._settings.neo_affect_band_irritated,
+                pissed=self._settings.neo_affect_band_pissed,
+            )
+            if directive:
+                candidates.append(ContextCandidate(
+                    layer=ContextLayer.NEO_AFFECT,
+                    source="affect",
+                    key="neo_affect",
+                    pin=True,
+                    text=directive,
+                    est_tokens=self._tc.count(directive),
+                    relevance=1.0,
+                    final_score=1.0,
+                    included=True,
+                ))
+                logger.info(
+                    "[ContextSelector] affect: cortisol=%.2f valence=%.2f trigger=%s",
+                    affect_state.cortisol, affect_state.valence, affect_state.last_trigger,
+                )
 
         # ── 5. USER_PREFS — scored ────────────────────────────────────────
         if prefs_text:
@@ -252,6 +281,24 @@ class PromptContextSelector:
                     pks_result, pks_context = result  # type: ignore[assignment]
 
         return neo_core_text, prefs_text, pks_result, pks_context
+
+    async def _fetch_affect(self, *, user_id: UUID | None):
+        """Load + time-decay Neo's cortisol toward this user. None when disabled/absent.
+
+        Single cheap field read; decay is pure math. Never raises into the prompt.
+        """
+        # Strict ``is True`` (not just truthy) so a spec-MagicMock settings in
+        # tests never accidentally activates the feature.
+        if self._settings.neo_affect_enabled is not True or not self._pks or not user_id:
+            return None
+        try:
+            from core.agent.affect import apply_decay
+
+            state = await self._pks.get_user_affect(user_id=user_id)
+            return apply_decay(state, half_life_min=self._settings.neo_affect_half_life_min)
+        except Exception as e:  # pragma: no cover - affect must never break the prompt
+            logger.warning("[ContextSelector] affect fetch failed: %s", e)
+            return None
 
     async def _safe_retrieve_system_context(self, user_message: str) -> str:
         assert self._pks is not None
@@ -388,6 +435,7 @@ class PromptContextSelector:
             ContextLayer.CORE,
             ContextLayer.RUNTIME,
             ContextLayer.NEO_CORE_PINNED,
+            ContextLayer.NEO_AFFECT,
             ContextLayer.NEO_CORE_CTX,
             ContextLayer.USER_PREFS,
             ContextLayer.USER_PKS,

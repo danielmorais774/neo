@@ -171,6 +171,50 @@ class Settings(BaseSettings):
         description="Minimum relevance score for non-pinned candidates to enter the prompt",
     )
 
+    # ── Neo affect / emotional state (cortisol per-user) ──────────
+    # Neo carries a per-user "cortisol" level: it rises when the user provokes
+    # him (wrong name, teasing, insults) and relaxes over time. High cortisol →
+    # curter/harsher tone; low cortisol → lighter, more playful. The level is
+    # appraised by a cheap LLM after each turn and injected (as a directive) into
+    # the next prompt. Read is cheap (stored field + decay); the LLM cost is paid
+    # async, off the response hot path.
+    neo_affect_enabled: bool = Field(
+        default=False,
+        description="Enable Neo's per-user emotional state (cortisol) modulation",
+    )
+    neo_affect_half_life_min: float = Field(
+        default=45.0, gt=0.0,
+        description="Minutes for cortisol to decay to half toward the calm baseline",
+    )
+    neo_affect_max_delta_up: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+        description="Max cortisol increase a single turn's appraisal may apply",
+    )
+    neo_affect_max_delta_down: float = Field(
+        default=0.3, ge=0.0, le=1.0,
+        description="Max cortisol decrease a single turn's appraisal may apply",
+    )
+    neo_affect_wrong_name_floor: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description="Deterministic cortisol floor bump when addressed by another AI's name",
+    )
+    neo_affect_band_irritated: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description="Cortisol at/above which Neo's tone turns curt (irritated band)",
+    )
+    neo_affect_band_pissed: float = Field(
+        default=0.6, ge=0.0, le=1.0,
+        description="Cortisol at/above which Neo's tone turns harsh (pissed band)",
+    )
+    neo_affect_model: str = Field(
+        default="",
+        description="Model id for the affect appraiser; empty → reuse intent classifier default",
+    )
+    neo_affect_recent_max: int = Field(
+        default=8, ge=0,
+        description="How many recent affect events to keep for transparency/debug",
+    )
+
     # Panel auth (temporary without login flow)
     panel_jwt_secret: str = Field(
         default="l5L0mJ30C7v10OTI4eEOvxShOGwhGkPSEst7eicOiFGq8qG6TgL9u4CQUr6mByjV",

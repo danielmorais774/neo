@@ -445,6 +445,8 @@ class AIService:
         self._skill_executor: "SkillExecutor | None" = None
         # Lazily-built HA adapter for the cognitive-core live snapshot injection.
         self._ha_adapter: "HomeAssistantAdapter | None" = None
+        # Lazily-built affect appraiser (per-user cortisol). None until first use.
+        self._affect_appraiser: Any | None = None
         self.planner = PlanManager(llm_router)
 
     # ---------------------------------------------------------------
@@ -1661,8 +1663,50 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PKS] Post-response write failed: {e}", exc_info=True)
 
+        async def _bg_affect() -> None:
+            """Appraise this turn's affect and update Neo's cortisol toward the user.
+
+            Off the response hot path. A deterministic wrong-name detector guarantees
+            the spike even if the appraiser under-rates or is unavailable. Neutral
+            turns are skipped (no write) so cortisol keeps decaying naturally.
+            """
+            appraiser = self._get_affect_appraiser()
+            if not (appraiser and user_id and full_response):
+                return
+            try:
+                from core.agent.affect import detect_wrong_name
+
+                wrong_name = detect_wrong_name(user_message)
+                current = await self.pks.get_user_affect(user_id=user_id)
+                signal = await appraiser.appraise(
+                    user_message=user_message,
+                    assistant_response=full_response,
+                    current=current,
+                )
+                neutral = (
+                    abs(signal.cortisol_delta) < 0.01 and abs(signal.valence_delta) < 0.01
+                )
+                if neutral and not wrong_name:
+                    return
+                updated = await self.pks.update_user_affect(
+                    user_id=user_id,
+                    signal=signal,
+                    wrong_name=wrong_name,
+                    source_message_id=source_message_id,
+                )
+                if updated and slog:
+                    slog.log_event(
+                        "Estado Emocional (cortisol)",
+                        f"trigger={updated.last_trigger} cortisol={updated.cortisol:.2f} "
+                        f"valence={updated.valence:.2f}"
+                        + (f" ← {signal.why}" if signal.why else ""),
+                    )
+            except Exception as e:
+                logger.warning(f"[Affect] Post-response appraisal failed: {e}", exc_info=True)
+
         asyncio.create_task(_bg_prefs())
         asyncio.create_task(_bg_pks())
+        asyncio.create_task(_bg_affect())
 
         # Internal control item: hand the parsed handoffs back to the orchestrator.
         # ``message=None`` + the private metadata key make it non-user-facing; the
@@ -1947,6 +1991,15 @@ class AIService:
             logger.warning("Could not build HA adapter for snapshot injection: %s", e)
             return None
         return self._ha_adapter
+
+    def _get_affect_appraiser(self):
+        """Lazily build the per-user affect appraiser. None when the feature is off."""
+        if not self.settings.neo_affect_enabled or not self.pks:
+            return None
+        if self._affect_appraiser is None:
+            from core.agent.affect import AffectAppraiser
+            self._affect_appraiser = AffectAppraiser(self.llm, self.settings, db=self.db)
+        return self._affect_appraiser
 
     async def _build_home_assistant_context_note(self, user_message: str) -> str | None:
         """Live HA snapshot for the cognitive core, gated by a device-name match.
