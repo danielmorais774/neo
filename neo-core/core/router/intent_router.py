@@ -91,6 +91,28 @@ _INTERROGATIVE_STARTS = (
     "onde", "qual", "quanto", "quantos", "quanta", "quantas", "o que", "oq",
 )
 
+# Foreign wake-name addressing: when the user addresses Neo by ANOTHER assistant's
+# name ("alexa, liga a luz", "ok google...", "chatgpt, faz X"), the turn MUST go to
+# the cognitive core — never fast-path to a skill. Neo's persona/behavior rules
+# (e.g. the trained "get offended when called Alexa, refuse and mock") live in the
+# PKS and are applied ONLY on the DIRECT_RESPONSE path (retrieve_system_context).
+# Without this, "alexia liga a luz" reads as a textbook imperative HA command
+# (confidence 1.0) → routed straight to the home_assistant skill, which never sees
+# the persona, so the trained reaction can never fire (session 2173af2b). Anchored
+# at the START of the message (a vocative), accent-stripped/lowercased. Fails safe:
+# sending an unrelated turn to the brain is always harmless (it's DIRECT_RESPONSE).
+_FOREIGN_ASSISTANT_NAMES = (
+    "amazon alexa", "alexa", "alexia",
+    "ok google", "hey google", "google assistente", "assistente do google",
+    "hey siri", "e ai siri", "oi siri", "siri",
+    "cortana", "bixby",
+    "chatgpt", "chat gpt", "gpt",
+    "gemini", "copilot", "claude",
+)
+_FOREIGN_ASSISTANT_ADDRESS = re.compile(
+    r"^(?:" + "|".join(re.escape(n) for n in _FOREIGN_ASSISTANT_NAMES) + r")\b"
+)
+
 # Skill requests that are CONDITIONAL on the user's own habits/preferences — or
 # that ASK about them — must go to the cognitive core (DIRECT_RESPONSE) so it can
 # read the PKS and decide whether to hand off to a skill, instead of the cheap
@@ -317,6 +339,12 @@ User: "manda whatsapp pro 5511988217222: oi tudo bem?"
 User: "pede uma pizza no Domino's"
 → tool_arguments: {{"text": "Olá, gostaria de fazer um pedido", "recipient": "Domino's"}}
 
+# contact_source (opcional): onde buscar o contato. Só preencha quando o usuário
+# disser EXPLICITAMENTE a fonte. Valores: "whatsapp" (lista/agenda do WhatsApp),
+# "saved" (contatos salvos do Neo). Omita para o padrão (busca PKS-first).
+User: "procura o João na lista do WhatsApp e manda um oi"
+→ tool_arguments: {{"text": "oi", "recipient": "João", "contact_source": "whatsapp"}}
+
 ## HOME_ASSISTANT — exemplos
 
 User: "acende a luz da sala" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
@@ -413,6 +441,13 @@ class IntentRouter:
         if self._is_training_message(user_message):
             logger.info("Intent: Neo training message → DIRECT_RESPONSE (router bypass)")
             return self._training_decision(user_message)
+
+        # Addressed by another assistant's name ("alexa, liga a luz") → cognitive
+        # core, so Neo's persona/behavior rules (pride/offense) apply instead of the
+        # message fast-pathing to a skill (which is persona-blind). See session 2173af2b.
+        if self._is_foreign_assistant_address(user_message):
+            logger.info("Intent: foreign-assistant address → DIRECT_RESPONSE (persona, router bypass)")
+            return self._foreign_assistant_decision(user_message)
 
         # Explicit memory directives ("lembra que...", "registra no PKS") are saved
         # by the PKS pipeline on the DIRECT_RESPONSE path — never a tool/terminal call.
@@ -863,6 +898,41 @@ class IntentRouter:
         self._apply_memory_heuristics(decision, message)
         return decision
 
+    @staticmethod
+    def _is_foreign_assistant_address(message: str) -> bool:
+        """True when the user addresses Neo by ANOTHER assistant's name at the start.
+
+        The message is accent-stripped/lowercased and whitespace-collapsed, then
+        matched against a vocative anchored at the START ("alexa, ...", "ok google
+        ...", "chatgpt ..."). A word boundary keeps "alexandre"/"sirineu" from
+        matching. This keeps the turn on the cognitive core so Neo's persona rules
+        (pride/offense) fire, instead of a persona-blind skill grabbing the command.
+        """
+        compact = " ".join(_strip_accents(message).split())
+        if not compact:
+            return False
+        return bool(_FOREIGN_ASSISTANT_ADDRESS.match(compact))
+
+    def _foreign_assistant_decision(self, message: str) -> RoutingDecision:
+        """Direct-response decision so the cognitive core applies Neo's persona.
+
+        The behavior rules ("get offended when called Alexa, refuse and mock") come
+        from the PKS system context (retrieve_system_context) on this path.
+        """
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=0.9,
+            explanation=(
+                "Usuário endereçou o Neo por nome de outro assistente → núcleo "
+                "cognitivo (aplica a persona/regra de comportamento; não fast-path pra skill)"
+            ),
+            needs_memory=True,
+            requires_approval=False,
+            needs_plan=False,
+        )
+        self._apply_memory_heuristics(decision, message)
+        return decision
+
     @classmethod
     def _is_brain_reasoning_request(cls, message: str) -> bool:
         """True when a request must go to the cognitive core (DIRECT_RESPONSE).
@@ -1051,6 +1121,10 @@ class IntentRouter:
         # Referential follow-up questions stay on DIRECT_RESPONSE.
         if self._is_referential_question(message):
             return self._referential_question_decision(message)
+
+        # Addressed by another assistant's name → cognitive core (persona rules).
+        if self._is_foreign_assistant_address(message):
+            return self._foreign_assistant_decision(message)
 
         # Conditional/habit-based actions and preference questions → cognitive core.
         if self._is_brain_reasoning_request(message):

@@ -1,5 +1,6 @@
 """Prompt builder - constrói prompts para o LLM."""
 
+from core.agent.persona import neo_persona
 from shared import Message, MessageRole, ToolSchema
 
 
@@ -60,7 +61,7 @@ class PromptBuilder:
 
     def _default_system_prompt(self) -> str:
         """Retorna o system prompt padrão."""
-        return """Você é o Neo, um agente de IA avançado capaz de executar tarefas usando ferramentas disponíveis.
+        return neo_persona("slim") + "\n\n" + """Você executa tarefas usando as ferramentas disponíveis.
 
 IMPORTANTE: Você SEMPRE deve responder em PORTUGUÊS do Brasil, independente do idioma da entrada.
 

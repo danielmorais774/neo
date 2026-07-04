@@ -12,6 +12,7 @@ from typing import Any
 from uuid import UUID
 
 from core.agent.agent_executor import AgentExecutor
+from core.agent.persona import neo_persona
 from core.memory import ConversationMemory
 from core.notifications.broker import NotificationBroker
 from core.skills import SkillPipeline, SkillResult
@@ -89,9 +90,12 @@ class HomeAssistantPipeline(SkillPipeline):
 
     def _build_system_prompt(self) -> str:
         try:
-            return _PROMPT_PATH.read_text(encoding="utf-8")
+            base = _PROMPT_PATH.read_text(encoding="utf-8")
         except Exception:
-            return _FALLBACK_PROMPT
+            base = _FALLBACK_PROMPT
+        # Voz do Neo (slim) vem da fonte única; sem o gatilho do nome — o roteador
+        # já desvia "alexa, ..." pro núcleo cognitivo, onde o gatilho vive.
+        return neo_persona("slim") + "\n\n" + base
 
     def _build_memory(
         self,

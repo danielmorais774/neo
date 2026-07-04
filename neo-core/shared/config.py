@@ -246,6 +246,31 @@ class Settings(BaseSettings):
         description="Webhook path for inbound WhatsApp messages",
     )
 
+    # WhatsApp Direct (light path — no mission agent loop, auto-closes)
+    whatsapp_direct_enabled: bool = Field(
+        default=True,
+        description="Enable the lightweight 'direct' kind for one-shot WhatsApp "
+        "messages (draft → confirm → send → single reply cycle → auto-close), "
+        "instead of always spinning up a tracked mission.",
+    )
+    whatsapp_direct_autosend: bool = Field(
+        default=False,
+        description="When False, a 'direct' message still asks the user to confirm "
+        "before sending (confirmação em tudo). Flip to True for fire-and-forget.",
+    )
+    whatsapp_pks_resolution_enabled: bool = Field(
+        default=True,
+        description="Resolve WhatsApp recipients PKS-first (person entities with "
+        "relationship + jid + linked_user_id) before the saved contact table and "
+        "the WhatsApp phonebook. See _resolve_recipient.",
+    )
+    whatsapp_reply_autopilot_enabled: bool = Field(
+        default=True,
+        description="Let the direct path classify an incoming reply "
+        "(close/ack/escalate/promote) and draft an ack, instead of always "
+        "escalating the reply to the user.",
+    )
+
     # Home Assistant
     home_assistant_url: str = Field(
         default="http://localhost:8123",

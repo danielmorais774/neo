@@ -2383,6 +2383,7 @@ class AIService:
                     agent_executor=self.agent,
                     db=self.db,
                     notification_broker=broker,
+                    pks=self.pks,
                 )
                 self._skill_executor = skill_executor
 
@@ -2501,6 +2502,7 @@ class AIService:
                     agent_executor=self.agent,
                     db=self.db,
                     notification_broker=broker,
+                    pks=self.pks,
                 )
                 self._skill_executor = skill_executor
 
@@ -2631,6 +2633,7 @@ class AIService:
                     agent_executor=self.agent,
                     db=self.db,
                     notification_broker=broker,
+                    pks=self.pks,
                 )
                 self._skill_executor = skill_executor
 

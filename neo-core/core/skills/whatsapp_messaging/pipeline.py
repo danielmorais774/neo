@@ -26,6 +26,7 @@ from uuid import UUID
 
 if TYPE_CHECKING:
     from observability.session_file_logger import SessionFileLogger
+    from core.pks import PKSService
 
 from core.agent.agent_executor import AgentExecutor
 from core.agent.prompt_builder import PromptBuilder
@@ -94,6 +95,18 @@ _COMMERCIAL_HINTS = {
     "pedido", "pedir", "encomenda", "encomendar", "comprar", "compra",
     "farmacia", "farmácia", "remedio", "remédio", "mercado", "supermercado",
     "loja", "restaurante", "comida",
+}
+
+# Signals that a personal-domain request needs a tracked mission (negotiation /
+# goal completion), not a one-shot "direct" send. Accent-folded before matching.
+_COORDINATION_HINTS = {
+    "agenda", "agendar", "agende", "combina", "combinar", "combine",
+    "marcar", "remarcar", "confirma se", "confirmar se", "confirme se",
+    "verifica com", "verificar com", "verifique com", "pergunta pra todos",
+    "pergunte a todos", "pergunta a todos", "quem tem", "quem pode", "quem tiver",
+    "quando ele pode", "quando ela pode", "que dia ele", "que dia ela",
+    "que horas ele", "que horas ela", "disponibilidade", "orcamento", "cotacao",
+    "negocia", "negociar",
 }
 
 _JID_RE = re.compile(r"\b(\d{6,20}@(?:c\.us|lid|s\.whatsapp\.net|g\.us))\b")
@@ -211,10 +224,12 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         agent_executor: AgentExecutor,
         db: AsyncPostgresClient,
         broker: NotificationBroker,
+        pks: "PKSService | None" = None,
     ) -> None:
         self.agent_executor = agent_executor
         self.db = db
         self.broker = broker
+        self.pks = pks
         self.gateway = WhatsAppGatewayClient()
         self.executor = WhatsAppMessagingExecutor(db, self.gateway)
 
@@ -332,6 +347,10 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 return await self._handle_approval(mission, extra, slog)
             if self._is_operator_instruction(extra):
                 return await self._handle_active_mission_user_message(mission, user_message, slog)
+            # Direct (light) missions classify the reply (close/ack/escalate/promote)
+            # and auto-close, instead of always drafting an ack like a tracked mission.
+            if (mission.extra_metadata or {}).get("kind") == "direct":
+                return await self._handle_direct_reply(mission, user_message, slog, extra, history)
             return await self._handle_inbound(mission, user_message, slog, extra, history)
 
         if user_id and self._looks_like_active_mission_followup(user_message):
@@ -442,6 +461,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         tool_args = extra.get("tool_arguments") or {}
         recipient_hint = (tool_args.get("recipient") or "").strip() or None
         message_text = (tool_args.get("text") or "").strip() or None
+        # Source override: the router may pass it; else detect it from the message
+        # ("procura no WhatsApp", "contato salvo"). Default "auto" = PKS-first stack.
+        contact_source = (tool_args.get("contact_source") or "").strip().lower() or None
+        if not contact_source:
+            contact_source = self._detect_contact_source(user_message)
 
         if not recipient_hint:
             recipient_hint = self._extract_recipient_hint(user_message)
@@ -449,17 +473,22 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             message_text = self._extract_message_text(user_message)
 
         mode = self._detect_mode(user_message, recipient_hint, message_text)
+        kind = self._classify_kind(user_message, message_text, mode, extra)
         slog.log_event(
             "whatsapp_messaging.kickoff_parse",
             {
                 "recipient_hint": recipient_hint,
                 "message_text": message_text,
                 "detected_mode": mode,
+                "detected_kind": kind,
+                "contact_source": contact_source,
                 "raw_user_message": user_message,
             },
         )
 
-        resolved = await self._resolve_recipient(user_id, recipient_hint, user_message)
+        resolved = await self._resolve_recipient(
+            user_id, recipient_hint, user_message, contact_source=contact_source
+        )
         slog.log_event(
             "whatsapp_messaging.resolve_recipient",
             {
@@ -469,6 +498,9 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 "phone_e164": resolved.phone_e164,
                 "error": resolved.error,
                 "candidates": resolved.candidates,
+                "source": resolved.source,
+                "relationship": resolved.relationship,
+                "linked_user_id": resolved.linked_user_id,
             },
         )
         if not resolved.ok:
@@ -526,12 +558,19 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             status="pending",
             extra_metadata={
                 "mode": mode,
+                "kind": kind,
                 "contact_phone_e164": contact_phone or "",
                 "contact_label": contact_label,
+                "recipient_source": resolved.source,
+                "linked_user_id": resolved.linked_user_id,
+                "relationship": resolved.relationship,
             },
         )
 
         if mode == "personal":
+            # kind ∈ {"direct","personal"}: both draft→confirm→send here, but a
+            # "direct" auto-closes after one reply cycle (see _handle_direct_reply);
+            # a "personal" mission keeps the ongoing ack loop (_handle_inbound).
             return await self._kickoff_personal(
                 mission_id=mission.id,
                 user_id=user_id,
@@ -540,6 +579,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 contact_phone=contact_phone,
                 draft_text=message_text or user_message,
                 slog=slog,
+                kind=kind,
             )
 
         return await self._kickoff_commercial(
@@ -562,12 +602,13 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         contact_phone: str | None,
         draft_text: str,
         slog: "SessionFileLogger",
+        kind: str = "personal",
     ) -> SkillResult:
         draft_messages = _split_whatsapp_messages(draft_text, mode="personal")
         await self.db.update_mission_status(
             mission_id,
             status="awaiting_confirmation",
-            extra_metadata={"draft_text": draft_text, "draft_messages": draft_messages},
+            extra_metadata={"draft_text": draft_text, "draft_messages": draft_messages, "kind": kind},
         )
         await self.db.set_mission_next_action(
             mission_id=mission_id,
@@ -591,6 +632,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             "contact_jid": contact_jid,
             "contact_phone_e164": contact_phone or phone_label,
             "mode": "personal",
+            "kind": kind,
         }
         await self._notify(
             user_id=user_id,
@@ -942,6 +984,169 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         await self.db.update_mission_status(mission.id, status="awaiting_reply")
         return SkillResult(ok=True, message="Resposta processada.", mission_id=mission.id)
+
+    # ───────────────────────── direct reply (light) ─────────────────────────
+
+    async def _handle_direct_reply(
+        self,
+        mission,
+        inbound_text: str,
+        slog: "SessionFileLogger",
+        extra: dict[str, Any],
+        history: list[dict[str, str]] | None = None,
+    ) -> SkillResult:
+        """Handle a reply on a *direct* (light) mission.
+
+        Classifies the contact's reply and, instead of always drafting an ack:
+          - ``close``    → complete the mission and just summarise it to the user
+                           (nothing is sent, so no confirmation is needed).
+          - ``ack``      → draft a short reply and ask the user to approve it
+                           (reuses the tracked-mission confirm flow — "confirmação
+                           em tudo").
+          - ``escalate`` → same confirm flow, but flagged as needing the user (never
+                           auto-answered — the guard-rail lives in the classifier).
+          - ``promote``  → the thread became a task: upgrade to a tracked mission
+                           (``kind=personal``) and hand it to the ongoing ack loop.
+        """
+        meta = mission.extra_metadata or {}
+        contact_label = meta.get("contact_label") or mission.title
+
+        decision = await self._classify_reply(inbound_text, mission, slog)
+        slog.log_event(
+            "whatsapp_messaging.direct_reply_classified",
+            {
+                "mission_id": str(mission.id),
+                "contact_label": contact_label,
+                "inbound_text": inbound_text,
+                "decision": decision,
+            },
+        )
+
+        if decision == "close":
+            # Nothing to send — record the inbound, close the thread, tell the user.
+            contact_phone = meta.get("contact_phone_e164") or _phone_from_jid(mission.contact_jid)
+            await self.db.save_message(
+                session_id=mission.session_id,
+                role="user",
+                content=inbound_text,
+                user_id=mission.user_id,
+                mission_id=mission.id,
+                metadata={
+                    "message_type": "whatsapp_inbound",
+                    "contact_label": contact_label,
+                    "contact_jid": mission.contact_jid,
+                    "contact_phone_e164": contact_phone,
+                    "inbound_message_id": extra.get("inbound_message_id") or extra.get("webhook_message_id"),
+                },
+            )
+            await self.db.update_mission_status(
+                mission.id,
+                status="completed",
+                extra_metadata={"last_inbound_text": inbound_text, "closed_reason": "direct_reply_close"},
+            )
+            await self._notify(
+                user_id=mission.user_id,
+                mission_id=mission.id,
+                kind="mission_completed",
+                title=f"Conversa com {contact_label} encerrada",
+                body=f"Falei com {contact_label}, tudo certo.\n\n{contact_label}: {inbound_text}",
+                payload={"mission_id": str(mission.id), "contact_label": contact_label},
+                config={"position": "bottom_right"},
+            )
+            return SkillResult(
+                ok=True,
+                message=f"Conversa com {contact_label} encerrada.",
+                mission_id=mission.id,
+            )
+
+        if decision == "promote":
+            # Became a task → keep it as a tracked mission from here on.
+            await self.db.update_mission_status(
+                mission.id,
+                status="processing",
+                extra_metadata={"kind": "personal", "promoted_from": "direct"},
+            )
+            slog.log_event(
+                "whatsapp_messaging.direct_reply_promoted",
+                {"mission_id": str(mission.id), "inbound_text": inbound_text},
+            )
+
+        # ack / escalate / promote → draft a reply and ask the user to approve it.
+        # (The classifier already refuses to auto-answer decisions/questions.)
+        return await self._handle_inbound(mission, inbound_text, slog, extra, history)
+
+    async def _classify_reply(
+        self,
+        inbound_text: str,
+        mission,
+        slog: "SessionFileLogger | None" = None,
+    ) -> str:
+        """Classify a contact's reply → "close" | "ack" | "escalate" | "promote".
+
+        Fail-safe: autopilot off, empty input, or any uncertainty → "escalate"
+        (never auto-handle something that might need the user).
+        """
+        if not getattr(self.agent_executor.settings, "whatsapp_reply_autopilot_enabled", True):
+            return "escalate"
+        text = (inbound_text or "").strip()
+        if not text:
+            return "escalate"
+
+        # Deterministic: a pure social closer needs no reply and no user.
+        folded = _fold_accents(text.lower()).strip(" !.")
+        _CLOSERS = {
+            "ok", "okay", "blz", "beleza", "ta bom", "tabom", "ta", "ta bem",
+            "valeu", "vlw", "obrigado", "obrigada", "brigado", "combinado",
+            "de nada", "isso", "certo", "perfeito", "show", "otimo", "otima",
+            "fechou", "ta certo", "ta otimo", "🙏", "👍",
+        }
+        if folded in _CLOSERS:
+            return "close"
+
+        try:
+            provider = self.agent_executor.llm_router.get_provider(None)
+            model = self.agent_executor.llm_router.get_default_model(None)
+            messages = [
+                Message(
+                    role=MessageRole.SYSTEM,
+                    content=(
+                        "Você classifica a resposta que um CONTATO enviou no WhatsApp a uma "
+                        "mensagem que o Neo mandou em nome do Daniel. Responda com UMA palavra:\n"
+                        "- close: fecho social sem conteúdo novo ('ok', 'beleza', 'valeu').\n"
+                        "- ack: o contato confirmou/aceitou e trouxe uma info simples que só "
+                        "precisa de um 'ok' educado ('ok, deixei comida na mesa').\n"
+                        "- escalate: o contato fez uma PERGUNTA, pediu uma DECISÃO, ou algo que "
+                        "compromete o Daniel / que só ele pode responder.\n"
+                        "- promote: a conversa virou uma TAREFA que exige combinar/agendar/"
+                        "negociar em vários passos.\n"
+                        "Na dúvida, responda escalate. Nunca invente. Responda só a palavra."
+                    ),
+                ),
+                Message(
+                    role=MessageRole.USER,
+                    content=(
+                        f"Pedido original do Daniel: {mission.goal}\n"
+                        f"Contato: {mission.extra_metadata.get('contact_label') if mission.extra_metadata else mission.title}\n"
+                        f"Resposta recebida do contato: {text}\n\n"
+                        "Classifique em uma palavra: close, ack, escalate ou promote."
+                    ),
+                ),
+            ]
+            response = await provider.complete(
+                messages=messages, tools=[], model=model, temperature=0.0, max_tokens=6
+            )
+            raw = _fold_accents((response.get_content() or "").strip().lower())
+            for label in ("promote", "escalate", "ack", "close"):
+                if label in raw:
+                    return label
+            return "escalate"
+        except Exception as e:
+            logger.warning("direct reply classification failed err=%s", e)
+            if slog:
+                slog.log_error_recovery(
+                    1, "DirectReplyClassificationFailed", "escalate", {"error": str(e)}
+                )
+            return "escalate"
 
     async def _build_personal_ack_reply(
         self,
@@ -1334,7 +1539,22 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         user_id: UUID,
         recipient_hint: str | None,
         full_message: str,
+        contact_source: str = "auto",
     ) -> "_ResolvedRecipient":
+        """Resolve a recipient into a sendable contact.
+
+        Priority (``contact_source="auto"``):
+          1. explicit JID in the message      (exact target, source-agnostic)
+          2. explicit phone in the hint        (exact target, source-agnostic)
+          3. PKS person entity                 (relationship + jid + linked_user_id)
+          4. saved contact table (agenda)       (cache)
+          5. WhatsApp phonebook (gateway)       (fuzzy, last resort)
+
+        An explicit ``contact_source`` overrides the default order: ``"whatsapp"``
+        goes straight to the gateway, ``"saved"`` straight to the agenda — the user
+        pinned the source, so we honour it (mirrors "explicit target wins").
+        """
+        # 1. Explicit JID anywhere → exact target, regardless of source.
         for source in (recipient_hint or "", full_message or ""):
             m = _JID_RE.search(source)
             if m:
@@ -1348,14 +1568,17 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                         jid=local.jid,
                         name=local.label,
                         phone_e164=local.phone_e164 or _phone_from_jid(jid),
+                        source="explicit",
                     )
                 return _ResolvedRecipient(
                     ok=True,
                     jid=jid,
                     name=None,
                     phone_e164=_phone_from_jid(jid),
+                    source="explicit",
                 )
 
+        # 2. Explicit phone in the hint → exact target, regardless of source.
         if recipient_hint:
             phone_match = _PHONE_RE.search(recipient_hint)
             if phone_match and len(re.sub(r"\D", "", phone_match.group(0))) >= 10:
@@ -1372,21 +1595,62 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     jid=jid,
                     name=None,
                     phone_e164=f"+{digits}",
+                    source="explicit",
                 )
 
         label = _strip_stopwords(recipient_hint or "")
         if not label:
             return _ResolvedRecipient(ok=False, error="Sem destinatário.")
 
-        local = await self.db.search_whatsapp_contact(user_id, label)
-        if local:
-            return _ResolvedRecipient(
-                ok=True,
-                jid=local.jid,
-                name=local.label,
-                phone_e164=local.phone_e164,
-            )
+        source_hint = (contact_source or "auto").lower()
 
+        # 3. PKS-first (default only). Pinned sources ("whatsapp"/"saved") skip it.
+        if (
+            source_hint == "auto"
+            and self.pks is not None
+            and getattr(self.agent_executor.settings, "whatsapp_pks_resolution_enabled", True)
+        ):
+            try:
+                person = await self.pks.resolve_person_contact(user_id=user_id, query=label)
+            except Exception as e:
+                logger.warning("PKS person resolution failed (non-fatal): err=%s", e)
+                person = None
+            if person and (person.get("jid") or person.get("phone_e164")):
+                jid = person.get("jid")
+                phone = person.get("phone_e164")
+                if not jid and phone:
+                    digits = re.sub(r"\D", "", phone)
+                    jid = f"{digits}@c.us"
+                return _ResolvedRecipient(
+                    ok=True,
+                    jid=jid,
+                    name=person.get("name") or label,
+                    phone_e164=phone or _phone_from_jid(jid),
+                    linked_user_id=person.get("linked_user_id"),
+                    relationship=person.get("relationship"),
+                    pks_entity_id=person.get("entity_id"),
+                    source="pks",
+                )
+            # Person known but without a number → fall through to agenda/gateway to
+            # find one; the caller can then link it back onto this PKS entity.
+
+        # 4. Saved contact table (agenda). Primary when source pinned to "saved".
+        if source_hint in ("auto", "saved"):
+            local = await self.db.search_whatsapp_contact(user_id, label)
+            if local:
+                return _ResolvedRecipient(
+                    ok=True,
+                    jid=local.jid,
+                    name=local.label,
+                    phone_e164=local.phone_e164,
+                    source="saved",
+                )
+
+        # 5. WhatsApp phonebook (gateway) — last resort / explicit "whatsapp" source.
+        return await self._resolve_via_gateway(label)
+
+    async def _resolve_via_gateway(self, label: str) -> "_ResolvedRecipient":
+        """Fuzzy-resolve ``label`` against the WhatsApp phonebook (the fuzziest source)."""
         results = await self.gateway.list_contacts(query=label, only_saved=False, limit=10)
         if not results:
             return _ResolvedRecipient(
@@ -1407,6 +1671,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 jid=top.get("jid"),
                 name=top.get("name"),
                 phone_e164=top.get("phone_e164"),
+                source="gateway",
             )
         return _ResolvedRecipient(
             ok=False,
@@ -1453,6 +1718,64 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         haystack = _fold_accents(haystack)
         if any(token in haystack for token in _COMMERCIAL_HINTS):
             return "commercial"
+        return "personal"
+
+    @staticmethod
+    def _detect_contact_source(user_message: str) -> str:
+        """Deterministic fallback for the resolution-source override.
+
+        An explicit instruction about WHERE to look wins over the default PKS-first
+        stack: "procura na lista do WhatsApp" → gateway; "contato salvo" → agenda.
+        Returns "whatsapp" | "saved" | "auto".
+        """
+        haystack = _fold_accents((user_message or "").lower())
+        whatsapp_markers = (
+            "lista de contato do whatsapp", "lista de contatos do whatsapp",
+            "lista do whatsapp", "contatos do whatsapp", "nos contatos do whatsapp",
+            "na agenda do whatsapp", "no whatsapp", "pelo whatsapp",
+        )
+        saved_markers = (
+            "contato salvo", "contatos salvos", "salvo como", "na minha agenda",
+            "no meu contato", "nos meus contatos", "que eu salvei",
+        )
+        if any(m in haystack for m in whatsapp_markers):
+            return "whatsapp"
+        if any(m in haystack for m in saved_markers):
+            return "saved"
+        return "auto"
+
+    def _classify_kind(
+        self,
+        user_message: str,
+        message_text: str | None,
+        mode: str,
+        extra: dict[str, Any],
+    ) -> str:
+        """Decide the execution kind: "direct" | "personal" | "commercial".
+
+        - ``commercial`` (from ``_detect_mode``) → agent-loop order pipeline.
+        - a coordination request (agendar, "quem tem", negotiate) → ``personal``
+          (a tracked mission with an ongoing reply loop).
+        - otherwise a one-shot personal message → ``direct`` (light: draft → confirm
+          → send → single reply cycle → auto-close), when the feature is enabled.
+
+        The cognitive core may override via ``extra["whatsapp_kind"]``.
+        """
+        if mode == "commercial":
+            return "commercial"
+
+        hint = (extra.get("whatsapp_kind") or "").strip().lower()
+        if hint in ("direct", "personal", "commercial"):
+            return hint
+        if hint == "coordinate":  # not split out yet (Phase 4) → tracked mission
+            return "personal"
+
+        haystack = _fold_accents(" ".join(filter(None, [user_message, message_text])).lower())
+        if any(sig in haystack for sig in _COORDINATION_HINTS):
+            return "personal"
+
+        if getattr(self.agent_executor.settings, "whatsapp_direct_enabled", True):
+            return "direct"
         return "personal"
 
     def _build_system_prompt(
@@ -1975,7 +2298,10 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
 
 
 class _ResolvedRecipient:
-    __slots__ = ("ok", "jid", "name", "phone_e164", "error", "candidates")
+    __slots__ = (
+        "ok", "jid", "name", "phone_e164", "error", "candidates",
+        "linked_user_id", "relationship", "source", "pks_entity_id",
+    )
 
     def __init__(
         self,
@@ -1985,6 +2311,10 @@ class _ResolvedRecipient:
         phone_e164: str | None = None,
         error: str | None = None,
         candidates: list[dict] | None = None,
+        linked_user_id: str | None = None,
+        relationship: str | None = None,
+        source: str | None = None,
+        pks_entity_id: str | None = None,
     ) -> None:
         self.ok = ok
         self.jid = jid
@@ -1992,6 +2322,12 @@ class _ResolvedRecipient:
         self.phone_e164 = phone_e164
         self.error = error
         self.candidates = candidates
+        # Where the match came from: "explicit" | "pks" | "saved" | "gateway".
+        self.source = source
+        # Present only when the matched person is a known account (their own PKS).
+        self.linked_user_id = linked_user_id
+        self.relationship = relationship
+        self.pks_entity_id = pks_entity_id
 
 
 def _phone_from_jid(jid: str | None) -> str | None:

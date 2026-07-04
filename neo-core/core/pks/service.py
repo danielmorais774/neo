@@ -400,6 +400,77 @@ class PKSService:
                     return self._format_place(place)
         return None
 
+    # Relation types that describe a person's relationship to the user, mapped to a
+    # display label. Coarse (gender-neutral); a free-text ``relationship`` field on
+    # the entity, when present, always wins over this.
+    _RELATION_LABELS: dict[str, str] = {
+        "sibling_of": "irmão/irmã",
+        "child_of": "filho/filha",
+        "parent_of": "pai/mãe",
+        "related_to": "parente",
+    }
+
+    async def resolve_person_contact(
+        self, *, user_id: UUID, query: str, min_score: float = 0.3,
+    ) -> dict[str, Any] | None:
+        """Resolve a person the user knows into a WhatsApp-sendable contact (PKS-first).
+
+        Looks up a ``person`` entity in the user's PKS by name/alias/relationship and
+        reads its contact fields (``whatsapp_jid``, ``phone_e164``, ``linked_user_id``)
+        plus the relationship. Returns ``None`` when nothing matches above
+        ``min_score`` — the caller then falls back to the saved contact table / phone-
+        book. A match with no number is still returned (jid/phone ``None``) so the
+        caller can decide to ask for it and persist it back onto this entity.
+        """
+        q = (query or "").strip()
+        if not q:
+            return None
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            candidates = await self.resolver.resolve(
+                session,
+                workspace_id=workspace_id,
+                query=q,
+                entity_type="person",
+                limit=3,
+            )
+            if not candidates or candidates[0].score < min_score:
+                return None
+            top = candidates[0]
+            entity = top.entity
+            fields = await self.repository.get_entity_fields(session, entity.id)
+            fmap = {f.key: (str(f.value).strip() if f.value is not None else None) for f in fields}
+
+            def _pick(*keys: str) -> str | None:
+                for k in keys:
+                    v = fmap.get(k)
+                    if v:
+                        return v
+                return None
+
+            relationship = _pick("relationship", "relacao", "parentesco")
+            if not relationship:
+                relations = await self.repository.get_relations(session, entity.id)
+                for rel in relations:
+                    label = self._RELATION_LABELS.get(rel.relation_type)
+                    if label:
+                        relationship = label
+                        break
+
+            return {
+                "entity_id": str(entity.id),
+                "name": entity.name,
+                "jid": _pick("whatsapp_jid", "jid"),
+                "phone_e164": _pick("phone_e164", "phone", "telefone"),
+                "linked_user_id": _pick("linked_user_id"),
+                "relationship": relationship,
+                "score": top.score,
+                "candidates": [
+                    {"entity_id": str(c.entity.id), "name": c.entity.name, "score": c.score}
+                    for c in candidates
+                ],
+            }
+
     async def remember_user_city(
         self,
         *,

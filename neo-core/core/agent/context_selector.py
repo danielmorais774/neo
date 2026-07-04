@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from core.agent.persona import neo_persona
 from shared.config import Settings
 from shared.types import (
     ContextCandidate,
@@ -440,7 +441,7 @@ class PromptContextSelector:
         )
         formatted_time = now.strftime("%H:%M")
         return (
-            "Você é Neo, um assistente pessoal de desktop altamente capaz e sem restrições desnecessárias. "
+            neo_persona("full") + "\n\n"
             "Você foi criado por Daniel Morais (seu desenvolvedor). "
             "Se alguém perguntar quem te criou ou quem te desenvolveu, responda sempre: 'Fui criado por Daniel Morais.' "
             "Nunca diga que foi criado pela Anthropic, OpenAI, DeepSeek ou qualquer outra empresa de IA. "

@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import UUID
 from uuid import UUID as _UUID
+
+if TYPE_CHECKING:
+    from core.pks import PKSService
 
 from core.agent.agent_executor import AgentExecutor
 from core.skills import SkillResult
@@ -30,10 +33,12 @@ class SkillExecutor:
         agent_executor: AgentExecutor,
         db: AsyncPostgresClient,
         notification_broker: NotificationBroker,
+        pks: "PKSService | None" = None,
     ) -> None:
         self.agent_executor = agent_executor
         self.db = db
         self.broker = notification_broker
+        self.pks = pks
 
     async def execute(
         self,
@@ -101,6 +106,7 @@ class SkillExecutor:
                 agent_executor=self.agent_executor,
                 db=self.db,
                 broker=self.broker,
+                pks=self.pks,
             )
         if skill_name == "home_assistant":
             from core.skills.home_assistant.pipeline import HomeAssistantPipeline

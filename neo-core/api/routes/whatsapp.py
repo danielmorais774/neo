@@ -239,6 +239,7 @@ async def _process_inbound(
             agent_executor=_skill_executor.agent_executor,
             db=_db,
             broker=_skill_executor.broker,
+            pks=getattr(_skill_executor, "pks", None),
         )
         history_messages = await _db.fetch_session_messages(
             mission.session_id,
