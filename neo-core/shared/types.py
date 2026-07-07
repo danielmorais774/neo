@@ -325,7 +325,7 @@ class ContextLayer(str, Enum):
     CORE            = "core"           # identidade, idioma, regras — pin=True sempre
     RUNTIME         = "runtime"        # OS, paths, shell — pin=True
     NEO_CORE_PINNED = "neo_core_pinned"  # personality, response-rules críticas — pin=True
-    NEO_AFFECT      = "neo_affect"      # estado emocional (cortisol) do Neo com o usuário — pin=True
+    NEO_AFFECT      = "neo_affect"      # estado emocional (vetor límbico) do Neo com o usuário — pin=True
     NEO_CORE_CTX    = "neo_core_ctx"   # exemplos, lições, projetos — scored
     USER_PREFS      = "user_prefs"     # preferências do usuário — scored
     USER_PKS        = "user_pks"       # entidades PKS do usuário — scored

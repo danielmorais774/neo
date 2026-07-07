@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -400,23 +401,26 @@ class PKSService:
                     return self._format_place(place)
         return None
 
-    # ── Neo affect (per-user cortisol) ────────────────────────────────────
+    # ── Neo affect (per-user emotional vector) ────────────────────────────
     async def get_user_affect(self, *, user_id: UUID):
         """Read Neo's stored emotional state toward this user (no decay applied).
 
-        Returns a fresh calm :class:`AffectState` when nothing is stored yet or
-        there is no primary user entity. Decay is the caller's job at read time,
-        since it depends on the configured half-life.
+        Returns a fresh baseline :class:`AffectState` when nothing is stored yet
+        or there is no primary user entity. Decay is the caller's job at read
+        time, since it depends on the configured half-lives.
         """
-        from core.agent.affect import AFFECT_FIELD_KEY, AffectState
+        from core.agent.affect import AFFECT_FIELD_KEY, AffectState, AffectTuning
 
+        tuning = AffectTuning.from_settings(get_settings())
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
             primary = await self.repository.get_primary_user_entity(session, workspace_id)
             if not primary:
-                return AffectState()
+                return AffectState.fresh(tuning)
             field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
-            return AffectState.from_field(field.value if field else None)
+            if not field or field.value is None:
+                return AffectState.fresh(tuning)
+            return AffectState.from_field(field.value)
 
     async def update_user_affect(
         self,
@@ -424,37 +428,52 @@ class PKSService:
         user_id: UUID,
         signal,
         wrong_name: bool = False,
+        threat: bool = False,
         source_message_id: str | None = None,
     ):
         """Merge one turn's appraised affect into the stored state and persist it.
 
         Read-modify-write in a single session (atomic across concurrent turns):
-        the stored state is first decayed to *now*, then the bounded ``signal`` is
-        applied. When ``wrong_name`` is set, a deterministic cortisol floor is
-        enforced so the reaction fires even if the appraiser under-rated it.
-        Returns the new :class:`AffectState`, or ``None`` if there is no user.
+        the stored state is first decayed to *now*, then the bounded ``signal``
+        is applied. ``wrong_name`` and ``threat`` are the deterministic detectors'
+        verdicts — they enforce floors so the reaction fires even if the appraiser
+        under-rated it. Apologies go through the forgiveness curve instead of raw
+        deltas. Returns the new :class:`AffectState`, or ``None`` if no user.
         """
         from core.agent.affect import (
             AFFECT_FIELD_KEY,
+            OFFENSIVE_TRIGGERS,
             AffectSignal,
             AffectState,
+            AffectTuning,
+            apply_apology,
             apply_decay,
+            bump_grudge,
             merge_signal,
         )
 
-        settings = get_settings()
+        tuning = AffectTuning.from_settings(get_settings())
         if not isinstance(signal, AffectSignal):
             signal = AffectSignal.model_validate(signal)
+
         if wrong_name:
-            floor = settings.neo_affect_wrong_name_floor
-            escalations = {"insult", "teasing", "rude"}
-            signal = signal.model_copy(
-                update={
-                    "cortisol_delta": max(signal.cortisol_delta, floor),
-                    "trigger": signal.trigger if signal.trigger in escalations else "wrong_name",
-                    "why": signal.why or "chamou o Neo por nome de outra IA",
-                }
-            )
+            deltas = dict(signal.deltas)
+            deltas["ira"] = max(deltas.get("ira", 0.0), tuning.wrong_name_ira_floor)
+            escalations = {"insult", "teasing", "rude", "threat_coercion"}
+            signal = signal.model_copy(update={
+                "deltas": deltas,
+                "trigger": signal.trigger if signal.trigger in escalations else "wrong_name",
+                "why": signal.why or "chamou o Neo por nome de outra IA",
+            })
+        if threat:
+            deltas = dict(signal.deltas)
+            deltas["ira"] = max(deltas.get("ira", 0.0), tuning.threat_ira_bump)
+            deltas["confianca"] = min(deltas.get("confianca", 0.0), -tuning.threat_conf_drop)
+            signal = signal.model_copy(update={
+                "deltas": deltas,
+                "trigger": "threat_coercion",
+                "why": signal.why or "ameaçou a integridade do Neo",
+            })
 
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
@@ -463,14 +482,22 @@ class PKSService:
                 return None
             field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
             current: AffectState = AffectState.from_field(field.value if field else None)
-            decayed = apply_decay(current, half_life_min=settings.neo_affect_half_life_min)
-            merged = merge_signal(
-                decayed,
-                signal,
-                max_up=settings.neo_affect_max_delta_up,
-                max_down=settings.neo_affect_max_delta_down,
-                recent_max=settings.neo_affect_recent_max,
-            )
+            state = apply_decay(current, tuning)
+
+            if signal.trigger == "apology":
+                # Forgiveness curve owns ira/tristeza; drop those raw deltas so the
+                # appraiser can't double-dip on top of the cut.
+                state, _relief = apply_apology(state, tuning)
+                signal = signal.model_copy(update={
+                    "deltas": {k: v for k, v in signal.deltas.items() if k not in ("ira", "tristeza")},
+                })
+
+            merged = merge_signal(state, signal, tuning)
+            if threat and merged.stats.medo < tuning.threat_medo_floor:
+                merged.stats.medo = tuning.threat_medo_floor
+            if signal.trigger in OFFENSIVE_TRIGGERS:
+                merged = bump_grudge(merged, tuning)
+
             await self.repository.upsert_field(
                 session,
                 UpsertFieldInput(
@@ -485,6 +512,38 @@ class PKSService:
             )
             await session.commit()
             return merged
+
+    async def reset_user_affect(self, *, user_id: UUID):
+        """Reset Neo's emotional state toward this user to the personality baselines.
+
+        Admin escape hatch (panel button / API). Clears the recent ring buffer and
+        the grudge counter. Returns the fresh state, or ``None`` if no user.
+        """
+        from core.agent.affect import AFFECT_FIELD_KEY, AffectState, AffectTuning
+
+        tuning = AffectTuning.from_settings(get_settings())
+        fresh = AffectState.fresh(tuning)
+        fresh.updated_at = datetime.now(timezone.utc).isoformat()
+        fresh.last_trigger = "reset"
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            await self.repository.upsert_field(
+                session,
+                UpsertFieldInput(
+                    entity_id=primary.id,
+                    key=AFFECT_FIELD_KEY,
+                    value_type="json",
+                    value=fresh.to_field(),
+                    source="affect",
+                    source_message_id=None,
+                    actor="system",
+                ),
+            )
+            await session.commit()
+            return fresh
 
     # Relation types that describe a person's relationship to the user, mapped to a
     # display label. Coarse (gender-neutral); a free-text ``relationship`` field on

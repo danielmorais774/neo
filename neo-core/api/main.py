@@ -42,7 +42,7 @@ for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -195,6 +195,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _pks = PKSService(db=_db, llm_router=_llm_router)
     context.set_pks_service(_pks)
     knowledge_graph.set_pks_service(_pks)
+    affect.set_pks_service(_pks)
+    if settings.neo_affect_enabled:
+        # Eager: WhatsApp inbound may be the first turn after a restart, and its
+        # pipeline reaches affect only through the shared updater.
+        from core.agent.affect_updater import AffectUpdater, set_shared_updater
+        set_shared_updater(AffectUpdater(_llm_router, settings, pks=_pks, db=_db))
 
     # search_pks executor needs the PKS service, so it's registered here (after
     # creation). Per-request user scoping happens via set_context in AIService.
@@ -355,6 +361,7 @@ app.include_router(debug.router, prefix="/api/v1", dependencies=[Depends(require
 app.include_router(session_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(context.router, prefix="/api/v1")
 app.include_router(knowledge_graph.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(affect.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
 app.include_router(missions.router, dependencies=[Depends(require_panel_jwt)])

@@ -258,7 +258,7 @@ async def _process_inbound(
             if msg.content and len(msg.content.strip()) >= 5
         ]
 
-        await pipeline.run(
+        result = await pipeline.run(
             session_id=mission.session_id,
             user_message=text,
             history=history,
@@ -270,6 +270,24 @@ async def _process_inbound(
                 "webhook_message_id": message_id,
             },
         )
+
+        # WhatsApp conversations move Neo's emotional state too. The shared
+        # updater (built by AIService) owns dedup/locks/health; when the desktop
+        # service hasn't started it yet, this quietly no-ops.
+        try:
+            from core.agent.affect_updater import get_shared_updater
+
+            updater = get_shared_updater()
+            if updater and mission.user_id:
+                updater.schedule(
+                    user_message=text,
+                    assistant_response=getattr(result, "message", None),
+                    user_id=mission.user_id,
+                    source="whatsapp",
+                    source_message_id=str(message_id) if message_id else None,
+                )
+        except Exception as e:  # noqa: BLE001 - affect must never break inbound
+            logger.warning("Affect schedule (whatsapp) failed: %s", e)
     except Exception as e:
         logger.error("Inbound processing failed: mission_id=%s err=%s", mission.id, e)
         await _db.update_mission_status(

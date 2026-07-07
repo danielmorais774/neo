@@ -144,7 +144,9 @@ class WhatsAppMessagingExecutor:
 
         mode = (mission.extra_metadata or {}).get("mode", "commercial")
 
-        if mode == "personal":
+        # personal + coordinate always confirm before delivery (confirmação em tudo);
+        # only commercial sends directly (multi-turn negotiation with a business).
+        if mode in ("personal", "coordinate"):
             return await self._request_confirmation(
                 mission_id,
                 question=f"Enviar para {mission.title}?",

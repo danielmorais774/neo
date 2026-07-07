@@ -474,6 +474,11 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         mode = self._detect_mode(user_message, recipient_hint, message_text)
         kind = self._classify_kind(user_message, message_text, mode, extra)
+        # A coordination mission runs the agent loop with a personal tone; store it
+        # as its own mode so the executor still intercepts sends (confirmação em tudo)
+        # and the inbound path routes it through the agent loop.
+        if kind == "coordinate":
+            mode = "coordinate"
         slog.log_event(
             "whatsapp_messaging.kickoff_parse",
             {
@@ -566,6 +571,20 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                 "relationship": resolved.relationship,
             },
         )
+
+        if kind == "coordinate":
+            # Goal-tracked personal-domain mission: agent loop drives toward the
+            # objective (agendar/negociar) and confirms every send.
+            return await self._kickoff_coordination(
+                mission_id=mission.id,
+                mission_session_id=session_id,
+                user_id=user_id,
+                user_message=user_message,
+                contact_label=contact_label,
+                contact_jid=contact_jid,
+                contact_phone=contact_phone,
+                slog=slog,
+            )
 
         if mode == "personal":
             # kind ∈ {"direct","personal"}: both draft→confirm→send here, but a
@@ -687,7 +706,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             mission_contact_phone=contact_phone or phone_label,
         )
 
-    async def _kickoff_commercial(
+    async def _kickoff_coordination(
         self,
         mission_id: UUID,
         mission_session_id: UUID,
@@ -698,8 +717,33 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         contact_phone: str | None,
         slog: "SessionFileLogger",
     ) -> SkillResult:
+        """Kick off a goal-tracked coordination mission (agent loop, personal tone)."""
+        return await self._kickoff_commercial(
+            mission_id=mission_id,
+            mission_session_id=mission_session_id,
+            user_id=user_id,
+            user_message=user_message,
+            contact_label=contact_label,
+            contact_jid=contact_jid,
+            contact_phone=contact_phone,
+            slog=slog,
+            mode="coordinate",
+        )
+
+    async def _kickoff_commercial(
+        self,
+        mission_id: UUID,
+        mission_session_id: UUID,
+        user_id: UUID,
+        user_message: str,
+        contact_label: str,
+        contact_jid: str,
+        contact_phone: str | None,
+        slog: "SessionFileLogger",
+        mode: str = "commercial",
+    ) -> SkillResult:
         system_prompt = self._build_system_prompt(
-            mode="commercial",
+            mode=mode,
             contact_label=contact_label,
             contact_jid=contact_jid,
             contact_phone=contact_phone,
@@ -708,7 +752,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         slog.log_event(
             "whatsapp_messaging.commercial_system_prompt",
             {
-                "mode": "commercial",
+                "mode": mode,
                 "contact_label": contact_label,
                 "contact_jid": contact_jid,
                 "contact_phone": contact_phone,
@@ -768,7 +812,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
                     "contact_label": contact_label,
                     "contact_jid": contact_jid,
                     "contact_phone_e164": contact_phone or phone_label,
-                    "mode": "commercial",
+                    "mode": mode,
                 },
                 actions=[
                     {"action_type": "approve", "label": "Aprovo", "button_style": "contained"},
@@ -933,7 +977,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
             mission_id=mission.id,
         )
         system_prompt = self._build_system_prompt(
-            mode="commercial",
+            mode=mode,
             contact_label=contact_label or mission.title,
             contact_jid=mission.contact_jid,
             contact_phone=contact_phone,
@@ -944,7 +988,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         slog.log_event(
             "whatsapp_messaging.inbound_commercial_system_prompt",
             {
-                "mode": "commercial",
+                "mode": mode,
                 "contact_label": contact_label or mission.title,
                 "contact_jid": mission.contact_jid,
                 "contact_phone": contact_phone,
@@ -1764,17 +1808,22 @@ class WhatsAppMessagingPipeline(SkillPipeline):
         if mode == "commercial":
             return "commercial"
 
+        settings = self.agent_executor.settings
+        coordination_on = getattr(settings, "whatsapp_coordination_enabled", True)
+
         hint = (extra.get("whatsapp_kind") or "").strip().lower()
         if hint in ("direct", "personal", "commercial"):
             return hint
-        if hint == "coordinate":  # not split out yet (Phase 4) → tracked mission
-            return "personal"
+        if hint == "coordinate":
+            return "coordinate" if coordination_on else "personal"
 
         haystack = _fold_accents(" ".join(filter(None, [user_message, message_text])).lower())
         if any(sig in haystack for sig in _COORDINATION_HINTS):
-            return "personal"
+            # A goal-tracked coordination mission, unless the feature is disabled
+            # (then fall back to the reactive personal ack loop).
+            return "coordinate" if coordination_on else "personal"
 
-        if getattr(self.agent_executor.settings, "whatsapp_direct_enabled", True):
+        if getattr(settings, "whatsapp_direct_enabled", True):
             return "direct"
         return "personal"
 

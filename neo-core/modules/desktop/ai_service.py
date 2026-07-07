@@ -445,9 +445,18 @@ class AIService:
         self._skill_executor: "SkillExecutor | None" = None
         # Lazily-built HA adapter for the cognitive-core live snapshot injection.
         self._ha_adapter: "HomeAssistantAdapter | None" = None
-        # Lazily-built affect appraiser (per-user cortisol). None until first use.
-        self._affect_appraiser: Any | None = None
+        # Lazily-built affect updater (per-user emotional vector). None until first use.
+        self._affect_updater: Any | None = None
+        # Strong refs to fire-and-forget post-turn tasks (prefs/PKS). Bare
+        # create_task results can be garbage-collected mid-flight.
+        self._bg_tasks: set[asyncio.Task] = set()
         self.planner = PlanManager(llm_router)
+
+    def _spawn_bg(self, coro, *, name: str) -> None:
+        """Schedule a tracked fire-and-forget task (post-response work only)."""
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     # ---------------------------------------------------------------
     # Main entry point — called by gRPC controller
@@ -898,6 +907,21 @@ class AIService:
             total_ms = round((time.monotonic() - t0_total) * 1000, 1)
             logger.info(f"[TIMING-TOTAL] neo-core total={total_ms}ms")
             slog.log_timing_summary(total_ms)
+            # Affect choke point: EVERY intent ends here (direct, skills, HA,
+            # tools, WhatsApp outbound), so emotions update no matter which path
+            # handled the turn — "Alexa, liga a luz" included. Runs after the
+            # final response was already yielded; scheduling only creates a task.
+            if not dispatch_error:
+                updater = self._get_affect_updater()
+                if updater:
+                    updater.schedule(
+                        user_message=user_message,
+                        assistant_response=final_response,
+                        user_id=user_id,
+                        source=f"intent:{decision.intent.value}",
+                        source_message_id=str(saved_msg.id) if saved_msg else None,
+                        slog=slog,
+                    )
             if decision.intent == IntentType.CLIENT_TOOL and not dispatch_error:
                 # Keep trace alive — continuation in process_tool_result / process_command_approval
                 # Must key by the desktop gRPC session_id (not the DB sid) so process_tool_result can find it
@@ -1663,50 +1687,11 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PKS] Post-response write failed: {e}", exc_info=True)
 
-        async def _bg_affect() -> None:
-            """Appraise this turn's affect and update Neo's cortisol toward the user.
-
-            Off the response hot path. A deterministic wrong-name detector guarantees
-            the spike even if the appraiser under-rates or is unavailable. Neutral
-            turns are skipped (no write) so cortisol keeps decaying naturally.
-            """
-            appraiser = self._get_affect_appraiser()
-            if not (appraiser and user_id and full_response):
-                return
-            try:
-                from core.agent.affect import detect_wrong_name
-
-                wrong_name = detect_wrong_name(user_message)
-                current = await self.pks.get_user_affect(user_id=user_id)
-                signal = await appraiser.appraise(
-                    user_message=user_message,
-                    assistant_response=full_response,
-                    current=current,
-                )
-                neutral = (
-                    abs(signal.cortisol_delta) < 0.01 and abs(signal.valence_delta) < 0.01
-                )
-                if neutral and not wrong_name:
-                    return
-                updated = await self.pks.update_user_affect(
-                    user_id=user_id,
-                    signal=signal,
-                    wrong_name=wrong_name,
-                    source_message_id=source_message_id,
-                )
-                if updated and slog:
-                    slog.log_event(
-                        "Estado Emocional (cortisol)",
-                        f"trigger={updated.last_trigger} cortisol={updated.cortisol:.2f} "
-                        f"valence={updated.valence:.2f}"
-                        + (f" ← {signal.why}" if signal.why else ""),
-                    )
-            except Exception as e:
-                logger.warning(f"[Affect] Post-response appraisal failed: {e}", exc_info=True)
-
-        asyncio.create_task(_bg_prefs())
-        asyncio.create_task(_bg_pks())
-        asyncio.create_task(_bg_affect())
+        # Affect is NOT scheduled here: process_user_input's epilogue is the
+        # single choke point (covers this path plus skills/HA/tools/WhatsApp
+        # outbound), with dedup by source_message_id in the AffectUpdater.
+        self._spawn_bg(_bg_prefs(), name="bg-prefs")
+        self._spawn_bg(_bg_pks(), name="bg-pks")
 
         # Internal control item: hand the parsed handoffs back to the orchestrator.
         # ``message=None`` + the private metadata key make it non-user-facing; the
@@ -1992,14 +1977,30 @@ class AIService:
             return None
         return self._ha_adapter
 
-    def _get_affect_appraiser(self):
-        """Lazily build the per-user affect appraiser. None when the feature is off."""
+    def _get_affect_updater(self):
+        """Lazily build the post-turn affect updater. None when the feature is off.
+
+        Also registered as the process-wide shared updater so out-of-band
+        channels (WhatsApp inbound pipeline) reuse the same task registry,
+        per-user locks and health counters.
+        """
         if not self.settings.neo_affect_enabled or not self.pks:
             return None
-        if self._affect_appraiser is None:
-            from core.agent.affect import AffectAppraiser
-            self._affect_appraiser = AffectAppraiser(self.llm, self.settings, db=self.db)
-        return self._affect_appraiser
+        if self._affect_updater is None:
+            from core.agent.affect_updater import (
+                AffectUpdater,
+                get_shared_updater,
+                set_shared_updater,
+            )
+            # main.py builds the shared updater at startup (so WhatsApp-first
+            # boots are covered); reuse it here. Fallback: build and share.
+            self._affect_updater = get_shared_updater()
+            if self._affect_updater is None:
+                self._affect_updater = AffectUpdater(
+                    self.llm, self.settings, pks=self.pks, db=self.db
+                )
+                set_shared_updater(self._affect_updater)
+        return self._affect_updater
 
     async def _build_home_assistant_context_note(self, user_message: str) -> str | None:
         """Live HA snapshot for the cognitive core, gated by a device-name match.

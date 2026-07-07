@@ -114,7 +114,7 @@ class PromptContextSelector:
                 decision=decision,
                 is_neo_training=is_neo_training,
             ),
-            self._fetch_affect(user_id=user_id),
+            self._fetch_affect(user_id=user_id, user_message=user_message),
         )
 
         # ── 4. NEO_CORE_PINNED — always pinned ───────────────────────────
@@ -136,14 +136,13 @@ class PromptContextSelector:
                 included=True,
             ))
 
-        # ── 4b. NEO_AFFECT — pinned tone directive (cortisol) ─────────────
+        # ── 4b. NEO_AFFECT — pinned tone/posture directive ────────────────
         if affect_state is not None:
-            from core.agent.affect import render_directive
+            from core.agent.affect import AXES, AffectTuning, render_directive
 
             directive = render_directive(
                 affect_state,
-                irritated=self._settings.neo_affect_band_irritated,
-                pissed=self._settings.neo_affect_band_pissed,
+                AffectTuning.from_settings(self._settings),
             )
             if directive:
                 candidates.append(ContextCandidate(
@@ -158,8 +157,9 @@ class PromptContextSelector:
                     included=True,
                 ))
                 logger.info(
-                    "[ContextSelector] affect: cortisol=%.2f valence=%.2f trigger=%s",
-                    affect_state.cortisol, affect_state.valence, affect_state.last_trigger,
+                    "[ContextSelector] affect: %s trigger=%s",
+                    " ".join(f"{a}={getattr(affect_state.stats, a):.0f}" for a in AXES),
+                    affect_state.last_trigger,
                 )
 
         # ── 5. USER_PREFS — scored ────────────────────────────────────────
@@ -282,20 +282,31 @@ class PromptContextSelector:
 
         return neo_core_text, prefs_text, pks_result, pks_context
 
-    async def _fetch_affect(self, *, user_id: UUID | None):
-        """Load + time-decay Neo's cortisol toward this user. None when disabled/absent.
+    async def _fetch_affect(self, *, user_id: UUID | None, user_message: str = ""):
+        """Load + time-decay Neo's emotional vector toward this user. None when disabled/absent.
 
-        Single cheap field read; decay is pure math. Never raises into the prompt.
+        Single cheap field read; decay is pure math. The INCOMING message then
+        gets a same-turn deterministic pass (threat/wrong-name regex): floors are
+        applied to this render-only copy so Neo reacts in the reply to the
+        provocation itself, not one turn later. The async appraiser persists the
+        real deltas afterwards — nothing here is written. Never raises into the
+        prompt.
         """
         # Strict ``is True`` (not just truthy) so a spec-MagicMock settings in
         # tests never accidentally activates the feature.
         if self._settings.neo_affect_enabled is not True or not self._pks or not user_id:
             return None
         try:
-            from core.agent.affect import apply_decay
+            from core.agent.affect import (
+                AffectTuning,
+                apply_decay,
+                apply_provisional_reaction,
+            )
 
+            tuning = AffectTuning.from_settings(self._settings)
             state = await self._pks.get_user_affect(user_id=user_id)
-            return apply_decay(state, half_life_min=self._settings.neo_affect_half_life_min)
+            state = apply_decay(state, tuning)
+            return apply_provisional_reaction(state, user_message, tuning)
         except Exception as e:  # pragma: no cover - affect must never break the prompt
             logger.warning("[ContextSelector] affect fetch failed: %s", e)
             return None
