@@ -157,6 +157,46 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config_executor = ConfigExecutor(db=_db, registry=build_default_registry())
     _tool_executor.register_module_executor("config", config_executor)
 
+    # Workbench — o sandbox de execução do próprio Neo (a "bash do Neo").
+    # Server-side: o neo-core roda comandos no container irmão via docker exec.
+    _workbench_sandbox = None
+    _job_manager = None
+    if settings.workbench_enabled:
+        from core.workbench import WORKBENCH_TOOLS, WorkbenchExecutor, WorkbenchSandbox
+
+        _workbench_sandbox = WorkbenchSandbox(
+            container=settings.workbench_container,
+            workspace_root=settings.workbench_workspace_root,
+            docker_socket=settings.workbench_docker_socket,
+            default_timeout=settings.workbench_default_timeout,
+            max_output_bytes=settings.workbench_max_output_bytes,
+        )
+        _tool_registry.register_many(WORKBENCH_TOOLS)
+        _tool_executor.register_module_executor(
+            "workbench", WorkbenchExecutor(_workbench_sandbox)
+        )
+        app.state.workbench_sandbox = _workbench_sandbox
+        print(f"✅ Workbench sandbox wired (container={settings.workbench_container})")
+
+        # Background jobs (workbench). Tools registered for LLM/router visibility;
+        # neo_bash_background/job_* dispatch through a per-request JobToolExecutor,
+        # not the global one. The manager loop is started later (after the dispatcher
+        # is wired), so boot-reconcile notifications can be delivered.
+        if settings.jobs_enabled:
+            from core.jobs import JOB_TOOLS, JobManager
+
+            _tool_registry.register_many(JOB_TOOLS)
+            _job_manager = JobManager(
+                db=_db,
+                sandbox=_workbench_sandbox,
+                max_concurrent=settings.job_max_concurrent,
+                tick_interval=settings.job_tick_interval,
+                default_timeout=settings.job_default_timeout,
+                workspace_root=settings.workbench_workspace_root,
+            )
+            app.state.job_manager = _job_manager
+            print("✅ JobManager created (background jobs)")
+
     # Register whatsapp_messaging tools in the global registry (for discovery / routing)
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
     _tool_registry.register_many(WHATSAPP_MESSAGING_TOOLS)
@@ -242,6 +282,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         preference_extractor=preference_extractor,
         pks=_pks,
         context_selector=context_selector,
+        job_manager=_job_manager,
     )
 
     # ── Skills + Notifications ─────────────────────────────────────
@@ -251,6 +292,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db=_db,
         notification_broker=_notification_broker,
     )
+
+    # ── Background jobs: wire the proactive dispatcher + start the loop ──
+    # Done here (not in the workbench block) because the dispatcher needs the
+    # notification broker. Starting AFTER set_dispatcher lets boot-reconcile
+    # notifications reach the user. See docs/workbench-background-jobs-plan.md.
+    if _job_manager is not None:
+        from core.jobs import ProactiveDispatcher
+
+        _job_manager.set_dispatcher(
+            ProactiveDispatcher(
+                db=_db,
+                broker=_notification_broker,
+                llm_router=_llm_router,
+                default_model=settings.default_model,
+            )
+        )
+        await _job_manager.start()
+        print("✅ JobManager started (dispatcher wired)")
 
     # Wire skill executor into webhook route
     from api.routes.whatsapp import set_dependencies as set_whatsapp_deps
@@ -319,6 +378,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ──────────────────────────────────────────────────
     print("🛑 Shutting down Neo Core 2...")
+
+    if _job_manager is not None:
+        try:
+            await _job_manager.stop()
+            print("✅ JobManager stopped")
+        except Exception as e:
+            print(f"⚠️ JobManager stop error: {e}")
 
     grpc_server = getattr(app.state, "grpc_server", None)
     if grpc_server is not None:

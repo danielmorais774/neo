@@ -18,6 +18,7 @@ from db.models.mission import Mission
 from db.models.whatsapp_contact import WhatsAppContact
 from db.models.user_notification import UserNotification
 from db.models.connected_device import ConnectedDevice
+from db.models.agent_job import AgentJob
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -1523,3 +1524,126 @@ class AsyncPostgresClient:
                 db.add(device)
             await db.commit()
             return len(stale)
+
+    # ---------------------------------------------------------------
+    # AgentJob CRUD (workbench / scheduler — background work)
+    # ---------------------------------------------------------------
+
+    async def create_agent_job(self, job: "AgentJob") -> "AgentJob":
+        """Persist a new AgentJob (status defaults to 'queued')."""
+        async with self.get_session() as db:
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+        return job
+
+    async def get_agent_job(self, job_id: UUID) -> "AgentJob | None":
+        async with self.get_session() as db:
+            return await db.get(AgentJob, job_id)
+
+    async def claim_due_agent_jobs(self, limit: int) -> list["AgentJob"]:
+        """Atomically claim up to ``limit`` queued jobs whose ``next_run_at`` is due.
+
+        Each claim is an atomic ``queued → running`` UPDATE guarded on the current
+        status, so a job is never picked twice (safe even if two ticks overlap).
+        Returns the claimed jobs (already marked running, with started_at set).
+        """
+        from datetime import datetime
+
+        if limit <= 0:
+            return []
+        now = datetime.utcnow()
+        async with self.get_session() as db:
+            stmt = (
+                select(AgentJob.id)
+                .where(AgentJob.status == "queued")
+                .where(
+                    (AgentJob.next_run_at.is_(None)) | (AgentJob.next_run_at <= now)
+                )
+                .order_by(AgentJob.created_at.asc())
+                .limit(limit)
+            )
+            candidate_ids = list((await db.execute(stmt)).scalars().all())
+
+        claimed: list[AgentJob] = []
+        for job_id in candidate_ids:
+            async with self.get_session() as db:
+                upd = (
+                    update(AgentJob)
+                    .where(AgentJob.id == job_id)
+                    .where(AgentJob.status == "queued")
+                    .values(status="running", started_at=now, heartbeat_at=now)
+                )
+                result = await db.execute(upd)
+                await db.commit()
+                if result.rowcount:
+                    job = await db.get(AgentJob, job_id)
+                    if job is not None:
+                        claimed.append(job)
+        return claimed
+
+    async def update_agent_job(self, job_id: UUID, **fields) -> "AgentJob | None":
+        """Patch an AgentJob's columns. ``spec_json``/``extra_metadata`` overwrite."""
+        async with self.get_session() as db:
+            job = await db.get(AgentJob, job_id)
+            if job is None:
+                return None
+            for key, value in fields.items():
+                setattr(job, key, value)
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            return job
+
+    async def reconcile_orphan_agent_jobs(self) -> list["AgentJob"]:
+        """On boot: mark jobs stuck in 'running' as failed (interrupted by restart).
+
+        Returns the reconciled jobs so the dispatcher can notify the user. A job is
+        orphaned when the process that owned it died (only one neo-core instance
+        runs, so any 'running' row at boot is orphaned).
+        """
+        from datetime import datetime
+
+        async with self.get_session() as db:
+            stmt = select(AgentJob).where(AgentJob.status == "running")
+            orphans = list((await db.execute(stmt)).scalars().all())
+            now = datetime.utcnow()
+            for job in orphans:
+                job.status = "failed"
+                job.finished_at = now
+                job.result_summary = (
+                    job.result_summary
+                    or "Job interrompido por reinício do Neo antes de concluir."
+                )
+                db.add(job)
+            await db.commit()
+            for job in orphans:
+                await db.refresh(job)
+            return orphans
+
+    async def list_agent_jobs(
+        self,
+        user_id: UUID | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = 20,
+    ) -> list["AgentJob"]:
+        async with self.get_session() as db:
+            stmt = select(AgentJob)
+            if user_id is not None:
+                stmt = stmt.where(AgentJob.user_id == user_id)
+            if statuses:
+                stmt = stmt.where(AgentJob.status.in_(statuses))
+            stmt = stmt.order_by(AgentJob.created_at.desc()).limit(limit)
+            return list((await db.execute(stmt)).scalars().all())
+
+    async def list_undelivered_terminal_jobs(self) -> list["AgentJob"]:
+        """Terminal jobs whose result was never delivered (dispatcher catch-up)."""
+        async with self.get_session() as db:
+            stmt = (
+                select(AgentJob)
+                .where(AgentJob.status.in_(["completed", "failed", "timeout"]))
+                .where(AgentJob.notified_at.is_(None))
+                .order_by(AgentJob.finished_at.asc())
+            )
+            return list((await db.execute(stmt)).scalars().all())

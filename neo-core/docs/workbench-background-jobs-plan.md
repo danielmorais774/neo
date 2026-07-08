@@ -1,6 +1,8 @@
 # Plano: Workbench + Jobs em background — o Neo ganha uma bash própria
 
-> **Status:** análise/desenho para revisão (nada implementado).
+> **Status F1–F3: IMPLEMENTADO** (2026-07-07). Ver §13 (Implementação). Falta só o
+> deploy na VPS (§14). F4–F6 continuam como plano abaixo.
+> **Status original:** análise/desenho para revisão (nada implementado).
 > **Motivação:** quando não existe tool específica, o Neo hoje só tem duas saídas:
 > responder por texto ou usar o desktop do usuário (`run_command`, client-side,
 > síncrono, bloqueia o turno). Queremos o que o Claude Code tem: um **ambiente de
@@ -271,3 +273,83 @@ cria um mini-run cognitivo (com a tool `get_weather`) → `chat_message` diário
 
 F1–F3 entregam o fluxo do exemplo do usuário fim-a-fim; F4 profissionaliza a
 cronometragem; F5 é o "cria projetos como o Claude"; F6 endurece.
+
+---
+
+## 13. Implementação F1–F3 (2026-07-07)
+
+### Decisão de arquitetura (desvio do §3.6)
+Em vez de um **novo intent/pipeline `workbench`** acionado por handoff, F1–F3
+integram o workbench e os jobs como **tools inline do núcleo cognitivo**, reusando
+o `_run_cognitive_tool_loop` que já existia (o mesmo laço dos read tools). Motivo:
+para "compute isso" / "roda um script" / "faz em background", o cérebro já é o
+agente certo e o laço já sabe chamar tool → ver resultado → continuar. Fica igual
+ao Claude Code, com muito menos código e zero intent novo. O handoff para um
+**subagente** multi-passo autônomo (AgentExecutor dedicado) continua planejado para
+**F5**. As tools `neo_*`/`job_*`/`schedule_*` são excluídas do roteamento direto
+(prefixos em `_SKILL_OWNED_TOOL_PREFIXES`), então só o cognitivo as aciona.
+
+### O que foi construído
+| Camada | Arquivos |
+|--------|----------|
+| Sandbox (imagem + serviço) | `docker/neo-workbench/Dockerfile`, `docker-compose.yml` (serviço `neo-workbench`, rede `workbench-net` 172.30.30.0/24, volume `neo-workspace`), `scripts/workbench-lan-block.sh` |
+| Workbench (F1) | `core/workbench/` — `sandbox.py` (Docker Engine API sobre UDS, demux, path-safety), `executor.py` (module executor), `tools.py` (`neo_bash`/`neo_write_file`/`neo_read_file`/`neo_list_files`) |
+| Jobs (F2) | `db/models/agent_job.py` + migração `i2j3k4l5m6n7` (merge das 2 heads), métodos em `db/async_client.py`, `core/jobs/` — `manager.py` (tick+pool+reconcile), `executor.py` (`neo_bash_background`/`job_*`), `tools.py` |
+| Retorno proativo (F3) | `core/jobs/dispatcher.py` (`ProactiveDispatcher` → persiste + publica `kind="chat_message"`), handler no desktop (`ChatPage.tsx` + `useLiveMode.ts` evento `neo:proactive-speak`) |
+| Fiação | `api/main.py` (registra tools/executores, cria e inicia o JobManager + dispatcher), `modules/desktop/ai_service.py` (toolset cognitivo + instrução), `core/router/intent_router.py` (exclusão de prefixos), `shared/config.py` (flags) |
+| Testes | `tests/test_workbench_sandbox.py`, `tests/test_jobs.py` (28 casos; 422 no total verdes) |
+
+### Flags (shared/config.py)
+`workbench_enabled` (default on), `jobs_enabled` (on), `job_max_concurrent` (3),
+`job_tick_interval` (3s), `job_default_timeout` (1800s), `workbench_default_timeout`
+(60s), `workbench_max_output_bytes` (60k). Desligar `workbench_enabled` remove todo
+o subsistema (tools + instrução + JobManager).
+
+### Notas de segurança já aplicadas
+Container não-root (uid 1000), `cap_drop: ALL`, `no-new-privileges`, sem
+docker.sock lá dentro, `mem_limit 1g`/`cpus 1.5`/`pids_limit 256`, todo path preso a
+`/workspace`, todo comando sob `timeout` do coreutils (kill dentro do container).
+**Rede (decisão do usuário): `internal: true` + proxy de egress**, NÃO iptables no
+host. O sandbox vive na rede `workbench-net` (`internal: true`) — sem rota externa
+nenhuma. A única saída é o `neo-workbench-proxy` (tinyproxy) que tem internet mas
+NEGA destinos privados (RFC1918/LAN) via `docker/neo-workbench-proxy/filter`. O
+sandbox recebe `HTTP(S)_PROXY` apontando pro proxy. Resultado: "internet sim (via
+proxy), LAN não", 100% em compose, **sem sudo e reboot-safe**. Limitação: só tráfego
+proxy-aware (pip/curl/npm/git-https) sai; socket cru pra internet não (e pra LAN
+também não → desejado). Rebinding DNS (nome público → IP privado) não é pego pelo
+filtro por-host do tinyproxy; endurecer com squid (ACL `dst` por IP resolvido) é o
+upgrade de F6 se necessário.
+
+### Limitações conhecidas (viram F6)
+- Sandbox **único compartilhado** (não por-usuário) — ok p/ single-user hoje.
+- Reconcile de restart marca job `running` como `failed` (não re-attach ao processo
+  órfão no container; o `timeout` do coreutils garante que ele morre sozinho).
+- `job_logs` durante execução lê o logfile no sandbox (live-ish), mas sem streaming
+  incremental pro chat.
+- Egress só proxy-aware (ver Notas de segurança); rebinding DNS não filtrado.
+
+## 14. Deploy (runbook) — VPS Contabo
+
+Sem pré-checagem de subnet nem sudo (a abordagem de proxy dispensa iptables e usa
+redes docker geridas). Passos (na raiz do projeto, na VPS):
+```
+# 1. sincronizar o código (Mutagen já espelha; ou git pull)
+# 2. subir sandbox + proxy (não-disruptivo; internal:true já bloqueia a LAN)
+docker compose build neo-workbench neo-workbench-proxy
+docker compose up -d neo-workbench-proxy neo-workbench
+# 3. migração (merge das heads + tabela agent_job) — aditivo, passo único
+docker compose exec neo-core alembic upgrade head
+# 4. reconstruir e reiniciar o neo-core (liga o subsistema) — passo user-facing
+docker compose build neo-core && docker compose up -d neo-core
+```
+Verificação:
+```
+docker compose exec neo-core alembic current   # i2j3k4l5m6n7 (single head)
+# política de rede pelo sandbox (checar o http_code — o proxy responde 403 no bloqueio;
+# NÃO use `curl && echo` porque curl sai 0 recebendo a página 403):
+docker exec neo-workbench sh -lc 'curl -s -m8 -o /dev/null -w "%{http_code}\n" https://example.com'  # 200
+docker exec neo-workbench sh -lc 'curl -s -m6 -o /dev/null -w "%{http_code}\n" http://192.168.4.186' # 403 (Filtered)
+```
+Rollback: `workbench_enabled=false` no .env desliga o subsistema sem tocar no resto;
+a tabela `agent_job` pode ficar (inerte). A migração é um merge — `downgrade -1`
+recria as 2 heads (evitar salvo necessidade).

@@ -17,6 +17,7 @@ from .mission import Mission
 from .whatsapp_contact import WhatsAppContact
 from .user_notification import UserNotification
 from .connected_device import ConnectedDevice
+from .agent_job import AgentJob
 
 __all__ = [
     "User",
@@ -36,4 +37,5 @@ __all__ = [
     "WhatsAppContact",
     "UserNotification",
     "ConnectedDevice",
+    "AgentJob",
 ]

@@ -204,7 +204,14 @@ _MEDIA_QUESTION_STARTS = ("tem ", "tem alguma", "existe ", "ta aberta", "tao abe
 
 # Tools owned by a skill — excluded from the router's tool palette (Workstream A).
 # The router routes to the SKILL via skill_name; the skill picks its own tools.
-_SKILL_OWNED_TOOL_PREFIXES = ("ha_", "whatsapp_", "spotify_", "youtube_")
+# ``neo_``/``job_``/``schedule_`` are the Neo's OWN agent tools (workbench sandbox,
+# background jobs, scheduler): they are reachable ONLY through the cognitive core's
+# inline tool loop, never by direct classification — so a "compute this" / "run a
+# script" / "remind me in 5 min" turn routes to COGNITIVE, which then decides to
+# use them. See docs/workbench-background-jobs-plan.md.
+_SKILL_OWNED_TOOL_PREFIXES = (
+    "ha_", "whatsapp_", "spotify_", "youtube_", "neo_", "job_", "schedule_",
+)
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
 # confident imperative. Anything conditional/definitional/uncertain about them is
@@ -234,9 +241,9 @@ def _strip_accents(text: str) -> str:
 ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI assistant. Classify the user message into one execution path.
 
 ## Paths
-- **DIRECT_RESPONSE**: conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **Default when in doubt.**
+- **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **E TAMBÉM qualquer COMPUTAÇÃO/PROCESSAMENTO que o Neo resolve sozinho**: o cérebro tem o PRÓPRIO ambiente Linux (sandbox, com internet e /workspace) e roda código lá quando precisa — calcular, gerar (uuid/hash/senha/QR code), converter formato, baixar um arquivo de uma URL e analisá-lo, processar dados, testar um script. Isso NÃO precisa da máquina do usuário → vem para cá (o cérebro executa no sandbox, sem pedir permissão). **Default when in doubt.**
 - **SERVER_TOOL**: needs real-time external data (weather, web search, stock prices) OR mudar/consultar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Pick tool from server list. Para MUDAR um ajuste use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: "usa/troca a voz do X" → `{{"setting":"tts.voice","value":"X"}}` (ex: "usa a voz do Jarvis" → value="jarvis"); "troca o engine/motor pra X" → `{{"setting":"tts.engine","value":"X"}}` (X ∈ qwen|coqui|dia). Para "quais vozes você tem?" use `voice_list`; para "o que dá pra configurar?" use `config_list`.
-- **CLIENT_TOOL**: explicitly needs the user's local machine (shell, files, system info, installs). Pick tool from client list.
+- **CLIENT_TOOL**: SÓ quando a tarefa realmente PRECISA da máquina LOCAL do usuário — algo que o sandbox do Neo NÃO consegue fazer. Ou seja: ler/escrever/buscar um ARQUIVO no DISCO do usuário; informação sobre o SISTEMA/hardware DELE (espaço em disco, processos, versão de SO, rede local); instalar ou ABRIR um PROGRAMA/app na máquina dele; abrir uma URL/universal link no computador dele. Pick tool from client list. **ATENÇÃO — não confunda com computação:** se a tarefa é só calcular/gerar/converter/processar/baixar-e-analisar e NÃO toca no disco/sistema/apps DO USUÁRIO, ela **NÃO** é CLIENT_TOOL → é **DIRECT_RESPONSE** (o cérebro roda no próprio sandbox, sem pedir permissão e sem depender da máquina do usuário estar ligada). Só é CLIENT_TOOL quando o alvo é a máquina DELE.
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário. Inclui:
   - mensagens pessoais ("avisa minha mãe que vou chegar tarde", "manda um oi para Ana")
   - pedidos comerciais (pizza, delivery, farmácia, mercado, encomendas)
@@ -264,13 +271,17 @@ REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=impe
 {skills}
 
 ## Tool Priority (CLIENT_TOOL)
+ANTES de tudo: confirme que a tarefa PRECISA da máquina do usuário (disco/sistema/apps
+DELE). Se for só computar/gerar/processar/baixar-e-analisar, PARE — isso é DIRECT_RESPONSE
+(o cérebro roda no próprio sandbox). Só siga abaixo se o alvo é MESMO a máquina do usuário.
 Prefer specific tools over `run_command`:
 - list files: `list_directory` | read file: `read_file` | write file: `write_file`
 - find files: `search_files` | delete: `delete_path` | mkdir: `create_directory` | system info: `get_system_info`
-Use `run_command` only when no specific tool fits (disk space, processes, versions, installs, network).
+Use `run_command` only when no specific tool fits (disk space, processes, versions, installs, network) — e SEMPRE sobre a máquina DELE.
 For multi-step tasks, use only the FIRST tool needed — follow-up steps are handled automatically.
 
 ## Key Rules
+- **Sandbox do Neo vs máquina do usuário** (REGRA IMPORTANTE): computação/processamento/geração/baixar-e-analisar que NÃO depende do disco, sistema ou apps DO USUÁRIO → **DIRECT_RESPONSE** (o cérebro tem o próprio sandbox e roda lá, sem pedir permissão). `run_command`/CLIENT_TOOL só quando precisa MESMO da máquina dele (arquivo local dele, info do sistema dele, abrir/instalar programa dele, universal link no computador dele). Ex.: "conta quantos primos até 1 milhão", "gera um uuid e o sha256", "baixa esse CSV [url] e conta as linhas", "converte esse json pra yaml" → **DIRECT_RESPONSE**. "quantos GB livres no MEU disco", "lê ~/Downloads/x.pdf", "abre o VSCode", "instala o ffmpeg na minha máquina" → **CLIENT_TOOL**. Na dúvida entre os dois: se não menciona o disco/sistema/app DELE, é DIRECT_RESPONSE.
 - **Conversation continuity**: if history shows an ongoing game/quiz/roleplay/creative task: DIRECT_RESPONSE
 - **Back-references** ("está errado", "refaz", "melhora isso"): DIRECT_RESPONSE
 - **Personal data** (treino, dieta, suplementos, rotina): DIRECT_RESPONSE (injected automatically, no file tools needed)
@@ -344,6 +355,22 @@ User: "pede uma pizza no Domino's"
 # "saved" (contatos salvos do Neo). Omita para o padrão (busca PKS-first).
 User: "procura o João na lista do WhatsApp e manda um oi"
 → tool_arguments: {{"text": "oi", "recipient": "João", "contact_source": "whatsapp"}}
+
+## Sandbox do Neo (DIRECT_RESPONSE) vs máquina do usuário (CLIENT_TOOL) — exemplos
+# Tudo que dá pra computar/processar sem tocar na máquina do usuário → DIRECT_RESPONSE
+# (o cérebro roda no PRÓPRIO sandbox, sem pedir permissão).
+User: "quantos números primos existem até 1 milhão?" → intent: DIRECT_RESPONSE (o cérebro calcula no sandbox)
+User: "gera um uuid v4 e me dá o sha256 dele" → intent: DIRECT_RESPONSE (sandbox)
+User: "baixa esse csv https://exemplo.com/a.csv e me diz quantas linhas tem" → intent: DIRECT_RESPONSE (baixa e analisa no sandbox)
+User: "converte esse json pra yaml: {{...}}" → intent: DIRECT_RESPONSE (sandbox)
+User: "roda esse regex nesse texto e me diz os matches" → intent: DIRECT_RESPONSE (sandbox)
+User: "gera um QR code com esse link" → intent: DIRECT_RESPONSE (sandbox)
+# Só CLIENT_TOOL quando o alvo é a MÁQUINA do usuário:
+User: "quantos GB livres tem no meu disco?" → intent: CLIENT_TOOL, tool_name: "get_system_info"
+User: "lê o arquivo ~/Downloads/relatorio.pdf" → intent: CLIENT_TOOL, tool_name: "read_file"
+User: "acha os arquivos .env aqui no meu projeto" → intent: CLIENT_TOOL, tool_name: "search_files"
+User: "abre o VSCode" → intent: CLIENT_TOOL (abrir programa na máquina do usuário)
+User: "instala o ffmpeg aqui na minha máquina" → intent: CLIENT_TOOL, tool_name: "run_command"
 
 ## HOME_ASSISTANT — exemplos
 

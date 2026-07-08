@@ -104,6 +104,52 @@ class Settings(BaseSettings):
         "produce a final answer.",
     )
 
+    # Workbench — o sandbox de execução do próprio Neo (docs/workbench-background-jobs-plan.md)
+    workbench_enabled: bool = Field(
+        default=True,
+        description="Registra as tools neo_* (sandbox do Neo) e o handoff "
+        "[[HANDOFF:workbench]]. Set false para desligar todo o subsistema.",
+    )
+    workbench_container: str = Field(
+        default="neo-workbench",
+        description="Nome do container Docker do sandbox (irmão do neo-core).",
+    )
+    workbench_docker_socket: str = Field(
+        default="/var/run/docker.sock",
+        description="Socket do Docker Engine (montado no neo-core) para docker exec.",
+    )
+    workbench_workspace_root: str = Field(
+        default="/workspace",
+        description="Raiz do workspace persistente dentro do sandbox.",
+    )
+    workbench_default_timeout: int = Field(
+        default=60, ge=5, le=600,
+        description="Timeout padrão (s) de um comando foreground no sandbox.",
+    )
+    workbench_max_output_bytes: int = Field(
+        default=60_000, ge=1_000,
+        description="Teto de bytes por fluxo (stdout/stderr) devolvido do sandbox.",
+    )
+
+    # Jobs — trabalho em background do Neo (JobManager + agent_job)
+    jobs_enabled: bool = Field(
+        default=True,
+        description="Liga o JobManager (fila de jobs em background) e as tools "
+        "neo_bash_background/job_*. Requer workbench_enabled.",
+    )
+    job_max_concurrent: int = Field(
+        default=3, ge=1, le=16,
+        description="Máximo de jobs rodando em paralelo no sandbox.",
+    )
+    job_tick_interval: int = Field(
+        default=3, ge=1, le=60,
+        description="Intervalo (s) do loop que reivindica jobs prontos da fila.",
+    )
+    job_default_timeout: int = Field(
+        default=1800, ge=30, le=21600,
+        description="Timeout padrão (s) de um job de sandbox em background.",
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://neo:neo@localhost:5432/neodb",

@@ -186,6 +186,26 @@ _HANDOFF_INSTRUCTION = (
     "- Se não há nada a executar, não escreva nenhum bloco."
 )
 
+# Workbench: the cognitive core has its OWN execution environment (a sandboxed
+# Linux with internet + a persistent /workspace). Injected on cognitive turns when
+# the workbench is enabled, so the brain knows it can write and run code whenever no
+# specific tool covers the task — exactly like Claude Code. See
+# docs/workbench-background-jobs-plan.md.
+_WORKBENCH_INSTRUCTION = (
+    "## Seu ambiente de execução (workbench)\n"
+    "Você tem um ambiente Linux PRÓPRIO e isolado (sandbox), com internet e uma "
+    "pasta /workspace que PERSISTE entre conversas. Use as tools `neo_bash`, "
+    "`neo_write_file`, `neo_read_file` e `neo_list_files` quando NÃO existir uma "
+    "tool específica para o que o usuário pediu e você conseguir resolver com "
+    "código/scripts: cálculos, processar dados, baixar e analisar um arquivo, gerar "
+    "algo, testar uma ideia. É a SUA máquina — não a do usuário (para a máquina "
+    "dele existe `run_command`). Reaproveite scripts que você já criou (liste o "
+    "/workspace antes). Depois de rodar, explique o resultado ao usuário em "
+    "linguagem natural; não cole saídas cruas enormes. Para trabalho demorado, "
+    "prefira rodar em background (quando disponível) e avise que vai avisar ao "
+    "terminar — não segure a conversa esperando."
+)
+
 # Music turns (decision.skill_hint == "music") get a STRICTER handoff contract so the
 # play never silently no-ops: the reply must end with exactly one control token —
 # [[HANDOFF:music]] to play, or [[NO_MUSIC]] to refuse/clarify/chat. If neither is
@@ -410,6 +430,26 @@ class AIServiceResponse:
         self.voice = voice
 
 
+class _CognitiveAgentExecutor:
+    """Routes a cognitive tool call to the right per-request executor.
+
+    Background-job tools (``neo_bash_background``/``job_*``) go to a session-scoped
+    :class:`JobToolExecutor`; everything else (read tools + workbench ``neo_*``) goes
+    to the :class:`CognitiveReadExecutor`, which itself delegates unknown names to
+    the global tool executor. See ``docs/workbench-background-jobs-plan.md``.
+    """
+
+    def __init__(self, read_executor: Any, job_executor: Any, job_tool_names: Any) -> None:
+        self._read = read_executor
+        self._jobs = job_executor
+        self._job_names = job_tool_names
+
+    async def execute_tool_call(self, tool_call: Any) -> Any:
+        if tool_call.name in self._job_names:
+            return await self._jobs.execute_tool_call(tool_call)
+        return await self._read.execute_tool_call(tool_call)
+
+
 class AIService:
     """Unified AI orchestrator — routes, processes, and responds."""
 
@@ -425,6 +465,7 @@ class AIService:
         preference_extractor: PreferenceExtractor | None = None,
         pks: PKSService | None = None,
         context_selector: PromptContextSelector | None = None,
+        job_manager: Any = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -437,6 +478,8 @@ class AIService:
         self.pks = pks
         self.settings = get_settings()
         self.context_selector = context_selector
+        # JobManager — background jobs (workbench). None disables neo_bash_background/job_*.
+        self.job_manager = job_manager
         self._pending_traces: dict[str, MessageTrace] = {}
         # Sessões cujo último turno veio do modo Live — usado para estilizar a
         # resposta de um client tool (process_tool_result), onde o metadata["mode"]
@@ -1292,6 +1335,15 @@ class AIService:
             else:
                 messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
 
+        # Workbench: tell the brain it has its own sandbox to write/run code when no
+        # specific tool fits. Training turns get no tools, so skip the note there too.
+        if (
+            self.settings.workbench_enabled
+            and self.settings.cognitive_tools_enabled
+            and not is_neo_training
+        ):
+            messages.append(Message(role=MessageRole.SYSTEM, content=_WORKBENCH_INSTRUCTION))
+
         # Real-time view of what's open/playing — injected on ANY cognitive turn when
         # media is open, so the brain can control it ("pausa", "próxima") AND answer
         # status questions ("o que tá tocando?", "como tá o YouTube?") that don't route
@@ -1402,14 +1454,26 @@ class AIService:
                     pks_service=self.pks,
                     user_id=user_id,
                 )
+                # The cognitive core's toolset = read tools + (when enabled) its own
+                # agent tools: the workbench sandbox (neo_*, dispatched through the
+                # global executor) and background jobs (neo_bash_background/job_*,
+                # which need the turn's user/session — routed to a per-request
+                # JobToolExecutor via the composite below).
+                cognitive_tools = list(cognitive_tools_for(user_id))
+                cog_executor: Any = read_executor
+                if self.settings.workbench_enabled:
+                    cognitive_tools += self._agent_action_tools()
+                    cog_executor = self._build_cognitive_executor(
+                        read_executor, user_id=user_id, session_id=session_id
+                    )
                 full_response = await self._run_cognitive_tool_loop(
                     provider=provider,
                     messages=messages,
                     req_model=_req_model,
                     model_name=model_name,
                     provider_name=provider_name,
-                    tools=cognitive_tools_for(user_id),
-                    tool_executor=read_executor,
+                    tools=cognitive_tools,
+                    tool_executor=cog_executor,
                     slog=slog,
                     trace=trace,
                 )
@@ -1704,6 +1768,56 @@ class AIService:
                 is_final=False,
                 metadata={"__pipeline_handoffs__": pipeline_handoffs},
             )
+
+    def _agent_action_tools(self) -> list[Any]:
+        """The Neo's own agent tools offered inline to the cognitive core.
+
+        F1: workbench sandbox (``neo_*``). F2 adds background-job tools and F4 the
+        scheduler (``job_*``/``schedule_*``) — appended here as they land. Guarded
+        by ``workbench_enabled`` at the call site; each group is only included when
+        its module executor is actually registered in the global tool executor.
+        """
+        tools: list[Any] = []
+        try:
+            from core.workbench import WORKBENCH_TOOLS
+
+            if self.agent.tool_registry.exists("neo_bash"):
+                tools += list(WORKBENCH_TOOLS)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Workbench] could not load workbench tools: %s", e)
+        if self.job_manager is not None:
+            try:
+                from core.jobs import JOB_TOOLS
+
+                if self.agent.tool_registry.exists("neo_bash_background"):
+                    tools += list(JOB_TOOLS)
+            except Exception:  # noqa: BLE001
+                pass
+        return tools
+
+    def _build_cognitive_executor(
+        self, read_executor: Any, *, user_id: UUID | None, session_id: UUID | None
+    ) -> Any:
+        """Composite executor: job tools → JobToolExecutor; everything else → reads.
+
+        The read executor already delegates unknown names (like ``neo_bash``) to the
+        global tool executor, so the workbench tools work through it. Only the
+        background-job tools need the turn's user/session context, so they are routed
+        to a fresh per-request :class:`JobToolExecutor`.
+        """
+        if self.job_manager is None:
+            return read_executor
+        try:
+            from core.jobs import JOB_TOOL_NAMES, JobToolExecutor
+        except Exception:  # noqa: BLE001
+            return read_executor
+        job_executor = JobToolExecutor(
+            db=self.db,
+            job_manager=self.job_manager,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return _CognitiveAgentExecutor(read_executor, job_executor, JOB_TOOL_NAMES)
 
     async def _run_cognitive_tool_loop(
         self,
