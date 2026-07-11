@@ -6,6 +6,7 @@ description: >
   fala ou da escuta do Neo.
 keywords: [voz, tts, stt, fala, falar, escutar, microfone, engine, mudo, transcricao]
 kind: instructional
+register: oficina
 enabled: true
 version: 1
 ---

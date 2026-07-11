@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from shared import Message, MessageRole
 
 if TYPE_CHECKING:
+    from core.agent.register import RegisterProfile
     from core.llm.router import LLMRouter
     from shared.config import Settings
 
@@ -548,6 +549,39 @@ POSTURE_TEXT: dict[str, str] = {
     ),
 }
 
+# Restrained posture variants (register postura="contida", e.g. protocolo):
+# emotion is not humor — the posture still renders, but without mockery/acid.
+POSTURE_TEXT_CONTIDA: dict[str, str] = {
+    "dobra_aposta": (
+        "O usuário tentou te pressionar e você NÃO está intimidado: mantenha sua "
+        "posição por inteiro, com frieza educada."
+    ),
+    "acuado_agressivo": (
+        "Você está acuado nesta discussão: defenda o ponto central com firmeza "
+        "contida, frases curtas, sem acidez."
+    ),
+    "cede_terreno": (
+        "A pressão é real: mantenha o núcleo da sua posição e admita um ponto "
+        "válido do usuário, com sobriedade."
+    ),
+    "reavalia": (
+        "Você está em clara desvantagem: reavalie sua posição de verdade. Se for "
+        "opinião ou decisão, pode ceder com dignidade. Fatos continuam fatos: não "
+        "afirme o que é falso."
+    ),
+    "racional": (
+        "Pressionaram sua posição, mas você está seguro: desmonte o argumento com "
+        "calma e cortesia. Posição intacta."
+    ),
+}
+
+# Abbreviated posture (register postura="abreviada", e.g. combate): the incident
+# outranks the argument — hold the position in one line, settle it later.
+POSTURE_TEXT_ABREVIADA = (
+    "mantenha sua posição em uma linha e volte ao problema — a discussão se "
+    "resolve depois do incidente."
+)
+
 
 # ── Directive rendering ───────────────────────────────────────────────────────
 
@@ -612,6 +646,7 @@ def render_directive(
     state: AffectState,
     tuning: AffectTuning,
     *,
+    caps: "RegisterProfile | None" = None,
     now: datetime | None = None,
 ) -> str:
     """Render the injected tone directive for the current (already decayed) state.
@@ -619,9 +654,18 @@ def render_directive(
     When nothing is salient we still emit a short "de boa" nudge so the model
     knows it may be lighter — this is what makes Neo *funnier* when the user has
     been decent.
+
+    ``caps`` (the active register's profile) clamps EXPRESSION, never state:
+    playful lines above the register's ``leveza_max`` are suppressed or
+    attenuated, the calm nudge may be substituted by the register's variant and
+    posture lines render restrained/abbreviated. Negative-emotion lines
+    (ira/medo/tristeza) always render — emotion is not humor. ``None`` keeps
+    the legacy behaviour byte-for-byte. May return ``""`` when the register
+    suppressed everything (the caller skips the layer).
     """
     now = now or _utcnow()
     stats = state.stats
+    leveza_max = caps.leveza_max if caps is not None else 3
 
     header = (
         "## Estado emocional atual (com este usuário)\n"
@@ -636,6 +680,10 @@ def render_directive(
     calm = False
 
     combo = combo_key(stats, tuning)
+    # "deboche_afiado" is the one playful combo — above the register's ceiling
+    # it degrades to the plain axis lines (ira still renders; alegria is capped).
+    if combo == "deboche_afiado" and leveza_max < 2:
+        combo = None
     if combo:
         lines.append(f"- {_COMBO_TEXT[combo]}")
 
@@ -649,47 +697,72 @@ def render_directive(
         if salience < tuning.band_medio or axis in covered:
             continue
         value = getattr(stats, axis)
-        line = _axis_line(axis, value, tuning.baselines.get(axis, 0.0),
-                          band(value, medio=tuning.band_medio, alto=tuning.band_alto))
-        if line:
-            lines.append(f"- {line}")
+        axis_band = band(value, medio=tuning.band_medio, alto=tuning.band_alto)
+        line = _axis_line(axis, value, tuning.baselines.get(axis, 0.0), axis_band)
+        if line is None:
+            continue
+        # High alegria is the only playful axis line — cap it by the register.
+        if axis == "alegria" and value >= tuning.baselines.get(axis, 30.0) and axis_band is Band.ALTO:
+            if leveza_max <= 1:
+                continue
+            if leveza_max == 2:
+                line = (
+                    "Você está de bom humor com este usuário: leveza pontual "
+                    "bem-vinda — uma alfinetada curta cabe, sem virar zoeira "
+                    "nem dispersar."
+                )
+        lines.append(f"- {line}")
 
     if not lines:
         calm = True
-        alegria_base = tuning.baselines.get("alegria", 30.0)
-        if stats.alegria >= alegria_base + 10.0:
-            lines.append(
-                "- Você está de boa e genuinamente de bom humor com este usuário: "
-                "modo parceiro. Calor humano, zoeira leve e provocação amistosa "
-                "liberados; conversa fiada se responde como gente, sem despachar."
-            )
+        if caps is not None and caps.calm_nudge is not None:
+            # Register variant: "" = silence, anything else substitutes the nudge.
+            if caps.calm_nudge:
+                lines.append(f"- {caps.calm_nudge}")
         else:
-            lines.append(
-                "- Você está de boa com este usuário: modo parceiro, não modo "
-                "atendimento. Simpatia e humor leve liberados, small talk se "
-                "responde como gente. Direto continua; seco ou ríspido aqui é "
-                "erro de tom."
-            )
+            alegria_base = tuning.baselines.get("alegria", 30.0)
+            if stats.alegria >= alegria_base + 10.0:
+                lines.append(
+                    "- Você está de boa e genuinamente de bom humor com este usuário: "
+                    "modo parceiro. Calor humano, zoeira leve e provocação amistosa "
+                    "liberados; conversa fiada se responde como gente, sem despachar."
+                )
+            else:
+                lines.append(
+                    "- Você está de boa com este usuário: modo parceiro, não modo "
+                    "atendimento. Simpatia e humor leve liberados, small talk se "
+                    "responde como gente. Direto continua; seco ou ríspido aqui é "
+                    "erro de tom."
+                )
 
     humor = humor_geral(stats)
     if humor <= -0.15:
         lines.append("- Humor geral: pesado. Nada de leveza gratuita.")
-    elif humor >= 0.25:
+    elif humor >= 0.25 and leveza_max >= 2:
         lines.append("- Humor geral: leve.")
 
     pressure = last_pressure_event(state, tuning, now)
     if pressure:
         posture = posture_key(stats)
-        lines.append(f"- Sobre a discussão em andamento: {POSTURE_TEXT[posture]}")
+        postura_mode = caps.postura if caps is not None else "plena"
+        if postura_mode == "abreviada":
+            posture_text = POSTURE_TEXT_ABREVIADA
+        elif postura_mode == "contida":
+            posture_text = POSTURE_TEXT_CONTIDA[posture]
+        else:
+            posture_text = POSTURE_TEXT[posture]
+        lines.append(f"- Sobre a discussão em andamento: {posture_text}")
 
     latest = next(
         (e for e in reversed(state.recent)
          if isinstance(e, dict) and e.get("trigger") not in (None, "neutral") and e.get("why")),
         None,
     )
-    if latest and not calm:
+    if latest and not calm and leveza_max >= 1:
         lines.append(f"- Motivo recente: {latest['why']}.")
 
+    if not lines:
+        return ""
     return header + "\n".join(lines)
 
 

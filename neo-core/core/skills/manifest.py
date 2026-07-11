@@ -26,6 +26,12 @@ class SkillManifest(BaseModel):
 
     # --- unificação com a biblioteca de skills ---
     kind: str = "pipeline"
+    # Registro da situação que esta skill impõe enquanto roteada/ativa
+    # (ex.: "oficina"). "" = não impõe. Lido pelo _derive_turn_register do
+    # ai_service quando decision.skill_name/skill_hint aponta para cá.
+    # (Nome ``tone_register`` porque ``register`` colidiria com o método
+    # :meth:`register` do registry logo abaixo.)
+    tone_register: str = ""
     # Pode ser alvo de [[HANDOFF:<name>]] do núcleo cognitivo?
     handoff: bool = True
     # Linha desta skill na instrução de handoff (curta, em PT). Vazio → usa description.

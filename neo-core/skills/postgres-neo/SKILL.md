@@ -6,6 +6,7 @@ description: >
   sobre os dados internos do Neo.
 keywords: [banco, postgres, sql, tabela, consulta, dados, sessao, mensagem, missao, pks, quantas, quantos]
 kind: tool_backed
+register: oficina
 tools: [sql_query_ro]
 enabled: true
 version: 1

@@ -233,3 +233,68 @@ def test_tools_for_only_registered(tmp_path):
 def test_tools_for_instructional_is_empty(tmp_path):
     _write_skill(tmp_path, "pura", "name: pura\ndescription: X.")
     assert _lib(tmp_path, registry=_Registry()).tools_for("pura") == []
+
+# ── register (registro da situação — docs/context-register-plan.md) ─────────
+
+def test_register_frontmatter_parsed(tmp_path):
+    _write_skill(
+        tmp_path, "sql-skill",
+        "name: sql-skill\ndescription: X.\nregister: oficina",
+    )
+    entry = _lib(tmp_path).get("sql-skill")
+    assert entry is not None
+    assert entry.tone_register == "oficina"
+
+
+def test_register_invalid_is_ignored_not_fatal(tmp_path):
+    _write_skill(
+        tmp_path, "torta",
+        "name: torta\ndescription: X.\nregister: turbo",
+    )
+    lib = _lib(tmp_path)
+    entry = lib.get("torta")
+    assert entry is not None  # skill carrega mesmo assim (fail-open)
+    assert entry.tone_register is None
+
+
+def test_skill_read_carries_register_note_when_enabled(tmp_path):
+    _write_skill(
+        tmp_path, "seria",
+        "name: seria\ndescription: X.\nregister: protocolo",
+    )
+    lib = _lib(tmp_path, settings=_settings(neo_register_enabled=True))
+    data = lib.read("seria")
+    assert "register_note" in data
+    assert "'protocolo'" in data["register_note"]
+    assert "## Registro da situação" in data["register_note"]
+
+
+def test_skill_read_no_register_note_when_disabled(tmp_path):
+    _write_skill(
+        tmp_path, "seria",
+        "name: seria\ndescription: X.\nregister: protocolo",
+    )
+    lib = _lib(tmp_path, settings=_settings(neo_register_enabled=False))
+    assert "register_note" not in lib.read("seria")
+
+
+def test_skill_read_no_register_note_without_register(tmp_path):
+    _write_skill(tmp_path, "solta", "name: solta\ndescription: X.")
+    lib = _lib(tmp_path, settings=_settings(neo_register_enabled=True))
+    assert "register_note" not in lib.read("solta")
+
+
+def test_write_skill_persists_register(tmp_path):
+    lib = _lib(tmp_path)
+    entry = lib.write_skill(
+        "nova", description="X.", body="# corpo", register="oficina",
+    )
+    assert entry.tone_register == "oficina"
+    raw = (tmp_path / "nova" / "SKILL.md").read_text(encoding="utf-8")
+    assert "register: oficina" in raw
+
+
+def test_write_skill_rejects_invalid_register(tmp_path):
+    lib = _lib(tmp_path)
+    with pytest.raises(ValueError, match="register inválido"):
+        lib.write_skill("nova", description="X.", body="# corpo", register="turbo")

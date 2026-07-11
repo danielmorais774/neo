@@ -348,6 +348,20 @@ class Settings(BaseSettings):
     # detectors still persist their floors, so the reaction is never lost.
     neo_affect_appraisal_timeout_s: float = Field(default=12.0, gt=0.0)
 
+    # ── Neo situational register (tone-regulation layer) ────────────────
+    # Second tone regulator, orthogonal to affect: Caráter × Registro × Afeto.
+    # The register is derived deterministically per turn (no new LLM call) and
+    # sets the CEILING for humor/ceremony/verbosity/initiative; the emotional
+    # state moves inside it. See docs/context-register-plan.md.
+    neo_register_enabled: bool = Field(
+        default=False,
+        description="Inject the situational register layer and clamp the affect directive",
+    )
+    neo_register_shadow: bool = Field(
+        default=True,
+        description="Derive + log the register per turn WITHOUT injecting (calibration mode; no-op when neo_register_enabled)",
+    )
+
     # Panel auth (temporary without login flow)
     panel_jwt_secret: str = Field(
         default="l5L0mJ30C7v10OTI4eEOvxShOGwhGkPSEst7eicOiFGq8qG6TgL9u4CQUr6mByjV",

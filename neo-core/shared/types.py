@@ -233,6 +233,16 @@ class RoutingDecision(BaseModel):
     # everything else routes to the cognitive core.
     speech_act: str = "imperative"
 
+    # --- situational register signals (docs/context-register-plan.md) ---
+    # gravity: how serious the SITUATION is (not the task's complexity).
+    # normal | alta | critica — a deterministic regex floor guarantees "alta"
+    # for live-problem messages even when the classifier misses it.
+    gravity: str = "normal"
+    # register_hint: weak LLM signal, only honored for registers whose
+    # deterministic cues are rare: "protocolo" (third parties will see the
+    # reply) or "confidente" (the user is venting). None otherwise.
+    register_hint: str | None = None
+
     # --- complexity assessment (avoids separate should_create_plan LLM call) ---
     needs_plan: bool = False  # True when 2+ steps with dependencies are needed
     tipo_tarefa: str = "simples"  # simples | multi_etapas | analitica | criacao
@@ -325,6 +335,7 @@ class ContextLayer(str, Enum):
     CORE            = "core"           # identidade, idioma, regras — pin=True sempre
     RUNTIME         = "runtime"        # OS, paths, shell — pin=True
     NEO_CORE_PINNED = "neo_core_pinned"  # personality, response-rules críticas — pin=True
+    NEO_REGISTER    = "neo_register"    # registro da situação (teto de tom) — pin=True
     NEO_AFFECT      = "neo_affect"      # estado emocional (vetor límbico) do Neo com o usuário — pin=True
     NEO_CORE_CTX    = "neo_core_ctx"   # exemplos, lições, projetos — scored
     USER_PREFS      = "user_prefs"     # preferências do usuário — scored

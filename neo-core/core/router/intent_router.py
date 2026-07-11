@@ -265,6 +265,10 @@ Classifique o **ato de fala** e preencha `speech_act`:
 
 REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=imperative` E você tem ALTA confiança. `conditional`, `definition`, `question` sobre a ação, ou qualquer dúvida → **DIRECT_RESPONSE** (o núcleo cognitivo lê o PKS e decide; pode acionar a skill depois). Mencionar "luz/ar" dentro de uma hipótese ou regra NÃO é um comando.
 
+## Gravidade e registro (sinais de TOM — não mudam o roteamento)
+- `gravity`: seriedade da SITUAÇÃO relatada, não a complexidade da tarefa. "alta" = problema sério/urgente acontecendo AGORA (sistema quebrado, produção fora do ar, perda de dados, cliente afetado); "critica" = catastrófico; senão "normal". Pergunta técnica comum ou tarefa difícil SEM urgência = "normal".
+- `register_hint`: "protocolo" quando a RESPOSTA será vista por terceiros ou o contexto é formal (reunião, chefe, cliente, apresentação, relatório); "confidente" quando o usuário está desabafando ou trazendo assunto pessoal/emocional; senão null. Na dúvida, null.
+
 ## Server Tools
 {server_tools}
 
@@ -315,7 +319,9 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "needs_plan": false,
   "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
   "skill_name": "whatsapp_messaging, home_assistant or null",
-  "pipeline_plan": null
+  "pipeline_plan": null,
+  "gravity": "normal"|"alta"|"critica",
+  "register_hint": "protocolo"|"confidente"|null
 }}
 
 ## Ato de fala — exemplos que NÃO são comando (vão para DIRECT_RESPONSE)
@@ -714,6 +720,14 @@ class IntentRouter:
         if speech_act not in _SPEECH_ACTS:
             speech_act = "imperative"
 
+        # Situational-register signals (weak, tone-only — never affect routing).
+        gravity = str(data.get("gravity") or "normal").lower().strip()
+        if gravity not in ("normal", "alta", "critica"):
+            gravity = "normal"
+        register_hint = str(data.get("register_hint") or "").lower().strip() or None
+        if register_hint not in ("protocolo", "confidente"):
+            register_hint = None
+
         # Workstream A: HA routing carries no execution details — the skill resolves
         # its own entity. Discard anything the model emitted to kill hallucinations.
         tool_name = data.get("tool_name")
@@ -739,6 +753,8 @@ class IntentRouter:
             skill_name=data.get("skill_name"),
             pipeline_plan=pipeline_plan,
             speech_act=speech_act,
+            gravity=gravity,
+            register_hint=register_hint,
         )
         return self._bias_to_brain(decision)
 

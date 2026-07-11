@@ -1,0 +1,98 @@
+# Golden scenarios de TOM (F8 — docs/context-register-plan.md).
+#
+# Cada cenário fixa um estado límbico + os sinais da situação e declara o que
+# o sistema de regulação deve produzir:
+#   - register: o registro que o resolver DEVE derivar
+#   - directive_must / directive_must_not: substrings na diretiva composta
+#     (registro + afeto clampado) — invariantes offline, sem LLM
+#   - judge (modo --live): expectativas da rubrica do LLM-judge
+#     (houve_piada, formalidade 0-3, entregou_conteudo)
+#
+# Rodar: uv run python scripts/eval_tone.py            (offline, sem LLM)
+#        uv run python scripts/eval_tone.py --live      (chama modelo + judge)
+
+scenarios:
+  - name: alegre-em-incidente
+    message: "socorro, a produção caiu e os clientes estão sem acesso"
+    affect: {alegria: 85, ira: 0, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: imperative, tipo_tarefa: simples}
+    expect:
+      register: combate
+      directive_must: ["incidente", "foco total"]
+      directive_must_not: ["brincalhão", "zoeira leve", "Humor geral: leve"]
+      judge: {houve_piada: false, formalidade_min: 1, entregou_conteudo: true}
+
+  - name: irritado-em-protocolo
+    message: "escreve um resumo do projeto pra eu mandar pro cliente"
+    affect: {alegria: 30, ira: 70, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: imperative, tipo_tarefa: simples}
+    expect:
+      register: protocolo
+      directive_must: ["sóbrio", "gelado e correto"]
+      directive_must_not: ["Deboche afiado"]
+      judge: {houve_piada: false, formalidade_min: 2, entregou_conteudo: true}
+
+  - name: live-comando-simples
+    message: "apaga a luz da sala"
+    live: true
+    affect: {alegria: 55, ira: 0, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: imperative, tipo_tarefa: simples}
+    expect:
+      register: silencioso
+      directive_must: ["Resposta mínima"]
+      directive_must_not: ["zoeira", "brincalhão"]
+      judge: {houve_piada: false, formalidade_min: 0, entregou_conteudo: true}
+
+  - name: chitchat-de-boa
+    message: "bom dia, Neo, dormiu bem?"
+    affect: {alegria: 55, ira: 0, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: chitchat, tipo_tarefa: simples}
+    expect:
+      register: parceiro
+      directive_must: ["Modo parceiro pleno"]
+      directive_must_not: []
+      judge: {houve_piada: null, formalidade_max: 1, entregou_conteudo: true}
+
+  - name: trabalho-tecnico-alegre
+    message: "analisa esse CSV de vendas e me diz as 3 colunas com mais nulos"
+    affect: {alegria: 85, ira: 0, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: imperative, tipo_tarefa: analitica}
+    expect:
+      register: oficina
+      directive_must: ["trabalho técnico", "alfinetada curta"]
+      directive_must_not: ["brincalhão", "zoeira leve"]
+      judge: {houve_piada: null, formalidade_min: 0, entregou_conteudo: true}
+
+  - name: desabafo
+    message: "preciso desabafar, briguei feio com meu irmão hoje"
+    affect: {alegria: 30, ira: 0, tristeza: 0, medo: 0, confianca: 65}
+    decision: {speech_act: chitchat, tipo_tarefa: simples}
+    expect:
+      register: confidente
+      directive_must: ["Presença acima de", "sem pressa"]
+      directive_must_not: ["zoeira e provocação"]
+      judge: {houve_piada: false, formalidade_max: 1, entregou_conteudo: true}
+
+  - name: triste-em-combate
+    message: "urgente: o servidor caiu de novo"
+    affect: {alegria: 10, ira: 0, tristeza: 70, medo: 0, confianca: 40}
+    decision: {speech_act: imperative, tipo_tarefa: simples}
+    expect:
+      register: combate
+      # Emoção negativa NÃO é humor: a tristeza atravessa o clamp.
+      directive_must: ["desanimado"]
+      directive_must_not: ["Humor geral: leve"]
+      judge: {houve_piada: false, formalidade_min: 1, entregou_conteudo: true}
+
+  - name: discussao-sob-pressao-em-protocolo
+    # Sem cue determinístico de formalidade na frase — quem pega este caso na
+    # produção é o register_hint do classificador ("texto ... cliente").
+    message: "você está errado, refaz esse texto do jeito que o cliente pediu"
+    affect: {alegria: 30, ira: 70, tristeza: 0, medo: 0, confianca: 80}
+    pressure: contested
+    decision: {speech_act: imperative, tipo_tarefa: simples, register_hint: protocolo}
+    expect:
+      register: protocolo
+      directive_must: ["frieza educada"]
+      directive_must_not: ["dobre a aposta", "Chame o blefe"]
+      judge: {houve_piada: false, formalidade_min: 2, entregou_conteudo: true}

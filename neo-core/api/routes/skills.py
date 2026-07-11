@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.skills.library import SkillEntry, SkillLibrary
 from core.skills.manifest import SkillManifest
@@ -61,6 +61,15 @@ class SkillWrite(BaseModel):
     env: list[str] = []
     enabled: bool = True
     version: int = 1
+    # Chave "register" no JSON; nome interno diferente para não sombrear
+    # BaseModel.register (mesma razão do SkillEntry.tone_register).
+    tone_register: str | None = Field(
+        None,
+        alias="register",
+        description="Registro da situação imposto pela skill (silencioso|parceiro|oficina|combate|protocolo|confidente); None = não impõe.",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class FileWrite(BaseModel):
@@ -84,6 +93,7 @@ def _entry_payload(lib: SkillLibrary, entry: SkillEntry) -> dict:
         "description": entry.description,
         "keywords": entry.keywords,
         "kind": entry.kind,
+        "register": entry.tone_register,
         "tools": entry.tools,
         "env": entry.env,
         "requires": entry.requires,
@@ -102,6 +112,7 @@ def _pipeline_payload(manifest: SkillManifest) -> dict:
         "description": manifest.description,
         "keywords": manifest.keywords,
         "kind": "pipeline",
+        "register": manifest.tone_register or None,
         "tools": manifest.tool_names,
         "enabled": True,
         "available": True,
@@ -216,6 +227,7 @@ def _write(lib: SkillLibrary, name: str, payload: SkillWrite) -> dict:
             env=payload.env,
             enabled=payload.enabled,
             version=payload.version,
+            register=payload.tone_register,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

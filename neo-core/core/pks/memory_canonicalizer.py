@@ -52,6 +52,42 @@ _BAD_MARKERS = ("exemplo ruim", "exemplos ruins", "nao aja assim", "exemplo erra
 _GOOD_MARKERS = ("exemplo bom", "exemplos bons", "correto seria", "certo seria")
 _QUOTE_RE = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{12,240})[\"“”'‘’]")
 
+# Condição situacional no treino → escopo de registro na regra canônica
+# (docs/context-register-plan.md §F6). Quando o treino diz "quando eu estiver
+# trabalhando"/"em incidente"/etc., a regra ganha `registers:` e um rule_key
+# ESCOPADO — como a dedup do writer é por rule_key, a regra específica deixa
+# de ser engolida pela genérica (fix da diluição, session-2173af2b).
+# Ordem estável = ordem do sufixo do rule_key. Cues em texto normalizado
+# (minúsculas, sem acento — ver normalize_text).
+_REGISTER_SCOPE_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("oficina", (
+        "quando eu estiver trabalhando", "enquanto eu trabalho", "trabalhando",
+        "codando", "programando", "mexendo em codigo", "durante o trabalho",
+        "em tarefa tecnica", "debugando",
+    )),
+    ("combate", (
+        "em incidente", "durante um incidente", "em urgencia", "coisa seria",
+        "situacao seria", "em emergencia", "producao caiu", "quando algo quebrar",
+    )),
+    ("protocolo", (
+        "em contexto formal", "em reuniao", "com cliente", "para o cliente",
+        "pro cliente", "com o chefe", "em apresentacao", "formalmente",
+    )),
+    ("confidente", (
+        "quando eu desabafar", "desabafando", "assunto pessoal", "papo pessoal",
+        "assunto sensivel",
+    )),
+)
+
+
+def _extract_register_scope(norm: str) -> list[str]:
+    """Registros citados como condição no treino ([] quando não há escopo)."""
+    return [
+        register
+        for register, cues in _REGISTER_SCOPE_CUES
+        if any(cue in norm for cue in cues)
+    ]
+
 
 class MemoryCanonicalizer:
     """Maps clean training content to canonical write operations."""
@@ -90,11 +126,15 @@ class MemoryCanonicalizer:
 
         ops: list[dict[str, Any]] = []
 
+        # Escopo situacional (registro) citado no treino — aplicado às regras
+        # de humor abaixo. [] = regra vale em qualquer situação (default).
+        register_scopes = _extract_register_scope(norm)
+
         has_playful_respect_pushback = self._is_playful_respect_pushback(norm)
 
         if has_playful_respect_pushback:
             examples_good = self._extract_playful_respect_examples(clean_content)
-            ops.append(
+            playful_op = (
                 base_op(
                     destination=DEST_RESPONSE_RULES,
                     kind="rule",
@@ -128,10 +168,13 @@ class MemoryCanonicalizer:
                     },
                 )
             )
+            if register_scopes:
+                playful_op["registers"] = list(register_scopes)
+            ops.append(playful_op)
 
         if self._is_random_useless_question_sarcasm(norm):
             examples_good = self._extract_inline_good_examples(clean_content)
-            ops.append(
+            random_op = (
                 base_op(
                     destination=DEST_RESPONSE_RULES,
                     kind="rule",
@@ -160,6 +203,9 @@ class MemoryCanonicalizer:
                     },
                 )
             )
+            if register_scopes:
+                random_op["registers"] = list(register_scopes)
+            ops.append(random_op)
 
         if self._is_identity_name_only(norm):
             ops.append(
@@ -179,20 +225,34 @@ class MemoryCanonicalizer:
             )
 
         if self._is_acid_humor(norm) and not has_playful_respect_pushback:
-            ops.append(
-                base_op(
-                    destination=DEST_RESPONSE_RULES,
-                    kind="rule",
-                    semantic_rule_key="use_acid_sarcasm_when_appropriate",
-                    rule_key="use_acid_sarcasm_when_appropriate",
-                    description=(
-                        "Neo pode usar sarcasmo, ironia e deboche contextual quando isso "
-                        "combinar com a situação, sem deixar o humor substituir a resposta útil."
-                    ),
-                    scope="response_generation",
-                    priority="high",
+            # Com condição situacional no treino, a regra vira uma variante
+            # ESCOPADA (rule_key próprio + registers) em vez de sobrescrever a
+            # genérica — é isso que impede a diluição.
+            if register_scopes:
+                acid_key = "use_acid_sarcasm__" + "_".join(register_scopes)
+                acid_description = (
+                    "Neo pode usar sarcasmo, ironia e deboche contextual "
+                    f"NESTAS situações: {', '.join(register_scopes)}. Fora delas, "
+                    "esta regra não se aplica. O humor nunca substitui a resposta útil."
                 )
+            else:
+                acid_key = "use_acid_sarcasm_when_appropriate"
+                acid_description = (
+                    "Neo pode usar sarcasmo, ironia e deboche contextual quando isso "
+                    "combinar com a situação, sem deixar o humor substituir a resposta útil."
+                )
+            acid_op = base_op(
+                destination=DEST_RESPONSE_RULES,
+                kind="rule",
+                semantic_rule_key=acid_key,
+                rule_key=acid_key,
+                description=acid_description,
+                scope="response_generation",
+                priority="high",
             )
+            if register_scopes:
+                acid_op["registers"] = list(register_scopes)
+            ops.append(acid_op)
             ops.append(
                 base_op(
                     destination=DEST_PERSONALITY,

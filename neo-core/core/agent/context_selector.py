@@ -25,6 +25,7 @@ from shared.types import (
 )
 
 if TYPE_CHECKING:
+    from core.agent.register import Register
     from core.agent.token_counter import TokenCounter
     from core.pks.service import PKSService
     from core.session.preference_extractor import PreferenceExtractor
@@ -69,8 +70,14 @@ class PromptContextSelector:
         pks_prewrite: dict[str, Any] | None = None,
         pks_system_prewrite: dict[str, Any] | None = None,
         mission_context: str | None = None,
+        register: "Register | None" = None,
     ) -> tuple[str, list[ContextCandidate]]:
         """Build system prompt with scored, budget-aware context selection.
+
+        ``register`` (when the situational-register feature is enabled) injects
+        the pinned NEO_REGISTER directive, clamps the affect directive by the
+        register's ceiling and scopes PKS persona rules by their ``registers:``
+        predicate. ``None`` keeps today's behaviour byte-for-byte.
 
         Returns:
             (system_prompt_text, all_candidates) — the second element is the
@@ -113,6 +120,7 @@ class PromptContextSelector:
                 user_id=user_id,
                 decision=decision,
                 is_neo_training=is_neo_training,
+                register=register,
             ),
             self._fetch_affect(user_id=user_id, user_message=user_message),
         )
@@ -136,6 +144,25 @@ class PromptContextSelector:
                 included=True,
             ))
 
+        # ── 4a. NEO_REGISTER — pinned situational ceiling ─────────────────
+        register_profile = None
+        if register is not None:
+            from core.agent.register import PROFILES, render_register_directive
+
+            register_profile = PROFILES[register]
+            register_text = render_register_directive(register)
+            candidates.append(ContextCandidate(
+                layer=ContextLayer.NEO_REGISTER,
+                source="register",
+                key=register.value,
+                pin=True,
+                text=register_text,
+                est_tokens=self._tc.count(register_text),
+                relevance=1.0,
+                final_score=1.0,
+                included=True,
+            ))
+
         # ── 4b. NEO_AFFECT — pinned tone/posture directive ────────────────
         if affect_state is not None:
             from core.agent.affect import AXES, AffectTuning, render_directive
@@ -143,6 +170,7 @@ class PromptContextSelector:
             directive = render_directive(
                 affect_state,
                 AffectTuning.from_settings(self._settings),
+                caps=register_profile,
             )
             if directive:
                 candidates.append(ContextCandidate(
@@ -245,13 +273,14 @@ class PromptContextSelector:
         user_id: UUID | None,
         decision: RoutingDecision,
         is_neo_training: bool,
+        register: "Register | None" = None,
     ) -> tuple[str, str, dict[str, Any] | None, str]:
         """Fetch neo core, prefs, and PKS context in parallel. Returns (neo, prefs, pks_result, pks_text)."""
         tasks: list[Any] = []
         task_keys: list[str] = []
 
         if self._pks:
-            tasks.append(self._safe_retrieve_system_context(user_message))
+            tasks.append(self._safe_retrieve_system_context(user_message, register))
             task_keys.append("neo_core")
 
         if self._prefs and not is_neo_training:
@@ -311,9 +340,14 @@ class PromptContextSelector:
             logger.warning("[ContextSelector] affect fetch failed: %s", e)
             return None
 
-    async def _safe_retrieve_system_context(self, user_message: str) -> str:
+    async def _safe_retrieve_system_context(
+        self, user_message: str, register: "Register | None" = None
+    ) -> str:
         assert self._pks is not None
-        return await self._pks.retrieve_system_context(user_message=user_message) or ""
+        return await self._pks.retrieve_system_context(
+            user_message=user_message,
+            register=register.value if register is not None else None,
+        ) or ""
 
     async def _safe_get_prefs(self, user_id: UUID | None) -> str:
         assert self._prefs is not None
@@ -446,6 +480,7 @@ class PromptContextSelector:
             ContextLayer.CORE,
             ContextLayer.RUNTIME,
             ContextLayer.NEO_CORE_PINNED,
+            ContextLayer.NEO_REGISTER,
             ContextLayer.NEO_AFFECT,
             ContextLayer.NEO_CORE_CTX,
             ContextLayer.USER_PREFS,

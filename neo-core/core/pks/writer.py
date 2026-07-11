@@ -588,7 +588,7 @@ class PKSWriter:
             item["trigger"] = op["trigger"]
         if op.get("action"):
             item["action"] = op["action"]
-        for key in ("variation_policy", "response_style", "applicability"):
+        for key in ("variation_policy", "response_style", "applicability", "registers"):
             if op.get(key) is not None:
                 item[key] = op[key]
         return item

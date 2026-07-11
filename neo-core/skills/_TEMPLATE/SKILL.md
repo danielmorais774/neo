@@ -6,6 +6,9 @@ description: >                   # ≤ 200 chars. É a ÚNICA coisa que o céreb
   se o modelo lê o resto.
 keywords: [palavra, chave, singular]   # prefiltro do catálogo quando ele cresce
 kind: instructional              # instructional | scripted | tool_backed
+# register: oficina              # opcional: registro de tom imposto enquanto a skill
+                                 # está ativa (silencioso|parceiro|oficina|combate|
+                                 # protocolo|confidente); omita para não impor
 tools: []                        # só tool_backed: tools destravadas pela leitura
 env: []                          # só scripted: envs que os scripts esperam no sandbox
 requires: []                     # gates de runtime ("workbench" é implícito p/ scripted)

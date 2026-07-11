@@ -5,6 +5,7 @@ description: >
   valores mais comuns. Use quando o usuário apontar um CSV para entender/resumir.
 keywords: [csv, planilha, dados, coluna, linha, tabela, analise, resumo]
 kind: scripted
+register: oficina
 enabled: true
 version: 1
 ---

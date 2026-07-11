@@ -174,7 +174,9 @@ class PKSService:
         """
         return self.writer.envelope_parser.parse(user_message).is_training
 
-    async def retrieve_system_context(self, *, user_message: str = "") -> str:
+    async def retrieve_system_context(
+        self, *, user_message: str = "", register: str | None = None
+    ) -> str:
         async with self.db.get_session() as session:
             workspace = await self.repository.get_system_workspace(session)
             if not workspace:
@@ -207,7 +209,9 @@ class PKSService:
                     lines.append(f"### {entity_name} [{entity_type}] (Alta Prioridade)")
                 else:
                     lines.append(f"### {entity_name} [{entity_type}]")
-                lines.extend(self._format_system_properties(properties, user_message=user_message))
+                lines.extend(self._format_system_properties(
+                    properties, user_message=user_message, register=register,
+                ))
 
             for extra_type in (SYSTEM_CORRECTION_EXAMPLE_TYPE, SYSTEM_LEARNED_LESSON_TYPE):
                 entities = await self.repository.list_entities_by_type(
@@ -222,7 +226,9 @@ class PKSService:
                     if not isinstance(properties, dict):
                         continue
                     lines.append(f"### {entity.name} [{entity.type}]")
-                    lines.extend(self._format_system_properties(properties, user_message=user_message))
+                    lines.extend(self._format_system_properties(
+                        properties, user_message=user_message, register=register,
+                    ))
 
             agent = await self.repository.get_system_agent_entity(session, workspace["id"])
             if agent:
@@ -243,13 +249,21 @@ class PKSService:
                             lines.append(f"- Procedimento aprendido: {item}")
             return "\n".join(lines)
 
-    def _format_system_properties(self, properties: dict[str, Any], *, user_message: str = "") -> list[str]:
+    def _format_system_properties(
+        self,
+        properties: dict[str, Any],
+        *,
+        user_message: str = "",
+        register: str | None = None,
+    ) -> list[str]:
         lines: list[str] = []
         for key, value in properties.items():
             if isinstance(value, list):
                 for item in value[-8:]:
                     if isinstance(item, dict):
-                        if not self._should_render_training_item(item, user_message=user_message):
+                        if not self._should_render_training_item(
+                            item, user_message=user_message, register=register,
+                        ):
                             continue
                         description = item.get("description") or item.get("rule_description")
                         rule_key = item.get("rule_key")
@@ -310,11 +324,25 @@ class PKSService:
         "salve este aprendizado",
     )
 
-    def _should_render_training_item(self, item: dict[str, Any], *, user_message: str) -> bool:
+    def _should_render_training_item(
+        self,
+        item: dict[str, Any],
+        *,
+        user_message: str,
+        register: str | None = None,
+    ) -> bool:
         description = str(item.get("description") or item.get("rule_description") or "")
         normalized = description.lower()
         if any(fragment in normalized for fragment in self._ENVELOPE_FRAGMENTS):
             return False
+        # Predicado de registro (docs/context-register-plan.md): uma regra
+        # escopada por `registers:` só renderiza dentro dos registros listados.
+        # Sem registro ativo (feature off / caminho sem registro) → renderiza
+        # tudo (fail-open, retrocompatível com o jsonb existente).
+        allowed = item.get("registers")
+        if register and isinstance(allowed, list) and allowed:
+            if register not in {str(r).strip().lower() for r in allowed}:
+                return False
         if item.get("priority") == "high":
             return True
         if not user_message:

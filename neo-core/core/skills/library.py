@@ -48,7 +48,7 @@ _MAX_FILE_BYTES = 256 * 1024
 _EDITABLE_DIRS = ("references", "scripts")
 _EDITABLE_SUFFIXES = frozenset({".md", ".txt", ".py", ".sh", ".json", ".yaml", ".yml", ".csv", ".sql"})
 # Ordem estável do frontmatter gerado (o resto do YAML original é preservado).
-_FRONTMATTER_KEYS = ("name", "description", "keywords", "kind", "tools", "env", "requires", "enabled", "version")
+_FRONTMATTER_KEYS = ("name", "description", "keywords", "kind", "register", "tools", "env", "requires", "enabled", "version")
 _WRITABLE_KINDS = ("instructional", "scripted", "tool_backed")
 
 # Kinds das skills declarativas; "pipeline" é reservado ao merge com os
@@ -75,6 +75,12 @@ class SkillEntry(BaseModel):
     requires: list[str] = []  # gates de runtime (ex.: "workbench")
     enabled: bool = True
     version: int = 1
+    # Registro da situação que esta skill impõe enquanto ativa (ex.: "oficina").
+    # None = não impõe. Aplicado via register_note no resultado do skill_read
+    # (o prompt do turno já foi montado quando a skill é lida). No frontmatter a
+    # chave é ``register:``; o campo se chama ``tone_register`` para não
+    # sombrear ``BaseModel.register``. Ver docs/context-register-plan.md.
+    tone_register: str | None = None
 
     # pipeline-only (nível 4) — preenchidos no merge com SkillManifest (F4).
     intent_type: Any | None = None
@@ -203,6 +209,18 @@ class SkillLibrary:
             # Scripts rodam no sandbox — o require é implícito; injeta e avisa.
             requires.append("workbench")
 
+        # register: inválido não derruba a skill — só avisa e ignora (fail-open).
+        register = str(meta.get("register") or "").strip().lower() or None
+        if register is not None:
+            from core.agent.register import Register
+
+            if register not in {r.value for r in Register}:
+                logger.warning(
+                    "[SkillLibrary] '%s': register inválido %r — ignorado (use um de: %s)",
+                    name, register, ", ".join(r.value for r in Register),
+                )
+                register = None
+
         entry = SkillEntry(
             name=name,
             description=description,
@@ -214,6 +232,7 @@ class SkillLibrary:
             requires=requires,
             enabled=bool(meta.get("enabled", True)),
             version=int(meta.get("version", 1)),
+            tone_register=register,
         )
 
         # tool_backed com tool não registrada: entra no catálogo, mas avisa — a
@@ -317,6 +336,20 @@ class SkillLibrary:
             )
 
         result: dict[str, Any] = {"skill": entry.name, "kind": entry.kind, "content": body}
+        # Registro declarado pela skill: como o prompt do turno já foi montado
+        # quando o modelo chama skill_read, a diretiva pega carona no resultado
+        # da tool (mesma mecânica do tool gating). Só quando a feature está ativa.
+        if entry.tone_register and getattr(self.settings, "neo_register_enabled", False) is True:
+            from core.agent.register import Register, render_register_directive
+
+            try:
+                result["register_note"] = (
+                    f"Desta leitura em diante, o registro da situação é "
+                    f"'{entry.tone_register}'.\n"
+                    + render_register_directive(Register(entry.tone_register))
+                )
+            except ValueError:  # pragma: no cover — validado no load
+                pass
         extras = self._list_extras(entry)
         result.update(extras)
         if entry.kind == "tool_backed" and entry.tools:
@@ -431,6 +464,7 @@ class SkillLibrary:
         env: list[str] | None = None,
         enabled: bool = True,
         version: int = 1,
+        register: str | None = None,
     ) -> SkillEntry:
         """Cria/sobrescreve o SKILL.md de ``name``. Valida antes; recarrega depois.
 
@@ -471,6 +505,16 @@ class SkillLibrary:
         elif tools:
             raise ValueError(f"'tools' só vale para kind=tool_backed (esta é {kind}).")
 
+        register = (register or "").strip().lower() or None
+        if register is not None:
+            from core.agent.register import Register
+
+            if register not in {r.value for r in Register}:
+                raise ValueError(
+                    f"register inválido: {register!r}. "
+                    f"Use um de: {', '.join(r.value for r in Register)}."
+                )
+
         # requires é derivado, não declarado: scripts só rodam no sandbox.
         requires = ["workbench"] if kind == "scripted" else []
 
@@ -490,6 +534,8 @@ class SkillLibrary:
             "enabled": bool(enabled),
             "version": int(version),
         }
+        if register:
+            meta["register"] = register
         if tools:
             meta["tools"] = tools
         if env:

@@ -20,6 +20,15 @@ from uuid import UUID, uuid4
 
 from core.agent.agent_executor import AgentExecutor
 from core.agent.context_selector import PromptContextSelector
+from core.agent.register import (
+    GravityTracker,
+    Register,
+    derive_register,
+    detect_gravity_floor,
+    detect_resolution_cue,
+    max_gravity,
+    render_register_directive,
+)
 from core.llm.router import LLMRouter
 from core.pks import PKSService
 from core.cognitive import CognitiveReadExecutor, cognitive_tools_for
@@ -521,6 +530,11 @@ class AIService:
         # resposta de um client tool (process_tool_result), onde o metadata["mode"]
         # original se perde no round-trip. Atualizado em process_user_input.
         self._live_sessions: set[str] = set()
+        # Registro da situação (docs/context-register-plan.md): gravidade sticky
+        # por sessão (RAM, decai sozinha) + registro do último turno — este último
+        # cobre as continuações (process_tool_result) que perdem o metadata.
+        self._gravity_tracker = GravityTracker()
+        self._session_registers: dict[str, Register] = {}
         self._skill_executor: "SkillExecutor | None" = None
         # Lazily-built HA adapter for the cognitive-core live snapshot injection.
         self._ha_adapter: "HomeAssistantAdapter | None" = None
@@ -536,6 +550,76 @@ class AIService:
         task = asyncio.create_task(coro, name=name)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    def _derive_turn_register(
+        self,
+        *,
+        decision: RoutingDecision,
+        user_message: str,
+        session_id: UUID,
+        live: bool,
+        slog: "SessionFileLogger | None" = None,
+    ) -> Register | None:
+        """Derive this turn's situational register. Fail-open: never raises.
+
+        Returns the register to INJECT, or None when the feature is off or in
+        shadow mode (shadow derives + logs only — calibration before go-live).
+        Also maintains the sticky session gravity (resolution cue clears it;
+        any grave turn refreshes it) and the per-session register used by
+        continuations that lose the original metadata (process_tool_result).
+        """
+        enabled = self.settings.neo_register_enabled is True
+        shadow = getattr(self.settings, "neo_register_shadow", False) is True
+        sid = str(session_id)
+        if not enabled and not shadow:
+            self._session_registers.pop(sid, None)
+            return None
+        try:
+            # Skill-declared register (pipeline manifests; SKILL.md skills
+            # apply mid-turn via skill_read's register_note instead).
+            skill_register: str | None = None
+            skill_name = decision.skill_name or decision.skill_hint
+            if skill_name:
+                from core.skills.manifest import SkillManifest
+
+                manifest = SkillManifest.all().get(skill_name)
+                if manifest is not None:
+                    skill_register = getattr(manifest, "tone_register", "") or None
+
+            # Sticky gravity: an all-clear only counts while the session is
+            # grave (so everyday "voltou" can't clear anything), then this
+            # turn's gravity (classifier + deterministic floor) merges in.
+            if self._gravity_tracker.current(sid) != "normal" and detect_resolution_cue(user_message):
+                self._gravity_tracker.resolve(sid)
+            turn_gravity = max_gravity(decision.gravity, detect_gravity_floor(user_message))
+            session_gravity = self._gravity_tracker.bump(sid, turn_gravity)
+
+            register, reason = derive_register(
+                decision,
+                user_message=user_message,
+                live=live,
+                skill_register=skill_register,
+                session_gravity=session_gravity,
+            )
+            logger.info(
+                "[Register] derived=%s reason=%s gravity=%s mode=%s",
+                register.value, reason, session_gravity,
+                "inject" if enabled else "shadow",
+            )
+            if slog:
+                slog.log_event(
+                    "Registro da Situação",
+                    f"**Registro:** {register.value} "
+                    f"({'injetado' if enabled else 'shadow — não injetado'})\n"
+                    f"**Motivo:** {reason} | **Gravidade da sessão:** {session_gravity}",
+                )
+            if enabled:
+                self._session_registers[sid] = register
+                return register
+            return None
+        except Exception:  # noqa: BLE001 — o registro nunca derruba o turno
+            logger.warning("[Register] derivation failed; turn continues without it", exc_info=True)
+            return None
 
     # ---------------------------------------------------------------
     # Main entry point — called by gRPC controller
@@ -894,6 +978,15 @@ class AIService:
             )
 
         # 6. Dispatch based on intent
+        # Registro da situação (teto de tom) — derivado uma vez por turno, antes
+        # do dispatch, e repassado aos handlers. None = flag off ou shadow mode.
+        register = self._derive_turn_register(
+            decision=decision,
+            user_message=user_message,
+            session_id=sid,
+            live=live,
+            slog=slog,
+        )
         final_response: str | None = None
         dispatch_error: str | None = None
         try:
@@ -913,6 +1006,7 @@ class AIService:
                     saved_msg=saved_msg,
                     allow_clarification=allow_clarification,
                     clarification_round=clarification_round,
+                    register=register,
                 ):
                     if resp.is_final:
                         final_response = resp.message
@@ -933,13 +1027,14 @@ class AIService:
                     source_message_id=str(saved_msg.id) if saved_msg else None,
                     allow_clarification=allow_clarification,
                     clarification_round=clarification_round,
+                    register=register,
                 ):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
 
             elif decision.intent == IntentType.SERVER_TOOL:
-                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, live=live, metadata=metadata):
+                async for resp in self._handle_server_tool(sid, user_message, history, decision, trace, slog=slog, user_id=user_id, live=live, metadata=metadata, register=register):
                     if resp.is_final:
                         final_response = resp.message
                     yield resp
@@ -1072,6 +1167,7 @@ class AIService:
         saved_msg: Any,
         allow_clarification: bool,
         clarification_round: int,
+        register: "Register | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Dispatch the turn through the PipelineOrchestrator.
 
@@ -1133,12 +1229,14 @@ class AIService:
                     allow_clarification=allow_clarification,
                     clarification_round=clarification_round,
                     enable_handoff=handoff_enabled,
+                    register=register,
                 )
             elif intent == IntentType.SERVER_TOOL:
                 gen = self._handle_server_tool(
                     sid, msg, history, dec, trace, slog=slog, user_id=user_id,
                     live=(step_metadata or {}).get("mode") == "live",
                     metadata=step_metadata,
+                    register=register,
                 )
             elif intent == IntentType.CLIENT_TOOL:
                 gen = self._handle_client_tool(
@@ -1210,6 +1308,7 @@ class AIService:
         allow_clarification: bool = True,
         clarification_round: int = 1,
         enable_handoff: bool = False,
+        register: "Register | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM.
 
@@ -1321,6 +1420,7 @@ class AIService:
                 pks_prewrite=pks_prewrite,
                 pks_system_prewrite=pks_system_prewrite,
                 mission_context=None,
+                register=register,
             )
             pks_ms = round((time.monotonic() - t0_ctx) * 1000, 1)
             if slog:
@@ -2419,12 +2519,16 @@ class AIService:
         user_id: UUID | None = None,
         live: bool = False,
         metadata: dict[str, Any] | None = None,
+        register: "Register | None" = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle server-side tool execution using AgentExecutor.
 
         ``live=True`` (turno do modo voz) anexa o estilo de fala ao task para o
         agente responder em texto corrido sem markdown. ``metadata`` carrega
         sinais do cliente (ex: GPS do dispositivo em ``metadata["geo"]``).
+        ``register`` (quando o registro da situação está ativo) anexa a diretiva
+        de tom ao task pelo mesmo mecanismo do modo live — este caminho não passa
+        pelo PromptContextSelector.
         """
 
         if slog:
@@ -2540,6 +2644,11 @@ class AIService:
             # sobrescrever o system prompt, preservando as instruções de tools do agente).
             if live:
                 task = f"{task}\n\n{_LIVE_STYLE_INSTRUCTION}"
+
+            # Registro da situação: mesmo mecanismo do live (sufixo no task),
+            # já que o SERVER_TOOL não passa pelo PromptContextSelector.
+            if register is not None:
+                task = f"{task}\n\n{render_register_directive(register)}"
 
             # Use AgentExecutor for multi-step tool execution
             result = await self.agent.execute(
@@ -2830,6 +2939,7 @@ class AIService:
             slog=slog,
             user_id=user_id,
             metadata=metadata,
+            register=self._session_registers.get(str(session_id)),
         ):
             yield resp
 
@@ -3619,6 +3729,7 @@ class AIService:
                 final_text = await self._format_tool_result(
                     user_message, command or tool_name, raw_output, trace=trace,
                     live=str(session_id) in self._live_sessions,
+                    register=self._session_registers.get(str(session_id)),
                 )
 
             # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
@@ -4633,11 +4744,14 @@ class AIService:
         output: str,
         trace: MessageTrace | None = None,
         live: bool = False,
+        register: "Register | None" = None,
     ) -> str:
         """Use LLM to format tool output into a user-friendly response.
 
         ``live=True`` (turno do modo voz) pede texto corrido sem markdown, já que a
-        resposta será falada por TTS.
+        resposta será falada por TTS. ``register`` anexa a diretiva de tom da
+        situação ao system prompt (continuações recuperam-no de
+        ``_session_registers``, pois o metadata original se perde no round-trip).
         """
         format_rule = (
             "Responda em TEXTO CORRIDO, natural e direto (será falado em voz alta): "
@@ -4655,6 +4769,8 @@ class AIService:
         )
 
         system_msg = "Você é Neo, um assistente de desktop. Responda de forma clara e concisa em português."
+        if register is not None:
+            system_msg = f"{system_msg}\n\n{render_register_directive(register)}"
         messages = [
             Message(role=MessageRole.SYSTEM, content=system_msg),
             Message(role=MessageRole.USER, content=prompt),
