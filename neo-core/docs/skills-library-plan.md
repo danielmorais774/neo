@@ -1,6 +1,26 @@
 # Plano — Biblioteca de Skills do Neo (do `.md` puro ao pipeline Python)
 
-> Status: PLANEJADO (pronto para implementar) · Autor: Claude + Daniel · 2026-07-08
+> Status: **IMPLEMENTADO (F1–F4) em 2026-07-08** · Autor: Claude + Daniel
+>
+> Desvios do plano na implementação:
+> - `skill_list` fica SEMPRE no read set (schema ~50 tokens; plumbing condicional
+>   não valia a complexidade). O catálogo diz quando usá-la.
+> - Router: prefixos `skill_`/`sql_` adicionados a `_SKILL_OWNED_TOOL_PREFIXES`
+>   (as tools da biblioteca nunca aparecem no palette do classificador).
+> - `sql_query_ro`: além do plano, a sessão roda com
+>   `default_transaction_read_only=on` (defesa mesmo sem a role `neo_ro`) e o
+>   validador bloqueia funções mutantes chamáveis de SELECT (`set_config`,
+>   `pg_terminate_backend`, `dblink*`, …). Role dedicada continua recomendada.
+> - Factory do SkillExecutor: em vez de dict de factories, o manifest declara
+>   `pipeline_factory="modulo:Classe"`; import lazy + kwargs filtrados por
+>   assinatura (`inspect.signature`).
+> - Skills exemplo embarcadas: `diagnostico-voz` (instructional),
+>   `analise-csv` (scripted) e `postgres-neo` (tool_backed, com
+>   `references/schema.md`).
+> - Aba Skills do neo-panel (F4 item 7) IMPLEMENTADA e ampliada: não é só
+>   listar/ligar/desligar — é CRUD dos 3 níveis declarativos. Ver §13.
+> - Pendências de deploy (VPS): `docker compose up -d neo-workbench` (mount novo
+>   `/skills:ro`); opcional criar role `neo_ro` + `SQLRO_DSN` no `.env`.
 >
 > Objetivo: um sistema ÚNICO de skills que vai da mais simples (um `SKILL.md` com
 > instruções) à mais complexa (pipeline Python com código próprio), com o núcleo
@@ -388,7 +408,7 @@ Critério de aceite: com a flag on, um turno "como eu diagnostico a voz?" gera
 | 4 | `core/router/intent_router.py` | `_format_skills()` só pipelines + seção §7.2 gerada do registry |
 | 5 | `core/skills/skill_executor.py` | factory por registro (dict) em vez de `if/elif` |
 | 6 | hot-reload | `maybe_reload()` no início de `catalog_note()` (mtime do dir — de graça em dev e na VPS, que monta o código) |
-| 7 | (opcional) neo-panel | aba "Skills": listar, ver corpo, enable/disable (persistir override em config DB) |
+| 7 | neo-panel | aba "Skills" — virou CRUD completo, ver §13 |
 
 ---
 
@@ -476,3 +496,51 @@ skills_router_note_enabled: bool = True  # F4
 | Corpo relido a cada turno de uma tarefa longa | aceito no MVP; session pinning como follow-up (F4+) |
 | Classificador manda assunto de skill p/ CLIENT_TOOL | seção §7.2 no router prompt (F4); até lá, o default-to-brain do router já cobre a maioria |
 | Tool gating confunde o modelo (tool "aparece" no meio) | o retorno do skill_read anuncia explicitamente as tools destravadas |
+
+---
+
+## 13. Aba Skills do neo-panel (F4 item 7)
+
+O painel virou o caminho normal de autoria: dos 4 níveis, os 3 declarativos
+nascem de um `SKILL.md` e portanto podem ser criados pela web. Nível 4 aparece
+read-only (é pacote Python).
+
+| Nível | No painel |
+|---|---|
+| `instructional` | criar, editar, ligar/desligar, apagar |
+| `scripted` | idem + editor de `scripts/*.py` (o require `workbench` é derivado, não digitado) |
+| `tool_backed` | idem, com as tools escolhidas num seletor do `ToolRegistry` — tool nova continua exigindo código |
+| `pipeline` | listado, read-only |
+
+### Peças
+
+- `core/skills/library.py` — `write_skill`, `set_enabled`, `delete_skill`,
+  `read_source`, `list_files`, `read_file`, `write_file`, `delete_file`,
+  `errors()`, `is_available()`. **A validação de escrita é a mesma do loader**:
+  o painel não consegue gravar uma skill que o boot recusaria (teste
+  `test_failed_write_leaves_no_partial_skill` e amigos).
+- `api/routes/skills.py` — CRUD atrás do `require_panel_jwt`, traduzindo
+  `ValueError` → HTTP 400. `GET /skills/catalog` devolve a nota que o cognitivo
+  injeta + estimativa de tokens (hoje ~340 com 3 skills).
+- `neo-panel/src/SkillsPanel.tsx` — lista, editor de frontmatter + corpo,
+  editor de arquivos, banner das skills puladas no load.
+
+### Decisões que valem lembrar
+
+- **Fonte da verdade continua o arquivo.** `enabled` é o `enabled:` do
+  frontmatter, não um override em DB: uma fonte só, e o hot-reload por mtime já
+  publica a mudança no turno seguinte, sem restart.
+- **Escrita atômica** (`tmp` + `os.replace`): o `maybe_reload()` nunca lê meio
+  arquivo.
+- **`requires` é derivado do `kind`**, nunca vem do cliente (`scripted` →
+  `workbench`).
+- **Allowlist de escrita**: só `references/<f>` e `scripts/<f>`, um nível, com
+  extensão em `_EDITABLE_SUFFIXES`. `SKILL.md` só via `write_skill` (validado).
+  `_resolve_writable` é mais estrito que o `_resolve_inside` (que só lê).
+- **Skill quebrada continua editável**: `read_source` devolve corpo +
+  `parse_error` mesmo com YAML inválido — senão um `SKILL.md` mal editado só
+  seria consertável por SSH. Em compensação, `set_enabled` se recusa a
+  reescrever um frontmatter que não parseou (apagaria o que o operador precisa
+  ver).
+- Chaves de frontmatter escritas à mão que o painel não conhece são
+  **preservadas** na edição.

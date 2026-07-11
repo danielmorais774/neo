@@ -150,6 +150,50 @@ class Settings(BaseSettings):
         description="Timeout padrão (s) de um job de sandbox em background.",
     )
 
+    # Skills Library — skills declarativas SKILL.md (docs/skills-library-plan.md)
+    skills_library_enabled: bool = Field(
+        default=True,
+        description="Liga a biblioteca de skills declarativas (SKILL.md): catálogo "
+        "no prompt cognitivo + tools skill_read/skill_list. Set false para "
+        "restaurar o comportamento anterior.",
+    )
+    skills_library_path: str = Field(
+        default="/app/skills",
+        description="Diretório raiz das skills declarativas (cada uma em "
+        "<name>/SKILL.md). No container, ./neo-core/skills montado em /app/skills.",
+    )
+    skills_catalog_max_entries: int = Field(
+        default=30, ge=1, le=200,
+        description="Máximo de skills no catálogo do prompt cognitivo; acima disso "
+        "o catálogo é prefiltrado por keywords da mensagem (skill_list cobre o resto).",
+    )
+    skill_read_max_bytes: int = Field(
+        default=16_384, ge=1_024,
+        description="Teto de bytes devolvidos por skill_read (corpo ou reference).",
+    )
+    skills_router_note_enabled: bool = Field(
+        default=True,
+        description="Injeta no prompt do classificador a lista de assuntos "
+        "cobertos por skills do cérebro (→ DIRECT_RESPONSE), evitando misroute "
+        "para CLIENT_TOOL/run_command.",
+    )
+
+    # SQL read-only (skill postgres-neo — tool gated via skills library)
+    sqlro_dsn: str = Field(
+        default="",
+        description="DSN asyncpg para sql_query_ro (ideal: role só-leitura, ex. "
+        "postgresql://neo_ro:...@neo-postgres:5432/neodb). Vazio → usa database_url; "
+        "a sessão roda com default_transaction_read_only=on em ambos os casos.",
+    )
+    sqlro_statement_timeout_ms: int = Field(
+        default=5_000, ge=100, le=60_000,
+        description="statement_timeout (ms) da sessão sql_query_ro.",
+    )
+    sqlro_max_rows: int = Field(
+        default=200, ge=1, le=2_000,
+        description="Teto absoluto de linhas devolvidas por sql_query_ro.",
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://neo:neo@localhost:5432/neodb",

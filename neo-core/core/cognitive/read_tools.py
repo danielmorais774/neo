@@ -20,6 +20,7 @@ from modules.config.tools import CONFIG_TOOLS
 from modules.devices.tools import DEVICES_TOOLS
 from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
+from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
 from shared import ToolCall, ToolResult, ToolSchema
@@ -44,10 +45,16 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     # Read-only config introspection (what's configurable / a setting's value).
     _by_name(CONFIG_TOOLS, "config_get"),
     _by_name(CONFIG_TOOLS, "config_list"),
+    # Skills library (docs/skills-library-plan.md): read a skill's instructions /
+    # list the catalog. Pure reads; gated at call time by skills_library_enabled.
+    _by_name(SKILLS_LIBRARY_TOOLS, "skill_read"),
+    _by_name(SKILLS_LIBRARY_TOOLS, "skill_list"),
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
 _USER_SCOPED = frozenset({"search_pks", "list_connected_devices", "get_user_location"})
+
+_SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
 
 
 def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
@@ -55,10 +62,16 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
 
     Without a user, user-scoped tools are withheld (the model can't usefully read
     a specific user's PKS/devices), leaving only global reads like get_weather.
+    Skills-library tools are withheld when the feature flag is off.
     """
+    from shared.config import get_settings
+
+    tools = list(COGNITIVE_READ_TOOLS)
+    if not get_settings().skills_library_enabled:
+        tools = [t for t in tools if t.name not in _SKILLS_LIBRARY_TOOL_NAMES]
     if user_id is None:
-        return [t for t in COGNITIVE_READ_TOOLS if t.name not in _USER_SCOPED]
-    return list(COGNITIVE_READ_TOOLS)
+        tools = [t for t in tools if t.name not in _USER_SCOPED]
+    return tools
 
 
 class CognitiveReadExecutor:

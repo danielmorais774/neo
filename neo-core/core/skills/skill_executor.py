@@ -62,7 +62,9 @@ class SkillExecutor:
         Returns:
             SkillResult with outcome details
         """
-        manifest = SkillManifest.get(skill_name)
+        # Valida a skill (via alias quando houver, ex. whatsapp_order) antes de
+        # instanciar o pipeline — erro claro em vez de import quebrado.
+        SkillManifest.get(self._SKILL_ALIASES.get(skill_name, skill_name))
         pipeline = self._create_pipeline(skill_name)
 
         logger.info(
@@ -95,34 +97,45 @@ class SkillExecutor:
                 user_id=resolved_user_id,
             )
 
-    def _create_pipeline(self, skill_name: str) -> Any:
-        """Factory: create pipeline instance for a skill.
+    # Aliases de roteamento: nomes alternativos que resolvem para o mesmo manifest.
+    _SKILL_ALIASES = {"whatsapp_order": "whatsapp_messaging"}
 
-        Import pipeline class dynamically to avoid circular imports.
+    def _create_pipeline(self, skill_name: str) -> Any:
+        """Factory data-driven: resolve a classe via ``manifest.pipeline_factory``.
+
+        O manifest é a fonte única (F4 — docs/skills-library-plan.md): uma skill
+        pipeline nova só declara ``pipeline_factory="pacote.pipeline:Classe"`` no
+        seu SkillManifest. O import é LAZY (evita ciclos, como antes) e os kwargs
+        injetados são FILTRADOS pela assinatura do __init__ da classe — por isso
+        pipelines com dependências diferentes (ex. whatsapp usa ``pks``) coexistem
+        sem if/elif aqui.
         """
-        if skill_name in ("whatsapp_messaging", "whatsapp_order"):
-            from core.skills.whatsapp_messaging.pipeline import WhatsAppMessagingPipeline
-            return WhatsAppMessagingPipeline(
-                agent_executor=self.agent_executor,
-                db=self.db,
-                broker=self.broker,
-                pks=self.pks,
+        import importlib
+        import inspect
+
+        resolved = self._SKILL_ALIASES.get(skill_name, skill_name)
+        try:
+            manifest = SkillManifest.get(resolved)
+        except KeyError:
+            raise KeyError(f"No pipeline found for skill '{skill_name}'")
+        factory_path = (manifest.pipeline_factory or "").strip()
+        if ":" not in factory_path:
+            raise KeyError(
+                f"Skill '{resolved}' sem pipeline_factory no manifest — "
+                "declare 'modulo.pipeline:Classe' para torná-la executável."
             )
-        if skill_name == "home_assistant":
-            from core.skills.home_assistant.pipeline import HomeAssistantPipeline
-            return HomeAssistantPipeline(
-                agent_executor=self.agent_executor,
-                db=self.db,
-                broker=self.broker,
-            )
-        if skill_name == "music":
-            from core.skills.music.pipeline import MusicPipeline
-            return MusicPipeline(
-                agent_executor=self.agent_executor,
-                db=self.db,
-                broker=self.broker,
-            )
-        raise KeyError(f"No pipeline found for skill '{skill_name}'")
+        module_name, _, class_name = factory_path.partition(":")
+        pipeline_cls = getattr(importlib.import_module(module_name), class_name)
+
+        candidates = {
+            "agent_executor": self.agent_executor,
+            "db": self.db,
+            "broker": self.broker,
+            "pks": self.pks,
+        }
+        params = inspect.signature(pipeline_cls.__init__).parameters
+        kwargs = {k: v for k, v in candidates.items() if k in params}
+        return pipeline_cls(**kwargs)
 
 
 import asyncio  # noqa: E402

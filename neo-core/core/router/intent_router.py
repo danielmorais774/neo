@@ -211,6 +211,10 @@ _MEDIA_QUESTION_STARTS = ("tem ", "tem alguma", "existe ", "ta aberta", "tao abe
 # use them. See docs/workbench-background-jobs-plan.md.
 _SKILL_OWNED_TOOL_PREFIXES = (
     "ha_", "whatsapp_", "spotify_", "youtube_", "neo_", "job_", "schedule_",
+    # Skills library (docs/skills-library-plan.md): skill_read/skill_list são do
+    # tool loop do cognitivo, e as tools "gated" (sql_*) só existem DEPOIS de o
+    # cérebro ler a skill — o classificador nunca as vê nem roteia para elas.
+    "skill_", "sql_",
 )
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
@@ -404,12 +408,16 @@ class IntentRouter:
         llm_router: LLMRouter,
         tool_registry: ToolRegistry,
         db: Any | None = None,
+        skill_library: Any | None = None,
     ) -> None:
         self.llm_router = llm_router
         self.tool_registry = tool_registry
         # Optional DB handle used to resolve the configurable classifier
         # provider/model (modules.intent_config). None → static default.
         self.db = db
+        # SkillLibrary (docs/skills-library-plan.md): fonte da seção "assuntos com
+        # skill do cérebro → DIRECT_RESPONSE" no prompt do classificador.
+        self.skill_library = skill_library
 
     async def _resolve_classifier(self) -> tuple[str, str]:
         """Resolve the (provider, model) used to classify intent.
@@ -530,6 +538,12 @@ class IntentRouter:
             skills=skills_desc or "(none registered yet)",
         )
 
+        # Assuntos cobertos por skills .md do cérebro → DIRECT_RESPONSE (evita o
+        # classificador mandar "consulta o banco" para run_command/CLIENT_TOOL).
+        brain_note = self._skills_brain_note()
+        if brain_note:
+            base_prompt += f"\n\n{brain_note}"
+
         # Inject system context (OS, paths) when provided by the client
         if system_context:
             base_prompt += f"\n\n## Contexto do Sistema do Usuário\n{system_context}"
@@ -618,6 +632,25 @@ class IntentRouter:
             )
             lines.append(f"- {t.name}: {t.description} ({params_desc})")
         return "\n".join(lines)
+
+    def _skills_brain_note(self) -> str | None:
+        """Nota "assuntos com skill do cérebro" gerada pela SkillLibrary.
+
+        None quando a library está ausente/vazia ou a flag está off — o prompt
+        fica idêntico ao anterior (comportamento fail-safe).
+        """
+        library = getattr(self, "skill_library", None)
+        if library is None:
+            return None
+        from shared.config import get_settings
+
+        if not get_settings().skills_router_note_enabled:
+            return None
+        try:
+            return library.router_note()
+        except Exception as e:  # noqa: BLE001 — classificação nunca quebra por isso
+            logger.warning("[SkillLibrary] router_note falhou: %s", e)
+            return None
 
     def _format_skills(self) -> str:
         """Format registered skills for the system prompt."""

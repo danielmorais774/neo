@@ -139,7 +139,10 @@ async def test_config_get_engine_default_when_absent():
     ex = _executor()
     out = await ex.execute("config_get", {"setting": "tts.engine"})
     assert out["ok"] is True and out["current"]  # falls back to settings default engine
-    assert set(out["options"]) == {"qwen", "coqui", "dia"}
+    # Options mirror the live backend list (modules.voice.catalog.BACKENDS) so a
+    # new engine never silently breaks this test again.
+    from modules.voice.catalog import BACKENDS
+    assert set(out["options"]) == set(BACKENDS)
 
 
 @pytest.mark.asyncio

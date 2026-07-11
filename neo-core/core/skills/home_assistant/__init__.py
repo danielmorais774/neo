@@ -23,6 +23,8 @@ home_assistant_manifest = SkillManifest(
         "ha_call_service",
         "ha_rename_entity",
     ],
+    handoff_line="controlar a casa (luzes, tomadas, clima, persianas, cenas).",
+    pipeline_factory="core.skills.home_assistant.pipeline:HomeAssistantPipeline",
 )
 
 home_assistant_manifest.register()

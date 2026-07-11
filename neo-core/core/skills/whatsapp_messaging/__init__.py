@@ -29,6 +29,8 @@ whatsapp_messaging_manifest = SkillManifest(
         "whatsapp_list_contacts",
         "whatsapp_notify_user",
     ],
+    handoff_line="enviar mensagem de WhatsApp (passa por confirmação).",
+    pipeline_factory="core.skills.whatsapp_messaging.pipeline:WhatsAppMessagingPipeline",
 )
 
 whatsapp_messaging_manifest.register()

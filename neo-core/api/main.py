@@ -42,7 +42,7 @@ for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify, skills
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -210,6 +210,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from core.skills.home_assistant import home_assistant_manifest  # noqa: F401
     from core.skills.music import music_manifest  # noqa: F401
 
+    # ── Skills Library — skills declarativas SKILL.md ─────────────
+    # Catálogo de 1 linha/skill no prompt cognitivo + corpo sob demanda via
+    # skill_read (progressive disclosure). Ver docs/skills-library-plan.md.
+    _skill_library = None
+    if settings.skills_library_enabled:
+        from core.skills.library import SkillLibrary
+        from modules.skills_library import SKILLS_LIBRARY_TOOLS, SkillsLibraryExecutor
+
+        _skill_library = SkillLibrary(
+            root=settings.skills_library_path,
+            settings=settings,
+            tool_registry=_tool_registry,
+        )
+        _skill_library.load()
+        _tool_registry.register_many(SKILLS_LIBRARY_TOOLS)
+        _tool_executor.register_module_executor(
+            "skills_library", SkillsLibraryExecutor(_skill_library)
+        )
+
+        # Tools "gated" por skill (tool_backed): registradas no executor/registry
+        # globais para despachar, mas FORA do read set default — o cognitivo só
+        # as vê depois de skill_read (tool gating no _run_cognitive_tool_loop).
+        from modules.sqlro import SQLRO_TOOLS, SqlRoExecutor
+
+        _tool_registry.register_many(SQLRO_TOOLS)
+        _tool_executor.register_module_executor("sqlro", SqlRoExecutor(settings))
+        app.state.skill_library = _skill_library
+        print(
+            f"✅ Skills library ready ({len(_skill_library.all())} skill(s) "
+            f"from {settings.skills_library_path})"
+        )
+
     # ── New AI pipeline ───────────────────────────────────────────
     embedding_service = EmbeddingService()
     # Pre-warm embedding model so the first user request doesn't pay the cold-start cost (~8s)
@@ -228,7 +260,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         hybrid_search=hybrid_search,
         token_counter=token_counter,
     )
-    intent_router = IntentRouter(llm_router=_llm_router, tool_registry=_tool_registry, db=_db)
+    intent_router = IntentRouter(
+        llm_router=_llm_router, tool_registry=_tool_registry, db=_db,
+        skill_library=_skill_library,
+    )
     preference_extractor = PreferenceExtractor(llm_router=_llm_router, db=_db)
 
     # ── Personal Knowledge Store ─────────────────────────────────
@@ -283,6 +318,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pks=_pks,
         context_selector=context_selector,
         job_manager=_job_manager,
+        skill_library=_skill_library,
     )
 
     # ── Skills + Notifications ─────────────────────────────────────
@@ -334,6 +370,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire Spotify OAuth route (neo-panel → Music page)
     spotify.set_dependencies(_db)
+
+    # Wire skills route (neo-panel → Skills page). _skill_library é None quando
+    # a flag está off — a rota responde 503 em vez de sumir.
+    skills.set_dependencies(_skill_library, _tool_registry)
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
@@ -436,6 +476,7 @@ app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
 # identity is bound via a signed `state`. See api/routes/spotify.py.
 app.include_router(spotify.router, prefix="/api/v1")

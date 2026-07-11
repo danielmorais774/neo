@@ -8,7 +8,14 @@ from shared.types import IntentType
 
 
 class SkillManifest(BaseModel):
-    """Manifest describing a skill — used for registration and routing."""
+    """Manifest describing a skill — used for registration and routing.
+
+    Nível 4 ("pipeline") da taxonomia de skills (docs/skills-library-plan.md).
+    Os campos de unificação abaixo fazem deste manifest a fonte única para o
+    handoff parser (``handoff``), a instrução de handoff do cognitivo
+    (``handoff_line``) e a factory do SkillExecutor (``pipeline_factory``) —
+    uma skill pipeline nova não precisa mais editar esses três lugares.
+    """
 
     name: str
     description: str
@@ -16,6 +23,17 @@ class SkillManifest(BaseModel):
     intent_type: IntentType
     tool_names: list[str] = []  # tool names this skill uses
     version: str = "1.0.0"
+
+    # --- unificação com a biblioteca de skills ---
+    kind: str = "pipeline"
+    # Pode ser alvo de [[HANDOFF:<name>]] do núcleo cognitivo?
+    handoff: bool = True
+    # Linha desta skill na instrução de handoff (curta, em PT). Vazio → usa description.
+    handoff_line: str = ""
+    # Caminho pontilhado "modulo.submodulo:Classe" do pipeline. O SkillExecutor
+    # importa LAZY (na primeira execução) e injeta só os kwargs que o __init__
+    # da classe declara (agent_executor/db/broker/pks).
+    pipeline_factory: str = ""
 
     # Registry of all skills — populated by SkillRegistry
     _registry: ClassVar[dict[str, "SkillManifest"]] = {}

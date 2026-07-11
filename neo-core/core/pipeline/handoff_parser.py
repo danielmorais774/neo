@@ -19,12 +19,30 @@ from shared.types import IntentType
 
 logger = logging.getLogger(__name__)
 
-# Map the skill name written inside the block to its routable intent.
-_SKILL_TO_INTENT: dict[str, IntentType] = {
+# Static fallback: the three built-in pipeline skills. The live map is built in
+# _skill_intent_map() from the SkillManifest registry (fonte única — F4 do
+# docs/skills-library-plan.md), so a new pipeline skill only declares its
+# manifest; this dict guarantees handoffs keep working even if no manifest was
+# imported (e.g. bare unit tests).
+_SKILL_TO_INTENT_STATIC: dict[str, IntentType] = {
     "home_assistant": IntentType.HOME_ASSISTANT,
     "whatsapp_messaging": IntentType.WHATSAPP_MESSAGING,
     "music": IntentType.MUSIC,
 }
+
+
+def _skill_intent_map() -> dict[str, IntentType]:
+    """Fallback estático + manifests pipeline registrados (handoff=True)."""
+    mapping = dict(_SKILL_TO_INTENT_STATIC)
+    try:
+        from core.skills.manifest import SkillManifest
+
+        for name, manifest in SkillManifest.all().items():
+            if getattr(manifest, "handoff", True) and manifest.intent_type is not None:
+                mapping[name] = manifest.intent_type
+    except Exception as e:  # noqa: BLE001 — parsing de handoff nunca pode quebrar
+        logger.warning("[HANDOFF] manifest registry unavailable, using static map: %s", e)
+    return mapping
 
 _HANDOFF_RE = re.compile(
     r"\[\[\s*HANDOFF\s*:\s*([a-zA-Z_]+)\s*\]\](.*?)\[\[\s*/\s*HANDOFF\s*\]\]",
@@ -60,10 +78,11 @@ def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
         return text, []
 
     handoffs: list[Handoff] = []
+    skill_to_intent = _skill_intent_map()
     for match in _HANDOFF_RE.finditer(text):
         skill = match.group(1).strip().lower()
         input_text = _clean_order(match.group(2) or "")
-        intent = _SKILL_TO_INTENT.get(skill)
+        intent = skill_to_intent.get(skill)
         if intent is None:
             logger.warning("[HANDOFF] unknown skill in block, dropping: %r", skill)
             continue

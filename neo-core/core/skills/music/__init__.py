@@ -28,6 +28,8 @@ music_manifest = SkillManifest(
         "spotify_control",
         "youtube_search",
     ],
+    handoff_line="tocar música no Spotify/YouTube (passe a faixa/artista concretos).",
+    pipeline_factory="core.skills.music.pipeline:MusicPipeline",
 )
 
 music_manifest.register()

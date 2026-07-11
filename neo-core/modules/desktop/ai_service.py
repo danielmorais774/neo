@@ -165,7 +165,7 @@ def _is_memory_verification_request(text: str) -> bool:
 # Pipeline handoff (Phase 2): the cognitive core may decide, after reasoning over
 # the PKS/context, that a concrete action must run via a skill. It appends a control
 # block that the user never sees; the orchestrator parses it and chains the skill.
-_HANDOFF_INSTRUCTION = (
+_HANDOFF_INSTRUCTION_HEADER = (
     "## Acionar uma skill (handoff)\n"
     "Você é o núcleo cognitivo do Neo. Se, DEPOIS de analisar o contexto/PKS, você "
     "concluir que uma AÇÃO concreta deve ser executada agora por uma skill, escreva "
@@ -175,16 +175,46 @@ _HANDOFF_INSTRUCTION = (
     "NUNCA escreva a palavra \"ordem\" nem os sinais `< >` dentro do bloco — vá a ação "
     "de verdade.\n\n"
     "Skills disponíveis:\n"
-    "- `home_assistant`: controlar a casa (luzes, tomadas, clima, persianas, cenas).\n"
-    "- `whatsapp_messaging`: enviar mensagem de WhatsApp (passa por confirmação).\n"
-    "- `music`: tocar música no Spotify/YouTube (passe a faixa/artista concretos).\n\n"
-    "Regras:\n"
+)
+
+_HANDOFF_INSTRUCTION_RULES = (
+    "\nRegras:\n"
     "- O texto dentro do bloco deve ser uma ordem COMPLETA e sem ambiguidade "
     "(ex.: \"ligar o ar-condicionado do quarto\"), porque a skill NÃO vê esta conversa.\n"
     "- Só emita o bloco se a ação realmente deve acontecer agora — inclusive quando o "
     "usuário condiciona (\"se eu costumo, pode ligar\") e o contexto confirma que sim.\n"
     "- Se não há nada a executar, não escreva nenhum bloco."
 )
+
+# Fallback estático (idêntico ao texto gerado pelos 3 manifests embutidos) para
+# quando o registry estiver vazio — ex.: unit tests que não importam os pacotes.
+_HANDOFF_SKILL_LINES_FALLBACK = (
+    "- `home_assistant`: controlar a casa (luzes, tomadas, clima, persianas, cenas).\n"
+    "- `whatsapp_messaging`: enviar mensagem de WhatsApp (passa por confirmação).\n"
+    "- `music`: tocar música no Spotify/YouTube (passe a faixa/artista concretos).\n"
+)
+
+
+def _build_handoff_instruction() -> str:
+    """Instrução de handoff com a lista de skills vinda dos SkillManifest.
+
+    Fonte única (F4 — docs/skills-library-plan.md): uma skill pipeline nova com
+    ``handoff=True`` entra aqui automaticamente via ``handoff_line``.
+    """
+    lines = ""
+    try:
+        from core.skills.manifest import SkillManifest
+
+        for name, manifest in sorted(SkillManifest.all().items()):
+            if not getattr(manifest, "handoff", True):
+                continue
+            desc = (manifest.handoff_line or manifest.description).strip()
+            lines += f"- `{name}`: {desc}\n"
+    except Exception as e:  # noqa: BLE001 — a instrução nunca pode faltar
+        logger.warning("[HANDOFF] manifest registry unavailable for instruction: %s", e)
+    if not lines:
+        lines = _HANDOFF_SKILL_LINES_FALLBACK
+    return _HANDOFF_INSTRUCTION_HEADER + lines + _HANDOFF_INSTRUCTION_RULES
 
 # Workbench: the cognitive core has its OWN execution environment (a sandboxed
 # Linux with internet + a persistent /workspace). Injected on cognitive turns when
@@ -200,7 +230,9 @@ _WORKBENCH_INSTRUCTION = (
     "código/scripts: cálculos, processar dados, baixar e analisar um arquivo, gerar "
     "algo, testar uma ideia. É a SUA máquina — não a do usuário (para a máquina "
     "dele existe `run_command`). Reaproveite scripts que você já criou (liste o "
-    "/workspace antes). Depois de rodar, explique o resultado ao usuário em "
+    "/workspace antes). Skills com scripts prontos ficam montadas em /skills "
+    "(read-only) — use os caminhos que o skill_read te der, não reescreva o "
+    "script. Depois de rodar, explique o resultado ao usuário em "
     "linguagem natural; não cole saídas cruas enormes. Para trabalho demorado, "
     "prefira rodar em background (quando disponível) e avise que vai avisar ao "
     "terminar — não segure a conversa esperando."
@@ -466,6 +498,7 @@ class AIService:
         pks: PKSService | None = None,
         context_selector: PromptContextSelector | None = None,
         job_manager: Any = None,
+        skill_library: Any = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -480,6 +513,9 @@ class AIService:
         self.context_selector = context_selector
         # JobManager — background jobs (workbench). None disables neo_bash_background/job_*.
         self.job_manager = job_manager
+        # SkillLibrary — skills declarativas SKILL.md (docs/skills-library-plan.md).
+        # None (flag off) → sem catálogo no prompt e sem tool gating.
+        self.skill_library = skill_library
         self._pending_traces: dict[str, MessageTrace] = {}
         # Sessões cujo último turno veio do modo Live — usado para estilizar a
         # resposta de um client tool (process_tool_result), onde o metadata["mode"]
@@ -1333,7 +1369,7 @@ class AIService:
             if decision.skill_hint == "music":
                 messages.append(Message(role=MessageRole.SYSTEM, content=_MUSIC_HANDOFF_INSTRUCTION))
             else:
-                messages.append(Message(role=MessageRole.SYSTEM, content=_HANDOFF_INSTRUCTION))
+                messages.append(Message(role=MessageRole.SYSTEM, content=_build_handoff_instruction()))
 
         # Workbench: tell the brain it has its own sandbox to write/run code when no
         # specific tool fits. Training turns get no tools, so skip the note there too.
@@ -1343,6 +1379,24 @@ class AIService:
             and not is_neo_training
         ):
             messages.append(Message(role=MessageRole.SYSTEM, content=_WORKBENCH_INSTRUCTION))
+
+        # Skills library: catálogo de 1 linha por skill (nível 0 da progressive
+        # disclosure) — o corpo só é pago quando o modelo chama skill_read. Sem
+        # tools (flag off / treino) a nota seria uma promessa vazia, então segue o
+        # mesmo gate do read set. Ver docs/skills-library-plan.md.
+        if (
+            self.skill_library is not None
+            and self.settings.skills_library_enabled
+            and self.settings.cognitive_tools_enabled
+            and not is_neo_training
+        ):
+            try:
+                _skills_note = self.skill_library.catalog_note(user_message)
+            except Exception as e:  # noqa: BLE001 — catálogo nunca derruba o turno
+                logger.warning("[SkillLibrary] catalog_note falhou: %s", e)
+                _skills_note = None
+            if _skills_note:
+                messages.append(Message(role=MessageRole.SYSTEM, content=_skills_note))
 
         # Real-time view of what's open/playing — injected on ANY cognitive turn when
         # media is open, so the brain can control it ("pausa", "próxima") AND answer
@@ -1841,6 +1895,11 @@ class AIService:
         max_rounds = self.settings.cognitive_max_tool_rounds
         seen: set[tuple[str, str]] = set()
         final_text = ""
+        # Cópia mutável: skill_read pode DESTRAVAR tools de uma skill tool_backed
+        # (tool gating — docs/skills-library-plan.md), estendendo o toolset dos
+        # rounds seguintes sem pagar o schema delas antes da leitura.
+        tools = list(tools or [])
+        skill_library = getattr(self, "skill_library", None)
 
         for round_idx in range(max_rounds + 1):
             round_tools = tools if (tools and round_idx < max_rounds) else None
@@ -1891,6 +1950,23 @@ class AIService:
                     result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
                 else:
                     result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
+                # Tool gating: ler uma skill tool_backed destrava as tools dela
+                # para os próximos rounds deste turno (e só deste turno).
+                if tc.name == "skill_read" and not tr.error and skill_library is not None:
+                    try:
+                        unlocked = skill_library.tools_for(str(tc.arguments.get("name", "")))
+                    except Exception as e:  # noqa: BLE001 — gating nunca derruba o turno
+                        logger.warning("[SkillLibrary] tools_for falhou: %s", e)
+                        unlocked = []
+                    have = {t.name for t in tools}
+                    fresh = [t for t in unlocked if t.name not in have]
+                    if fresh:
+                        tools.extend(fresh)
+                        if slog:
+                            slog.log_event(
+                                "Skill tools destravadas",
+                                ", ".join(f"`{t.name}`" for t in fresh),
+                            )
                 if slog:
                     slog.log_event(
                         "Cognitive Tool Result",
