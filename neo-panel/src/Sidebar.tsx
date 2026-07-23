@@ -1,27 +1,64 @@
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import Icon, { type IconName } from './ui/Icon';
 
 interface NavItem {
   path: string;
   label: string;
-  icon: string;
+  icon: IconName;
 }
 
-const NAV_ITEMS: NavItem[] = [
-  { path: '/whatsapp-status', label: 'WhatsApp Status', icon: '🔑' },
-  { path: '/whatsapp', label: 'WhatsApp', icon: '📱' },
-  { path: '/debug', label: 'Debug', icon: '🔬' },
-  { path: '/session-logs', label: 'Session Logs', icon: '📝' },
-  { path: '/vision', label: 'Vision', icon: '🎬' },
-  { path: '/frame', label: 'Frame', icon: '🔍' },
-  { path: '/knowledge-graph', label: 'Knowledge Graph', icon: '🕸️' },
-  { path: '/missions', label: 'Missões', icon: '📋' },
-  { path: '/devices', label: 'Dispositivos', icon: '💻' },
-  { path: '/logs', label: 'Logs', icon: '📋' },
-  { path: '/letta', label: 'Letta', icon: '🤖' },
-  { path: '/pks', label: 'PKS', icon: '🧠' },
-  { path: '/pks-context', label: 'PKS Context', icon: '🔍' },
-  { path: '/settings', label: 'Config', icon: '⚙️' },
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+/*
+ * A lista era plana e tinha 18 itens. O corte aqui é por natureza da tela:
+ * o que se usa no dia a dia (operação), o que é a cabeça do neo (mente), o que
+ * se olha quando algo quebra (diagnóstico) e o que se configura uma vez
+ * (sistema). WhatsApp deixou de existir como três entradas separadas — o QR
+ * virou Config › Conexões (é setup), e conversas + missões viraram Comunicação.
+ */
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: 'Operação',
+    items: [
+      { path: '/chat', label: 'Chat', icon: 'robot' },
+      { path: '/comunicacao', label: 'Comunicação', icon: 'chat' },
+      { path: '/musica', label: 'Música', icon: 'music' },
+      { path: '/pesquisas', label: 'Pesquisas', icon: 'search' },
+      { path: '/servicos', label: 'Serviços', icon: 'gear' },
+      { path: '/arquivos', label: 'Arquivos', icon: 'file' },
+    ],
+  },
+  {
+    label: 'Mente',
+    items: [
+      { path: '/memoria', label: 'Memória', icon: 'brain' },
+      { path: '/emocoes', label: 'Emoções', icon: 'emotion' },
+      { path: '/skills', label: 'Skills', icon: 'skill' },
+    ],
+  },
+  {
+    label: 'Olhos',
+    items: [
+      { path: '/visao', label: 'Visão', icon: 'vision' },
+    ],
+  },
+  {
+    label: 'Diagnóstico',
+    items: [
+      { path: '/sessoes', label: 'Sessões', icon: 'bug' },
+      { path: '/logs', label: 'Logs', icon: 'logs' },
+    ],
+  },
+  {
+    label: 'Sistema',
+    items: [
+      { path: '/config', label: 'Config', icon: 'gear' },
+    ],
+  },
 ];
 
 const Sidebar = () => {
@@ -29,88 +66,58 @@ const Sidebar = () => {
   const location = useLocation();
 
   return (
-    <div style={{
-      width: collapsed ? 60 : 220,
-      background: '#13161f',
-      borderRight: '1px solid #1e2235',
-      display: 'flex',
-      flexDirection: 'column',
-      transition: 'width 0.2s ease',
-      flexShrink: 0,
-    }}>
-      {/* Header */}
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: collapsed ? 'center' : 'flex-start',
-        padding: collapsed ? '16px 8px' : '16px 20px',
-        borderBottom: '1px solid #1e2235',
-        gap: 12,
-      }}>
-        <img
-          src="https://api.dicebear.com/7.x/bottts-neutral/svg?seed=neo&backgroundColor=7c3aed"
-          alt="Neo Avatar"
-          width={collapsed ? 28 : 24}
-          height={collapsed ? 28 : 24}
-          style={{ borderRadius: 6, objectFit: 'cover', flexShrink: 0 }}
-        />
+    <div className="neo-sidebar" style={{ width: collapsed ? 72 : 280 }}>
+      <div className="neo-brand" style={collapsed ? { justifyContent: 'center', padding: '6px 0 22px' } : undefined}>
+        <div className="neo-brand-mark">
+          <div className="neo-brand-pulse" />
+        </div>
         {!collapsed && (
-          <>
-            <span style={{ color: '#7c3aed', fontWeight: 700, fontSize: 16 }}>Neo</span>
-            <span style={{ color: '#64748b', fontWeight: 400, fontSize: 14 }}>Panel</span>
-          </>
+          <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
+            <span className="neo-brand-name">Neo</span>
+            <span className="neo-brand-sub">Panel</span>
+          </div>
         )}
       </div>
 
-      {/* Navigation */}
-      <nav style={{ flex: 1, padding: '8px 0', overflowY: 'auto' }}>
-        {NAV_ITEMS.map((item) => {
-          const isActive = location.pathname === item.path;
-          return (
-            <Link
-              key={item.path}
-              to={item.path}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                padding: collapsed ? '12px 8px' : '12px 20px',
-                color: isActive ? '#a78bfa' : '#64748b',
-                background: isActive ? 'rgba(124, 58, 237, 0.1)' : 'transparent',
-                textDecoration: 'none',
-                fontSize: 14,
-                fontWeight: isActive ? 600 : 400,
-                transition: 'all 0.15s',
-                borderLeft: isActive ? '3px solid #7c3aed' : '3px solid transparent',
-                justifyContent: collapsed ? 'center' : 'flex-start',
-              }}
-              title={collapsed ? item.label : undefined}
-            >
-              <span style={{ fontSize: 18 }}>{item.icon}</span>
-              {!collapsed && <span>{item.label}</span>}
-            </Link>
-          );
-        })}
+      <nav className="neo-nav">
+        {NAV_GROUPS.map((group) => (
+          <div key={group.label}>
+            {collapsed ? (
+              <div className="neo-nav-group-rule" />
+            ) : (
+              <div className="neo-nav-group-label">{group.label}</div>
+            )}
+            {group.items.map((item) => {
+              const isActive = location.pathname === item.path;
+              return (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  className={
+                    'neo-nav-item' +
+                    (isActive ? ' is-active' : '') +
+                    (collapsed ? ' is-collapsed' : '')
+                  }
+                  title={collapsed ? item.label : undefined}
+                >
+                  {isActive && <div className="neo-nav-bar" />}
+                  <Icon name={item.icon} />
+                  {!collapsed && <span>{item.label}</span>}
+                </Link>
+              );
+            })}
+          </div>
+        ))}
       </nav>
 
-      {/* Collapse button */}
       <button
+        className="neo-collapse"
         onClick={() => setCollapsed(!collapsed)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 16,
-          border: 'none',
-          background: 'transparent',
-          color: '#64748b',
-          cursor: 'pointer',
-          borderTop: '1px solid #1e2235',
-          fontSize: 18,
-        }}
-        title={collapsed ? 'Expand' : 'Collapse'}
+        style={collapsed ? { justifyContent: 'center' } : undefined}
+        title={collapsed ? 'Expandir' : 'Recolher'}
       >
-        {collapsed ? '→' : '←'}
+        <span style={{ fontSize: 15 }}>{collapsed ? '→' : '←'}</span>
+        {!collapsed && <span>Recolher</span>}
       </button>
     </div>
   );
