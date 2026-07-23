@@ -150,6 +150,76 @@ class Settings(BaseSettings):
         description="Timeout padrão (s) de um job de sandbox em background.",
     )
 
+    # Web search + deep research (docs/web-search-deep-research-plan.md)
+    web_search_enabled: bool = Field(
+        default=True,
+        description="Liga as tools web_search/web_fetch no toolset do cognitivo "
+        "(camada 1: busca inline SearXNG + fallback ddgs).",
+    )
+    searxng_url: str = Field(
+        default="http://searxng:8080",
+        description="URL do SearXNG self-hosted (serviço 'searxng' no compose, "
+        "sem porta publicada). Precisa de formats:[html,json] no settings.yml.",
+    )
+    web_search_backends: str = Field(
+        default="searxng,ddgs",
+        description="Ordem da cadeia de backends de busca (csv). Backend que "
+        "falha fica degradado 5min e a cadeia pula direto pro próximo.",
+    )
+    web_search_cache_ttl: int = Field(
+        default=600, ge=30, le=86400,
+        description="TTL (s) do cache RAM de buscas/fetches (news/day usa metade).",
+    )
+    web_fetch_max_chars: int = Field(
+        default=8000, ge=500, le=100_000,
+        description="Truncamento default do texto extraído por web_fetch.",
+    )
+    research_enabled: bool = Field(
+        default=True,
+        description="Liga a tool deep_research (pesquisa profunda em background "
+        "via agent_job kind=research). Requer jobs_enabled e web_search_enabled.",
+    )
+    research_model: str = Field(
+        default="deepseek-v4-flash",
+        description="Modelo do VOLUME do ResearchAgent (intake/plan/triage/"
+        "evidência/reflect/organize). Barato por design — são muitas chamadas "
+        "sobre texto de web.",
+    )
+    research_model_writer: str = Field(
+        default="deepseek-v4-pro",
+        description="Modelo FORTE do ResearchAgent (escrita por seção, resumo "
+        "executivo/conclusão, crítica e revisão). São poucas chamadas e é onde a "
+        "qualidade do relatório é decidida — ver docs/deep-research-v2-plan.md.",
+    )
+
+    # Browser Agent — subagente browser-use no backend (docs/browser-agent-plan.md)
+    browser_agent_enabled: bool = Field(
+        default=False,
+        description="Liga a tool browser_task (Chromium no backend dirigido pelo "
+        "browser-use via agent_job kind=browser). Requer jobs_enabled e o "
+        "container neo-browser-agent no ar.",
+    )
+    browser_agent_url: str = Field(
+        default="http://neo-browser-agent:5100",
+        description="URL do wrapper FastAPI do neo-browser-agent (rede browser-net "
+        "do compose, sem porta publicada).",
+    )
+    browser_task_timeout: int = Field(
+        default=600, ge=60, le=3600,
+        description="Timeout (s) de uma browser_task — o loop do subagente é "
+        "1 chamada de LLM por passo, então minutos são o normal.",
+    )
+    browser_default_session: str = Field(
+        default="user-default",
+        description="Sessão de browser default (perfil Chromium persistente). Uma "
+        "por usuário — o auth/cookies atravessa conversas; sessões nomeadas isolam "
+        "contextos quando preciso.",
+    )
+    browser_max_steps: int = Field(
+        default=40, ge=3, le=100,
+        description="Teto default de passos do subagente browser-use por task.",
+    )
+
     # Skills Library — skills declarativas SKILL.md (docs/skills-library-plan.md)
     skills_library_enabled: bool = Field(
         default=True,
@@ -360,6 +430,61 @@ class Settings(BaseSettings):
     neo_register_shadow: bool = Field(
         default=True,
         description="Derive + log the register per turn WITHOUT injecting (calibration mode; no-op when neo_register_enabled)",
+    )
+
+    # Service Gateway (docs/service-gateway-dsl-plan.md) — HTTP arbitrário para
+    # serviços cadastrados sem o LLM ver credencial. Default off (padrão da casa).
+    neo_gateway_enabled: bool = Field(
+        default=False,
+        description="Liga o Service Gateway: tools service_list/service_docs/service_request/"
+        "service_confirm + registro de conexões (host/auth por referência) + política "
+        "deny>confirm>allow. Off restaura o comportamento anterior (só tools curadas).",
+    )
+
+    # Cofre de credenciais (F2 do gateway + F3 do browser-agent — store ÚNICO).
+    # Chave Fernet base64 (32 bytes). Vazia → sem cofre: 'fernet://' recusa com
+    # mensagem clara e só 'env://' funciona. Gere com:
+    #   python -c "from core.credentials import generate_credential_key as g; print(g())"
+    neo_cred_key: str = Field(
+        default="",
+        description="Chave Fernet do cofre de credenciais (NEO_CRED_KEY). Só na env "
+        "da VPS — nunca no banco. Trocar a chave invalida os segredos já cifrados.",
+    )
+
+    # File Store (docs/file-store-plan.md §12) — entrada/catálogo de arquivos.
+    neo_files_enabled: bool = Field(
+        default=False,
+        description="Liga o File Store: tools file_* + rotas /api/v1/files + GC. "
+        "Off → tools somem do registry e as rotas devolvem 503.",
+    )
+    neo_files_root: str = Field(
+        default="/data/files",
+        description="Raiz do store no neo-core (volume neo-files, rw): blobs/ + derived/",
+    )
+    neo_files_sandbox_mount: str = Field(
+        default="/files",
+        description="Onde o volume do store aparece DENTRO do neo-workbench (read-only) — "
+        "usado pelo file_stage para copiar o blob sem passar pelo core",
+    )
+    neo_files_ttl_days: int = Field(
+        default=7, ge=1,
+        description="Validade de um arquivo 'temp' (o GC expira depois disso)",
+    )
+    neo_files_max_file_mb: int = Field(
+        default=50, ge=1,
+        description="Tamanho máximo por arquivo no upload/ingestão",
+    )
+    neo_files_quota_gb: float = Field(
+        default=2.0, gt=0,
+        description="Quota total do store (uso real em disco, dedup por sha256)",
+    )
+    neo_files_read_cap_chars: int = Field(
+        default=8000, ge=500,
+        description="Teto de caracteres por chamada de file_read (economia de contexto)",
+    )
+    neo_files_gc_interval_s: int = Field(
+        default=3600, ge=60,
+        description="Intervalo do tick do GC de arquivos temporários expirados",
     )
 
     # Panel auth (temporary without login flow)

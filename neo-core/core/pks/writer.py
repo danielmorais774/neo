@@ -21,6 +21,8 @@ from core.pks.memory_canonicalizer import (
     DEST_TRAINING_EXAMPLES,
     MemoryCanonicalizer,
 )
+from core.credentials.guard import credential_violation
+from core.pks.ledger_guard import ledger_violation
 from core.pks.memory_ingestion_planner import (
     BLOCKED_TRAINING_ROUTES,
     MEMORY_TYPE_AGENT_TRAINING,
@@ -183,6 +185,48 @@ class PKSWriter:
                             before=None,
                             after=op.model_dump(mode="json"),
                             reason=op.reason,
+                            confidence=op.confidence,
+                            source_message_id=source_message_id,
+                        )
+                        continue
+                    # Extrato não vira memória semântica: o valor/saldo aqui seria uma
+                    # cópia chutada do que vive nas tabelas fin_*. Ver ledger_guard.
+                    ledger_reason = ledger_violation(op)
+                    if ledger_reason:
+                        logger.info("[PKS][plan_memory] discard_ledger_op %s", ledger_reason)
+                        await self.audit.log(
+                            session,
+                            workspace_id=workspace_id,
+                            actor_type="agent",
+                            actor_id="pks_writer",
+                            action="discard_ledger_op",
+                            target_type="operation",
+                            before=None,
+                            after=op.model_dump(mode="json"),
+                            reason=ledger_reason,
+                            confidence=op.confidence,
+                            source_message_id=source_message_id,
+                        )
+                        continue
+                    # Segredo não vira memória semântica: o PKS é injetado no
+                    # prompt, então um token aqui vazaria para o contexto do LLM
+                    # em todo turno — o oposto do que o cofre/gateway existem
+                    # para garantir. Fonte da verdade é o cofre cifrado.
+                    credential_reason = credential_violation(op)
+                    if credential_reason:
+                        logger.info(
+                            "[PKS][plan_memory] discard_credential_op %s", credential_reason
+                        )
+                        await self.audit.log(
+                            session,
+                            workspace_id=workspace_id,
+                            actor_type="agent",
+                            actor_id="pks_writer",
+                            action="discard_credential_op",
+                            target_type="operation",
+                            before=None,
+                            after=None,  # o payload É o segredo — não auditamos o valor
+                            reason=credential_reason,
                             confidence=op.confidence,
                             source_message_id=source_message_id,
                         )

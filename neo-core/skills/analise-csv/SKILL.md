@@ -3,7 +3,7 @@ name: analise-csv
 description: >
   Analisa um CSV (do /workspace ou URL): colunas, tipos, nulos, estatísticas e
   valores mais comuns. Use quando o usuário apontar um CSV para entender/resumir.
-keywords: [csv, planilha, dados, coluna, linha, tabela, analise, resumo]
+keywords: [csv, planilha, dataframe]
 kind: scripted
 register: oficina
 enabled: true

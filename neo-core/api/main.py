@@ -1,5 +1,6 @@
 """Main FastAPI application for Neo Core 2."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -8,41 +9,33 @@ from typing import AsyncIterator
 # Configure logging early so all loggers (including modules) respect LOG_LEVEL
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-# File handler for app logs
+# App logs (/app/logs/app.log) are written by the container entrypoint, which tees
+# uvicorn's stdout+stderr into that file (see entrypoint-dev.sh, `> >(tee ...) 2>&1`).
+# We must NOT also attach a FileHandler to the same path: root's StreamHandler
+# already reaches app.log via stderr→tee, so a second FileHandler wrote every
+# `logger.*` line TWICE into app.log (while bare `print()`s appeared once). Keeping
+# a single writer (the tee) gives one clean copy — and `docker logs` still shows it.
 _logs_dir = os.environ.get("SESSION_LOGS_DIR", "/app/logs")
-_file_handler = None
 try:
     os.makedirs(_logs_dir, exist_ok=True)
-    _file_handler = logging.FileHandler(f"{_logs_dir}/app.log")
-    _file_handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
-    _file_handler.setLevel(getattr(logging, _log_level, logging.INFO))
 except Exception as e:
-    print(f"⚠️  Could not create app.log file handler: {e}")
+    print(f"⚠️  Could not create logs dir {_logs_dir}: {e}")
 
-# Configure root logger
+# Configure root logger. Its StreamHandler goes to stderr, which the entrypoint
+# tees into app.log (uvicorn's own loggers already emit there the same way).
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
     format="%(levelname)s:     %(name)s - %(message)s",
     force=True,
 )
-# Add file handler if available
-if _file_handler:
-    logging.root.addHandler(_file_handler)
 # Silence noisy third-party loggers
 for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# Also configure uvicorn loggers to write to app.log
-for _uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-    _uv_logger = logging.getLogger(_uv_logger_name)
-    if _file_handler and _uv_logger.level == 0:
-        _uv_logger.addHandler(_file_handler)
-        _uv_logger.setLevel(getattr(logging, _log_level, logging.INFO))
-
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify, skills
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify, skills, research, files, connections
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -139,6 +132,53 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     weather_executor = WeatherExecutor()
     _tool_executor.register_module_executor("weather", weather_executor)
 
+    # Web search (camada 1 — docs/web-search-deep-research-plan.md): busca inline
+    # do cognitivo (SearXNG self-host + fallback ddgs). Leitura global, como weather.
+    _web_search_executor = None
+    if settings.web_search_enabled:
+        from modules.web_search import WEB_SEARCH_TOOLS, WebSearchExecutor
+
+        _web_search_executor = WebSearchExecutor(
+            searxng_url=settings.searxng_url,
+            backends_order=settings.web_search_backends,
+            cache_ttl=settings.web_search_cache_ttl,
+            fetch_max_chars=settings.web_fetch_max_chars,
+        )
+        _tool_registry.register_many(WEB_SEARCH_TOOLS)
+        _tool_executor.register_module_executor("web_search", _web_search_executor)
+        app.state.web_search_executor = _web_search_executor
+        print(f"✅ Web search wired (backends={settings.web_search_backends})")
+
+    # Service Gateway (docs/service-gateway-dsl-plan.md): HTTP arbitrário para
+    # serviços cadastrados (HA, GitHub, …) sem o LLM ver credencial. Registry
+    # (db + seed das envs), política deny>confirm>allow, broker env://.
+    if settings.neo_gateway_enabled:
+        from core.credentials import build_credential_store
+        from core.gateway import build_gateway_service
+        from modules.services import SERVICE_TOOLS, ServicesExecutor
+
+        # Cofre Fernet (F2): só existe com NEO_CRED_KEY. build_credential_store
+        # importa `cryptography` LÁ DENTRO — sem chave, a lib nem é tocada e o
+        # broker recusa 'fernet://' com mensagem clara (só 'env://' funciona).
+        _cred_store = build_credential_store(db=_db, key=settings.neo_cred_key)
+        _gateway_service = build_gateway_service(
+            db=_db, settings=settings, fernet_store=_cred_store
+        )
+        _tool_registry.register_many(SERVICE_TOOLS)
+        _tool_executor.register_module_executor("services", ServicesExecutor(_gateway_service))
+        connections.set_context(
+            gateway=_gateway_service,
+            registry=_gateway_service.registry,
+            cred_store=_cred_store,
+            db=_db,
+        )
+        app.state.gateway_service = _gateway_service
+        app.state.credential_store = _cred_store
+        print(
+            "✅ Service Gateway wired (tools service_*; cofre: "
+            f"{'ON' if _cred_store else 'OFF — sem NEO_CRED_KEY'})"
+        )
+
     # Default devices executor (no user scoping) — per-user scoping is injected
     # per-request via DevicesContextExecutor in AIService._handle_server_tool.
     devices_executor = DevicesExecutor(db=_db)
@@ -183,9 +223,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # not the global one. The manager loop is started later (after the dispatcher
         # is wired), so boot-reconcile notifications can be delivered.
         if settings.jobs_enabled:
-            from core.jobs import JOB_TOOLS, JobManager
+            from core.jobs import JOB_TOOLS, JobManager, build_research_runner
 
             _tool_registry.register_many(JOB_TOOLS)
+            # Runner de deep_research (kind=research), injetado sem acoplar o
+            # JobManager ao core/research (docs/web-search-deep-research-plan.md).
+            _research_runner = None
+            if settings.research_enabled and _web_search_executor is not None:
+                _research_runner = build_research_runner(
+                    db=_db,
+                    llm_router=_llm_router,
+                    web_search=_web_search_executor,
+                    sandbox=_workbench_sandbox,
+                    research_model=settings.research_model,
+                    research_model_writer=settings.research_model_writer,
+                )
+                print(
+                    f"✅ Research runner wired (volume={settings.research_model}, "
+                    f"writer={settings.research_model_writer})"
+                )
+            # Runner de browser_task (kind=browser) — delega ao container
+            # neo-browser-agent (docs/browser-agent-plan.md).
+            _browser_runner = None
+            if settings.browser_agent_enabled:
+                from core.jobs import build_browser_runner
+
+                _browser_runner = build_browser_runner(
+                    db=_db,
+                    base_url=settings.browser_agent_url,
+                    timeout_s=settings.browser_task_timeout,
+                )
+                print(f"✅ Browser runner wired (url={settings.browser_agent_url})")
             _job_manager = JobManager(
                 db=_db,
                 sandbox=_workbench_sandbox,
@@ -193,9 +261,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tick_interval=settings.job_tick_interval,
                 default_timeout=settings.job_default_timeout,
                 workspace_root=settings.workbench_workspace_root,
+                research_runner=_research_runner,
+                browser_runner=_browser_runner,
             )
             app.state.job_manager = _job_manager
             print("✅ JobManager created (background jobs)")
+
+    # File Store (docs/file-store-plan.md): entrada/catálogo de arquivos. Depende
+    # do sandbox para o file_stage (materializa o blob em /workspace/files via cp
+    # no workbench) — sem workbench, file_stage recusa e o resto segue funcionando.
+    _file_store = None
+    _files_gc_task = None
+    if settings.neo_files_enabled:
+        from core.files import FILE_TOOLS, FilesExecutor, build_file_store, gc_loop
+
+        _file_store = build_file_store(db=_db, settings=settings, sandbox=_workbench_sandbox)
+        _file_store.ensure_dirs()
+        _tool_registry.register_many(FILE_TOOLS)
+        _tool_executor.register_module_executor("files", FilesExecutor(_file_store))
+        files.set_store(_file_store)
+        app.state.file_store = _file_store
+        _files_gc_task = asyncio.create_task(gc_loop(_file_store, settings.neo_files_gc_interval_s))
+        app.state.files_gc_task = _files_gc_task
+        print(f"✅ File Store wired (root={settings.neo_files_root}, tools file_*)")
 
     # Register whatsapp_messaging tools in the global registry (for discovery / routing)
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
@@ -223,7 +311,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings=settings,
             tool_registry=_tool_registry,
         )
-        _skill_library.load()
         _tool_registry.register_many(SKILLS_LIBRARY_TOOLS)
         _tool_executor.register_module_executor(
             "skills_library", SkillsLibraryExecutor(_skill_library)
@@ -236,6 +323,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         _tool_registry.register_many(SQLRO_TOOLS)
         _tool_executor.register_module_executor("sqlro", SqlRoExecutor(settings))
+
+        # Finanças pessoais (skill 'financas'): tools fin_* gated e user-scoped.
+        # O executor global fica SEM usuário (recusa educadamente); o cognitivo
+        # cria um executor fresco por request no CognitiveReadExecutor.
+        from modules.finance import FINANCE_TOOLS, FinanceExecutor
+
+        _tool_registry.register_many(FINANCE_TOOLS)
+        _tool_executor.register_module_executor("finance", FinanceExecutor(db=_db))
+
+        # load() só DEPOIS de registrar as tools gated: ele valida `tools:` do
+        # frontmatter contra o registry e avisaria "tools não registradas" para
+        # toda skill tool_backed (falso alarme que já custou um diagnóstico).
+        _skill_library.load()
         app.state.skill_library = _skill_library
         print(
             f"✅ Skills library ready ({len(_skill_library.all())} skill(s) "
@@ -319,6 +419,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         context_selector=context_selector,
         job_manager=_job_manager,
         skill_library=_skill_library,
+        file_store=_file_store,
     )
 
     # ── Skills + Notifications ─────────────────────────────────────
@@ -361,6 +462,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire devices route
     devices.set_db(_db)
+
+    # Wire research route (neo-panel → aba Pesquisas)
+    research.set_db(_db)
+    research.set_job_manager(_job_manager)
 
     # Wire intent classifier config route (neo-panel → Config page)
     intent_config.set_dependencies(_db, _llm_router)
@@ -426,6 +531,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:
             print(f"⚠️ JobManager stop error: {e}")
 
+    if _files_gc_task is not None:
+        _files_gc_task.cancel()
+        try:
+            await _files_gc_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        print("✅ File Store GC stopped")
+
     grpc_server = getattr(app.state, "grpc_server", None)
     if grpc_server is not None:
         await grpc_server.stop(0)
@@ -471,6 +584,14 @@ app.include_router(affect.router, prefix="/api/v1", dependencies=[Depends(requir
 app.include_router(quick_help.router, prefix="/api/v1")
 app.include_router(whatsapp.router)
 app.include_router(missions.router, dependencies=[Depends(require_panel_jwt)])
+app.include_router(research.router, dependencies=[Depends(require_panel_jwt)])
+# File Store: SEM guarda global — upload/download seguem o nível das rotas do
+# desktop (que não têm JWT); a gestão do catálogo pede panel JWT por endpoint.
+# Ver docs/file-store-plan.md §8 e o cabeçalho de api/routes/files.py.
+app.include_router(files.router)
+# Service Gateway (docs/service-gateway-dsl-plan.md §8): tela de administração
+# (conexões, cofre de credenciais, auditoria) — sempre atrás do panel JWT.
+app.include_router(connections.router, dependencies=[Depends(require_panel_jwt)])
 app.include_router(devices.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop, sem JWT
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])

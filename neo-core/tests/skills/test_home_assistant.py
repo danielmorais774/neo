@@ -253,6 +253,105 @@ async def test_climate_turn_off_flags_unverified_when_still_active():
     assert out["verified"] is False  # asked off, still cool
 
 
+# ── Invented entity_id guard + verify-read failure (the "desliga ela" incident) ─
+
+class _RosterAdapter:
+    """Adapter with a controllable roster (``get_states_cached``) and a pluggable
+    ``get_state`` so we can simulate an invented id and a failing verify read."""
+
+    is_configured = True
+
+    def __init__(self, roster, get_state_impl=None):
+        self._roster = roster
+        self._get_state_impl = get_state_impl
+        self.calls: list = []
+
+    async def get_states_cached(self, ttl):
+        return self._roster
+
+    async def get_states(self):
+        return self._roster
+
+    async def get_state(self, entity_id):
+        if self._get_state_impl is not None:
+            return self._get_state_impl(entity_id)
+        return {"entity_id": entity_id, "state": "off", "attributes": {}}
+
+    async def call_service(self, domain, service, data=None):
+        self.calls.append((domain, service, data))
+        return []
+
+
+@pytest.mark.asyncio
+async def test_call_service_blocks_invented_entity_id():
+    # The incident: agent guessed ``light.quarto`` (real id is light.led_bulb_w5k).
+    # We must NOT POST a phantom command; bounce back to ha_list_entities instead.
+    roster = [{"entity_id": "light.led_bulb_w5k", "state": "on",
+               "attributes": {"friendly_name": "Luz do quarto"}}]
+    fake = _RosterAdapter(roster)
+    ex = HomeAssistantExecutor(fake)
+    out = await ex.execute(
+        "ha_call_service", {"domain": "light", "service": "turn_off", "entity_id": "light.quarto"}
+    )
+    assert out["ok"] is False
+    assert out["unknown_entity"] is True
+    assert "ha_list_entities" in out["error"]
+    assert fake.calls == []  # phantom command never sent
+
+
+@pytest.mark.asyncio
+async def test_call_service_allows_known_entity_id():
+    roster = [{"entity_id": "light.led_bulb_w5k", "state": "off", "attributes": {}}]
+    fake = _RosterAdapter(
+        roster, get_state_impl=lambda eid: {"entity_id": eid, "state": "off", "attributes": {}}
+    )
+    ex = HomeAssistantExecutor(fake)
+    out = await ex.execute(
+        "ha_call_service",
+        {"domain": "light", "service": "turn_off", "entity_id": "light.led_bulb_w5k"},
+    )
+    assert out["ok"] is True
+    assert "unknown_entity" not in out
+    assert fake.calls and fake.calls[0][:2] == ("light", "turn_off")
+    assert out["verified"] is True  # off requested, state off
+
+
+@pytest.mark.asyncio
+async def test_verify_read_failure_flags_unverified_not_success():
+    # Entity passes the roster guard but the post-action verify read 404s → we must
+    # report verified=False (unconfirmed), never a phantom success as before.
+    roster = [{"entity_id": "light.led_bulb_w5k", "state": "on", "attributes": {}}]
+
+    def _raise(entity_id):
+        raise ValueError('Home Assistant rejeitou (404): {"message":"Entity not found."}')
+
+    fake = _RosterAdapter(roster, get_state_impl=_raise)
+    ex = HomeAssistantExecutor(fake)
+    out = await ex.execute(
+        "ha_call_service",
+        {"domain": "light", "service": "turn_off", "entity_id": "light.led_bulb_w5k"},
+    )
+    assert out["ok"] is True            # HA accepted the POST
+    assert out["verified"] is False     # but we could not confirm → NOT success
+    assert out["resulting_state"] is None
+
+
+@pytest.mark.asyncio
+async def test_call_service_skips_validation_for_entity_list():
+    # A comma-separated / group target isn't pre-validated (fail open) so bulk
+    # actions still work.
+    roster = [{"entity_id": "light.a", "state": "off", "attributes": {}}]
+    fake = _RosterAdapter(
+        roster, get_state_impl=lambda eid: {"entity_id": "light.a", "state": "on", "attributes": {}}
+    )
+    ex = HomeAssistantExecutor(fake)
+    out = await ex.execute(
+        "ha_call_service", {"domain": "light", "service": "turn_on", "entity_id": "light.a,light.b"}
+    )
+    assert "unknown_entity" not in out
+    assert fake.calls and fake.calls[0][:2] == ("light", "turn_on")
+
+
 # ── Adapter caches (snapshot injection) ──────────────────────────────────────
 
 @pytest.mark.asyncio

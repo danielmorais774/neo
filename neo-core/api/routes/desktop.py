@@ -1,10 +1,15 @@
 """Desktop routes - endpoints da API para o módulo desktop."""
 
 import json
+import logging
+import time
+from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from api.schemas.requests import (
     DesktopChatMessage,
@@ -18,9 +23,11 @@ from api.schemas.requests import (
 from api.routes.missions import _execute_mission_command
 from db.async_client import AsyncPostgresClient
 from db.models import ConversationMessage, Mission
-from modules.desktop import AIService, DesktopService
+from modules.desktop import AIService, AIServiceResponse, DesktopService
 from shared import NeoError
 from shared.types import MessageType, MissionCommandPayload
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/desktop", tags=["desktop"])
 
@@ -174,6 +181,19 @@ def _coerce_legacy_mission_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
     return None
 
 
+def _files_payload(files: Any) -> list[dict[str, Any]] | None:
+    """``[{file_id, name, size_bytes}]`` (interno) → ``[{id, name, sizeBytes}]``
+    (wire, mesmo shape do `AttachmentRef` do painel) — chip de download na
+    mensagem para o arquivo que o Neo salvou no catálogo neste turno."""
+    if not files:
+        return None
+    return [
+        {"id": f.get("file_id"), "name": f.get("name"), "sizeBytes": f.get("size_bytes")}
+        for f in files
+        if f.get("file_id")
+    ] or None
+
+
 def _serialize_chat_message(
     message: ConversationMessage,
     mission: Mission | None = None,
@@ -197,6 +217,9 @@ def _serialize_chat_message(
         "timestamp": message.created_at.isoformat(),
         "messageType": "text",
     }
+    files_payload = _files_payload(metadata.get("files"))
+    if files_payload:
+        payload["files"] = files_payload
 
     if is_whatsapp_inbound:
         contact_label = (
@@ -373,6 +396,210 @@ async def handle_desktop_chat_message(
         "session_id": final_session_id,
         "voice": final_voice,
     }
+
+
+# ============ CHAT STREAMING (NDJSON) ============
+#
+# O gRPC ExecuteTask (grpc_server.py) é o canal "rico" que o neo-desktop-tauri
+# usa: stream bidirecional emitindo thinking/plan_update/command_request/
+# complete em tempo real. Não existe grpc-web configurado, então um cliente de
+# navegador (neo-panel) não alcança esse canal. Estes dois endpoints replicam a
+# MESMA leitura de AIServiceResponse (process_user_input/process_command_approval)
+# em NDJSON (uma linha JSON `{"type", "data"}` por evento) via HTTP/fetch — sem
+# precisar de proxy grpc-web. Ver neo-panel/src/lib/chatStream.ts no client.
+#
+# tool_request (execução de mídia/shell no lado do cliente) é OMITIDO de
+# propósito: exige acesso ao SO local, que só o neo-desktop-tauri tem. O
+# command_request (aprovação de comando de shell) é mostrado no chat, mas só o
+# "Rejeitar" fecha o turno de fato — a execução remota fica para depois.
+
+
+def _sse_line(event_type: str, data: dict[str, Any]) -> str:
+    return json.dumps({"type": event_type, "data": data}, ensure_ascii=False) + "\n"
+
+
+async def _stream_ai_events(
+    resp_iter: AsyncIterator[AIServiceResponse],
+    session_id_hint: str,
+) -> AsyncIterator[str]:
+    """AIServiceResponse → NDJSON chat events. Mirrors grpc_server.py's
+    `_to_core_message` + `ai_agent.rs`'s `core_message_to_event`, minus the
+    client-side tool/media plumbing that requires local OS access."""
+    start = time.monotonic()
+    active_session_id = session_id_hint
+    final_message: str | None = None
+    final_iterations = 1
+    final_files: list[dict[str, Any]] | None = None
+    got_final = False
+
+    try:
+        async for resp in resp_iter:
+            sid = str(resp.session_id) if resp.session_id else active_session_id
+            if sid and sid != active_session_id:
+                previous = active_session_id
+                active_session_id = sid
+                yield _sse_line(
+                    "session_changed",
+                    {"sessionId": sid, "previousSessionId": previous},
+                )
+
+            metadata = resp.metadata or {}
+            plan_update = metadata.get("plan_update")
+            if plan_update:
+                yield _sse_line(
+                    "plan_update",
+                    {
+                        "sessionId": active_session_id,
+                        "planId": plan_update.get("plan_id", ""),
+                        "goal": plan_update.get("goal", ""),
+                        "currentStep": plan_update.get("current_step", 0),
+                        "status": plan_update.get("status", "active"),
+                        "parentPlanId": plan_update.get("parent_plan_id", ""),
+                        "steps": [
+                            {
+                                "id": s.get("id", ""),
+                                "index": s.get("index", 0),
+                                "description": s.get("description", ""),
+                                "toolName": s.get("tool_name", ""),
+                                "status": s.get("status", "pending"),
+                                "resultSummary": s.get("result_summary", ""),
+                                "error": s.get("error", ""),
+                            }
+                            for s in plan_update.get("steps", [])
+                        ],
+                    },
+                )
+                continue
+
+            if resp.command_request:
+                cr = resp.command_request
+                yield _sse_line(
+                    "command_request",
+                    {
+                        "sessionId": active_session_id,
+                        "id": cr.get("command_id", ""),
+                        "cmd": cr.get("command", ""),
+                        "command": cr.get("command", ""),
+                        "explanation": cr.get("explanation", ""),
+                        "isBackground": cr.get("is_background", False),
+                        "status": "pending",
+                    },
+                )
+                continue
+
+            if resp.tool_request:
+                continue
+
+            if resp.is_final and resp.message:
+                got_final = True
+                final_message = resp.message
+                final_iterations = resp.iterations
+                final_files = _files_payload(metadata.get("files"))
+                continue
+
+            if resp.message and not resp.is_final and metadata.get("persist_reply"):
+                assistant_payload: dict[str, Any] = {"sessionId": active_session_id, "content": resp.message}
+                files_payload = _files_payload(metadata.get("files"))
+                if files_payload:
+                    assistant_payload["files"] = files_payload
+                yield _sse_line("assistant_message", assistant_payload)
+                continue
+
+            if resp.message and not resp.is_final:
+                yield _sse_line(
+                    "thinking",
+                    {
+                        "sessionId": active_session_id,
+                        "type": "processing",
+                        "content": resp.message,
+                        "iteration": resp.iterations,
+                    },
+                )
+    except Exception:
+        logger.error("[desktop-chat-stream] error", exc_info=True)
+        yield _sse_line(
+            "error",
+            {
+                "message": "Não foi possível concluir a execução: ocorreu um erro interno. "
+                "Pode tentar novamente?"
+            },
+        )
+        return
+
+    if got_final:
+        complete_payload: dict[str, Any] = {
+            "success": True,
+            "message": final_message or "Tarefa concluída!",
+            "iterations": final_iterations,
+            "durationMs": int((time.monotonic() - start) * 1000),
+            "sessionId": active_session_id,
+        }
+        if final_files:
+            complete_payload["files"] = final_files
+        yield _sse_line("complete", complete_payload)
+
+
+@router.post("/chat/stream")
+async def handle_desktop_chat_stream(
+    request: DesktopChatMessage,
+    ai_service: AIService = Depends(get_ai_service),
+) -> StreamingResponse:
+    """Mesma entrada do `/chat`, mas em streaming NDJSON (thinking/plan/command/
+    complete em tempo real) — ver comentário de módulo acima."""
+    if not (request.user_message or "").strip():
+        raise HTTPException(status_code=400, detail="user_message é obrigatório")
+
+    metadata: dict[str, Any] = {"client": "neo-panel"}
+    if request.provider:
+        metadata["provider"] = request.provider
+    if request.model:
+        metadata["model"] = request.model
+    if request.attachments:
+        metadata["attachments"] = request.attachments
+
+    resp_iter = ai_service.process_user_input(
+        user_message=request.user_message.strip(),
+        session_id=request.session_id,
+        user_id=request.user_id,
+        service="neo-panel",
+        metadata=metadata,
+    )
+    session_id_hint = str(request.session_id) if request.session_id else ""
+    return StreamingResponse(
+        _stream_ai_events(resp_iter, session_id_hint),
+        media_type="application/x-ndjson",
+    )
+
+
+class DesktopCommandResponseMessage(BaseModel):
+    """Aprovação/rejeição de um `command_request` recebido no `/chat/stream`."""
+
+    session_id: UUID
+    command_id: str
+    command: str
+    approved: bool
+    user_message: str = ""
+
+
+@router.post("/chat/command-response")
+async def handle_desktop_command_response(
+    request: DesktopCommandResponseMessage,
+    ai_service: AIService = Depends(get_ai_service),
+) -> StreamingResponse:
+    """Continuação de um turno pausado por `command_request`. Aprovar não executa
+    nada pelo painel (sem acesso a shell local) — o turno fecha informando isso;
+    rejeitar fecha o turno normalmente. Ver módulo `_stream_ai_events` acima."""
+    resp_iter = ai_service.process_command_approval(
+        session_id=request.session_id,
+        command_id=request.command_id,
+        approved=request.approved,
+        command=request.command,
+        user_message=request.user_message,
+    )
+    return StreamingResponse(
+        _stream_ai_events(resp_iter, str(request.session_id)),
+        media_type="application/x-ndjson",
+    )
 
 
 @router.get("/tools", response_model=ListToolsResponse)

@@ -118,6 +118,30 @@ class HomeAssistantExecutor:
             "attributes": entity.get("attributes") or {},
         }
 
+    @staticmethod
+    def _is_concrete_entity_id(entity_id: str | None) -> bool:
+        """True for a single, concrete ``domain.object_id`` — not a list, entity
+        group or keyword (``all``/``none``), which we don't pre-validate."""
+        if not isinstance(entity_id, str):
+            return False
+        eid = entity_id.strip()
+        if not eid or "," in eid or eid in {"all", "none"}:
+            return False
+        return eid.count(".") == 1
+
+    async def _entity_exists(self, entity_id: str) -> bool | None:
+        """Whether ``entity_id`` is in HA's live roster. ``None`` when the roster
+        can't be fetched, so the caller fails open (an infra blip must not block a
+        real command)."""
+        try:
+            states = await self.adapter.get_states_cached(8.0)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("HA entity validation fetch failed for %s: %s", entity_id, e)
+            return None
+        if not states:
+            return None
+        return any(s.get("entity_id") == entity_id for s in states)
+
     async def _call_service(
         self,
         domain: str,
@@ -125,6 +149,29 @@ class HomeAssistantExecutor:
         entity_id: str | None,
         data: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        # Guard: never fire a service at an invented entity_id. HA's REST API answers
+        # 200 even when the target entity does not exist (it just affects nothing), so
+        # a hallucinated id like ``light.quarto`` silently no-ops while looking like a
+        # success. Validate a single concrete id against the live roster and bounce the
+        # agent back to ha_list_entities. (Multi/group targets and unfetchable rosters
+        # fail open — they proceed to the real call.)
+        if self._is_concrete_entity_id(entity_id):
+            exists = await self._entity_exists(entity_id)  # type: ignore[arg-type]
+            if exists is False:
+                logger.warning("HA call_service blocked: unknown entity_id %s", entity_id)
+                return {
+                    "ok": False,
+                    "unknown_entity": True,
+                    "domain": domain,
+                    "service": service,
+                    "entity_id": entity_id,
+                    "error": (
+                        f"O entity_id '{entity_id}' não existe no Home Assistant — o "
+                        "comando NÃO foi enviado. Chame ha_list_entities para achar o "
+                        "entity_id correto e refaça a ação."
+                    ),
+                }
+
         payload: dict[str, Any] = dict(data or {})
         if entity_id:
             payload["entity_id"] = entity_id
@@ -156,20 +203,32 @@ class HomeAssistantExecutor:
     ) -> tuple[str | None, str | None, bool | None]:
         """Re-read ``entity_id`` after an action, polling to absorb HA's eventual
         consistency. Returns ``(state, human_summary, verified)``. Early-exits once
-        the spec is satisfied (or after one read when there is no spec). ``verified``
-        is ``None`` when there is no spec to check.
+        the spec is satisfied (or after one read when there is no spec).
+
+        ``verified`` is ``None`` ONLY when there is no spec to check. When a spec
+        exists but we could never read the entity back (e.g. it 404s), that is a
+        FAILURE, not "unknown": we return ``verified=False`` so the agent never
+        reports a phantom success. A permanent 4xx stops polling early; transient
+        errors retry across the schedule.
         """
         state: str | None = None
         summary: str | None = None
         verified: bool | None = None
+        read_ok = False
         for delay in _VERIFY_DELAYS:
             if delay:
                 await asyncio.sleep(delay)
             try:
                 entity = await self.adapter.get_state(entity_id)
-            except Exception as e:  # pragma: no cover - defensive
+            except ValueError as e:
+                # 4xx (e.g. 404 entity-not-found) is permanent — stop polling.
                 logger.warning("HA verify read failed for %s: %s", entity_id, e)
                 break
+            except Exception as e:  # pragma: no cover - defensive
+                # Transient (network/5xx already retried in the adapter) — try again.
+                logger.warning("HA verify read error for %s: %s", entity_id, e)
+                continue
+            read_ok = True
             state = entity.get("state")
             summary = summarize_state(entity)
             if spec is None:
@@ -177,6 +236,10 @@ class HomeAssistantExecutor:
             verified = state_satisfies_spec(entity, spec)
             if verified:
                 break
+        if spec is not None and not read_ok:
+            # Asked to verify a concrete expectation but never got a state back →
+            # unconfirmed/failed, never a success.
+            verified = False
         return state, summary, verified
 
     async def _rename_entity(self, entity_id: str, name: str) -> dict[str, Any]:

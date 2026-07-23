@@ -15,6 +15,7 @@ def _settings(**overrides):
     base = dict(
         workbench_enabled=True,
         skills_library_enabled=True,
+        web_search_enabled=True,
         skill_read_max_bytes=16_384,
         skills_catalog_max_entries=30,
     )

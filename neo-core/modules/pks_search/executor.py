@@ -9,6 +9,8 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from core.pks.ledger_guard import LEDGER_REDIRECT, looks_like_money_query
+
 logger = logging.getLogger(__name__)
 
 _MAX_RESULTS = 12
@@ -33,6 +35,19 @@ class PKSSearchExecutor:
             raise ValueError("search_pks requer 'query' não-vazia.")
         if not self._user_id:
             raise ValueError("search_pks requer um usuário identificado (user_id ausente).")
+
+        # Pergunta de dinheiro não se responde pela memória: o PKS não guarda extrato
+        # (ledger_guard), então aqui ele ou não acha nada — e o modelo chuta — ou acha
+        # um resto velho. Devolver o redirecionamento é mais útil que devolver vazio.
+        if looks_like_money_query(query):
+            logger.info("[pks_search] money query → redirect para a skill financas: %r", query)
+            return {
+                "query": query,
+                "found": False,
+                "count": 0,
+                "results": [],
+                "redirect": LEDGER_REDIRECT,
+            }
 
         rows = await self.pks.search_entities(user_id=self._user_id, query=query)
         results = [

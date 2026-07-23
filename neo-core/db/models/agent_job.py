@@ -30,7 +30,7 @@ class AgentJob(SQLModel, table=True):
         default=None,
         sa_column=Column("session_id", SAUuid, nullable=True, index=True),
     )
-    # sandbox_task | timer | cron | subagent
+    # sandbox_task | research | browser | timer | cron | subagent
     kind: str = Field(
         sa_column=Column("kind", String(32), nullable=False, index=True),
     )

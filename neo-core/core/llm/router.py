@@ -63,6 +63,8 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "mixtral-8x7b-32768": "groq",
     "gemma2-9b-it": "groq",
     # OpenRouter (openrouter.ai) — gateway unificado (IDs no formato vendor/modelo)
+    "x-ai/grok-4.5": "openrouter",
+    "x-ai/grok-4.20": "openrouter",
     "google/gemini-3.1-flash-lite": "openrouter",
     "google/gemini-2.0-flash-001": "openrouter",
     "anthropic/claude-3.5-sonnet": "openrouter",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from sqlalchemy import text
 from core.pks.bootstrap import PKSBootstrap
 from core.pks.context_builder import ContextBuilder
 from core.pks.entity_resolver import EntityResolver
+from core.pks.ledger_guard import is_ledger_memory
 from core.pks.ontology import OntologyResolver
 from core.pks.repository import PKSRepository
 from core.pks.schemas import EntityCandidate, Neighborhood, RetrievalResult
@@ -28,6 +30,8 @@ GLOBAL_TYPES = ("health_state", "restriction")
 # (core/pks/ontology.py), which handles PT/EN aliases and plural forms. This
 # avoids a second, drifting synonym map: "dispositivos", "devices", "device"
 # all resolve to type "device" there.
+logger = logging.getLogger(__name__)
+
 _ONTOLOGY = OntologyResolver()
 
 # A resolved type pulls in its sibling types for the fallback query, so recall
@@ -131,6 +135,18 @@ class PKSRetriever:
                 await self._neighborhood(session, candidate.entity)
                 for candidate in candidates
             ]
+            # Dinheiro não vai para o prompt: valor/saldo guardado aqui é cópia velha
+            # do extrato (tabelas fin_*), e chega ao modelo SEM passar por tool nenhuma.
+            # Ver core/pks/ledger_guard.
+            ledger_ids = {
+                n.entity.id
+                for n in neighborhoods
+                if is_ledger_memory(n.entity.name, [f.key for f in n.fields])
+            }
+            if ledger_ids:
+                logger.info("[PKS][retrieve] %d entidade(s) de extrato fora do contexto", len(ledger_ids))
+                neighborhoods = [n for n in neighborhoods if n.entity.id not in ledger_ids]
+                candidates = [c for c in candidates if c.entity.id not in ledger_ids]
             await self.repository.touch_entities(session, [n.entity.id for n in neighborhoods])
             await session.commit()
 

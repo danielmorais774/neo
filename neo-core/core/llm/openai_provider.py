@@ -1,6 +1,8 @@
 """OpenAI provider implementation."""
 
+import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -10,6 +12,20 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessage
 
 from core.llm.provider import CompletionResponse, LLMProvider
 from shared import LLMProviderError, Message, StreamChunk, StreamEventType, ToolCall, ToolSchema
+
+logger = logging.getLogger(__name__)
+
+# 429 = TPM/RPM da org estourado; renova em segundos. Backoff curto porque há um
+# usuário esperando no chat — melhor 3 tentativas rápidas que um erro na cara dele.
+_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF = (2.0, 5.0, 10.0)
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    if status == 429:
+        return True
+    return type(error).__name__ == "RateLimitError" or "429" in str(error)
 
 
 class OpenAICompletionResponse(CompletionResponse):
@@ -85,14 +101,34 @@ class OpenAIProvider(LLMProvider):
                 **kwargs,
             }
 
-            # Adiciona tools se fornecidas
+            # Adiciona tools se fornecidas. O chamador pode impor `tool_choice`
+            # (ex.: "required" para obrigar uma tool no primeiro round) — sem tools
+            # o parâmetro é inválido na API, então cai fora.
             if tools:
                 params["tools"] = self.format_tools_for_api(tools)
-                params["tool_choice"] = "auto"
+                params.setdefault("tool_choice", "auto")
+            else:
+                params.pop("tool_choice", None)
 
-            # Faz a chamada
-            response = await self.client.chat.completions.create(**params)
-            return OpenAICompletionResponse(response)
+            # Rate limit (429) é transitório: o TPM da org se renova em segundos. Sem
+            # retry, o turno morria virando "Erro ao processar: 429" — que ainda por
+            # cima entra no histórico e envenena os turnos seguintes.
+            last_error: Exception | None = None
+            for attempt in range(_RATE_LIMIT_RETRIES + 1):
+                try:
+                    response = await self.client.chat.completions.create(**params)
+                    return OpenAICompletionResponse(response)
+                except Exception as e:  # noqa: BLE001 — só o 429 é retentável
+                    last_error = e
+                    if not _is_rate_limit(e) or attempt == _RATE_LIMIT_RETRIES:
+                        raise
+                    delay = _RATE_LIMIT_BACKOFF[attempt]
+                    logger.warning(
+                        "[OpenAI] rate limit (429) — retry %d/%d em %.1fs",
+                        attempt + 1, _RATE_LIMIT_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+            raise last_error  # type: ignore[misc]  # inalcançável: o loop ou retorna ou levanta
 
         except Exception as e:
             raise LLMProviderError(

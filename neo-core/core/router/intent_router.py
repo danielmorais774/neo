@@ -212,9 +212,22 @@ _MEDIA_QUESTION_STARTS = ("tem ", "tem alguma", "existe ", "ta aberta", "tao abe
 _SKILL_OWNED_TOOL_PREFIXES = (
     "ha_", "whatsapp_", "spotify_", "youtube_", "neo_", "job_", "schedule_",
     # Skills library (docs/skills-library-plan.md): skill_read/skill_list são do
-    # tool loop do cognitivo, e as tools "gated" (sql_*) só existem DEPOIS de o
-    # cérebro ler a skill — o classificador nunca as vê nem roteia para elas.
-    "skill_", "sql_",
+    # tool loop do cognitivo, e as tools "gated" (sql_*, fin_*) só existem DEPOIS
+    # de o cérebro ler a skill — o classificador nunca as vê nem roteia para elas.
+    "skill_", "sql_", "fin_",
+    # Busca web + deep research (docs/web-search-deep-research-plan.md): decisão
+    # do cérebro, inline — nunca roteadas direto (evita o bypass do cognitivo).
+    "web_", "deep_",
+    # Service Gateway (docs/service-gateway-dsl-plan.md): o cognitivo é quem
+    # descobre a conexão (service_list/service_docs) e só então monta a chamada.
+    # Rotear direto para service_request deixaria o classificador inventar
+    # service/path/body sem passar pela descoberta — o mesmo bypass que fazia a
+    # skill HA alucinar entity_id. A política ainda barraria a escrita, mas o
+    # caminho certo é o cérebro.
+    "service_",
+    # File Store (docs/file-store-plan.md §4): tools do catálogo são do tool loop
+    # do cognitivo — quem ativa é o manifesto do anexo, não o classificador.
+    "file_",
 )
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
@@ -246,7 +259,7 @@ ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI ass
 
 ## Paths
 - **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **E TAMBÉM qualquer COMPUTAÇÃO/PROCESSAMENTO que o Neo resolve sozinho**: o cérebro tem o PRÓPRIO ambiente Linux (sandbox, com internet e /workspace) e roda código lá quando precisa — calcular, gerar (uuid/hash/senha/QR code), converter formato, baixar um arquivo de uma URL e analisá-lo, processar dados, testar um script. Isso NÃO precisa da máquina do usuário → vem para cá (o cérebro executa no sandbox, sem pedir permissão). **Default when in doubt.**
-- **SERVER_TOOL**: needs real-time external data (weather, web search, stock prices) OR mudar/consultar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Pick tool from server list. Para MUDAR um ajuste use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: "usa/troca a voz do X" → `{{"setting":"tts.voice","value":"X"}}` (ex: "usa a voz do Jarvis" → value="jarvis"); "troca o engine/motor pra X" → `{{"setting":"tts.engine","value":"X"}}` (X ∈ qwen|coqui|dia). Para "quais vozes você tem?" use `voice_list`; para "o que dá pra configurar?" use `config_list`.
+- **SERVER_TOOL**: needs real-time external data (weather via get_weather) OR mudar/consultar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Pick tool from server list. Para MUDAR um ajuste use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: "usa/troca a voz do X" → `{{"setting":"tts.voice","value":"X"}}` (ex: "usa a voz do Jarvis" → value="jarvis"); "troca o engine/motor pra X" → `{{"setting":"tts.engine","value":"X"}}` (X ∈ qwen|coqui|dia). Para "quais vozes você tem?" use `voice_list`; para "o que dá pra configurar?" use `config_list`.
 - **CLIENT_TOOL**: SÓ quando a tarefa realmente PRECISA da máquina LOCAL do usuário — algo que o sandbox do Neo NÃO consegue fazer. Ou seja: ler/escrever/buscar um ARQUIVO no DISCO do usuário; informação sobre o SISTEMA/hardware DELE (espaço em disco, processos, versão de SO, rede local); instalar ou ABRIR um PROGRAMA/app na máquina dele; abrir uma URL/universal link no computador dele. Pick tool from client list. **ATENÇÃO — não confunda com computação:** se a tarefa é só calcular/gerar/converter/processar/baixar-e-analisar e NÃO toca no disco/sistema/apps DO USUÁRIO, ela **NÃO** é CLIENT_TOOL → é **DIRECT_RESPONSE** (o cérebro roda no próprio sandbox, sem pedir permissão e sem depender da máquina do usuário estar ligada). Só é CLIENT_TOOL quando o alvo é a máquina DELE.
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário. Inclui:
   - mensagens pessoais ("avisa minha mãe que vou chegar tarde", "manda um oi para Ana")
@@ -290,6 +303,8 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
 
 ## Key Rules
 - **Sandbox do Neo vs máquina do usuário** (REGRA IMPORTANTE): computação/processamento/geração/baixar-e-analisar que NÃO depende do disco, sistema ou apps DO USUÁRIO → **DIRECT_RESPONSE** (o cérebro tem o próprio sandbox e roda lá, sem pedir permissão). `run_command`/CLIENT_TOOL só quando precisa MESMO da máquina dele (arquivo local dele, info do sistema dele, abrir/instalar programa dele, universal link no computador dele). Ex.: "conta quantos primos até 1 milhão", "gera um uuid e o sha256", "baixa esse CSV [url] e conta as linhas", "converte esse json pra yaml" → **DIRECT_RESPONSE**. "quantos GB livres no MEU disco", "lê ~/Downloads/x.pdf", "abre o VSCode", "instala o ffmpeg na minha máquina" → **CLIENT_TOOL**. Na dúvida entre os dois: se não menciona o disco/sistema/app DELE, é DIRECT_RESPONSE.
+- **Arquivo ANEXADO na conversa** (REGRA IMPORTANTE): se o contexto tem a seção "ARQUIVOS ANEXADOS NESTA MENSAGEM" ou "ARQUIVOS DESTA CONVERSA", esses arquivos estão no catálogo do PRÓPRIO Neo (não no disco do usuário) — QUALQUER pergunta sobre eles ("o que tem nesse arquivo?", "de qual instituição é?", "resume", "quantas linhas tem") é **DIRECT_RESPONSE**: o cérebro lê sozinho com as tools `file_*`. **NUNCA** escolha `read_file`/`run_command` para eles e **NUNCA invente um caminho** (ex.: `/Users/.../Downloads/<nome>`) a partir do nome do arquivo — o arquivo NÃO está no disco dele. Só é CLIENT_TOOL quando o USUÁRIO cita explicitamente um caminho/pasta da máquina dele nesta mensagem.
+- **Evento atual / notícia / esporte / cotação** ("qual o jogo hoje?", "quem ganhou X?", "cotação do dólar", "saiu a versão nova?"): **DIRECT_RESPONSE** — o cérebro tem a tool `web_search` e busca na web sozinho antes de responder. NÃO roteie para SERVER_TOOL nem escolha tool aqui; questionamentos sobre a veracidade de uma resposta anterior ("tem certeza?") também são DIRECT_RESPONSE (o cérebro re-verifica na web/PKS).
 - **Conversation continuity**: if history shows an ongoing game/quiz/roleplay/creative task: DIRECT_RESPONSE
 - **Back-references** ("está errado", "refaz", "melhora isso"): DIRECT_RESPONSE
 - **Personal data** (treino, dieta, suplementos, rotina): DIRECT_RESPONSE (injected automatically, no file tools needed)

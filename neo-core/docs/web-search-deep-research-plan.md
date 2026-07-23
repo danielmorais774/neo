@@ -1,6 +1,12 @@
 # Plano: Pesquisa Web + Deep Research — o Neo conectado à realidade
 
-> **Status:** APROVADO para execução (nada implementado). Decisões fechadas:
+> **Status:** ✅ IMPLEMENTADO E EM PRODUÇÃO (F1–F4, 2026-07-11). Validado na VPS:
+> "como foi o jogo do brasil contra a Noruega" → web_search → resposta com fato
+> real + fontes + data; deep_research → relatório em 3min24s (13 buscas, 21
+> fontes) + entrega proativa no chat + aba Pesquisas no painel. Desvios do plano:
+> triage com JSON inválido degrada para ordem da busca (em vez de falha limpa);
+> User-Agent do fetch precisa de contato (política Wikimedia, senão 403).
+> Decisões fechadas:
 > SearXNG primário + ddgs fallback (self-host sempre que possível, sem chave);
 > subagente de pesquisa PRÓPRIO e desacoplado; tabela `research_task` + painel
 > no neo-panel; LLM do research = **`deepseek-v4-flash`** (barato, suficiente

@@ -16,7 +16,7 @@ import asyncio
 import logging
 import shlex
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from db.models.agent_job import AgentJob
 from core.workbench.sandbox import WorkbenchSandbox, WorkbenchUnavailableError
@@ -41,6 +41,8 @@ class JobManager:
         default_timeout: int = 1800,
         workspace_root: str = "/workspace",
         dispatcher: "ProactiveDispatcher | None" = None,
+        research_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
+        browser_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
     ) -> None:
         self.db = db
         self.sandbox = sandbox
@@ -48,6 +50,12 @@ class JobManager:
         self.default_timeout = default_timeout
         self.workspace_root = workspace_root.rstrip("/") or "/workspace"
         self._dispatcher = dispatcher
+        # Runner de jobs kind="research", injetado no bootstrap (o JobManager
+        # NÃO importa core/research — docs/web-search-deep-research-plan.md §5.4).
+        self._research_runner = research_runner
+        # Runner de jobs kind="browser" (subagente browser-use no container
+        # neo-browser-agent — docs/browser-agent-plan.md), mesmo padrão.
+        self._browser_runner = browser_runner
         self._sem = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._active: dict[str, asyncio.Task] = {}
@@ -150,6 +158,10 @@ class JobManager:
             try:
                 if job.kind == "sandbox_task":
                     terminal = await self._run_sandbox_task(job)
+                elif job.kind == "research" and self._research_runner is not None:
+                    terminal = await self._research_runner(job)
+                elif job.kind == "browser" and self._browser_runner is not None:
+                    terminal = await self._browser_runner(job)
                 else:
                     terminal = {
                         "status": "failed",

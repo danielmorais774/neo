@@ -26,6 +26,13 @@ dependencies = [
     "numpy>=1.26.0",
     "sentence-transformers>=3.0",
     "pyyaml>=6.0",
+    "trafilatura>=1.12",
+    "ddgs>=9.0",
+    "pypdf>=5.0",
+    # Upload multipart das rotas /api/v1/files (FastAPI exige para UploadFile).
+    "python-multipart>=0.0.9",
+    # Fernet do cofre de credenciais (core/credentials/store.py).
+    "cryptography>=42.0",
 ]
 
 [build-system]

@@ -18,6 +18,19 @@ from .whatsapp_contact import WhatsAppContact
 from .user_notification import UserNotification
 from .connected_device import ConnectedDevice
 from .agent_job import AgentJob
+from .research_task import ResearchTask
+from .finance import (
+    FinAccount,
+    FinBudget,
+    FinCard,
+    FinCategory,
+    FinInstallmentPlan,
+    FinRecurring,
+    FinTransaction,
+)
+from .credential import Credential
+from .gateway import ServiceConnection, ServiceRequestLog
+from .stored_file import StoredFile
 
 __all__ = [
     "User",
@@ -38,4 +51,16 @@ __all__ = [
     "UserNotification",
     "ConnectedDevice",
     "AgentJob",
+    "ResearchTask",
+    "FinAccount",
+    "FinBudget",
+    "FinCard",
+    "FinCategory",
+    "FinInstallmentPlan",
+    "FinRecurring",
+    "FinTransaction",
+    "Credential",
+    "ServiceConnection",
+    "ServiceRequestLog",
+    "StoredFile",
 ]

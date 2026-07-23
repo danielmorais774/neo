@@ -1604,6 +1604,8 @@ class AsyncPostgresClient:
         """
         from datetime import datetime
 
+        from db.models.research_task import RESEARCH_TERMINAL_STATUSES, ResearchTask
+
         async with self.get_session() as db:
             stmt = select(AgentJob).where(AgentJob.status == "running")
             orphans = list((await db.execute(stmt)).scalars().all())
@@ -1616,6 +1618,22 @@ class AsyncPostgresClient:
                     or "Job interrompido por reinício do Neo antes de concluir."
                 )
                 db.add(job)
+
+            # Terminal do job ⇒ terminal da task, SEMPRE: sem isso a research_task
+            # do job órfão fica presa na fase em que morreu (ex.: 'searching') e o
+            # painel mostra uma pesquisa "ativa" que ninguém está mais rodando.
+            research_job_ids = [job.id for job in orphans if job.kind == "research"]
+            if research_job_ids:
+                task_stmt = select(ResearchTask).where(
+                    ResearchTask.job_id.in_(research_job_ids),
+                    ResearchTask.status.notin_(list(RESEARCH_TERMINAL_STATUSES)),
+                )
+                for task in (await db.execute(task_stmt)).scalars().all():
+                    task.status = "failed"
+                    task.finished_at = now
+                    task.error = task.error or "Interrompida por reinício do Neo."
+                    db.add(task)
+
             await db.commit()
             for job in orphans:
                 await db.refresh(job)
@@ -1647,3 +1665,100 @@ class AsyncPostgresClient:
                 .order_by(AgentJob.finished_at.asc())
             )
             return list((await db.execute(stmt)).scalars().all())
+
+    # ---------------------------------------------------------------
+    # ResearchTask CRUD (deep_research — docs/web-search-deep-research-plan.md)
+    # ---------------------------------------------------------------
+
+    async def create_research_task(self, task: "ResearchTask") -> "ResearchTask":
+        """Persist a new ResearchTask (status defaults to 'queued')."""
+        from db.models.research_task import ResearchTask  # noqa: F401
+
+        async with self.get_session() as db:
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+        return task
+
+    async def get_research_task(self, task_id: UUID) -> "ResearchTask | None":
+        from db.models.research_task import ResearchTask
+
+        async with self.get_session() as db:
+            return await db.get(ResearchTask, task_id)
+
+    async def get_research_task_by_job(self, job_id: UUID) -> "ResearchTask | None":
+        from db.models.research_task import ResearchTask
+
+        async with self.get_session() as db:
+            stmt = select(ResearchTask).where(ResearchTask.job_id == job_id).limit(1)
+            return (await db.execute(stmt)).scalars().first()
+
+    async def update_research_task(self, task_id: UUID, **fields) -> "ResearchTask | None":
+        """Patch a ResearchTask's columns. ``stats_json``/``sources_json`` overwrite."""
+        from db.models.research_task import ResearchTask
+
+        async with self.get_session() as db:
+            task = await db.get(ResearchTask, task_id)
+            if task is None:
+                return None
+            for key, value in fields.items():
+                setattr(task, key, value)
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+    async def list_research_tasks(
+        self,
+        user_id: UUID | None = None,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list["ResearchTask"]:
+        """Lista compacta para o painel — NÃO retorna report_markdown (payload
+        pesado só no get). Colunas explícitas para não carregar o texto."""
+        from db.models.research_task import ResearchTask
+
+        cols = (
+            ResearchTask.id, ResearchTask.job_id, ResearchTask.user_id,
+            ResearchTask.session_id, ResearchTask.topic, ResearchTask.depth,
+            ResearchTask.status, ResearchTask.model, ResearchTask.backend,
+            ResearchTask.stats_json, ResearchTask.quality_json,
+            ResearchTask.report_path,
+            ResearchTask.error, ResearchTask.created_at, ResearchTask.started_at,
+            ResearchTask.finished_at,
+            (ResearchTask.report_markdown.isnot(None)).label("has_report"),
+        )
+        async with self.get_session() as db:
+            stmt = select(*cols)
+            if user_id is not None:
+                stmt = stmt.where(ResearchTask.user_id == user_id)
+            if status:
+                stmt = stmt.where(ResearchTask.status == status)
+            stmt = stmt.order_by(ResearchTask.created_at.desc()).limit(limit)
+            rows = (await db.execute(stmt)).all()
+        out = []
+        for row in rows:
+            m = row._mapping
+            out.append(
+                {
+                    "id": m[ResearchTask.id],
+                    "job_id": m[ResearchTask.job_id],
+                    "user_id": m[ResearchTask.user_id],
+                    "session_id": m[ResearchTask.session_id],
+                    "topic": m[ResearchTask.topic],
+                    "depth": m[ResearchTask.depth],
+                    "status": m[ResearchTask.status],
+                    "model": m[ResearchTask.model],
+                    "backend": m[ResearchTask.backend],
+                    "stats_json": m[ResearchTask.stats_json] or {},
+                    "quality_json": m[ResearchTask.quality_json] or {},
+                    "report_path": m[ResearchTask.report_path],
+                    "error": m[ResearchTask.error],
+                    "created_at": m[ResearchTask.created_at],
+                    "started_at": m[ResearchTask.started_at],
+                    "finished_at": m[ResearchTask.finished_at],
+                    "has_report": bool(m["has_report"]),
+                }
+            )
+        return out

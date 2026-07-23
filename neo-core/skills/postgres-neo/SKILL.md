@@ -4,7 +4,7 @@ description: >
   Consulta o banco Postgres do Neo (PKS, sessões e mensagens de conversa,
   missões, preferências, jobs) com SQL somente-leitura. Use para perguntas
   sobre os dados internos do Neo.
-keywords: [banco, postgres, sql, tabela, consulta, dados, sessao, mensagem, missao, pks, quantas, quantos]
+keywords: [banco do neo, banco de dados do neo, postgres do neo, tabela do neo, pks]
 kind: tool_backed
 register: oficina
 tools: [sql_query_ro]

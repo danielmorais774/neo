@@ -4,7 +4,7 @@ description: >
   Diagnóstico passo a passo quando a voz do Neo falha ou soa errada (STT não
   transcreve, TTS mudo, voz/engine trocada). Use quando o usuário reclamar da
   fala ou da escuta do Neo.
-keywords: [voz, tts, stt, fala, falar, escutar, microfone, engine, mudo, transcricao]
+keywords: [tts, stt, microfone, mudo, transcricao, não te escuto, nao te escuto, não te ouço, nao te ouco, sua voz]
 kind: instructional
 register: oficina
 enabled: true

@@ -66,3 +66,11 @@ Colunas listadas são as úteis para consulta; timestamps em UTC.
 
 ### user_message
 - mensagens avulsas por canal (ex. WhatsApp inbound fora de sessão).
+
+## Finanças pessoais (fin_*)
+
+Tabelas `fin_account`, `fin_card`, `fin_category`, `fin_transaction`,
+`fin_installment_plan`, `fin_recurring`, `fin_budget` — extrato, cartões,
+parcelas, orçamentos. Dinheiro em `*_cents` (centavos BRL); `fin_transaction`
+tem soft delete (`deleted_at IS NULL`). Schema completo + exemplos:
+`skill_read(name="financas", file="references/schema.md")`.

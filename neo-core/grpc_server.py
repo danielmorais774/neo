@@ -363,6 +363,21 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         )
 
     @staticmethod
+    def _segments_pb(segments: "list[dict] | None") -> "list[neo_desktop_pb2.SpeechSegment]":
+        """Build repeated SpeechSegment protos from resolved segment dicts (voice
+        imitation). A segment without a voice leaves it unset → renderer speaks it
+        with the reply-level default voice."""
+        if not segments:
+            return []
+        return [
+            neo_desktop_pb2.SpeechSegment(
+                text=seg.get("text") or "",
+                voice=NeoDesktopServicer._voice_pb(seg.get("voice")),
+            )
+            for seg in segments
+        ]
+
+    @staticmethod
     def _to_core_message(session_id: str, resp: AIServiceResponse) -> neo_desktop_pb2.CoreMessage | None:
         """Convert an AIServiceResponse to a protobuf CoreMessage."""
         # Prefer the DB-assigned session_id from the response over the raw desktop string.
@@ -437,6 +452,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     is_final=True,
                     total_iterations=resp.iterations,
                     voice=NeoDesktopServicer._voice_pb(resp.voice),
+                    segments=NeoDesktopServicer._segments_pb(getattr(resp, "segments", None)),
                 ),
             )
 

@@ -16,7 +16,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from modules.voice.catalog import VoiceCatalog, normalize
+from modules.voice.catalog import VoiceCatalog
 from shared import ToolCall, ToolResult
 from shared.config import Settings, get_settings
 
@@ -100,9 +100,9 @@ class VoiceExecutor:
 
     # -- tools -----------------------------------------------------------------
     async def _list(self, engine: str | None) -> dict[str, Any]:
-        entries = await self.catalog.fetch()
-        if engine:
-            entries = [e for e in entries if e["engine"] == normalize(engine)]
+        # Scope the fetch to the requested engine so a dead backend (slow 502)
+        # can't blow the tool timeout — the whole reason voice_list was failing.
+        entries = await self.catalog.fetch(engine=engine)
         return {"voices": self.catalog.compact(entries), "count": len(entries)}
 
     async def _get(self) -> dict[str, Any]:

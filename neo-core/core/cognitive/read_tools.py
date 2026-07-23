@@ -16,13 +16,17 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from core.files.tools import FILE_TOOLS
 from modules.config.tools import CONFIG_TOOLS
 from modules.devices.tools import DEVICES_TOOLS
+from modules.finance import FINANCE_TOOL_NAMES
 from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
+from modules.services.tools import SERVICE_TOOLS
 from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
+from modules.web_search.tools import WEB_SEARCH_TOOLS
 from shared import ToolCall, ToolResult, ToolSchema
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,11 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     _by_name(DEVICES_TOOLS, "list_connected_devices"),
     _by_name(LOCATION_TOOLS, "get_user_location"),
     _by_name(WEATHER_TOOLS, "get_weather"),
+    # Busca web inline (docs/web-search-deep-research-plan.md): leitura GLOBAL
+    # (fora de _USER_SCOPED), despachada pelo executor global como get_weather.
+    # Gated em cognitive_tools_for por web_search_enabled.
+    _by_name(WEB_SEARCH_TOOLS, "web_search"),
+    _by_name(WEB_SEARCH_TOOLS, "web_fetch"),
     # Read-only voice introspection (which voices exist / which is active). The
     # side-effecting config_set stays out of the cognitive read set — it routes as
     # a SERVER_TOOL action.
@@ -49,12 +58,37 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     # list the catalog. Pure reads; gated at call time by skills_library_enabled.
     _by_name(SKILLS_LIBRARY_TOOLS, "skill_read"),
     _by_name(SKILLS_LIBRARY_TOOLS, "skill_list"),
+    # Service Gateway (docs/service-gateway-dsl-plan.md): descoberta (list/docs) +
+    # chamada HTTP arbitrária a serviço cadastrado. service_request/service_confirm
+    # NÃO são "read", mas o gate real é a POLÍTICA da conexão (escrita → confirm),
+    # não a presença da tool. Todos gated por neo_gateway_enabled. Despacho pelo
+    # executor global "services" (fall-through), como web_search.
+    _by_name(SERVICE_TOOLS, "service_list"),
+    _by_name(SERVICE_TOOLS, "service_docs"),
+    _by_name(SERVICE_TOOLS, "service_request"),
+    _by_name(SERVICE_TOOLS, "service_confirm"),
+    # File Store (docs/file-store-plan.md): catálogo de arquivos. Ficam SEMPRE no
+    # subset (gated por neo_files_enabled) porque o usuário pode citar um arquivo
+    # sem anexar agora ("aquele CSV de ontem" → file_list). Quem de fato ATIVA o
+    # uso é o manifesto do anexo injetado no system_context (§5) — tool disponível
+    # não é tool usada (lição da skill financas).
+    *FILE_TOOLS,
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
-_USER_SCOPED = frozenset({"search_pks", "list_connected_devices", "get_user_location"})
+# As fin_* NÃO entram no read set default (são gated pela skill 'financas' via
+# tool gating), mas o dispatch delas passa por este executor e exige usuário.
+_USER_SCOPED = frozenset(
+    {"search_pks", "list_connected_devices", "get_user_location"} | FINANCE_TOOL_NAMES
+)
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
+
+_WEB_SEARCH_TOOL_NAMES = frozenset(t.name for t in WEB_SEARCH_TOOLS)
+
+_SERVICE_TOOL_NAMES = frozenset(t.name for t in SERVICE_TOOLS)
+
+_FILE_TOOL_NAMES = frozenset(t.name for t in FILE_TOOLS)
 
 
 def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
@@ -66,9 +100,16 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
     """
     from shared.config import get_settings
 
+    settings = get_settings()
     tools = list(COGNITIVE_READ_TOOLS)
-    if not get_settings().skills_library_enabled:
+    if not settings.skills_library_enabled:
         tools = [t for t in tools if t.name not in _SKILLS_LIBRARY_TOOL_NAMES]
+    if not settings.web_search_enabled:
+        tools = [t for t in tools if t.name not in _WEB_SEARCH_TOOL_NAMES]
+    if not getattr(settings, "neo_gateway_enabled", False):
+        tools = [t for t in tools if t.name not in _SERVICE_TOOL_NAMES]
+    if not getattr(settings, "neo_files_enabled", False):
+        tools = [t for t in tools if t.name not in _FILE_TOOL_NAMES]
     if user_id is None:
         tools = [t for t in tools if t.name not in _USER_SCOPED]
     return tools
@@ -87,6 +128,7 @@ class CognitiveReadExecutor:
         self._devices: Any = None
         self._pks_search: Any = None
         self._location: Any = None
+        self._finance: Any = None
         # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
         # user-scoped executor avoids mutating the shared global one (no race).
         from modules.voice import VoiceExecutor
@@ -100,10 +142,15 @@ class CognitiveReadExecutor:
         self._config.set_context(user_id)
         if user_id is not None:
             from modules.devices import DevicesExecutor
+            from modules.finance import FinanceExecutor
             from modules.pks_search import PKSSearchExecutor
 
             self._devices = DevicesExecutor(db=db)
             self._devices.set_context(user_id)
+            # Finanças (fin_*, gated pela skill 'financas') — executor fresco e
+            # user-scoped por request, como devices (o global fica sem usuário).
+            self._finance = FinanceExecutor(db=db)
+            self._finance.set_context(user_id)
             if pks_service is not None:
                 self._pks_search = PKSSearchExecutor(pks_service=pks_service)
                 self._pks_search.set_context(user_id)
@@ -128,6 +175,8 @@ class CognitiveReadExecutor:
                 result = await self._voice.execute(name, tool_call.arguments)
             elif name in ("config_get", "config_list"):
                 result = await self._config.execute(name, tool_call.arguments)
+            elif name in FINANCE_TOOL_NAMES and self._finance is not None:
+                result = await self._finance.execute(name, tool_call.arguments)
             else:
                 # Read-only globals (e.g. get_weather) go through the global executor.
                 return await self._global.execute_tool_call(tool_call)

@@ -62,6 +62,13 @@ def _norm(text: str) -> str:
     return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
 
+def _keyword_hit(keyword: str, message: str) -> bool:
+    """Keyword casa como palavra/frase inteira — 'gasto' não casa em 'gastronomia'."""
+    if not keyword:
+        return False
+    return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", message) is not None
+
+
 class SkillEntry(BaseModel):
     """Uma skill carregada — metadados do frontmatter + caminho no disco."""
 
@@ -701,7 +708,141 @@ class SkillLibrary:
                 "\nCatálogo PARCIAL (filtrado para esta mensagem) — use `skill_list()` "
                 "para ver todas as skills."
             )
+        match = self._match_note(self.all(), user_message or "")
+        if match:
+            note += "\n\n" + match
         return note
+
+    def keyword_match(self, user_message: str | None) -> str | None:
+        """Nome da skill tool_backed cujas keywords casam com a mensagem (ou None).
+
+        Separado do ``autoload_for`` porque o CHAMADOR precisa distinguir "o usuário
+        falou do assunto agora" (renova a skill ativa na sessão) de "veio grudado do
+        turno anterior" (consome o prazo).
+        """
+        self.maybe_reload()
+        msg = _norm(user_message or "")
+        if not msg:
+            return None
+        best: tuple[int, str] | None = None
+        for e in self.all():
+            if e.kind != "tool_backed":
+                continue
+            hits = sum(1 for k in e.keywords if _keyword_hit(_norm(k), msg))
+            if hits and (best is None or hits > best[0]):
+                best = (hits, e.name)
+        return best[1] if best else None
+
+    def autoload_for(
+        self, user_message: str | None, sticky: str | None = None
+    ) -> tuple[SkillEntry, str, list[Any]] | None:
+        """Skill tool_backed com match DURO de keyword: corpo + tools já no round 1.
+
+        A progressive disclosure economiza prompt, mas deixa a ATIVAÇÃO na sorte do
+        modelo: com o mesmo pedido ele ora chama ``skill_read``, ora responde de
+        memória e inventa o resultado (foi o que quebrou a 'financas' em prod —
+        "registrei" sem gravar nada). Quando a keyword casa, a economia não vale o
+        risco: antecipamos o nível 1 (corpo + tools destravadas), e o modelo só
+        precisa escolher a tool. Sem match, nada muda — catálogo + skill_read.
+
+        ``sticky`` é a skill que já está ATIVA na sessão. Sem ela, a ativação seria
+        por mensagem — e conversa é multi-turno: "recebi 50 reais" casa, mas o "so
+        salva"/"variados"/"sim" que vêm depois NÃO casam, as tools sumiam no meio do
+        fluxo e o modelo voltava a alucinar que tinha registrado (sessão d4e2ba0f).
+        Keyword nova sempre vence a sticky (troca de assunto entre skills).
+
+        Devolve ``None`` quando nenhuma skill casa (ou as tools dela não estão
+        registradas). O corpo vem do mesmo ``read()`` que o skill_read serve.
+        """
+        self.maybe_reload()
+        msg = _norm(user_message or "")
+        best: tuple[int, SkillEntry] | None = None
+        if msg:
+            for e in self.all():
+                if e.kind != "tool_backed":
+                    continue
+                hits = sum(1 for k in e.keywords if _keyword_hit(_norm(k), msg))
+                if hits and (best is None or hits > best[0]):
+                    best = (hits, e)
+        if best is not None:
+            entry = best[1]
+        elif sticky:
+            candidate = self.get(sticky)
+            if candidate is None or candidate.kind != "tool_backed" or not candidate.enabled:
+                return None
+            entry = candidate
+        else:
+            return None
+        tools = self.tools_for(entry.name)
+        if not tools:
+            return None
+        try:
+            body = str(self.read(entry.name).get("content") or "")
+        except Exception as e:  # noqa: BLE001 — autoload nunca derruba o turno
+            logger.warning("[SkillLibrary] autoload de '%s' falhou: %s", entry.name, e)
+            return None
+        if not body:
+            return None
+        return entry, body, tools
+
+    def autoload_note(self, entry: SkillEntry, body: str) -> str:
+        """System note com o corpo da skill autocarregada + ordem de usar as tools."""
+        tool_names = ", ".join(f"`{t}`" for t in entry.tools)
+        return (
+            f"## Skill ATIVA nesta mensagem: `{entry.name}`\n"
+            "Esta mensagem casou com a skill abaixo, então ela já está carregada e as "
+            f"tools dela ({tool_names}) JÁ estão disponíveis para você — não precisa "
+            "chamar `skill_read`. Siga as instruções e chame a tool AGORA, nesta mesma "
+            "resposta.\n"
+            "O dado desta skill vive nas tools dela: não responda de memória, não use "
+            "`search_pks` e não peça confirmação para registrar/consultar. Dizer que "
+            "registrou/consultou sem ter chamado a tool é mentira — ou chama, ou não "
+            "afirma que fez.\n"
+            "MAS isso vale para a AÇÃO PEDIDA AGORA. Se você já executou a ação numa "
+            "mensagem ANTERIOR desta conversa, ela está feita: NÃO repita a escrita "
+            "para 'confirmar' — releia com uma tool de consulta. Escrever duas vezes "
+            "cobra o usuário duas vezes.\n\n"
+            + body
+        )
+
+    def _match_note(self, entries: list[SkillEntry], user_message: str) -> str | None:
+        """Aviso quando as keywords da mensagem casam com uma skill. None se nenhuma.
+
+        O catálogo sozinho deixa a decisão de chamar ``skill_read`` na sorte do
+        modelo — e para assunto que ele acha que "lembra" (finanças) ele responde
+        de memória, cai no ``search_pks`` (onde o dado NÃO está) ou promete
+        registrar depois. Este aviso transforma o match em ordem, mantendo a
+        guarda ("se o pedido for sobre isso") para o falso positivo sair barato.
+        """
+        msg = _norm(user_message)
+        if not msg:
+            return None
+        matched: list[tuple[int, SkillEntry, list[str]]] = []
+        for e in entries:
+            hits = [k for k in e.keywords if _keyword_hit(_norm(k), msg)]
+            if hits:
+                matched.append((len(hits), e, hits))
+        if not matched:
+            return None
+        matched.sort(key=lambda m: (-m[0], m[1].name))
+        top = matched[: self._MATCH_NOTE_MAX_SKILLS]
+        names = ", ".join(
+            f"`{e.name}` (casou: {', '.join(hits[:3])})" for _, e, hits in top
+        )
+        return (
+            f"⚠️ Esta mensagem casa com {names}. Se o pedido for sobre isso, chame "
+            "`skill_read` dessa skill ANTES de responder e execute o que ela mandar "
+            "AGORA, nesta mesma resposta — as tools dela são liberadas na hora. "
+            "Não responda de memória, não procure no `search_pks` (o dado dessas "
+            "skills NÃO mora no PKS), não peça confirmação para registrar/consultar "
+            "e não prometa fazer depois.\n"
+            "Registrar/gravar/lançar aqui é CHAMAR A TOOL da skill — não existe "
+            "handoff nem confirmação para isso. Dizer \"registrei\"/\"já lancei\" sem "
+            "ter chamado a tool nesta resposta é MENTIRA: ou você chama a tool, ou "
+            "não afirma que fez."
+        )
+
+    _MATCH_NOTE_MAX_SKILLS = 2
 
     def _prefilter(
         self, entries: list[SkillEntry], user_message: str, max_entries: int

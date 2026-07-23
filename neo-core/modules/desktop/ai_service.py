@@ -33,6 +33,7 @@ from core.llm.router import LLMRouter
 from core.pks import PKSService
 from core.cognitive import CognitiveReadExecutor, cognitive_tools_for
 from core.pipeline.handoff_parser import extract_handoffs
+from core.pipeline.speech_segments_parser import extract_speech_segments
 from core.pipeline.orchestrator import PipelineOrchestrator
 from core.pipeline.policy import handoff_requires_confirmation
 from core.pipeline.types import Handoff, PipelineStep, StepOutcome
@@ -93,6 +94,9 @@ MAX_CLARIFICATION_ROUNDS = 2
 # o texto será FALADO por TTS e mostrado como legenda, então pedimos texto corrido
 # sem markdown/emojis (que soam mal falados e poluem a legenda). Ativado por
 # metadata["mode"] == "live" (enviado pelo neo-desktop-tauri).
+# Teto de anexos citados no manifesto de um turno (os mais recentes da sessão).
+_MAX_SESSION_ATTACHMENTS = 10
+
 _LIVE_STYLE_INSTRUCTION = (
     "## MODO VOZ (live)\n"
     "Sua resposta será LIDA EM VOZ ALTA por TTS e exibida como legenda curta. "
@@ -186,13 +190,52 @@ _HANDOFF_INSTRUCTION_HEADER = (
     "Skills disponíveis:\n"
 )
 
+# Por quantos turnos SEM keyword a skill continua ativa na sessão. Cobre o vaivém
+# normal de um fluxo ("so salva" / "variados" / "sim") sem grudar para sempre; cada
+# uso real de uma tool da skill renova o prazo.
+_SKILL_STICKY_TURNS = 5
+
+# A resposta AFIRMA ter executado algo (passado, não promessa). Usado para barrar a
+# mentira quando nenhuma tool da skill rodou no turno — o modelo dizia "registrei,
+# pode confiar" com zero chamadas (sessão d4e2ba0f). Só formas no passado: "posso
+# registrar?" e "quer que eu registre?" não disparam.
+_CLAIMS_ACTION = re.compile(
+    r"\b("
+    r"registr(ei|ado|ada|amos)|lanc(ei|ado|ada)|lanç(ei|ado|ada)|salv(ei|o|a)"
+    r"|cri(ei|ado|ada)|adicion(ei|ado|ada)|apagu?ei|apagad[oa]|exclu(i|í|ído|ida)"
+    r"|atualiz(ei|ado|ada)|marqu?ei|transferi|paguei"
+    # O detector só pega o que ele consegue NOMEAR: "arquivado" faltava aqui e a
+    # mentira passou batida ("pronto, cartão arquivado" — com o banco intacto).
+    r"|arquiv(ei|ado|ada)|cancel(ei|ado|ada)|desfiz|desfeit[oa]|revert(i|ido|ida)"
+    r"|remov(i|ido|ida)|limpei|zerei|renome(ei|ado|ada)"
+    r")\b",
+    re.IGNORECASE,
+)
+# "não registrei", "ainda não salvei" — negação não é afirmação de ter feito.
+_NEGATED_CLAIM = re.compile(r"\b(nao|não)\s+(\w+\s+){0,2}$", re.IGNORECASE)
+
+
+def _claims_action_without_tool(text: str) -> bool:
+    """A resposta diz que FEZ (registrou/criou/apagou), sem negação na frente?"""
+    for m in _CLAIMS_ACTION.finditer(text or ""):
+        prefix = (text or "")[max(0, m.start() - 24) : m.start()]
+        if not _NEGATED_CLAIM.search(prefix):
+            return True
+    return False
+
+
 _HANDOFF_INSTRUCTION_RULES = (
     "\nRegras:\n"
     "- O texto dentro do bloco deve ser uma ordem COMPLETA e sem ambiguidade "
     "(ex.: \"ligar o ar-condicionado do quarto\"), porque a skill NÃO vê esta conversa.\n"
     "- Só emita o bloco se a ação realmente deve acontecer agora — inclusive quando o "
     "usuário condiciona (\"se eu costumo, pode ligar\") e o contexto confirma que sim.\n"
-    "- Se não há nada a executar, não escreva nenhum bloco."
+    "- Se não há nada a executar, não escreva nenhum bloco.\n"
+    "- Handoff vale SÓ para as skills acima. As skills da sua biblioteca (seção "
+    "\"Suas skills\") NÃO têm handoff: quem age nelas é VOCÊ, chamando as tools que "
+    "o `skill_read` libera — registrar um gasto, por exemplo, é uma chamada de tool "
+    "sua, não um bloco. NUNCA diga que registrou/gravou/executou algo dessas skills "
+    "sem ter chamado a tool nesta mesma resposta."
 )
 
 # Fallback estático (idêntico ao texto gerado pelos 3 manifests embutidos) para
@@ -456,6 +499,7 @@ class AIServiceResponse:
         iterations: int = 1,
         metadata: dict[str, Any] | None = None,
         voice: dict[str, Any] | None = None,
+        segments: list[dict[str, Any]] | None = None,
     ) -> None:
         self.intent = intent
         self.session_id = session_id
@@ -469,6 +513,10 @@ class AIServiceResponse:
         # (desktop) speaks with the voice persisted in the DB. Filled at the
         # transport boundary (gRPC/HTTP) via modules.voice.get_active_voice.
         self.voice = voice
+        # Voice imitation: ordered speech segments, each ``{text, voice}`` where
+        # ``voice`` is a resolved voice-settings dict or None (→ default voice).
+        # Present only on multi-voice replies; None keeps the single-voice path.
+        self.segments = segments
 
 
 class _CognitiveAgentExecutor:
@@ -508,6 +556,7 @@ class AIService:
         context_selector: PromptContextSelector | None = None,
         job_manager: Any = None,
         skill_library: Any = None,
+        file_store: Any = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -525,6 +574,12 @@ class AIService:
         # SkillLibrary — skills declarativas SKILL.md (docs/skills-library-plan.md).
         # None (flag off) → sem catálogo no prompt e sem tool gating.
         self.skill_library = skill_library
+        # FileStore — catálogo de arquivos (docs/file-store-plan.md). None (flag
+        # off) → metadata["attachments"] é ignorado e nenhum manifesto é injetado.
+        self.file_store = file_store
+        # Anexos por sessão (RAM): o arquivo anexado uma vez segue valendo nos
+        # turnos seguintes da conversa — ver _remember_session_attachments.
+        self._session_attachments: dict[str, list[str]] = {}
         self._pending_traces: dict[str, MessageTrace] = {}
         # Sessões cujo último turno veio do modo Live — usado para estilizar a
         # resposta de um client tool (process_tool_result), onde o metadata["mode"]
@@ -544,6 +599,126 @@ class AIService:
         # create_task results can be garbage-collected mid-flight.
         self._bg_tasks: set[asyncio.Task] = set()
         self.planner = PlanManager(llm_router)
+
+    @staticmethod
+    def _parse_attachment_ids(metadata: dict[str, Any] | None) -> list[str]:
+        """Ids dos anexos DESTE turno. Nunca levanta — anexo ruim não derruba o turno."""
+        if not metadata:
+            return []
+        raw = metadata.get("attachments") or []
+        if isinstance(raw, str):
+            # Clientes gRPC mandam metadata como map<string,string> → a lista de
+            # ids chega serializada. Mesmo padrão do media_context da música
+            # (core/skills/music/service.py:112).
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[files] metadata.attachments não é JSON válido: %.80s", raw
+                )
+                return []
+        if not isinstance(raw, list):
+            return []
+        ids: list[str] = []
+        for item in raw[:_MAX_SESSION_ATTACHMENTS]:
+            # Aceita o id cru ou um objeto {"file_id": ...} (clientes variam).
+            file_id = item.get("file_id") if isinstance(item, dict) else item
+            if file_id and str(file_id) not in ids:
+                ids.append(str(file_id))
+        return ids
+
+    def _remember_session_attachments(self, session_id: str, ids: list[str]) -> None:
+        """Anexo vale para a CONVERSA, não só para a mensagem que o trouxe.
+
+        Sem isto o follow-up ("de qual instituição de ensino?") chega sem
+        manifesto: o cognitivo perde a ficha e — pior — o classificador, que
+        também recebe o system_context, inventa um caminho no disco do usuário e
+        roteia para o read_file client-side. Mesma família dos bugs de rota já
+        conhecidos (computação→run_command, entity_id inventado na HA).
+        """
+        known = self._session_attachments.setdefault(session_id, [])
+        for file_id in ids:
+            if file_id in known:
+                known.remove(file_id)
+            known.append(file_id)
+        # Mantém os mais recentes (a lista é o teto do manifesto do turno).
+        del known[:-_MAX_SESSION_ATTACHMENTS]
+
+    async def _manifest_lines(self, ids: list[str]) -> list[str]:
+        lines: list[str] = []
+        for file_id in ids:
+            try:
+                entry = await self.file_store.get(file_id)
+            except Exception as exc:  # noqa: BLE001 — anexo ruim não derruba o turno
+                logger.warning("[files] anexo %s não resolveu: %s", file_id, exc)
+                continue
+            if entry is None or entry.status != "available":
+                continue
+            lines.append(self.file_store.manifest_line(entry))
+        return lines
+
+    async def _build_attachments_manifest(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        session_id: Any = None,
+    ) -> str | None:
+        """Manifesto compacto dos anexos (docs/file-store-plan.md §5).
+
+        É ISTO que entra no prompt — nunca o conteúdo do arquivo. Uma linha por
+        anexo (nome, tipo, tamanho, páginas/linhas, id) + a instrução de COMO ler.
+        Sem isso as tools file_* existem mas o modelo não as usa (lição da skill
+        financas: tool disponível ≠ tool usada).
+
+        Cobre os anexos deste turno E os que já vieram antes na sessão
+        (``session_id``) — uma conversa sobre um arquivo tem mais de um turno.
+        """
+        if self.file_store is None:
+            return None
+        fresh_ids = self._parse_attachment_ids(metadata)
+        sid = str(session_id) if session_id else None
+        if sid and fresh_ids:
+            self._remember_session_attachments(sid, fresh_ids)
+        carry_ids = [
+            file_id
+            for file_id in (self._session_attachments.get(sid, []) if sid else [])
+            if file_id not in fresh_ids
+        ]
+        if not fresh_ids and not carry_ids:
+            return None
+
+        fresh_lines = await self._manifest_lines(fresh_ids)
+        carry_lines = await self._manifest_lines(carry_ids)
+        if not fresh_lines and not carry_lines:
+            return None
+
+        blocks: list[str] = []
+        if fresh_lines:
+            blocks.append("## ARQUIVOS ANEXADOS NESTA MENSAGEM\n" + "\n".join(fresh_lines))
+        if carry_lines:
+            blocks.append(
+                ("## OUTROS ARQUIVOS DESTA CONVERSA (anexados antes)\n" if fresh_lines
+                 else "## ARQUIVOS DESTA CONVERSA (anexados antes, seguem valendo)\n")
+                + "\n".join(carry_lines)
+            )
+        logger.info(
+            "[files] manifesto injetado: %d anexo(s) neste turno, %d da conversa",
+            len(fresh_lines), len(carry_lines),
+        )
+        blocks.append(
+            "Estes arquivos estão no SEU catálogo (não no disco do usuário): "
+            "para qualquer pergunta sobre eles use as tools file_* — NUNCA "
+            "read_file/run_command, e nunca invente um caminho no computador dele.\n"
+            "O conteúdo NÃO está aqui — você tem só a ficha. Para dizer QUALQUER "
+            "coisa sobre o conteúdo, LEIA antes: file_read (em FATIAS, com "
+            "start_line/max_lines) quando for texto; file_stage (materializa no seu "
+            "sandbox) + neo_bash quando for binário/planilha ou trabalho pesado. "
+            "O preview do file_info é só uma amostra dos primeiros caracteres — "
+            "NUNCA descreva o arquivo (nem responda 'parece ser') com base só nele. "
+            "Leia quantas fatias precisar para responder de verdade — só não peça "
+            "o arquivo inteiro de uma vez."
+        )
+        return "\n\n".join(blocks)
 
     def _spawn_bg(self, coro, *, name: str) -> None:
         """Schedule a tracked fire-and-forget task (post-response work only)."""
@@ -778,6 +953,16 @@ class AIService:
             sys_context = "\n\n".join(part for part in (sys_context, _LIVE_STYLE_INSTRUCTION) if part)
         else:
             self._live_sessions.discard(str(sid))
+        # Anexos (docs/file-store-plan.md §5): só o MANIFESTO entra no prompt; o
+        # modelo lê por fatia/materializa com as tools file_*. Mesmo seam do estilo
+        # Live acima — chega ao cognitivo via system_context E ao classificador
+        # (que recebe o mesmo sys_context), por isso os anexos da sessão inteira
+        # entram: é o que impede o roteamento de tratar o anexo como arquivo local.
+        attachments_manifest = await self._build_attachments_manifest(
+            metadata, session_id=sid
+        )
+        if attachments_manifest:
+            sys_context = "\n\n".join(part for part in (sys_context, attachments_manifest) if part)
         mission_context = await self._build_recent_missions_context(sid, user_id)
         if mission_context:
             sys_context = "\n\n".join(part for part in (sys_context, mission_context) if part)
@@ -1289,6 +1474,44 @@ class AIService:
         async for resp in orchestrator.run(self._seed_steps(decision, user_message)):
             yield resp
 
+    async def _resolve_speech_segments(
+        self, parsed: list[Any]
+    ) -> list[dict[str, Any]] | None:
+        """Resolve voice-imitation segments (raw names) to transport dicts.
+
+        Each parsed segment carries a raw voice name; resolve it against the coqui
+        catalog to a concrete voice-settings dict. Unknown names fall back to the
+        default voice (``voice=None``). Returns ``None`` when no segment ended up
+        with a real override — the caller then uses the ordinary single-voice path.
+        """
+        if not parsed:
+            return None
+        from modules.voice import VoiceCatalog
+
+        catalog = getattr(self, "_voice_catalog", None)
+        if catalog is None:
+            catalog = VoiceCatalog(getattr(self, "settings", None))
+            self._voice_catalog = catalog
+
+        resolved: list[dict[str, Any]] = []
+        cache: dict[str, dict[str, Any] | None] = {}
+        any_voice = False
+        for seg in parsed:
+            voice: dict[str, Any] | None = None
+            name = getattr(seg, "voice", None)
+            if name:
+                if name not in cache:
+                    try:
+                        cache[name] = await catalog.resolve_named(name, engine="coqui")
+                    except Exception as e:  # pragma: no cover - defensive
+                        logger.warning("voice imitation: resolve '%s' failed: %s", name, e)
+                        cache[name] = None
+                voice = cache[name]
+                if voice:
+                    any_voice = True
+            resolved.append({"text": seg.text, "voice": voice})
+        return resolved if any_voice else None
+
     # ---------------------------------------------------------------
     # Handler: DIRECT_RESPONSE — conversational, no tools
     # ---------------------------------------------------------------
@@ -1349,13 +1572,38 @@ class AIService:
                 "[PKS] Neo training message detected — blocking user preference/personal memory routes"
             )
 
+        # Skill tool_backed dona do assunto (match duro de keyword). Resolvido AQUI,
+        # antes do PKS, porque a decisão vale para os dois lados do turno: o corpo e as
+        # tools dela entram no prompt lá embaixo, e o PKS NÃO aprende esta mensagem —
+        # o dado tem casa própria (ex.: tabelas fin_*) e o planner LLM só saberia
+        # recriá-lo com valor/data chutados (saldo fantasma). Mesma linha do
+        # device_memory_handled logo abaixo.
+        _autoload: tuple[Any, str, list[Any]] | None = None
+        if (
+            self.skill_library is not None
+            and self.settings.skills_library_enabled
+            and self.settings.cognitive_tools_enabled
+            and not is_neo_training
+        ):
+            try:
+                sticky = await self._active_skill(session_id)
+                _kw_match = self.skill_library.keyword_match(user_message)
+                _autoload = self.skill_library.autoload_for(user_message, sticky=sticky)
+            except Exception as e:  # noqa: BLE001 — autoload nunca derruba o turno
+                logger.warning("[SkillLibrary] autoload_for falhou: %s", e)
+                _autoload = None
+                _kw_match = None
+            # Keyword nova renova o prazo; turno que só herdou a skill consome um.
+            await self._touch_active_skill(session_id, renew=_kw_match)
+        skill_owns_turn = _autoload is not None
+
         # Ensure PKS exists and persist direct factual statements before the reply.
         pks_prewrite: dict[str, Any] | None = None
         pks_system_prewrite: dict[str, Any] | None = None
         if self.pks and user_id:
             try:
                 await self.pks.ensure_user_pks(user_id=user_id)
-                if not is_neo_training:
+                if not is_neo_training and not skill_owns_turn:
                     pks_prewrite = await self.pks.learn_before_response(
                         user_id=user_id,
                         user_message=user_message,
@@ -1484,6 +1732,7 @@ class AIService:
         # disclosure) — o corpo só é pago quando o modelo chama skill_read. Sem
         # tools (flag off / treino) a nota seria uma promessa vazia, então segue o
         # mesmo gate do read set. Ver docs/skills-library-plan.md.
+        _autoloaded_tools: list[Any] = []
         if (
             self.skill_library is not None
             and self.settings.skills_library_enabled
@@ -1497,6 +1746,27 @@ class AIService:
                 _skills_note = None
             if _skills_note:
                 messages.append(Message(role=MessageRole.SYSTEM, content=_skills_note))
+
+            # Match duro de keyword numa skill tool_backed (resolvido antes do PKS):
+            # carrega o corpo e destrava as tools JÁ neste round, em vez de torcer
+            # para o modelo chamar skill_read (ele às vezes responde de memória e
+            # inventa que registrou). Sem match, a disclosure normal segue igual.
+            if _autoload is not None:
+                _entry, _body, _autoloaded_tools = _autoload
+                messages.append(
+                    Message(
+                        role=MessageRole.SYSTEM,
+                        content=self.skill_library.autoload_note(_entry, _body),
+                    )
+                )
+                if slog:
+                    slog.log_event(
+                        "Skill autocarregada",
+                        f"`{_entry.name}` (match de keyword) — tools já disponíveis: "
+                        + ", ".join(f"`{t.name}`" for t in _autoloaded_tools)
+                        + f".\nPKS não aprende este turno: o dado é da skill "
+                        f"`{_entry.name}`, não da memória semântica.",
+                    )
 
         # Real-time view of what's open/playing — injected on ANY cognitive turn when
         # media is open, so the brain can control it ("pausa", "próxima") AND answer
@@ -1585,6 +1855,7 @@ class AIService:
             logger.info(f"[HISTORY-DEBUG]   LLM[{i}] {role_val}: {(m.content or '')[:120]}")
 
         # Stream response
+        produced_files: list[dict[str, Any]] = []
         try:
             _req_model = (metadata or {}).get("model")
             _req_provider = (metadata or {}).get("provider")
@@ -1614,12 +1885,24 @@ class AIService:
                 # which need the turn's user/session — routed to a per-request
                 # JobToolExecutor via the composite below).
                 cognitive_tools = list(cognitive_tools_for(user_id))
+                # Tools da skill autocarregada (match de keyword) entram já no
+                # round 1 — o gating por skill_read continua valendo para as outras.
+                _have = {t.name for t in cognitive_tools}
+                cognitive_tools += [t for t in _autoloaded_tools if t.name not in _have]
+                if _autoloaded_tools:
+                    # Com a skill ativa, o search_pks é só uma tentação: o modelo ia
+                    # procurar o lançamento na memória semântica (onde ele nunca
+                    # esteve), não achava e mesmo assim dizia "registrei" (d4e2ba0f).
+                    # A skill é a fonte de verdade do turno — a memória sai da mesa.
+                    cognitive_tools = [t for t in cognitive_tools if t.name != "search_pks"]
                 cog_executor: Any = read_executor
                 if self.settings.workbench_enabled:
                     cognitive_tools += self._agent_action_tools()
                     cog_executor = self._build_cognitive_executor(
                         read_executor, user_id=user_id, session_id=session_id
                     )
+                _skill_tool_names = {t.name for t in _autoloaded_tools}
+                _used_tools: set[str] = set()
                 full_response = await self._run_cognitive_tool_loop(
                     provider=provider,
                     messages=messages,
@@ -1630,8 +1913,16 @@ class AIService:
                     tool_executor=cog_executor,
                     slog=slog,
                     trace=trace,
+                    force_tool_first=bool(_autoloaded_tools),
+                    skill_tool_names=_skill_tool_names,
+                    used_tools=_used_tools,
+                    produced_files=produced_files,
                 )
                 llm_ms = (time.monotonic() - t0) * 1000
+                # Usou a skill de verdade → o assunto está vivo: renova o prazo dela
+                # mesmo que a próxima mensagem seja um "sim" sem keyword nenhuma.
+                if _autoload is not None and (_used_tools & _skill_tool_names):
+                    await self._touch_active_skill(session_id, renew=_autoload[0].name)
             else:
                 if slog:
                     slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
@@ -1763,6 +2054,21 @@ class AIService:
             if not full_response.strip():
                 full_response = "Ok 🎵"
 
+        # Voice imitation: pull any [[VOICE:name]]…[[/VOICE]] spans out of the reply
+        # into ordered speech segments so the renderer switches TTS voice per span.
+        # The block is always stripped from `full_response` (the saved/displayed
+        # text); names are resolved against the coqui catalog. No tag → no-op.
+        full_response, _parsed_segments = extract_speech_segments(full_response)
+        speech_segments = await self._resolve_speech_segments(_parsed_segments)
+        if speech_segments and slog:
+            slog.log_event(
+                "Imitação de Vozes",
+                "\n".join(
+                    f"- {'[default]' if not s['voice'] else s['voice'].get('label') or s['voice'].get('voice')}: {s['text']}"
+                    for s in speech_segments
+                ),
+            )
+
         # Save assistant response
         t0_save = time.monotonic()
         await self.sessions.add_message(
@@ -1771,6 +2077,7 @@ class AIService:
             content=full_response,
             generate_embedding=False,
             user_id=user_id,
+            metadata={"files": produced_files} if produced_files else None,
         )
         save_ms = round((time.monotonic() - t0_save) * 1000, 1)
         logger.info(f"[TIMING-DIRECT] recover={recover_ms}ms prefs={prefs_ms}ms pks={pks_ms}ms llm={llm_ms:.0f}ms save_assistant={save_ms}ms")
@@ -1797,13 +2104,19 @@ class AIService:
         # On a music handoff this reply isn't the stream's final (the play follows), but it IS a
         # real user-facing message — tag it persist_reply so the desktop renders it as its own chat
         # bubble (not a transient "thinking"), then shows "🎵 …" as a second message.
+        _resp_metadata: dict[str, Any] = {}
+        if _client_handoff:
+            _resp_metadata["persist_reply"] = True
+        if produced_files:
+            _resp_metadata["files"] = produced_files
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
             message=full_response,
             is_final=not _client_handoff,
             iterations=1,
-            metadata={"persist_reply": True} if _client_handoff else None,
+            metadata=_resp_metadata or None,
+            segments=speech_segments,
         )
 
         # Context handed to the PKS memory planner. When the user talks about the
@@ -1867,7 +2180,7 @@ class AIService:
                 # planner so it can't re-ingest a hallucinated id/specs from the
                 # assistant's reply.
                 applied = []
-                if not is_neo_training and not device_memory_handled:
+                if not is_neo_training and not device_memory_handled and not skill_owns_turn:
                     applied = await self.pks.learn(
                         user_id=user_id,
                         user_message=user_message,
@@ -1944,10 +2257,71 @@ class AIService:
                 from core.jobs import JOB_TOOLS
 
                 if self.agent.tool_registry.exists("neo_bash_background"):
-                    tools += list(JOB_TOOLS)
+                    job_tools = list(JOB_TOOLS)
+                    # deep_research exige web_search + research ligados; sem eles a
+                    # tool seria uma promessa vazia no toolset.
+                    if not (self.settings.research_enabled and self.settings.web_search_enabled):
+                        job_tools = [t for t in job_tools if t.name != "deep_research"]
+                    # Mesmo critério para browser_task (container neo-browser-agent).
+                    if not self.settings.browser_agent_enabled:
+                        job_tools = [t for t in job_tools if t.name != "browser_task"]
+                    tools += job_tools
             except Exception:  # noqa: BLE001
                 pass
         return tools
+
+    async def _active_skill(self, session_id: UUID | None) -> str | None:
+        """Skill que continua ATIVA nesta sessão (grudenta por alguns turnos).
+
+        Sem isto a ativação seria por mensagem, e conversa é multi-turno: depois de
+        "recebi 50 reais" (casa keyword), o "so salva" / "variados" / "sim" não casam
+        nada — as tools da skill sumiam do turno e o modelo voltava a afirmar que
+        tinha registrado sem registrar (sessão d4e2ba0f).
+        """
+        if session_id is None:
+            return None
+        try:
+            sess = await self.db.get_conversation_session(session_id)
+        except Exception as e:  # noqa: BLE001 — sessão nunca derruba o turno
+            logger.warning("[SkillLibrary] leitura da skill ativa falhou: %s", e)
+            return None
+        if sess is None:
+            return None
+        active = (sess.extra_metadata or {}).get("active_skill") or {}
+        name = active.get("name")
+        turns_left = int(active.get("turns_left") or 0)
+        if not name or turns_left <= 0:
+            return None
+        return str(name)
+
+    async def _touch_active_skill(self, session_id: UUID | None, *, renew: str | None) -> None:
+        """Renova a skill ativa (``renew`` = casou keyword / usou tool) ou gasta um turno.
+
+        Sem o consumo, um "obrigado" depois de falar de dinheiro carregaria a skill
+        para sempre; sem a renovação, ela morreria no meio do fluxo (o bug original).
+        """
+        if session_id is None:
+            return
+        try:
+            sess = await self.db.get_conversation_session(session_id)
+            if sess is None:
+                return
+            meta = dict(sess.extra_metadata or {})
+            current = dict(meta.get("active_skill") or {})
+            if renew:
+                meta["active_skill"] = {"name": renew, "turns_left": _SKILL_STICKY_TURNS}
+            elif current.get("name"):
+                turns_left = int(current.get("turns_left") or 0) - 1
+                if turns_left > 0:
+                    meta["active_skill"] = {**current, "turns_left": turns_left}
+                else:
+                    meta.pop("active_skill", None)
+            else:
+                return
+            sess.extra_metadata = meta
+            await self.db.update_session(sess)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[SkillLibrary] persistência da skill ativa falhou: %s", e)
 
     def _build_cognitive_executor(
         self, read_executor: Any, *, user_id: UUID | None, session_id: UUID | None
@@ -1985,33 +2359,63 @@ class AIService:
         tool_executor: Any,
         slog: "SessionFileLogger | None",
         trace: "MessageTrace | None",
+        force_tool_first: bool = False,
+        skill_tool_names: set[str] | None = None,
+        used_tools: set[str] | None = None,
+        produced_files: list[dict[str, Any]] | None = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
         Mirrors the text-based ReAct pattern of AgentExecutor (tool results fed back
         as a user message). Returns the final answer text. Identical buffered output
         to the legacy streaming path when the model calls no tools.
+
+        ``force_tool_first`` impõe ``tool_choice="required"`` no primeiro round: usado
+        quando uma skill tool_backed foi autocarregada por match de keyword. A 0.9 de
+        temperatura o modelo ignorava a ordem de chamar a tool em ~metade dos turnos e
+        respondia de memória (inventando "registrei"); a resposta em texto continua
+        vindo do round seguinte, com a persona intacta.
+
+        ``skill_tool_names`` liga a guarda anti-mentira: se a resposta AFIRMA ter
+        registrado/criado/apagado e nenhuma tool da skill rodou, o texto não passa —
+        o turno ganha um round extra com a tool obrigatória. "Ou chama a tool, ou não
+        afirma que fez" deixa de ser um pedido no prompt e vira invariante.
+
+        ``produced_files`` (in/out, como ``used_tools``): se passado, recebe um dict
+        ``{file_id, name, size_bytes}`` por ``file_save`` bem-sucedido neste turno —
+        é como o chamador entrega um anexo clicável na mensagem final sem o modelo
+        precisar (e sem poder) inventar uma URL.
         """
         max_rounds = self.settings.cognitive_max_tool_rounds
         seen: set[tuple[str, str]] = set()
         final_text = ""
+        files_out: list[dict[str, Any]] = produced_files if produced_files is not None else []
         # Cópia mutável: skill_read pode DESTRAVAR tools de uma skill tool_backed
         # (tool gating — docs/skills-library-plan.md), estendendo o toolset dos
         # rounds seguintes sem pagar o schema delas antes da leitura.
         tools = list(tools or [])
         skill_library = getattr(self, "skill_library", None)
+        skill_tool_names = set(skill_tool_names or set())
+        used: set[str] = used_tools if used_tools is not None else set()
+        force_next = False
+        lie_retried = False
 
         for round_idx in range(max_rounds + 1):
             round_tools = tools if (tools and round_idx < max_rounds) else None
             if slog:
                 slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
             t0 = time.monotonic()
+            extra: dict[str, Any] = {}
+            if round_tools and ((force_tool_first and round_idx == 0) or force_next):
+                extra["tool_choice"] = "required"
+            force_next = False
             resp = await provider.complete(
                 messages=messages,
                 tools=round_tools,
                 model=req_model or None,
                 temperature=0.9,
                 max_tokens=self.settings.default_max_tokens,
+                **extra,
             )
             llm_ms = (time.monotonic() - t0) * 1000
             content = resp.get_content() or ""
@@ -2029,6 +2433,39 @@ class AIService:
                 )
 
             if not tool_calls:
+                # Guarda anti-mentira: ele afirmou ter EXECUTADO algo da skill sem ter
+                # chamado tool nenhuma. Não devolve o texto — dá um round extra com a
+                # tool obrigatória. Uma vez só, para não virar laço.
+                if (
+                    round_tools
+                    and skill_tool_names
+                    and not (used & skill_tool_names)
+                    and not lie_retried
+                    and _claims_action_without_tool(content)
+                ):
+                    lie_retried = True
+                    force_next = True
+                    if slog:
+                        slog.log_event(
+                            "Anti-mentira",
+                            "A resposta afirmava ter executado sem chamar tool — "
+                            f"round extra com tool obrigatória.\n\n> {content[:200]}",
+                        )
+                    logger.warning("[Cognitive] resposta afirmava ação sem tool — forçando tool")
+                    messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE: você afirmou ter feito isso, mas não chamou tool "
+                                "nenhuma — nada foi executado e a frase é falsa. Chame "
+                                "AGORA a tool da skill que executa de verdade e só "
+                                "responda depois de ver o resultado dela. Se faltar "
+                                "informação para executar, NÃO diga que fez: pergunte."
+                            ),
+                        )
+                    )
+                    continue
                 final_text = content
                 if slog:
                     slog.log_llm_response("COGNITIVE", final_text, duration_ms=llm_ms, model=model_name)
@@ -2043,6 +2480,7 @@ class AIService:
                     result_lines.append(f"Tool: {tc.name}\nResult: (já consultado neste turno — não repita; use o resultado anterior)")
                     continue
                 seen.add(key)
+                used.add(tc.name)
                 if slog:
                     slog.log_event("Cognitive Tool", f"→ `{tc.name}` {tc.arguments}")
                 tr = await tool_executor.execute_tool_call(tc)
@@ -2050,6 +2488,14 @@ class AIService:
                     result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
                 else:
                     result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
+                if tc.name == "file_save" and not tr.error and isinstance(tr.result, dict):
+                    fid = tr.result.get("file_id")
+                    if fid:
+                        files_out.append({
+                            "file_id": str(fid),
+                            "name": tr.result.get("name"),
+                            "size_bytes": tr.result.get("size_bytes"),
+                        })
                 # Tool gating: ler uma skill tool_backed destrava as tools dela
                 # para os próximos rounds deste turno (e só deste turno).
                 if tc.name == "skill_read" and not tr.error and skill_library is not None:

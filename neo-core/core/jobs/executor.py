@@ -46,6 +46,10 @@ class JobToolExecutor:
         try:
             if name == "neo_bash_background":
                 result = await self._enqueue(args)
+            elif name == "deep_research":
+                result = await self._deep_research(args)
+            elif name == "browser_task":
+                result = await self._browser_task(args)
             elif name == "job_status":
                 result = await self._status(args)
             elif name == "job_list":
@@ -110,6 +114,132 @@ class JobToolExecutor:
             "title": title,
             "status": "queued",
             "note": "Job enfileirado. Avise o usuário que você avisará quando terminar.",
+        }
+
+    async def _browser_task(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Cria agent_job(kind=browser) e volta na hora (docs/browser-agent-plan.md).
+
+        Sem segredos no ``spec_json`` (jsonb legível): credenciais entram só na F3,
+        por labels resolvidos pelo runner na hora do POST.
+        """
+        from shared.config import get_settings
+
+        settings = get_settings()
+        if not settings.browser_agent_enabled:
+            return {"ok": False, "error": "browser_task está desligado na config."}
+        task = str(args.get("task") or "").strip()
+        if not task:
+            return {"ok": False, "error": "task vazia."}
+        title = str(args.get("title") or "Tarefa no browser").strip()[:256]
+        session = str(args.get("session") or settings.browser_default_session).strip()
+        # Nome de sessão vira diretório de perfil no container — sanear.
+        session = "".join(c for c in session if c.isalnum() or c in "-_")[:64] or "user-default"
+        spec: dict[str, Any] = {"task": task, "session": session}
+        context = str(args.get("context") or "").strip()
+        if context:
+            spec["context"] = context[:2000]
+        try:
+            spec["max_steps"] = max(3, min(int(args.get("max_steps") or settings.browser_max_steps), 100))
+        except (TypeError, ValueError):
+            spec["max_steps"] = settings.browser_max_steps
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="browser",
+            title=title,
+            spec_json=spec,
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "job_id": str(job.id),
+            "title": title,
+            "session": session,
+            "status": "queued",
+            "note": "Tarefa de browser enfileirada. Avise o usuário que você avisará quando terminar.",
+        }
+
+    async def _deep_research(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Cria agent_job(kind=research) + research_task(queued) e volta na hora."""
+        from shared.config import get_settings
+
+        settings = get_settings()
+        if not settings.research_enabled or not settings.web_search_enabled:
+            return {"ok": False, "error": "deep_research está desligado na config."}
+
+        topic = str(args.get("topic") or "").strip()
+        if not topic:
+            return {"ok": False, "error": "topic vazio."}
+        instructions = str(args.get("instructions") or "").strip() or None
+        depth = str(args.get("depth") or "standard").strip()
+        if depth not in ("quick", "standard", "deep"):
+            depth = "standard"
+
+        from core.research.budgets import budget_for
+        from db.models.research_task import ResearchTask
+
+        budget = budget_for(depth)
+        title = f"Pesquisa: {topic[:200]}"
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="research",
+            title=title,
+            spec_json={"topic": topic, "depth": depth},
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        try:
+            task = ResearchTask(
+                job_id=job.id,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                topic=topic,
+                instructions=instructions,
+                depth=depth,
+                status="queued",
+                model=settings.research_model,
+            )
+            task = await self.db.create_research_task(task)
+        except Exception as e:  # noqa: BLE001 — sem a task o job não tem o que rodar
+            await self.db.update_agent_job(
+                job.id,
+                status="failed",
+                finished_at=datetime.utcnow(),
+                result_summary=f"Falha ao criar a research_task: {e}",
+                notified_at=datetime.utcnow(),
+            )
+            return {"ok": False, "error": f"não consegui criar a pesquisa: {e}"}
+
+        # Amarra o job à task (o runner carrega por job_id; o id aqui é p/ debug).
+        try:
+            await self.db.update_agent_job(
+                job.id, spec_json={**(job.spec_json or {}), "research_task_id": str(task.id)}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        eta = {"quick": "~3 minutos", "standard": "~10 minutos", "deep": "~25 minutos"}[depth]
+        return {
+            "ok": True,
+            "job_id": str(job.id),
+            "research_id": str(task.id),
+            "depth": depth,
+            "eta_hint": eta,
+            "note": (
+                "Pesquisa em background iniciada. Avise o usuário que você trará o "
+                f"relatório quando terminar ({eta}); NÃO fique esperando."
+            ),
         }
 
     async def _status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -187,6 +317,17 @@ class JobToolExecutor:
             finished_at=datetime.utcnow(),
             result_summary=(job.result_summary or "Cancelado pelo usuário."),
         )
+        # Job de research ainda na fila: o runner nunca vai rodar, então a fase
+        # fina da research_task precisa ser fechada aqui (terminal ⇒ terminal).
+        if job.kind == "research":
+            try:
+                task = await self.db.get_research_task_by_job(job.id)
+                if task is not None and task.status not in ("completed", "failed", "timeout", "cancelled"):
+                    await self.db.update_research_task(
+                        task.id, status="cancelled", finished_at=datetime.utcnow()
+                    )
+            except Exception:  # noqa: BLE001
+                pass
         # Aborta o worker em execução, se houver.
         try:
             task = self.jm._active.get(str(job.id))

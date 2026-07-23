@@ -29,6 +29,14 @@ echo "🚀 Starting uvicorn with hot-reload..."
 # tasks to complete" (the in-process gRPC server + open desktop streams never finish),
 # leaving neo-core down on every code change. Bounding it to 5s makes --reload actually
 # apply edits without a manual `docker restart`. See neo-music-feature.
+# O log vai para o arquivo E para o stdout do container por PROCESS SUBSTITUTION,
+# não por pipe. Com `exec uvicorn ... | tee`, o exec NÃO substitui o PID 1: o
+# shell precisa ficar vivo para manter o pipeline, então quando o uvicorn morre
+# (aconteceu: corrupção de heap do lxml, ver docs/deep-research-v2-plan.md §12.6)
+# o `tee` segue de pé e o container continua "Up" MENTINDO que está saudável —
+# a API fica fora do ar até alguém reiniciar na mão. Com `> >(tee ...)` o uvicorn
+# é o PID 1 de verdade: se ele morre, o container morre e a restart policy sobe
+# tudo de novo.
 exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
   --timeout-graceful-shutdown 5 \
   --reload-dir /app/api \
@@ -37,4 +45,4 @@ exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
   --reload-dir /app/modules \
   --reload-dir /app/db \
   --reload-dir /app/grpc_server.py \
-  2>&1 | tee -a /app/logs/app.log
+  > >(tee -a /app/logs/app.log) 2>&1

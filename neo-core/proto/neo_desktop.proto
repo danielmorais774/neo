@@ -140,7 +140,19 @@ message AgentResponse {
   string message = 1;
   bool is_final = 2;
   int32 total_iterations = 3;
-  VoiceSettings voice = 4;  // active TTS voice/engine to render this reply (Pattern A)
+  VoiceSettings voice = 4;  // default TTS voice/engine to render this reply (Pattern A)
+  // Multi-voice reply: ordered speech segments, each optionally with its own
+  // voice (voice imitation). When present, the renderer speaks each segment in
+  // order; a segment with an empty `voice` uses the reply-level `voice` above.
+  // `message` still carries the full concatenated text (display + back-compat).
+  repeated SpeechSegment segments = 5;
+}
+
+// One chunk of a multi-voice reply. `text` is spoken with `voice` if set,
+// otherwise with the AgentResponse-level default voice.
+message SpeechSegment {
+  string text = 1;
+  VoiceSettings voice = 2;  // optional per-segment voice override
 }
 
 // Active TTS voice the renderer (desktop) should use to speak the reply. Resolved

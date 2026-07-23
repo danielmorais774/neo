@@ -14,8 +14,9 @@ VOICE_TOOLS: list[ToolSchema] = [
         name="voice_list",
         description=(
             "Lista as vozes de TTS disponíveis no neo-voice (vozes embutidas e clones), "
-            "com engine e descrição. Use para responder 'quais vozes você tem?' ou para "
-            "conferir os nomes antes de trocar."
+            "com engine e descrição. Use para responder 'quais vozes você tem?', para "
+            "conferir os nomes antes de trocar, ou para saber quais vozes/personagens "
+            "dá pra IMITAR (clones do coqui — passe engine=\"coqui\")."
         ),
         module="voice",
         execution="server-side",
@@ -23,8 +24,11 @@ VOICE_TOOLS: list[ToolSchema] = [
         parameters={
             "engine": ToolParameter(
                 type="string",
-                description="Filtra por engine. Opcional (sem filtro lista todas).",
-                enum=["qwen", "coqui", "dia"],
+                description=(
+                    "Filtra por engine. Opcional (sem filtro lista todas). Para "
+                    "imitação de vozes use \"coqui\"."
+                ),
+                enum=["coqui", "qwen", "dia", "cosyvoice", "f5", "chatterbox"],
                 required=False,
             ),
         },

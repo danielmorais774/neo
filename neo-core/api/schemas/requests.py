@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field
 from shared.types import MessageType, MissionCommand
 
 
-LLMProviderName = Literal["openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq"]
+LLMProviderName = Literal[
+    "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter"
+]
 
 
 class DesktopChatMessage(BaseModel):
@@ -27,6 +29,8 @@ class DesktopChatMessage(BaseModel):
     mission_id: UUID | None = None
     edited_text: str | None = None
     user_id: UUID | None = None
+    # Ids do File Store (neo-core) anexados a este turno — ver file-store-plan.md §5.
+    attachments: list[str] | None = None
 
 
 class ExecuteTaskRequest(BaseModel):
