@@ -13,6 +13,9 @@ LOCATION_TOOLS: list[ToolSchema] = [
             "invente. Quando o usuário informar a cidade, chame de novo com "
             "save_city para o Neo aprender e nunca mais perguntar."
         ),
+        router_summary=(
+            "Resolve a cidade provável do usuário (PKS → GPS) antes do get_weather."
+        ),
         module="location",
         execution="server-side",
         timeout=10,

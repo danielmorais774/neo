@@ -33,7 +33,7 @@ class PlanStep(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4())[:8])
     index: int
     description: str  # Human-readable: "Listar arquivos CSV na pasta de documentos"
-    tool_name: str = "run_command"  # run_command, read_file, list_directory, etc.
+    tool_name: str = "run_command"  # única tool client-side real hoje
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     raw_command: str | None = None  # Shell command if tool_name == run_command
     requires_approval: bool = False
@@ -125,7 +125,13 @@ class ExecutionPlan(BaseModel):
         return self.status in ("completed", "failed", "cancelled")
 
     def to_summary(self) -> str:
-        """Generate a summary of the plan for display."""
+        """Resumo do plano em markdown — só para log/depuração.
+
+        NÃO mandar isto pro cliente: o desktop desenha a timeline a partir do
+        `plan_update` (``build_plan_update``), e este texto chegava lá como uma
+        bolha de "Pensando" com ⬜/✅ crus, que é o que o usuário via em vez do
+        cartão.
+        """
         lines = [f"**Plano:** {self.goal}\n"]
         for step in self.steps:
             icon = {"pending": "⬜", "running": "🔄", "completed": "✅", "failed": "❌", "skipped": "⏭️"}[step.status]
@@ -265,20 +271,37 @@ class PlanManager:
             "   Nesses casos, o campo 'raw_command' pode conter um TEMPLATE com {previous_output}\n"
             "   que será preenchido com o resultado real do passo anterior\n"
             "5. Marque requires_approval=true para operações destrutivas (delete, kill, format)\n"
-            "6. Use a ferramenta mais apropriada:\n"
-            "   - run_command: para comandos shell (ls, find, grep, cat, etc.)\n"
-            "   - read_file: para ler conteúdo de um arquivo específico\n"
-            "   - write_file: para criar/escrever em arquivos\n"
-            "   - list_directory: para listar conteúdo de diretórios\n"
+            "6. A ÚNICA ferramenta client-side disponível é `run_command` — não existe\n"
+            "   `read_file`/`write_file`/`list_directory`/`search_files`/`get_system_info`\n"
+            "   (nunca tiveram execução real e travam o turno se você inventar). TUDO usa\n"
+            "   `run_command` com um comando shell: listar (`ls`/`find`), ler (`cat`),\n"
+            "   escrever (`printf '%s' \"$conteudo\" > caminho` ou heredoc), espaço/sistema\n"
+            "   (`df -h`, `uname -a`).\n"
             "7. Para o primeiro passo e passos independentes, escreva o comando COMPLETO\n"
             "8. Para passos dependentes, descreva o que precisa ser feito — o sistema\n"
             "   vai gerar o comando exato quando o passo anterior completar\n"
             "9. CRÍTICO para tarefas de leitura de múltiplos arquivos + escrita de resumo:\n"
-            "   - Crie um step read_file SEPARADO para CADA arquivo, com o path absoluto correto\n"
-            "   - Cada read_file tem depends_on_previous=false (são independentes entre si)\n"
-            "   - O step write_file final DEVE ter depends_on_previous=true\n"
-            "   - No write_file, use content='[SERÁ GERADO COM BASE NOS ARQUIVOS LIDOS]' como placeholder\n"
-            "     O conteúdo real será construído após todos os reads serem completados\n\n"
+            "   - Crie um step `run_command` (`cat <path>`) SEPARADO para CADA arquivo, com\n"
+            "     o path absoluto correto\n"
+            "   - Cada step de leitura tem depends_on_previous=false (são independentes entre si)\n"
+            "   - O step de escrita final DEVE ter depends_on_previous=true\n"
+            "   - Nesse step, use command='[SERÁ GERADO COM BASE NOS ARQUIVOS LIDOS]' como\n"
+            "     placeholder — o comando real (heredoc com o conteúdo) será construído após\n"
+            "     todos os reads serem completados\n"
+            "10. CRÍTICO — NUNCA assuma o nome/caminho exato de um arquivo que o usuário só\n"
+            "    DESCREVEU sem citar o nome literal (ex.: \"meu relatório de finanças\", \"aquele\n"
+            "    pdf da nota fiscal\"). Nesse caso o PRIMEIRO passo tem que ser uma sondagem\n"
+            "    read-only na pasta mais provável (ver Contexto do Sistema: Desktop/Downloads/\n"
+            "    Documents) — `ls -la <pasta>` ou `find <pasta> -iname '*palavra-chave*'` —\n"
+            "    NUNCA um comando que já cita um nome de arquivo inventado. O passo seguinte\n"
+            "    (depends_on_previous=true) só decide o arquivo real depois de ver esse\n"
+            "    resultado. Se a sondagem não achar nada parecido, o plano deve terminar\n"
+            "    relatando isso ao usuário — nunca inventar um nome pra seguir em frente.\n"
+            "    Exemplo: usuário pede \"me manda meu relatório de finanças que tá no\n"
+            "    desktop\" sem dizer o nome do arquivo →\n"
+            "    passo 1: run_command `ls -la ~/Desktop` (depends_on_previous=false)\n"
+            "    passo 2: descrição \"identificar e mostrar o arquivo de finanças encontrado\"\n"
+            "    (depends_on_previous=true, comando definido depois de ver o passo 1)\n\n"
             "## Formato de Resposta\n"
             "Responda APENAS com JSON válido (sem markdown fences):\n"
             "{\n"
@@ -326,8 +349,21 @@ class PlanManager:
             plan_ms = (time.monotonic() - t0) * 1000
 
             raw = (response.get_content() or "").strip()
+            # Vazio = o raciocínio consumiu o max_tokens (finish_reason=length), não
+            # "sem plano" — ver deepseek-empty-response-reasoning. Sem retry, o
+            # json.loads estoura "Expecting value: line 1 column 1", o plano volta
+            # None, e quem chamou fica sem passo nenhum (sessão 9f7abeec).
+            if not raw:
+                logger.warning("[PLAN] resposta vazia (teto consumido pelo raciocínio) — retentando")
+                response = await provider.complete(
+                    messages=messages, temperature=0.2, max_tokens=3000,
+                )
+                raw = (response.get_content() or "").strip()
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            if not raw:
+                logger.warning("[PLAN] resposta vazia mesmo após retry — sem plano")
+                return None
 
             parsed = json.loads(raw)
             logger.info(f"[PLAN] Generated plan in {plan_ms:.0f}ms: {len(parsed.get('steps', []))} steps")
@@ -733,11 +769,17 @@ class PlanManager:
             "- decision=subplan SÓ se o resultado revela N items que os steps restantes não cobrem\n"
             "- decision=retry SÓ se retry_classification ≠ \"fatal\"\n"
             "- subplan_steps tem MAX 5 steps\n"
-            "- CRÍTICO para write_file com depends_on_previous=true:\n"
-            "  Você DEVE retornar refined_step com 'content' REAL e COMPLETO construído a partir dos\n"
-            "  resultados dos steps de leitura anteriores (visíveis no estado do plano como '→ conteúdo').\n"
+            "- CRÍTICO para um step de escrita (run_command com heredoc/printf >) com\n"
+            "  depends_on_previous=true: você DEVE retornar refined_step com o comando shell\n"
+            "  REAL e COMPLETO (conteúdo já embutido) construído a partir dos resultados dos\n"
+            "  steps de leitura anteriores (visíveis no estado do plano como '→ conteúdo').\n"
             "  NUNCA use placeholder como '[conteúdo baseado no arquivo]' ou '[SERÁ GERADO]'.\n"
-            "  Se algum arquivo ainda não foi lido (step pendente), retorne decision=continue para ler esse arquivo primeiro.\n\n"
+            "  Se algum arquivo ainda não foi lido (step pendente), retorne decision=continue para ler esse arquivo primeiro.\n"
+            "- CRÍTICO para um step de SONDAGEM (`ls`/`find` num arquivo que o usuário só\n"
+            "  descreveu, sem nome exato): o refined_step do PRÓXIMO passo só pode citar um\n"
+            "  nome de arquivo que REALMENTE apareceu no resultado da sondagem acima. Se a\n"
+            "  sondagem não achou nada parecido, decision=finish relatando isso ao usuário —\n"
+            "  NUNCA invente um nome pra seguir em frente.\n\n"
             "Responda APENAS com JSON válido."
         )
 
@@ -757,6 +799,17 @@ class PlanManager:
                 max_tokens=2000,
             )
             raw = (response.get_content() or "").strip()
+            # Mesmo vazio do generate_plan (deepseek-empty-response-reasoning): o
+            # raciocínio come o teto e volta content="". Sem o retry, o json.loads
+            # estoura, o fallback devolve "continue" com refined_step=None — e um
+            # passo dependente é despachado com o comando PLACEHOLDER que o prompt
+            # do planner mandou pôr, que vai literalmente pro shell do usuário.
+            if not raw:
+                logger.warning("[PLAN] advance_and_refine vazio (teto consumido pelo raciocínio) — retentando")
+                response = await provider.complete(
+                    messages=messages, temperature=0.1, max_tokens=4000,
+                )
+                raw = (response.get_content() or "").strip()
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
@@ -919,6 +972,24 @@ class PlanManager:
         for s in plan.steps:
             if not s.description or not s.description.strip():
                 logger.warning(f"[PLAN] Validation: step {s.index} has empty description")
+                return False
+
+        # Um passo `run_command` SEM comando é indespachável: o desktop recebe o
+        # tool_request, não tem o que executar e nunca devolve resultado — o turno
+        # trava em "Executando" até a conexão cair (sessão e8e5664b). A validação
+        # olhava só descrição/contagem, então o plano furado passava e só quebrava
+        # no cliente. Passos DEPENDENTES são exceção: o comando deles é montado
+        # depois, pelo refine_step, com a saída do passo anterior em mãos.
+        for s in plan.steps:
+            if s.depends_on_previous:
+                continue
+            if s.tool_name == "run_command" and not str(
+                (s.tool_arguments or {}).get("command") or s.raw_command or ""
+            ).strip():
+                logger.warning(
+                    "[PLAN] Validation: step %s é run_command sem comando (indespachável)",
+                    s.index,
+                )
                 return False
 
         return True

@@ -63,6 +63,11 @@ class ClaudeProvider(LLMProvider):
     ) -> CompletionResponse:
         """Realiza completion com Claude."""
         try:
+            # Intenção do chamador ("quero a saída estruturada, não o raciocínio"),
+            # não parâmetro da API: aqui não há o que traduzir (o extended thinking
+            # do Claude é opt-in), então some antes de virar 400 no corpo.
+            kwargs.pop("disable_thinking", None)
+
             # Separa system message
             system_content: str | None = None
             claude_messages: list[dict[str, Any]] = []

@@ -21,6 +21,11 @@ CONFIG_TOOLS: list[ToolSchema] = [
             "casar, devolve as opções disponíveis. NÃO invente settings: use os ids "
             "expostos por config_list (ex.: 'tts.voice', 'tts.engine')."
         ),
+        # O prompt do classificador já traz o mapeamento "usa a voz do X" →
+        # {setting: tts.voice, value: X}; repeti-lo aqui é pagar duas vezes.
+        router_summary=(
+            "Muda uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.) pelo id do ajuste."
+        ),
         module="config",
         execution="server-side",
         timeout=15,

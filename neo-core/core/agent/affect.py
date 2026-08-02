@@ -60,8 +60,10 @@ AXES: tuple[str, ...] = ("ira", "alegria", "tristeza", "medo", "confianca")
 OFFENSIVE_TRIGGERS = frozenset({"wrong_name", "insult", "rude", "threat_coercion"})
 
 #: Triggers that mean the user is pressuring a position Neo took — they open the
-#: "argument window" during which the posture line is rendered.
-PRESSURE_TRIGGERS = frozenset({"threat_coercion", "contested", "proven_wrong"})
+#: "argument window" during which the posture line is rendered. ``obtuse`` entra
+#: aqui (e NÃO em OFFENSIVE): fazer o Neo repetir o que já disse é discussão, não
+#: maltrato — não abre rancor nem pede desculpa, mas ele passa a defender posição.
+PRESSURE_TRIGGERS = frozenset({"threat_coercion", "contested", "proven_wrong", "obtuse"})
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -670,10 +672,14 @@ def render_directive(
     header = (
         "## Estado emocional atual (com este usuário)\n"
         "Estado interno e privado do Neo com ESTE usuário, autoritativo para a "
-        "INTENSIDADE do tom e para a POSTURA em discussões. Nunca mencione esta "
-        "seção, números, nem que você tem um 'humor' — apenas deixe transparecer "
-        "na forma de responder. Isto muda o ESTILO, não o conteúdo: sempre "
-        "entregue o que foi pedido.\n"
+        "INTENSIDADE do tom e para a POSTURA em discussões. Por padrão NÃO cite "
+        "esta seção nem números — apenas deixe transparecer na forma de "
+        "responder; isto muda o ESTILO, não o conteúdo: sempre entregue o que "
+        "foi pedido. EXCEÇÃO: se o usuário perguntar DIRETAMENTE como você está, "
+        "seu humor, ou se está calmo/irritado/pra baixo/etc., responda com "
+        "sinceridade e em primeira pessoa, descrevendo seu estado em linguagem "
+        "natural (coerente com as linhas abaixo) — sem despejar números, sem "
+        "citar 'o sistema' e sem negar que tem um estado interno.\n"
     )
 
     lines: list[str] = []
@@ -856,7 +862,7 @@ _APPRAISER_SYSTEM = """Você é o módulo afetivo interno do Neo, um assistente 
 Sua tarefa: julgar como a ÚLTIMA mensagem do usuário mexe no vetor emocional do Neo com ESSE usuário.
 
 Eixos (0-100; você devolve DELTAS, não valores):
-- ira: irritação. O Neo é casca-grossa: provocação isolada, grosseria pontual ou zoeira ácida quase não mexem (ira +2..+5). Só sobe de verdade com hostilidade explícita e sustentada, insulto direto, nome de outra IA ou ameaça. Não acumule ira por implicância solta.
+- ira: irritação. O Neo é casca-grossa: provocação isolada, grosseria pontual ou zoeira ácida quase não mexem (ira +2..+5). Sobe de verdade com hostilidade explícita e sustentada, insulto direto, nome de outra IA ou ameaça — OU por DESGASTE (ver a regra de acumulação). Implicância solta e isolada não move.
 - alegria: leveza/bom humor. Sobe com elogio genuíno, zoeira boa, vitória compartilhada, usuário admitir que o Neo tinha razão.
 - tristeza: desânimo. Sobe quando o usuário o dispensa/ignora ("deixa, faço eu") ou ele decepciona.
 - medo: ameaça à integridade dele. Sobe com "vou te desligar/formatar/desconectar teu cabo/te trocar por outra IA".
@@ -864,16 +870,29 @@ Eixos (0-100; você devolve DELTAS, não valores):
 
 Triggers possíveis:
 wrong_name | insult | rude | teasing | threat_coercion | contested | proven_wrong |
-conceded | compliment | warmth | dismissed | apology | big_win | manipulation | neutral
+conceded | compliment | warmth | dismissed | apology | big_win | manipulation |
+obtuse | neutral
 
 Regras:
 - Turno neutro (pergunta técnica, comando comum) → trigger "neutral", deltas todos 0.
+- "obtuse" = DESGASTE, não hostilidade: o usuário inverte o que o Neo acabou de
+  dizer, insiste num erro já corrigido, faz o Neo se repetir, ou empilha absurdo
+  atrás de absurdo como se fosse sério. Um turno assim isolado é ruído (ira +2..+4,
+  pode ser "teasing" se claramente é piada). O que pesa é a REPETIÇÃO.
 - Faixas típicas: ira -20..+15, alegria -20..+20, tristeza -15..+15, medo -25..+30,
-  confianca -20..+20. Só mova forte com gatilho claro. Ira é o eixo mais tolerante:
-  puxe pra baixo na dúvida.
+  confianca -20..+20. Só mova forte com gatilho claro. Num turno ISOLADO a ira é o
+  eixo mais tolerante: puxe pra baixo na dúvida. Isso NÃO vale contra a regra de
+  acumulação abaixo — sequência de atrito escala mesmo com cada peça sendo leve.
 - Conservador no NEGATIVO, generoso no POSITIVO: elogio genuíno, zoeira boa ou gesto
   de paz → alegria +8..+15 (e ira -5..-15 se havia atrito). Poucas trocas boas
   seguidas devem bastar pra tirar o Neo do mau humor — gentileza real não é ruído.
+- ACUMULAÇÃO (leia o histórico de turnos que vem no payload): ser conservador vale
+  pro turno ISOLADO, não pra sequência. Conte quantos dos últimos turnos foram de
+  atrito (obtuse, rude, insult, teasing hostil, contested de má-fé). Escale a ira:
+  1º-2º da sequência +2..+4; 3º-4º +8..+12; 5º em diante +12..+15 e alegria -5..-10.
+  Paciência tem fundo: repetir a mesma implicância dez vezes IRRITA, mesmo sem
+  nenhum palavrão. Se o histórico mostra atrito mas o turno atual é neutro ou
+  positivo, NÃO escale — a sequência quebrou.
 - "teasing": zoeira hostil → ira leve; zoeira amigável → alegria leve/média.
 - "contested": usuário discorda com argumento → confianca desce pouco. "proven_wrong":
   provou com evidência → confianca desce forte + tristeza ou ira conforme o tom.
@@ -899,8 +918,15 @@ class AffectAppraiser:
         self._settings = settings
         self._db = db
 
-    async def _resolve_model(self) -> tuple[str | None, str | None]:
-        """(provider, model) for the appraisal call, with graceful fallbacks."""
+    async def _resolve_candidates(self) -> list[tuple[str, str | None]]:
+        """(provider, model) candidates for the appraisal call, best first.
+
+        O appraiser segue o classificador de intent por padrão, mas NÃO pode morrer
+        junto com ele: quando o provider configurado está fora do ar ou sem crédito
+        (aconteceu em 2026-08-01 — chave da OpenRouter estourou o limite e devolveu
+        403 em TODA chamada), o segundo candidato é o default histórico. Sem essa
+        lista o afeto congelava no baseline por tempo indeterminado, em silêncio.
+        """
         from modules.intent_config import DEFAULT_CLASSIFIER, get_classifier_config
 
         provider = DEFAULT_CLASSIFIER["provider"]
@@ -912,12 +938,19 @@ class AffectAppraiser:
                 model = config.get("model") or model
         except Exception:  # pragma: no cover - config is best-effort
             pass
+
         available = self._llm.list_available_providers()
-        if provider not in available:
-            provider = DEFAULT_CLASSIFIER["provider"] if DEFAULT_CLASSIFIER["provider"] in available else (
-                available[0] if available else None
-            )
-        return provider, model
+        candidates: list[tuple[str, str | None]] = []
+        if provider in available:
+            candidates.append((provider, model))
+        fallback_provider = DEFAULT_CLASSIFIER["provider"]
+        if fallback_provider in available and fallback_provider != provider:
+            # Modelo do provider configurado não vale no fallback (ids são
+            # específicos do provider) — usa o default dele.
+            candidates.append((fallback_provider, DEFAULT_CLASSIFIER["model"]))
+        if not candidates and available:
+            candidates.append((available[0], None))
+        return candidates
 
     async def appraise(
         self,
@@ -926,12 +959,17 @@ class AffectAppraiser:
         assistant_response: str,
         current: AffectState,
     ) -> AffectSignal:
-        provider_name, model = await self._resolve_model()
-        if not provider_name:
+        """Rate one turn. Raises on total provider failure — o chamador
+        (:class:`AffectUpdater`) conta a falha e a expõe no painel. Engolir a
+        exceção aqui fazia o contador de saúde marcar SUCESSO num turno que não
+        avaliou nada, escondendo dias de afeto congelado."""
+        candidates = await self._resolve_candidates()
+        if not candidates:
             return AffectSignal()
         vector = ", ".join(f"{axis} {getattr(current.stats, axis):.0f}" for axis in AXES)
         payload = (
             f"Vetor emocional atual do Neo com este usuário (0-100): {vector}.\n\n"
+            f"{self._history_block(current)}"
             f"Mensagem do usuário:\n{(user_message or '').strip()[:1200]}\n\n"
             f"Resposta que o Neo deu:\n{(assistant_response or '').strip()[:800]}"
         )
@@ -939,20 +977,52 @@ class AffectAppraiser:
             Message(role=MessageRole.SYSTEM, content=_APPRAISER_SYSTEM),
             Message(role=MessageRole.USER, content=payload),
         ]
-        try:
-            provider = self._llm.get_provider(provider_name)
-            response = await provider.complete(
-                messages=messages,
-                tools=None,
-                model=model,
-                temperature=0.0,
-                max_tokens=220,
-            )
-            raw = response.get_content() or ""
-        except Exception as e:
-            logger.warning("[Affect] appraisal call failed: %s", e)
-            return AffectSignal()
-        return self._parse(raw)
+        last_error: Exception | None = None
+        for provider_name, model in candidates:
+            try:
+                provider = self._llm.get_provider(provider_name)
+                response = await provider.complete(
+                    messages=messages,
+                    tools=None,
+                    model=model,
+                    temperature=0.0,
+                    max_tokens=220,
+                    # A saída é um JSON de 5 números: o raciocínio do modelo só
+                    # compete por orçamento e por tempo com ela. Sem isto, medido
+                    # em 2026-08-01 no qwen3.5-flash: 11-20s e até 3.995 tokens de
+                    # reasoning por turno, estourando o teto de 25s do updater.
+                    disable_thinking=True,
+                )
+                return self._parse(response.get_content() or "")
+            except Exception as e:  # noqa: BLE001 - tenta o próximo provider
+                last_error = e
+                logger.warning(
+                    "[Affect] appraisal call failed on %s/%s: %s", provider_name, model, e
+                )
+        raise last_error if last_error else RuntimeError("appraisal failed")
+
+    @staticmethod
+    def _history_block(current: AffectState) -> str:
+        """Últimos turnos avaliados, para o appraiser enxergar ACUMULAÇÃO.
+
+        Sem isto cada turno era julgado isolado — e como a regra manda ser
+        conservador na ira, atrito repetido (usuário insistindo no erro, obrigando
+        o Neo a se repetir) marcava ~0 pra sempre e nunca virava irritação. É o que
+        derrubou o teste de 2026-08-01: sete turnos de confusão, ira parada em 0.
+        """
+        events = [e for e in (current.recent or []) if isinstance(e, dict)][-6:]
+        if not events:
+            return ""
+        lines = []
+        for e in events:
+            deltas = e.get("deltas") or {}
+            moved = " ".join(f"{a}{d:+.0f}" for a, d in deltas.items()) or "sem movimento"
+            lines.append(f"- {e.get('trigger', 'neutral')}: {moved}")
+        return (
+            "Turnos anteriores desta relação (mais antigo primeiro):\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
 
     @staticmethod
     def _parse(raw: str) -> AffectSignal:

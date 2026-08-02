@@ -205,7 +205,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         if core_msg:
                             yield core_msg
                         # Track pending flows
-                        if resp.metadata and not resp.is_final:
+                        if self._is_pending_flow(resp):
                             self._pending[session_id] = {**resp.metadata, "session_id": session_id}
 
                 elif desktop_msg.HasField("tool_result"):
@@ -233,7 +233,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         if core_msg:
                             yield core_msg
                         # Re-track pending metadata for retry flows (new tool_request/command_request)
-                        if resp.metadata and not resp.is_final:
+                        if self._is_pending_flow(resp):
                             self._pending[session_id] = {**resp.metadata, "session_id": session_id}
 
                 elif desktop_msg.HasField("command_approval"):
@@ -294,6 +294,19 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         self.ai_service.db.mark_device_offline(device_id)
                     )
                 logger.info(f"[Devices] Stream ended, marked offline: {device_id}")
+
+    @staticmethod
+    def _is_pending_flow(resp: AIServiceResponse) -> bool:
+        """True quando o response deixa o turno esperando algo do desktop.
+
+        Um `plan_update` puro (só desenha a timeline) NÃO é isso: rastreá-lo
+        sobrescreveria o pending real com um dicionário sem `flow`, e o
+        `plan_update` final — que vem depois do último passo — deixaria uma
+        entrada órfã em `_pending` até o próximo turno da sessão.
+        """
+        if resp.is_final or not resp.metadata:
+            return False
+        return bool(resp.metadata.get("flow"))
 
     def _close_incomplete_tool_turn(self, pending: dict) -> None:
         """Persist a failure message when a client-tool turn ends without a result.
@@ -361,6 +374,25 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
             language=voice.get("language") or "",
             label=voice.get("label") or "",
         )
+
+    @staticmethod
+    def _files_pb(files: "list[dict] | None") -> "list[neo_desktop_pb2.FileRef]":
+        """Build repeated FileRef protos from produced_files (file_save results).
+
+        Mirrors the REST/NDJSON `files` payload (api/routes/desktop.py) so the
+        desktop can offer the same download button as the panel, hitting the
+        same client-agnostic GET /api/v1/files/{id}/download endpoint.
+        """
+        if not files:
+            return []
+        return [
+            neo_desktop_pb2.FileRef(
+                id=str(f.get("file_id") or ""),
+                name=f.get("name") or "",
+                size_bytes=int(f.get("size_bytes") or 0),
+            )
+            for f in files
+        ]
 
     @staticmethod
     def _segments_pb(segments: "list[dict] | None") -> "list[neo_desktop_pb2.SpeechSegment]":
@@ -453,6 +485,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     total_iterations=resp.iterations,
                     voice=NeoDesktopServicer._voice_pb(resp.voice),
                     segments=NeoDesktopServicer._segments_pb(getattr(resp, "segments", None)),
+                    files=NeoDesktopServicer._files_pb(resp.metadata.get("files") if resp.metadata else None),
                 ),
             )
 
@@ -472,6 +505,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     message=resp.message,
                     is_final=False,
                     total_iterations=resp.iterations,
+                    files=NeoDesktopServicer._files_pb(resp.metadata.get("files")),
                 ),
             )
 

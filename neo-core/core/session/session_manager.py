@@ -28,6 +28,47 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Quantas mensagens do assistente (as mais recentes) ganham a nota técnica —
+# só o turno imediatamente anterior importa pra continuidade de curto prazo
+# ("cade os arquivos?"); memória de longo prazo é papel do PKS, não daqui.
+_TOOL_TRACE_ENRICH_LAST_N_ASSISTANT = 2
+_TOOL_TRACE_NOTE_MAX_CHARS = 800
+
+
+def _render_tool_trace_note(extra_metadata: dict[str, Any] | None) -> str | None:
+    """Resumo compacto do que as tools fizeram num turno, pro PRÓXIMO turno.
+
+    Nunca é mostrado ao usuário (o chat sempre mostra só ``content``) — isso só
+    entra na lista de mensagens montada pro LLM, em get_history(). Sem isso, um
+    follow-up curto ("cade os arquivos?") não sabe que 3 arquivos já foram
+    escritos e o modelo refaz tudo do zero com dados inventados diferentes.
+    """
+    if not extra_metadata:
+        return None
+    trace = extra_metadata.get("tool_trace") or []
+    files = extra_metadata.get("files") or []
+    if not trace and not files:
+        return None
+    lines = [
+        "[nota técnica automática do turno anterior — não é algo que você disse; "
+        "use como contexto do que já foi feito, não repita isso ao usuário]"
+    ]
+    for entry in trace[:8]:
+        tool = entry.get("tool", "?")
+        if not entry.get("ok", True):
+            lines.append(f"- {tool}: falhou ({entry.get('error', '?')})")
+        elif tool == "neo_write_file":
+            lines.append(f"- {tool} → {entry.get('path')} ({entry.get('bytes')} bytes)")
+        elif tool == "neo_bash":
+            lines.append(f"- {tool} → `{entry.get('command')}` (exit={entry.get('exit_code')})")
+        elif tool == "file_save":
+            lines.append(f"- {tool} → '{entry.get('name')}' salvo no catálogo")
+        else:
+            lines.append(f"- {tool}: {str(entry.get('summary', ''))[:120]}")
+    for f in files[:5]:
+        lines.append(f"- entregue ao usuário: '{f.get('name')}' (file_id={f.get('file_id')})")
+    return "\n".join(lines)[:_TOOL_TRACE_NOTE_MAX_CHARS]
+
 
 class PersistentSessionManager:
     """Gerencia sessões com rotação automática e recuperação de contexto."""
@@ -245,8 +286,24 @@ class PersistentSessionManager:
                 except Exception as e:
                     logger.warning(f"[HISTORY] Embedding relevance merge failed: {e}")
 
-        # Strip token_count before returning — LLM doesn't need it
-        return [{"role": m["role"], "content": m["content"]} for m in budgeted]
+        # Strip token_count/extra_metadata before returning — LLM só recebe
+        # {role, content}. Antes de cortar, os últimos turnos do assistente
+        # ganham uma nota técnica (tools executadas, arquivos criados) anexada
+        # SÓ no content mandado pro LLM — o texto salvo no banco (o que o chat
+        # mostra) nunca é tocado, porque essa enriquização acontece aqui, não
+        # em add_message.
+        result: list[dict[str, str]] = []
+        enriched = 0
+        for m in reversed(budgeted):
+            content = m["content"]
+            if m["role"] == "assistant" and enriched < _TOOL_TRACE_ENRICH_LAST_N_ASSISTANT:
+                note = _render_tool_trace_note(m.get("extra_metadata"))
+                if note:
+                    content = f"{content}\n\n{note}"
+                    enriched += 1
+            result.append({"role": m["role"], "content": content})
+        result.reverse()
+        return result
 
     # ---------------------------------------------------------------
     # Topic change detection

@@ -683,7 +683,12 @@ class AsyncPostgresClient:
         session_id: UUID,
         limit: int = 20,
     ) -> list[dict[str, str]]:
-        """Fetch the last N user/assistant messages as [{role, content, token_count}] for LLM context."""
+        """Fetch the last N user/assistant messages as [{role, content, token_count}] for LLM context.
+
+        ``extra_metadata`` também vem junto (sem custo extra de query — já é uma
+        coluna do mesmo SELECT via ORM): session_manager.get_history() usa ela pra
+        reinjetar um resumo técnico do que as tools fizeram no turno mais recente.
+        """
         messages = await self.fetch_session_messages(
             session_id,
             limit=limit,
@@ -692,7 +697,10 @@ class AsyncPostgresClient:
             min_content_length=5,
         )
         return [
-            {"role": m.role, "content": m.content, "token_count": m.token_count or 0}
+            {
+                "role": m.role, "content": m.content, "token_count": m.token_count or 0,
+                "extra_metadata": m.extra_metadata,
+            }
             for m in messages
         ]
 

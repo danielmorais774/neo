@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from core.pks import PKSService
-from shared.types import IntentType, RoutingDecision
 
 router = APIRouter(prefix="/context", tags=["context"])
 
@@ -43,15 +42,36 @@ class CandidateTrace(BaseModel):
     skip_reason: str
 
 
+class RecoveredMemory(BaseModel):
+    content: str
+    source: str
+    score: float
+
+
+class DecisionInfo(BaseModel):
+    intent: str
+    needs_memory: bool
+    knowledge_keywords: list[str] = Field(default_factory=list)
+
+
 class PromptPreviewResponse(BaseModel):
     system_prompt: str
     trace: list[CandidateTrace]
     prompt_tokens_est: int
+    # Full-fidelity fields: the panel renders the same layers the live turn
+    # injects — the PKS neighborhoods, the semantic-memory (RETRIEVED) layer and
+    # the real routing decision — instead of a stripped-down preview.
+    decision: DecisionInfo
+    contexts_found: list[dict] = Field(default_factory=list)
+    context_text: str = ""
+    recovered: list[RecoveredMemory] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
 
 
 # ── Dependency injection ──────────────────────────────────────────
 _pks_service: PKSService | None = None
 _context_selector = None
+_ai_service = None
 
 
 def set_pks_service(service: PKSService) -> None:
@@ -62,6 +82,11 @@ def set_pks_service(service: PKSService) -> None:
 def set_context_selector(selector) -> None:
     global _context_selector
     _context_selector = selector
+
+
+def set_ai_service(service) -> None:
+    global _ai_service
+    _ai_service = service
 
 
 def get_pks_service() -> PKSService:
@@ -96,32 +121,29 @@ async def retrieve_context(
 
 @router.post("/prompt-preview", response_model=PromptPreviewResponse)
 async def prompt_preview(body: PromptPreviewRequest):
-    """Monta o system prompt completo via PromptContextSelector sem chamar o LLM.
+    """Reproduz a montagem do prompt do turno real, sem escrever nem chamar o LLM.
 
-    Retorna o texto exato que seria enviado ao modelo, mais o trace de seleção
-    com score, tokens estimados e motivo de inclusão/exclusão de cada empresa.
+    Roda o MESMO pré-processamento de ``_handle_direct_response`` — classificação
+    real de intent (keywords/needs_memory reais), recuperação semântica
+    cross-sessão (camada RETRIEVED) e o registro situacional — e então monta o
+    prompt. Sem os efeitos colaterais do turno vivo: NÃO grava no PKS
+    (``learn_before_response``) e nunca chama o modelo. Retorna o texto exato que
+    iria ao LLM, o trace de seleção, as entidades do PKS, a memória semântica
+    recuperada e a decisão de roteamento.
     """
-    if _context_selector is None:
+    if _ai_service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ContextSelector não inicializado",
+            detail="AIService não inicializado",
         )
 
-    decision = RoutingDecision(
-        intent=IntentType.DIRECT_RESPONSE,
-        confidence=1.0,
-        needs_memory=False,  # sem busca cross-session no preview
-        knowledge_keywords=None,
+    result = await _ai_service.preview_prompt(
+        user_id=body.user_id,
+        user_message=body.user_input,
     )
 
-    system_prompt, candidates = await _context_selector.build_prompt(
-        user_message=body.user_input,
-        user_id=body.user_id,
-        decision=decision,
-        system_context=None,
-        recovered_context=[],
-        is_neo_training=False,
-    )
+    candidates = result["candidates"]
+    decision = result["decision"]
 
     trace = [
         CandidateTrace(
@@ -138,10 +160,24 @@ async def prompt_preview(body: PromptPreviewRequest):
         for c in candidates
     ]
 
-    prompt_tokens_est = sum(c.est_tokens for c in candidates if c.included)
-
     return PromptPreviewResponse(
-        system_prompt=system_prompt,
+        system_prompt=result["system_prompt"],
         trace=trace,
-        prompt_tokens_est=prompt_tokens_est,
+        prompt_tokens_est=result["prompt_tokens_est"],
+        decision=DecisionInfo(
+            intent=decision.intent.value,
+            needs_memory=bool(decision.needs_memory),
+            knowledge_keywords=list(decision.knowledge_keywords or []),
+        ),
+        contexts_found=result["contexts_found"],
+        context_text=result["context_text"],
+        recovered=[
+            RecoveredMemory(
+                content=r.content,
+                source=r.source,
+                score=round(r.final_score, 3),
+            )
+            for r in result["recovered"]
+        ],
+        keywords=result["keywords"],
     )

@@ -48,7 +48,13 @@ logger = logging.getLogger(__name__)
 
 #: Internal fallback replies that must not be fed to the appraiser as if Neo
 #: actually said them (the turn errored; rate the user message alone).
-_ERROR_RESPONSE_PREFIXES = ("Erro ao processar", "Desculpe, não consegui gerar")
+#: "Não consegui responder agora" é o TURN_FAILED_REPLY do ai_service — o texto
+#: que fecha um turno derrubado por falha de provider.
+_ERROR_RESPONSE_PREFIXES = (
+    "Erro ao processar",
+    "Desculpe, não consegui gerar",
+    "Não consegui responder agora",
+)
 
 _health: dict[str, Any] = {
     "appraisals": 0,

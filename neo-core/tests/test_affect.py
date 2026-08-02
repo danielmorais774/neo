@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -471,6 +471,94 @@ async def test_appraiser_appraise_parses_provider_response():
     )
     assert sig.trigger == "wrong_name"
     assert sig.deltas["ira"] == 35.0
+
+
+@pytest.mark.asyncio
+async def test_appraiser_raises_when_every_provider_fails():
+    """Engolir o erro fazia o AffectUpdater contar SUCESSO e o painel mostrar
+    saúde perfeita enquanto o afeto ficava congelado (403 da OpenRouter, 2026-08-01)."""
+    provider = AsyncMock()
+    provider.complete = AsyncMock(side_effect=RuntimeError("403 key limit exceeded"))
+
+    llm = MagicMock()
+    llm.list_available_providers = MagicMock(return_value=["deepseek"])
+    llm.get_provider = MagicMock(return_value=provider)
+
+    settings = MagicMock(spec=Settings)
+    settings.neo_affect_model = ""
+
+    appraiser = AffectAppraiser(llm, settings, db=None)
+    with pytest.raises(RuntimeError, match="403"):
+        await appraiser.appraise(
+            user_message="oi", assistant_response="oi", current=AffectState()
+        )
+
+
+@pytest.mark.asyncio
+async def test_appraiser_falls_back_to_default_provider():
+    """Provider configurado fora do ar não pode levar o afeto junto."""
+    broken = AsyncMock()
+    broken.complete = AsyncMock(side_effect=RuntimeError("403 key limit exceeded"))
+    working = AsyncMock()
+    completion = MagicMock()
+    completion.get_content = MagicMock(
+        return_value='{"trigger":"obtuse","deltas":{"ira":9},"why":"insistiu no erro"}'
+    )
+    working.complete = AsyncMock(return_value=completion)
+
+    llm = MagicMock()
+    llm.list_available_providers = MagicMock(return_value=["openrouter", "deepseek"])
+    llm.get_provider = MagicMock(
+        side_effect=lambda name: broken if name == "openrouter" else working
+    )
+
+    settings = MagicMock(spec=Settings)
+    settings.neo_affect_model = ""
+
+    appraiser = AffectAppraiser(llm, settings, db=None)
+    with patch(
+        "modules.intent_config.get_classifier_config",
+        AsyncMock(return_value={"provider": "openrouter", "model": "qwen/whatever"}),
+    ):
+        sig = await appraiser.appraise(
+            user_message="e a europa fica dentro da frança?",
+            assistant_response="não, é o contrário",
+            current=AffectState(),
+        )
+    assert sig.trigger == "obtuse"
+    assert sig.deltas["ira"] == 9.0
+    assert broken.complete.await_count == 1 and working.complete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_appraiser_payload_carries_recent_history():
+    """Sem histórico no payload o appraiser julga cada turno isolado e, mandado a
+    ser conservador na ira, nunca acumula desgaste (teste de 2026-08-01)."""
+    provider = AsyncMock()
+    completion = MagicMock()
+    completion.get_content = MagicMock(return_value='{"trigger":"obtuse","deltas":{"ira":10}}')
+    provider.complete = AsyncMock(return_value=completion)
+
+    llm = MagicMock()
+    llm.list_available_providers = MagicMock(return_value=["deepseek"])
+    llm.get_provider = MagicMock(return_value=provider)
+
+    settings = MagicMock(spec=Settings)
+    settings.neo_affect_model = ""
+
+    state = AffectState(
+        recent=[
+            {"t": "2026-08-01T19:00:00+00:00", "trigger": "obtuse", "deltas": {"ira": 3}},
+            {"t": "2026-08-01T19:01:00+00:00", "trigger": "obtuse", "deltas": {"ira": 4}},
+        ]
+    )
+    appraiser = AffectAppraiser(llm, settings, db=None)
+    await appraiser.appraise(
+        user_message="mas foi o que você disse", assistant_response="não foi", current=state
+    )
+    payload = provider.complete.await_args.kwargs["messages"][1].content
+    assert "Turnos anteriores" in payload
+    assert payload.count("obtuse") == 2
 
 
 # ── Injection into the built prompt ───────────────────────────────────────────

@@ -8,6 +8,7 @@ Vantagem: uma única API key dá acesso a dezenas de modelos (Google, Anthropic,
 Meta, Mistral, etc.) com fallback automático e roteamento por preço/disponibilidade.
 """
 
+import logging
 from typing import Any
 
 import httpx
@@ -16,6 +17,22 @@ from openai import AsyncOpenAI
 from core.llm.openai_provider import OpenAIProvider
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, Message, StreamChunk, StreamEventType, ToolSchema
+
+logger = logging.getLogger(__name__)
+
+#: Tradução de ``disable_thinking`` para o campo do OpenRouter.
+#:
+#: Muitos modelos servidos aqui raciocinam POR PADRÃO, e o gateway não aplica o
+#: ``max_tokens`` ao orçamento de raciocínio. Medido em 2026-08-01 com
+#: ``qwen/qwen3.5-flash-02-23`` (upstream Alibaba) no prompt do appraiser de afeto,
+#: ``max_tokens=220``: **11-20s e 2.040-3.995 tokens de reasoning** para emitir ~180
+#: chars de JSON. Com este campo: ~0,6s e zero reasoning.
+#:
+#: Isto é o que faltava para a intenção ``disable_thinking`` valer aqui: como este
+#: provider herda o ``complete`` da OpenAI — que DESCARTA a flag por ser ruído para
+#: a API dela —, quem pedia saída curta e estruturada (o ``intent_router`` pede em
+#: toda classificação) estava pagando o raciocínio inteiro sem saber.
+_REASONING_DISABLED = {"reasoning": {"enabled": False}}
 
 
 class OpenRouterProvider(OpenAIProvider):
@@ -60,6 +77,18 @@ class OpenRouterProvider(OpenAIProvider):
         )
         self.model = self.DEFAULT_MODEL
 
+    @staticmethod
+    def _apply_reasoning_pref(kwargs: dict[str, Any]) -> None:
+        """Traduz a intenção ``disable_thinking`` para o campo ``reasoning`` da API.
+
+        Consome a flag ANTES de subir para ``OpenAIProvider``, que a descartaria.
+        Um ``extra_body`` vindo do chamador vence — quem foi explícito manda.
+        """
+        if not kwargs.pop("disable_thinking", False):
+            return
+        kwargs["extra_body"] = {**_REASONING_DISABLED, **(kwargs.get("extra_body") or {})}
+        logger.debug("[OpenRouter] reasoning desligado nesta chamada (saída estruturada pedida)")
+
     async def complete(
         self,
         messages: list[Message],
@@ -70,6 +99,7 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Completion via OpenRouter (usa mesma lógica da OpenAI)."""
+        self._apply_reasoning_pref(kwargs)
         try:
             return await super().complete(
                 messages=messages,
@@ -95,6 +125,7 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Streaming via OpenRouter."""
+        self._apply_reasoning_pref(kwargs)
         try:
             async for chunk in super().stream_complete(
                 messages=messages,

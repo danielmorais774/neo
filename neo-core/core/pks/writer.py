@@ -106,7 +106,7 @@ class PKSWriter:
         self.resolver = resolver
         self.validator = validator
         self.audit = audit
-        self.memory_planner = PKSMemoryPlanner(llm_router)
+        self.memory_planner = PKSMemoryPlanner(llm_router, db=db)
         # Memory Pipeline v2 for Neo training messages.
         self.envelope_parser = TrainingEnvelopeParser()
         self.canonicalizer = MemoryCanonicalizer()
@@ -128,6 +128,8 @@ class PKSWriter:
         recent_history: str = "",
         recent_messages: list[dict[str, str]] | None = None,
         source_message_id: str | None = None,
+        confirmed_save: bool = False,
+        forget: bool = False,
     ) -> list[dict[str, Any]]:
         if memory_target == "system":
             return await self._learn_system(
@@ -136,35 +138,56 @@ class PKSWriter:
                 assistant_response=assistant_response,
                 source_message_id=source_message_id,
             )
-        if self._extract_assistant_communication_policy(user_message) or self._is_agent_training_intent(normalize_token(user_message)):
+        # No modo esquecer, a mensagem sintética ("esquece isto ...") não é treino
+        # de comportamento — pular os guards de policy/treino que só valem p/ save.
+        if not forget and (
+            self._extract_assistant_communication_policy(user_message)
+            or self._is_agent_training_intent(normalize_token(user_message))
+        ):
             logger.info("[PKS][plan_memory] agent training routed to system workspace")
             return []
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         logger.info(
-            "[PKS][plan_memory] learn_start workspace_id=%s source_message_id=%s",
+            "[PKS][plan_memory] learn_start workspace_id=%s source_message_id=%s forget=%s",
             workspace_id,
             source_message_id,
+            forget,
         )
-        confirmed = await self._learn_from_confirmed_artifact(
-            workspace_id=workspace_id,
-            user_message=user_message,
-            assistant_response=assistant_response,
-            recent_messages=recent_messages,
-            source_message_id=source_message_id,
-        )
-        if confirmed:
-            logger.info(
-                "[PKS][plan_memory] learn_complete path=confirmed_artifact applied=%d",
-                len(confirmed),
+        if not forget:
+            confirmed = await self._learn_from_confirmed_artifact(
+                workspace_id=workspace_id,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                recent_messages=recent_messages,
+                source_message_id=source_message_id,
             )
-            return confirmed
+            if confirmed:
+                logger.info(
+                    "[PKS][plan_memory] learn_complete path=confirmed_artifact applied=%d",
+                    len(confirmed),
+                )
+                return confirmed
 
         operations = await self._plan_operations(
             user_message=user_message,
             assistant_response=assistant_response,
             pks_context=pks_context,
             recent_history=recent_history,
+            confirmed_save=confirmed_save,
+            forget=forget,
         )
+        # Trava de segurança: no modo esquecer, SÓ operações de remoção passam —
+        # se o planner alucinar um upsert, ele é descartado (nunca cria/altera
+        # ao "esquecer"). Ver docs/pks-write-on-demand-plan.md §Fase 5.
+        if forget:
+            _delete_ops = {"soft_delete_entity", "expire_relation"}
+            before = len(operations)
+            operations = [op for op in operations if op.op in _delete_ops]
+            if len(operations) != before:
+                logger.info(
+                    "[PKS][plan_memory] forget_filter dropped=%d non-delete ops",
+                    before - len(operations),
+                )
         logger.info("[PKS][plan_memory] planned_operations=%d", len(operations))
         if not operations:
             logger.info("[PKS][plan_memory] learn_complete path=planner applied=0")
@@ -174,7 +197,11 @@ class PKSWriter:
         async with self.db.get_session() as session:
             for op in operations[:MAX_PLANNER_OPERATIONS]:
                 try:
-                    if op.confidence < MIN_APPLY_CONFIDENCE:
+                    # No modo confirmado (pks_remember) ou esquecer (pks_forget), o
+                    # usuário JÁ confirmou a ação: não descartamos por confidence
+                    # baixo — quem decidiu foi o cognitivo, não o planner.
+                    # Ledger/credencial abaixo continuam valendo.
+                    if not (confirmed_save or forget) and op.confidence < MIN_APPLY_CONFIDENCE:
                         await self.audit.log(
                             session,
                             workspace_id=workspace_id,
@@ -824,6 +851,11 @@ class PKSWriter:
         style_pref = self._extract_system_style_preference(user_message)
         confirmation = self._is_memory_confirmation(user_message)
         has_memory_intent = self._is_system_memory_intent(user_message)
+        # "salva essa ideia" / "guarda isso... de novo": o fato está no turno
+        # anterior, não no comando. Não fabricar entidade de sistema a partir do
+        # comando cru — o subagente (pks_remember, user scope) faz a gravação
+        # certa. Ver _is_reference_only_save (fix da session-d41ed0fa).
+        reference_only = self._is_reference_only_save(user_message)
 
         if communication_policy:
             updates.append(
@@ -879,7 +911,7 @@ class PKSWriter:
                 }
             )
 
-        if has_memory_intent:
+        if has_memory_intent and not reference_only:
             goals_properties = self._infer_goals_properties(user_message)
             if goals_properties:
                 updates.append(
@@ -1455,6 +1487,8 @@ class PKSWriter:
         assistant_response: str,
         pks_context: str,
         recent_history: str,
+        confirmed_save: bool = False,
+        forget: bool = False,
     ) -> list[PKSOperation]:
         return await self.memory_planner.plan(
             user_message=user_message,
@@ -1462,6 +1496,8 @@ class PKSWriter:
             pks_context=pks_context,
             recent_history=recent_history,
             max_operations=MAX_PLANNER_OPERATIONS,
+            confirmed_save=confirmed_save,
+            forget=forget,
         )
 
     async def _apply_direct_fact_writes(
@@ -2035,6 +2071,36 @@ class PKSWriter:
             "anota isso",
         )
         return any(token in normalized for token in intents)
+
+    # Marcadores de que o "salva" se refere a um conteúdo que está EM OUTRO LUGAR
+    # (o turno anterior do assistente), não a um fato declarado inline. Um pedido
+    # assim ("salva essa ideia", "guarda isso", "...tenta de novo") não carrega o
+    # fato no próprio texto — o fato vive na resposta anterior. Fabricar uma
+    # entidade de sistema a partir do COMANDO é o bug (session-d41ed0fa: "...com
+    # meu nome, tenta de novo" virou stable_fact). Nesses casos os _infer_* se
+    # calam e a gravação certa vai pelo subagente (tool pks_remember, user scope).
+    _REFERENCE_SAVE_MARKERS = (
+        "isso",
+        "isto",
+        "aquilo",
+        "de novo",
+        "pra depois",
+        "para depois",
+        "essa ideia",
+        "essa dica",
+        "essa receita",
+        "a ideia",
+        "sua resposta",
+        "o que voce falou",
+        "o que voce disse",
+        "o que voce acabou",
+    )
+
+    def _is_reference_only_save(self, text: str) -> bool:
+        normalized = normalize_token(text)
+        if not normalized or not self._is_system_memory_intent(text):
+            return False
+        return any(marker in normalized for marker in self._REFERENCE_SAVE_MARKERS)
 
     def _extract_system_style_preference(self, text: str) -> str | None:
         normalized = normalize_token(text)

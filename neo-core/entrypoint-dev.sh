@@ -37,12 +37,24 @@ echo "🚀 Starting uvicorn with hot-reload..."
 # a API fica fora do ar até alguém reiniciar na mão. Com `> >(tee ...)` o uvicorn
 # é o PID 1 de verdade: se ele morre, o container morre e a restart policy sobe
 # tudo de novo.
+# --reload-dir /app (e não a lista de subpastas): o servidor também importa
+# módulos na RAIZ (grpc_server.py, neo_desktop_pb2*.py), então watchar só
+# api/core/shared/modules/db deixaria edição de gRPC sem reload. Antes a lista
+# de subpastas estava aqui E o /app no fim — o uvicorn colapsa dirs contidos uns
+# nos outros, então as cinco linhas eram no-op e o watch era /app inteiro.
+#
+# --reload-exclude: pastas com .py que o servidor NUNCA importa. Sem isto, salvar
+# um script de avaliação (scripts/eval_router.py) ou um teste derrubava a API no
+# meio de um turno: o reload cancela as tasks em voo depois do
+# --timeout-graceful-shutdown, o stream gRPC do desktop morre no meio e o cliente
+# mostra `status: Unknown, message: "transport error"`. Aconteceu em 2026-08-01
+# (13 reloads em 6h vindos só de scripts/eval_router.py via Mutagen).
 exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
   --timeout-graceful-shutdown 5 \
-  --reload-dir /app/api \
-  --reload-dir /app/core \
-  --reload-dir /app/shared \
-  --reload-dir /app/modules \
-  --reload-dir /app/db \
-  --reload-dir /app/grpc_server.py \
+  --reload-dir /app \
+  --reload-exclude /app/scripts \
+  --reload-exclude /app/tests \
+  --reload-exclude /app/alembic \
+  --reload-exclude /app/docs \
+  --reload-exclude /app/logs \
   > >(tee -a /app/logs/app.log) 2>&1

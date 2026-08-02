@@ -146,6 +146,20 @@ message AgentResponse {
   // order; a segment with an empty `voice` uses the reply-level `voice` above.
   // `message` still carries the full concatenated text (display + back-compat).
   repeated SpeechSegment segments = 5;
+  // Arquivos que o Neo gerou/catalogou nesta resposta (ex: um .zip criado via
+  // a tool file_save) — mesmo campo que o REST/NDJSON (`files`) já expõe pro
+  // neo-panel. Baixável via GET /api/v1/files/{id}/download no neo-core
+  // (endpoint aberto, agnóstico de cliente). Vazio quando nenhum file_save
+  // rodou neste turno.
+  repeated FileRef files = 6;
+}
+
+// Referência a um arquivo gerado/catalogado (file_save), pronto pra download
+// via GET /api/v1/files/{id}/download no neo-core.
+message FileRef {
+  string id = 1;
+  string name = 2;
+  int64 size_bytes = 3;
 }
 
 // One chunk of a multi-voice reply. `text` is spoken with `voice` if set,

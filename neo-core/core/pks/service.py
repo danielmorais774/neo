@@ -123,6 +123,8 @@ class PKSService:
         recent_history: str = "",
         recent_messages: list[dict[str, str]] | None = None,
         source_message_id: str | None = None,
+        confirmed_save: bool = False,
+        forget: bool = False,
     ) -> list[dict[str, Any]]:
         return await self.writer.learn(
             user_id=user_id,
@@ -134,6 +136,8 @@ class PKSService:
             recent_history=recent_history,
             recent_messages=recent_messages,
             source_message_id=source_message_id,
+            confirmed_save=confirmed_save,
+            forget=forget,
         )
 
     async def register_device(

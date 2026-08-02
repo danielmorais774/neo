@@ -69,6 +69,7 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "google/gemini-2.0-flash-001": "openrouter",
     "anthropic/claude-3.5-sonnet": "openrouter",
     "meta-llama/llama-3.3-70b-instruct": "openrouter",
+    "qwen/qwen3.5-flash-02-23": "openrouter",
 }
 
 
@@ -207,7 +208,7 @@ class LLMRouter:
             "openai": "gpt-4-turbo-preview",
             "anthropic": "claude-3-opus-20240229",
             "ollama": "gemma4:e2b",
-            "deepseek": "deepseek-chat",
+            "deepseek": "deepseek-v4-flash",
             "gemini": "gemini-2.0-flash",
             "grok": "grok-3-mini",
             "groq": "llama-3.3-70b-versatile",

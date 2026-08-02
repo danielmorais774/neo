@@ -72,7 +72,7 @@ Regras de domínio para academia:
 
 Contexto PKS atual:
 {pks_context}
-
+{confirmed_override}
 Formato:
 {{
   "operations": [
@@ -119,11 +119,53 @@ Formato:
 """
 
 
+# Override injetado quando a escrita foi acionada por uma AÇÃO EXPLÍCITA do
+# usuário (tool pks_remember): quem decidiu "salvar" foi o cognitivo, que já
+# entendeu o pedido e resolveu a referência ("essa ideia"). O planner NÃO
+# re-julga se salva — só estrutura. Sem isso, o gate de "sugestão do assistente
+# sem confirmação" poderia devolver {"operations": []} e anular a decisão do
+# LLM logo acima dele (docs/pks-write-on-demand-plan.md §4.1).
+_CONFIRMED_SAVE_OVERRIDE = """
+MODO CONFIRMADO (prioridade máxima): o conteúdo abaixo JÁ foi confirmado pelo
+usuário via ação explícita de "salvar/lembrar". Sua ÚNICA tarefa é ESTRUTURÁ-LO
+na ontologia certa (entidade/campos/relações) — NÃO decida se vale a pena
+salvar, NÃO devolva operações vazias por achar que é "sugestão do assistente".
+Extraia o(s) fato(s) do conteúdo, escolha o entity type mais específico
+(preference, food, supplement, routine, place, person...) e proponha as
+operações. Use confidence >= 0.90. Só devolva {"operations": []} se o conteúdo
+for genuinamente inestruturável (vazio ou sem nenhum fato).
+"""
+
+
+# Override para a tool pks_forget: o usuário pediu para ESQUECER/APAGAR algo da
+# memória. Aqui o planner NÃO cria nem atualiza nada — só localiza no "Contexto
+# PKS atual" a(s) entidade(s) que casam com o alvo e emite soft_delete_entity.
+# docs/pks-write-on-demand-plan.md §Fase 5.
+_FORGET_OVERRIDE = """
+MODO ESQUECER (prioridade máxima): o usuário pediu para REMOVER algo da memória.
+Sua ÚNICA tarefa é encontrar, no "Contexto PKS atual" acima, a(s) entidade(s)
+que correspondem ao alvo descrito e emitir operações **soft_delete_entity** para
+elas (com o name e type EXATOS como aparecem no contexto). Regras:
+- Emita SOMENTE operações "soft_delete_entity". NUNCA upsert_entity/upsert_field/
+  upsert_relation neste modo — não crie nem altere nada.
+- Só apague o que casa CLARAMENTE com o alvo. Na dúvida entre duas entidades,
+  escolha a que casa melhor pelo nome; se nada casa, devolva {"operations": []}.
+- Se o alvo não existe no contexto, devolva {"operations": []} (não invente nome).
+- Use confidence >= 0.90.
+Formato de cada operação: {"op": "soft_delete_entity", "confidence": 0.95,
+"reason": "usuário pediu para esquecer", "entity": {"name": "<exato>", "type": "<exato>"}}
+"""
+
+
 class PKSMemoryPlanner:
     """Produces proposed PKS write operations using an LLM."""
 
-    def __init__(self, llm_router: LLMRouter) -> None:
+    def __init__(self, llm_router: LLMRouter, db: object | None = None) -> None:
         self.llm = llm_router
+        # DB is optional so tests/callers without one still work — the model then
+        # comes from settings/default. When present, the panel-selected model for
+        # role "memory_planner" (modules.model_config) overrides it.
+        self.db = db
 
     async def plan(
         self,
@@ -133,17 +175,28 @@ class PKSMemoryPlanner:
         pks_context: str,
         recent_history: str,
         max_operations: int = 40,
+        confirmed_save: bool = False,
+        forget: bool = False,
     ) -> list[PKSOperation]:
         logger.info(
-            "[PKS][plan_memory] start user_chars=%d assistant_chars=%d context_chars=%d history_chars=%d max_operations=%d",
+            "[PKS][plan_memory] start user_chars=%d assistant_chars=%d context_chars=%d history_chars=%d max_operations=%d confirmed_save=%s forget=%s",
             len(user_message or ""),
             len(assistant_response or ""),
             len(pks_context or ""),
             len(recent_history or ""),
             max_operations,
+            confirmed_save,
+            forget,
         )
         history = f"Mensagens recentes:\n{recent_history}\n\n" if recent_history else ""
         prompt = _MEMORY_PLANNER_PROMPT.replace("{pks_context}", pks_context or "(vazio)")
+        if forget:
+            override = _FORGET_OVERRIDE
+        elif confirmed_save:
+            override = _CONFIRMED_SAVE_OVERRIDE
+        else:
+            override = ""
+        prompt = prompt.replace("{confirmed_override}", override)
         user_content = (
             f"{history}"
             f"Mensagem atual do usuário:\n{user_message}\n\n"
@@ -151,18 +204,32 @@ class PKSMemoryPlanner:
             f"Limite de operações: {max_operations}"
         )
         try:
-            provider = self._provider()
+            # Modelo EXPLÍCITO: sem isso, o provider caía no DEFAULT_MODEL, que já
+            # foi "deepseek-chat" (aposentado → 400 invalid_request) e fazia TODA
+            # gravação do PKS falhar silenciosamente (session-77a77b00). O padrão
+            # (settings.pks_planner_model) é o fallback; a escolha feita no
+            # neo-panel (role "memory_planner") tem prioridade e vale sem restart.
+            model = await self._resolve_model()
+            # O provider SEGUE o modelo escolhido — antes era deepseek fixo, o que
+            # quebraria se a UI apontasse pra um modelo de outro provider.
+            provider = self.llm.get_provider_for_model(model)
             logger.info(
-                "[PKS][plan_memory] provider_selected provider=%s",
+                "[PKS][plan_memory] provider_selected provider=%s model=%s",
                 getattr(provider, "name", provider.__class__.__name__),
+                model,
             )
             response = await provider.complete(
                 messages=[
                     Message(role=MessageRole.SYSTEM, content=prompt),
                     Message(role=MessageRole.USER, content=user_content),
                 ],
+                model=model,
                 temperature=0.0,
-                max_tokens=3000,
+                # Folga: o modelo às vezes monta um grafo maior (pessoa +
+                # coleção + entidade + relações) e, com o teto antigo (3000), o
+                # JSON truncava no meio → parse falhava → 0 operações salvas
+                # (session-77a77b00). O parser ainda salva o que completou.
+                max_tokens=8000,
             )
             raw = response.get_content() or "{}"
             logger.info("[PKS][plan_memory] llm_response_received chars=%d", len(raw))
@@ -174,13 +241,26 @@ class PKSMemoryPlanner:
         logger.info("[PKS][plan_memory] parse_complete operations=%d", len(parsed))
         return parsed
 
-    def _provider(self):
-        for provider_name in ("deepseek", None):
-            try:
-                return self.llm.get_provider(provider_name)  # type: ignore[arg-type]
-            except Exception:
-                continue
-        raise RuntimeError("No LLM provider available for PKS memory planner")
+    async def _resolve_model(self) -> str:
+        """Model for the planner: panel selection (DB) → settings → hard default.
+
+        Reads role "memory_planner" from :mod:`modules.model_config` (memoized,
+        never raises). Falls back to ``settings.pks_planner_model`` when nothing is
+        persisted or the DB is absent, keeping the pre-panel behavior intact.
+        """
+        from shared.config import get_settings
+
+        fallback = getattr(get_settings(), "pks_planner_model", "deepseek-v4-flash")
+        try:
+            from modules.model_config import get_model_config
+
+            config = await get_model_config(
+                self.db, "memory_planner", fallback_model=fallback
+            )
+            return config.get("model") or fallback
+        except Exception as e:  # pragma: no cover - defensive; never break writes
+            logger.warning("[PKS] resolve planner model failed, using %s: %s", fallback, e)
+            return fallback
 
     def _parse(self, raw: str, *, max_operations: int) -> list[PKSOperation]:
         logger.info("[PKS][plan_memory] parse_start raw_chars=%d", len(raw or ""))
@@ -191,13 +271,23 @@ class PKSMemoryPlanner:
             text = text[start:end] if start >= 0 and end > start else text
         try:
             data = json.loads(text)
+            items = data.get("operations", [])
         except Exception:
-            logger.warning("[PKS] Could not parse Plan Memory JSON: %s", raw[:300])
-            return []
+            # JSON truncado (ex.: modelo estourou max_tokens no meio do array):
+            # salva as operações que COMPLETARAM em vez de perder tudo.
+            items = self._salvage_operations(text)
+            if items:
+                logger.warning(
+                    "[PKS] Plan Memory JSON truncado — salvando %d op(s) completas",
+                    len(items),
+                )
+            else:
+                logger.warning("[PKS] Could not parse Plan Memory JSON: %s", raw[:300])
+                return []
 
         parsed: list[PKSOperation] = []
         skipped = 0
-        for item in data.get("operations", []):
+        for item in items:
             if not isinstance(item, dict):
                 skipped += 1
                 continue
@@ -214,3 +304,52 @@ class PKSMemoryPlanner:
             len(limited),
         )
         return limited
+
+    @staticmethod
+    def _salvage_operations(text: str) -> list[dict]:
+        """Extrai objetos de operação completos de um JSON truncado.
+
+        Varre o array ``"operations": [ ... ]`` casando chaves ``{}`` (ignorando
+        as que estão dentro de strings) e decodifica cada objeto de topo do
+        array isoladamente. O último objeto, se veio cortado, é descartado — o
+        que já completou é preservado. Melhor salvar N-1 fatos do que zero.
+        """
+        marker = text.find('"operations"')
+        if marker < 0:
+            return []
+        start = text.find("[", marker)
+        if start < 0:
+            return []
+        items: list[dict] = []
+        depth = 0
+        obj_start = -1
+        in_str = False
+        escape = False
+        for i in range(start + 1, len(text)):
+            ch = text[i]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start >= 0:
+                    chunk = text[obj_start : i + 1]
+                    try:
+                        items.append(json.loads(chunk))
+                    except Exception:
+                        pass
+                    obj_start = -1
+            elif ch == "]" and depth == 0:
+                break
+        return items

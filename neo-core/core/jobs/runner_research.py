@@ -171,7 +171,33 @@ def build_research_runner(
     ``research_model_writer`` (forte) escreve, critica e revisa — poucas chamadas,
     onde a qualidade do relatório é decidida.
     """
-    writer_model = research_model_writer or research_model
+    default_writer_model = research_model_writer or research_model
+
+    async def _resolve_models() -> tuple[str, str]:
+        """Volume + writer models for this run: panel selection (DB) → settings.
+
+        Reads roles "research_volume"/"research_writer" from
+        :mod:`modules.model_config` (memoized, never raises). Resolved PER JOB — not
+        baked into the closure — so a change in the panel lands on the next
+        pesquisa without a restart. Falls back to the env-derived defaults.
+        """
+        volume, writer = research_model, default_writer_model
+        try:
+            from modules.model_config import get_model_config
+
+            volume = (
+                await get_model_config(
+                    db, "research_volume", fallback_model=research_model
+                )
+            ).get("model") or research_model
+            writer = (
+                await get_model_config(
+                    db, "research_writer", fallback_model=default_writer_model
+                )
+            ).get("model") or default_writer_model
+        except Exception as e:  # noqa: BLE001 — nunca quebra a pesquisa por config
+            logger.warning("[Research] resolve models falhou, usando defaults: %s", e)
+        return volume, writer
 
     async def run_research_job(job: AgentJob) -> dict:
         from core.research import ResearchAgent, ResearchError, budget_for
@@ -183,9 +209,11 @@ def build_research_runner(
                 "result_summary": "Job de pesquisa sem research_task correspondente.",
             }
 
+        volume_model, writer_model = await _resolve_models()
+
         budget = budget_for(task.depth)
         await db.update_research_task(
-            task.id, started_at=datetime.utcnow(), model=research_model
+            task.id, started_at=datetime.utcnow(), model=volume_model
         )
         try:
             await db.update_agent_job(
@@ -198,7 +226,7 @@ def build_research_runner(
 
         search_adapter = _SearchAdapter(web_search)
         agent = ResearchAgent(
-            llm=_LLMAdapter(llm_router, research_model),
+            llm=_LLMAdapter(llm_router, volume_model),
             search=search_adapter,
             progress=_ProgressAdapter(db, task.id, job.id),
             budget=budget,

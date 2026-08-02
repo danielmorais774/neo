@@ -152,6 +152,14 @@ class ToolSchema(BaseModel):
     module: str
     execution: Literal["client-side", "server-side"] = "client-side"
     timeout: int = 30
+    #: Linha curta usada SÓ no catálogo do classificador de intenção
+    #: (``IntentRouter._format_tools``). A ``description`` completa continua
+    #: indo para a API como schema da função — é ela que ensina o núcleo
+    #: cognitivo a USAR a tool. O classificador tem outro trabalho: só precisa
+    #: RECONHECER a tool, e paga a descrição inteira em toda mensagem do
+    #: usuário. Sem isto, encurtar para o router significava enfraquecer o
+    #: cérebro. Vazio → cai na ``description``.
+    router_summary: str | None = None
 
 
 class ToolCall(BaseModel):

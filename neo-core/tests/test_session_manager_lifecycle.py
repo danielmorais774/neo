@@ -273,3 +273,54 @@ async def test_new_chat_short_followup_does_not_silently_inherit_context():
     )
 
     assert result["action"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_get_history_enriches_last_assistant_turn_with_tool_trace():
+    """session-7b0956de: o modelo escreveu 3 arquivos, prometeu zipar e não
+    terminou o turno; o follow-up ("cade os arquivos?") não sabia de nada disso
+    e refez tudo do zero. A nota técnica injetada aqui é o que fecha essa lacuna
+    — sem tocar no `content` que o chat mostra."""
+    session_id = uuid4()
+    db = _FakeDB()
+    db.histories[session_id] = [
+        {"role": "user", "content": "gera um zip do portfolio", "token_count": 10},
+        {
+            "role": "assistant",
+            "content": "Três arquivos prontos. Agora vou zipar tudo e já te mando o arquivo.",
+            "token_count": 12,
+            "extra_metadata": {
+                "tool_trace": [
+                    {"tool": "neo_write_file", "ok": True, "path": "/workspace/index.html", "bytes": 1811},
+                    {"tool": "neo_write_file", "ok": True, "path": "/workspace/style.css", "bytes": 761},
+                    {"tool": "neo_write_file", "ok": True, "path": "/workspace/script.js", "bytes": 1175},
+                ],
+            },
+        },
+    ]
+
+    history = await _manager(db).get_history(session_id, current_embedding=None)
+
+    assert history[0]["content"] == "gera um zip do portfolio"
+    # O texto salvo/exibido continua intacto — a nota vem DEPOIS, anexada.
+    assert history[1]["content"].startswith(
+        "Três arquivos prontos. Agora vou zipar tudo e já te mando o arquivo."
+    )
+    assert "/workspace/index.html (1811 bytes)" in history[1]["content"]
+    assert "/workspace/style.css (761 bytes)" in history[1]["content"]
+    assert "/workspace/script.js (1175 bytes)" in history[1]["content"]
+    assert "não repita isso ao usuário" in history[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_get_history_skips_note_when_no_tool_trace():
+    session_id = uuid4()
+    db = _FakeDB()
+    db.histories[session_id] = [
+        {"role": "user", "content": "oi", "token_count": 2},
+        {"role": "assistant", "content": "E aí.", "token_count": 3, "extra_metadata": None},
+    ]
+
+    history = await _manager(db).get_history(session_id, current_embedding=None)
+
+    assert history[1]["content"] == "E aí."

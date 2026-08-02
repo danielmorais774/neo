@@ -153,7 +153,11 @@ Recomendo **(B)**: agência por padrão, garantia onde honestidade importa.
   Gate por flag + checagem de capacidade.
 - **Flags:**
   - `cognitive_tools_enabled` (default `true`) — liga o toolset de leitura no cérebro.
-  - `cognitive_max_tool_rounds` (default `3`).
+  - `cognitive_max_tool_rounds` (default original `3`, pensado só pras read tools
+    deste doc). Depois que o workbench — `neo_write_file`/`neo_bash`/`file_save`
+    (docs/workbench-background-jobs-plan.md) — passou a usar o MESMO loop, tarefas
+    de vários arquivos/downloads estouravam esse budget; subiu pra `32`/teto `100`,
+    alinhado com `max_iterations` do `AgentExecutor`.
 - **Anti-loop:** `MAX_TOOL_ROUNDS` + dedup de chamadas idênticas (mesma tool+args)
   para o modelo não repetir a mesma leitura.
 

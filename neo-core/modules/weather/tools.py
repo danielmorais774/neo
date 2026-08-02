@@ -11,6 +11,7 @@ WEATHER_TOOLS: list[ToolSchema] = [
             "NÃO invente cidade: se o usuário não disser e você não souber, use "
             "get_user_location antes. Sem cidade nem coordenadas, retorna needs_city."
         ),
+        router_summary="Clima/tempo de uma cidade (ou lat/lon).",
         module="weather",
         execution="server-side",
         timeout=15,

@@ -43,6 +43,12 @@ _MEMORY_DIRECTIVE_PATTERNS = [
         r"\banot[ae]\w*\s+(que|isso|ai|aqui)",          # anota que / anote isso
         r"\bnao esquec",                                # nao esqueca / não esqueça
         r"\b(remember|memorize|take note|keep in mind)\b",
+        # Referências INEQUÍVOCAS de memória/anotações (não casam save de arquivo,
+        # que não fala em "anotações"/"ideia"/"lembrar"). Fecham o gap da Fase 2:
+        # "salva essa ideia", "coloca isso nas nossas anotações", "pra eu lembrar".
+        r"\bnas?\s+(minhas?\s+|nossas?\s+|suas?\s+)?(anotac\w+|notas)\b",  # nas (nossas) anotações
+        r"\b(salv|guard|anot|registr)\w*\s+(a |o |essa |esta |esse |este |uma |um )?(ideia|dica|receita|informacao|info|observacao)\b",  # salva essa ideia/dica
+        r"\b(pra|para)\s+(eu\s+)?lembrar\b",            # pra lembrar / para eu lembrar
     )
 ]
 
@@ -73,6 +79,12 @@ _DEVICE_KNOWLEDGE_TERMS = (
 )
 # Back-reference pronouns for the correction turn ("quero os que você conhece").
 _BACKREF_PATTERN = re.compile(r"\b(os que|as que|aqueles|aquelas|esses|essas)\b")
+
+# Caminho de arquivo ESPECÍFICO (com extensão) dentro de um comando de shell — usado
+# pelo grounding guard de CLIENT_TOOL (ver _ungrounded_path_literals). Exige extensão
+# de propósito: comandos exploratórios (`ls ~/Desktop`, `df -h`, `find . -iname
+# '.env*'`) não citam um arquivo específico e não devem disparar o guard.
+_PATH_WITH_EXT_RE = re.compile(r"(?:~|/)[^\s'\"|;&<>]*\.[A-Za-z0-9]{1,6}(?=[\s'\"|;&<>]|$)")
 
 # Referential questions point back to an earlier turn via a demonstrative+
 # preposition contraction ("como tu chegou NESSA conta de 22?", "de onde veio
@@ -230,6 +242,13 @@ _SKILL_OWNED_TOOL_PREFIXES = (
     "file_",
 )
 
+# request_user_file (plano "arquivos sob iniciativa do cérebro") é client-side mas
+# PURAMENTE do cérebro: ele decide puxar um arquivo do usuário no meio do turno
+# cognitivo (via ClientActuationRequested). Fica fora da visão do classificador
+# pra não roubar do DIRECT_RESPONSE os pedidos de arquivo (start conservador). O
+# save_generated_file, esse sim, segue roteável ("salva aí" → CLIENT_TOOL).
+_BRAIN_ONLY_CLIENT_TOOLS = frozenset({"request_user_file"})
+
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
 # confident imperative. Anything conditional/definitional/uncertain about them is
 # routed to the cognitive core instead (Workstream B — bias to brain).
@@ -241,6 +260,31 @@ _SIDE_EFFECT_SKILL_INTENTS = frozenset({
 _SPEECH_ACTS = frozenset({
     "imperative", "question", "conditional", "definition", "chitchat",
 })
+
+# ── Orçamento de saída da classificação ─────────────────────────────────────
+# `max_tokens` é TETO, não reserva: cobra-se o que o modelo gera, e ele para
+# sozinho ao fechar o JSON. Ou seja, margem larga é grátis no caminho normal e
+# só aparece na conta quando evita um turno perdido — a assimetria toda está do
+# lado de dar folga.
+#
+# A resposta típica (16 campos, explicação em PT) mede ~150 tokens; o pior caso
+# realista — `pipeline_plan` com vários steps e explicação longa — fica em ~400.
+# O valor antigo (300) foi escrito em fev/2026, quando o contrato tinha 8 campos
+# e ~60 tokens: era 5× de margem. O contrato dobrou em quatro features
+# (`knowledge_keywords`, `speech_act`, `pipeline_plan`, `gravity`/
+# `register_hint`) e o classificador virou um modelo que RACIOCINA antes de
+# responder — aí o raciocínio consumia o teto antes da primeira chave e o
+# conteúdo voltava truncado, ou vazio, caindo no fallback por palavra-chave
+# (medido: 13 de 46 casos com deepseek-v4-flash).
+#
+# 2048 dá ~14× a resposta típica e ~5× o pior caso, e ainda absorve um bom
+# tanto de raciocínio se algum provider ignorar `disable_thinking`. 4096 na
+# retentativa é o dobro disso E o teto de saída mais baixo entre os providers
+# que o painel deixa escolher (modelos Claude antigos param em 4096) — pedir
+# mais que isso arriscaria um 400 em vez de uma classificação.
+_CLASSIFIER_TYPICAL_OUTPUT_TOKENS = 150
+_CLASSIFIER_MAX_TOKENS = 2048
+_CLASSIFIER_MAX_TOKENS_RETRY = 4096
 
 
 def _strip_accents(text: str) -> str:
@@ -255,18 +299,32 @@ def _strip_accents(text: str) -> str:
         out = out.replace(src, dst)
     return out
 
-ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI assistant. Classify the user message into one execution path.
+ROUTER_SYSTEM_PROMPT = """You are an intent classifier for Neo, a desktop AI assistant. Classify the LAST user message into ONE execution path. Você é CLASSIFICADOR, não o assistente: não responda ao usuário — devolva só o JSON do formato de saída.
+
+## Regra mestra: em QUE MÁQUINA a tarefa precisa rodar
+Três lugares FÍSICOS distintos, sem filesystem compartilhado entre eles:
+1. **Sandbox do cérebro** — `/workspace`, container Linux na VPS, com internet. É onde o DIRECT_RESPONSE cria e processa arquivo (tools `neo_*` do cérebro).
+2. **Máquina do usuário** — o disco, o sistema e os apps DELE. Só o CLIENT_TOOL (`run_command`) executa lá de verdade.
+3. **Catálogo de arquivos** (File Store do neo-core) — a ÚNICA ponte entre os dois: o cérebro publica um arquivo do sandbox com `file_save` e ele aparece no histórico como "entregue ao usuário: 'nome' (file_id=...)".
+
+Esta é a decisão que mais erra — resolva-a ANTES de escolher tool:
+- Calcular, gerar (uuid/hash/senha/QR code), converter formato, processar dados, rodar/testar código, baixar de uma URL e analisar → **DIRECT_RESPONSE**: o cérebro faz isso no PRÓPRIO sandbox, sem pedir permissão e sem depender da máquina do usuário estar ligada.
+- Arquivo que já existe no DISCO dele, info do SISTEMA/hardware dele, instalar/ABRIR um programa dele, abrir uma URL/universal link no computador dele → **CLIENT_TOOL**.
+- Na dúvida entre os dois: se a mensagem não fala do disco/sistema/app DELE, é DIRECT_RESPONSE.
+
+Nada cruza de um lado pro outro por caminho ou URL escrita à mão: um `run_command` citando `/workspace/...` sempre falha ("No such file or directory" — esse caminho só existe na VPS), e um `curl` pra baixar o arquivo do neo-core nunca funciona (você não sabe, e não pode adivinhar, o host/porta real — só o cliente sabe). Levar um arquivo GERADO PELO CÉREBRO pro lado do usuário ("salva aí", "manda pra mim", "põe no Desktop/Downloads/naquela pasta") tem um caminho só:
+- Já existe `file_id` no histórico → **CLIENT_TOOL** com `tool_name="save_generated_file"` e `tool_arguments={{"file_id": "<o file_id exato, copiado literalmente do histórico>", "file_name": "<nome do arquivo>", "destination": "<destino>"}}`. `destination` é opcional (padrão "desktop"): "downloads"/"documents"/"home" pros atalhos conhecidos, ou um caminho literal (ex: "~/Projetos/financas") se o usuário citou a pasta.
+- Ainda NÃO existe `file_id` → **DIRECT_RESPONSE** primeiro (o cérebro gera e chama `file_save`); só no turno seguinte "coloca no meu disco" vira CLIENT_TOOL.
+Nunca invente um `file_id` nem um caminho que o usuário não mencionou.
 
 ## Paths
-- **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversation, general knowledge, greetings, games, translations, personal info (workout/diet/routines) — anything answerable with text only. **E TAMBÉM qualquer COMPUTAÇÃO/PROCESSAMENTO que o Neo resolve sozinho**: o cérebro tem o PRÓPRIO ambiente Linux (sandbox, com internet e /workspace) e roda código lá quando precisa — calcular, gerar (uuid/hash/senha/QR code), converter formato, baixar um arquivo de uma URL e analisá-lo, processar dados, testar um script. Isso NÃO precisa da máquina do usuário → vem para cá (o cérebro executa no sandbox, sem pedir permissão). **Default when in doubt.**
-- **SERVER_TOOL**: needs real-time external data (weather via get_weather) OR mudar/consultar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Pick tool from server list. Para MUDAR um ajuste use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: "usa/troca a voz do X" → `{{"setting":"tts.voice","value":"X"}}` (ex: "usa a voz do Jarvis" → value="jarvis"); "troca o engine/motor pra X" → `{{"setting":"tts.engine","value":"X"}}` (X ∈ qwen|coqui|dia). Para "quais vozes você tem?" use `voice_list`; para "o que dá pra configurar?" use `config_list`.
-- **CLIENT_TOOL**: SÓ quando a tarefa realmente PRECISA da máquina LOCAL do usuário — algo que o sandbox do Neo NÃO consegue fazer. Ou seja: ler/escrever/buscar um ARQUIVO no DISCO do usuário; informação sobre o SISTEMA/hardware DELE (espaço em disco, processos, versão de SO, rede local); instalar ou ABRIR um PROGRAMA/app na máquina dele; abrir uma URL/universal link no computador dele. Pick tool from client list. **ATENÇÃO — não confunda com computação:** se a tarefa é só calcular/gerar/converter/processar/baixar-e-analisar e NÃO toca no disco/sistema/apps DO USUÁRIO, ela **NÃO** é CLIENT_TOOL → é **DIRECT_RESPONSE** (o cérebro roda no próprio sandbox, sem pedir permissão e sem depender da máquina do usuário estar ligada). Só é CLIENT_TOOL quando o alvo é a máquina DELE.
-- **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário. Inclui:
-  - mensagens pessoais ("avisa minha mãe que vou chegar tarde", "manda um oi para Ana")
-  - pedidos comerciais (pizza, delivery, farmácia, mercado, encomendas)
-  - mensagens para JID/telefone direto ("manda 'oi' para 5511988217222").
-  Sempre extraia em `tool_arguments` os campos `text` (texto da mensagem) e `recipient` (JID, telefone OU apelido como "minha mãe", "pai", "Ana"). NÃO interprete o apelido — passe-o cru, o pipeline resolve buscando na agenda.
-- **HOME_ASSISTANT**: controlar ou consultar a casa inteligente do usuário via Home Assistant — luzes, tomadas/interruptores, clima/termostato, persianas, cenas, scripts e automações. Ex: "acende a luz da sala", "desliga as luzes do quarto", "qual a temperatura do termostato?", "ativa o modo cinema", "abre a persiana". É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*` nem preencha `entity_id`/`tool_arguments`; a skill resolve o dispositivo sozinha. Nunca invente entity_id. NÃO confundir com `list_connected_devices` (dispositivos do PRÓPRIO Neo — desktop/celular).
+- **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversa, conhecimento geral, saudação, jogo, tradução, dados pessoais (treino, dieta, suplemento, rotina — injetados automaticamente) — qualquer coisa respondível em texto — MAIS tudo que roda no sandbox (regra mestra acima). O cérebro também tem `web_search` e as tools `file_*` do catálogo. **Default na dúvida.**
+- **SERVER_TOOL**: dado externo em tempo real (clima via `get_weather`) OU ler/mudar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Para MUDAR use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: voz → `{{"setting":"tts.voice","value":"<nome>"}}`; engine/motor → `{{"setting":"tts.engine","value":"<qwen|coqui|dia>"}}`. "quais vozes você tem?" → `voice_list`; "o que dá pra configurar?" → `config_list`.
+- **CLIENT_TOOL**: só o que exige a máquina do usuário (regra mestra acima). Existem DUAS tools client-side e nenhuma outra — `read_file`, `list_directory`, `search_files`, `get_system_info` NÃO existem, nunca invente uma terceira:
+  - `save_generated_file`: entrega no disco dele um arquivo que o cérebro já publicou (exige um `file_id` real do histórico).
+  - `run_command`: todo o resto (ler/listar/escrever arquivo, espaço em disco, processos, instalar/abrir programa), via `raw_command` de shell. O comando só pode citar nome/caminho que o USUÁRIO disse nesta mensagem ou no histórico recente — NUNCA invente um nome plausível que ele não mencionou (pediram "meu relatório de finanças" sem dizer o nome → não existe `relatorio.csv` pra chutar; isso é DIRECT_RESPONSE ou plano de sondagem).
+- **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário — pessoal ("avisa minha mãe que vou chegar tarde"), comercial (pizza, delivery, farmácia, mercado, encomenda) ou pra telefone/JID direto. Extraia sempre em `tool_arguments` os campos `text` (o texto) e `recipient` (JID, telefone OU apelido cru como "minha mãe", "pai", "Ana" — NÃO interprete o apelido, o pipeline resolve na agenda). `contact_source` ("whatsapp" = agenda do WhatsApp | "saved" = contatos salvos do Neo) só quando o usuário disser a fonte EXPLICITAMENTE; senão omita.
+- **HOME_ASSISTANT**: a casa inteligente do usuário — luz, tomada/interruptor, clima/termostato, persiana, cena, script, automação ("acende a luz da sala", "ativa o modo cinema", "qual a temperatura do termostato?"). É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*`, NÃO preencha `entity_id`/`tool_arguments` (a skill resolve o dispositivo sozinha) e nunca invente entity_id. NÃO confundir com `list_connected_devices`, que é dos dispositivos do PRÓPRIO Neo (desktop/celular).
 
 ## Ato de fala (decida ANTES do intent)
 Classifique o **ato de fala** e preencha `speech_act`:
@@ -276,7 +334,7 @@ Classifique o **ato de fala** e preencha `speech_act`:
 - `definition` — definir/cadastrar uma regra/brincadeira/comportamento ("cadastra uma brincadeira: se eu te provocar, você pode desligar a luz").
 - `chitchat` — conversa, sem ação.
 
-REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=imperative` E você tem ALTA confiança. `conditional`, `definition`, `question` sobre a ação, ou qualquer dúvida → **DIRECT_RESPONSE** (o núcleo cognitivo lê o PKS e decide; pode acionar a skill depois). Mencionar "luz/ar" dentro de uma hipótese ou regra NÃO é um comando.
+REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=imperative` E você tem ALTA confiança. `conditional`, `definition`, `question` sobre a ação, ação que DEPENDE de um hábito/preferência do usuário ("se eu costumo…", "como eu gosto de…"), ou qualquer dúvida → **DIRECT_RESPONSE** (o núcleo cognitivo lê o PKS e decide; pode acionar a skill depois). Mencionar "luz/ar" dentro de uma hipótese ou regra NÃO é um comando.
 
 ## Gravidade e registro (sinais de TOM — não mudam o roteamento)
 - `gravity`: seriedade da SITUAÇÃO relatada, não a complexidade da tarefa. "alta" = problema sério/urgente acontecendo AGORA (sistema quebrado, produção fora do ar, perda de dados, cliente afetado); "critica" = catastrófico; senão "normal". Pergunta técnica comum ou tarefa difícil SEM urgência = "normal".
@@ -291,33 +349,20 @@ REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=impe
 ## Skills
 {skills}
 
-## Tool Priority (CLIENT_TOOL)
-ANTES de tudo: confirme que a tarefa PRECISA da máquina do usuário (disco/sistema/apps
-DELE). Se for só computar/gerar/processar/baixar-e-analisar, PARE — isso é DIRECT_RESPONSE
-(o cérebro roda no próprio sandbox). Só siga abaixo se o alvo é MESMO a máquina do usuário.
-Prefer specific tools over `run_command`:
-- list files: `list_directory` | read file: `read_file` | write file: `write_file`
-- find files: `search_files` | delete: `delete_path` | mkdir: `create_directory` | system info: `get_system_info`
-Use `run_command` only when no specific tool fits (disk space, processes, versions, installs, network) — e SEMPRE sobre a máquina DELE.
-For multi-step tasks, use only the FIRST tool needed — follow-up steps are handled automatically.
-
 ## Key Rules
-- **Sandbox do Neo vs máquina do usuário** (REGRA IMPORTANTE): computação/processamento/geração/baixar-e-analisar que NÃO depende do disco, sistema ou apps DO USUÁRIO → **DIRECT_RESPONSE** (o cérebro tem o próprio sandbox e roda lá, sem pedir permissão). `run_command`/CLIENT_TOOL só quando precisa MESMO da máquina dele (arquivo local dele, info do sistema dele, abrir/instalar programa dele, universal link no computador dele). Ex.: "conta quantos primos até 1 milhão", "gera um uuid e o sha256", "baixa esse CSV [url] e conta as linhas", "converte esse json pra yaml" → **DIRECT_RESPONSE**. "quantos GB livres no MEU disco", "lê ~/Downloads/x.pdf", "abre o VSCode", "instala o ffmpeg na minha máquina" → **CLIENT_TOOL**. Na dúvida entre os dois: se não menciona o disco/sistema/app DELE, é DIRECT_RESPONSE.
-- **Arquivo ANEXADO na conversa** (REGRA IMPORTANTE): se o contexto tem a seção "ARQUIVOS ANEXADOS NESTA MENSAGEM" ou "ARQUIVOS DESTA CONVERSA", esses arquivos estão no catálogo do PRÓPRIO Neo (não no disco do usuário) — QUALQUER pergunta sobre eles ("o que tem nesse arquivo?", "de qual instituição é?", "resume", "quantas linhas tem") é **DIRECT_RESPONSE**: o cérebro lê sozinho com as tools `file_*`. **NUNCA** escolha `read_file`/`run_command` para eles e **NUNCA invente um caminho** (ex.: `/Users/.../Downloads/<nome>`) a partir do nome do arquivo — o arquivo NÃO está no disco dele. Só é CLIENT_TOOL quando o USUÁRIO cita explicitamente um caminho/pasta da máquina dele nesta mensagem.
-- **Evento atual / notícia / esporte / cotação** ("qual o jogo hoje?", "quem ganhou X?", "cotação do dólar", "saiu a versão nova?"): **DIRECT_RESPONSE** — o cérebro tem a tool `web_search` e busca na web sozinho antes de responder. NÃO roteie para SERVER_TOOL nem escolha tool aqui; questionamentos sobre a veracidade de uma resposta anterior ("tem certeza?") também são DIRECT_RESPONSE (o cérebro re-verifica na web/PKS).
-- **Conversation continuity**: if history shows an ongoing game/quiz/roleplay/creative task: DIRECT_RESPONSE
-- **Back-references** ("está errado", "refaz", "melhora isso"): DIRECT_RESPONSE
-- **Personal data** (treino, dieta, suplementos, rotina): DIRECT_RESPONSE (injected automatically, no file tools needed)
-- **Memory directives** ("lembra que...", "registra no PKS", "memoriza isso", "anota que...", "não esqueça que..."): DIRECT_RESPONSE — these are saved automatically to the knowledge store (PKS). NEVER route to `write_file` or any client tool.
-- **Devices**: "conectados/online/agora/em tempo real" → SERVER_TOOL `list_connected_devices` (WebSocket ao vivo). "que eu tenho/meus/cadastrados/registrados/que você conhece" → DIRECT_RESPONSE com `needs_memory=true` e `knowledge_keywords:["dispositivo"]` (vêm do PKS, injetados automaticamente). `list_connected_devices` é APENAS para conexões ativas no momento.
-- **Explicit paths**: use absolute paths as-is; use folder hints from "Contexto do Sistema" (Documents, Downloads, Desktop)
-- `requires_approval=true` for destructive ops (delete, kill, format); `false` for read-only
-- `needs_memory=false` for greetings/acks ("oi", "ok", "valeu"); `true` for substantive topics
-- `knowledge_keywords`: up to 6 singular PT nouns from user message (devices, health, food, finance, etc.); `[]` for greetings
-- **Casa inteligente**: "acende/apaga/liga/desliga" luz/tomada, ajustar clima, ativar cena/script, abrir/fechar persiana → HOME_ASSISTANT (`skill_name="home_assistant"`). "dispositivos conectados/online" do Neo → SERVER_TOOL `list_connected_devices`. São coisas DIFERENTES.
-- **Imperativo direto vs. condicional/preferência**: só use HOME_ASSISTANT (ou qualquer skill) direto quando o pedido é uma ORDEM imperativa e clara ("acende a luz", "desliga o ar do quarto"). Se a ação DEPENDE do que o usuário COSTUMA fazer / de uma PREFERÊNCIA dele, ou vem como PERGUNTA sobre o hábito ("como eu gosto de usar o ar?", "se eu costumo, pode ligar", "se fizer sentido, liga"), use **DIRECT_RESPONSE** — o núcleo cognitivo lê o PKS e decide a ação. NÃO invente entity_id a partir do texto.
-- `needs_plan=true` only for CLIENT_TOOL with 2+ dependent steps; always `false` for DIRECT_RESPONSE/SERVER_TOOL/WHATSAPP_MESSAGING/HOME_ASSISTANT
-- **Cascata (`pipeline_plan`)**: SOMENTE quando a mensagem tem 2+ ações CLARAMENTE INDEPENDENTES ligadas por "e"/"depois" ("apaga as luzes **e** manda um whatsapp pro porteiro"), preencha `pipeline_plan` com a lista ordenada de steps `{{intent, input, skill_name}}`, onde cada `input` é uma ordem imperativa, limpa e auto-contida. Em caso de UMA única ação, ou de ação condicional/baseada em hábito, **não** use `pipeline_plan` (deixe `null`). NÃO seja agressivo: na dúvida, `null`.
+- **Arquivo ANEXADO na conversa**: se o contexto tem a seção "ARQUIVOS ANEXADOS NESTA MENSAGEM" ou "ARQUIVOS DESTA CONVERSA", esses arquivos estão no catálogo do PRÓPRIO Neo (não no disco do usuário) — QUALQUER pergunta sobre eles ("o que tem nesse arquivo?", "de qual instituição é?", "resume", "quantas linhas tem") é **DIRECT_RESPONSE**: o cérebro lê sozinho com as tools `file_*`. NUNCA escolha `run_command` para eles e **NUNCA invente um caminho** (ex.: `/Users/.../Downloads/<nome>`) a partir do nome do arquivo. Só é CLIENT_TOOL quando o USUÁRIO cita explicitamente um caminho/pasta da máquina dele nesta mensagem.
+- **Mostrar/exibir IMAGEM** ("carrega essa imagem aqui no chat", "mostra a foto X", "quero ver o print"): quem exibe é o CÉREBRO — ele escreve `[[IMAGE:/caminho/da/imagem.ext]]` na resposta e o cliente desenha. Se o caminho JÁ apareceu nesta conversa (o usuário citou, ou saiu de um comando anterior) → **DIRECT_RESPONSE**. Só é CLIENT_TOOL quando ainda falta DESCOBRIR onde a imagem está (`ls`/`find`). NUNCA roteie para um comando que "converte a imagem" (`base64`, `xxd`, `cat` de .jpg/.png): isso não mostra nada e despeja um blob gigante na conversa.
+- **Evento atual / notícia / esporte / cotação** ("qual o jogo hoje?", "quem ganhou X?", "cotação do dólar", "saiu a versão nova?") e questionamento de resposta anterior ("tem certeza?"): **DIRECT_RESPONSE** — o cérebro busca na web sozinho antes de responder. NÃO escolha tool aqui.
+- **Agir é o padrão; só o TEXTO do comando é a exceção**: quando o pedido depende da máquina do usuário, a resposta certa é RODAR (CLIENT_TOOL), não explicar como rodar — inclusive em follow-up curto logo depois de um comando ("e quais?", "lista os nomes", "então roda", "e agora?", "mostra tudo"), que é a MESMA tarefa com mais detalhe. A ÚNICA exceção é ele pedir explicitamente só o texto ("qual o comando pra...", "me diz o comando", "como eu faço pelo terminal?", "não roda, só me mostra") → **DIRECT_RESPONSE**.
+- **Continuidade e back-reference**: jogo/quiz/roleplay/tarefa criativa em andamento no histórico, ou referência ao que já foi feito ("está errado", "refaz", "melhora isso", "de onde veio isso?") → DIRECT_RESPONSE.
+- **Diretiva de memória** ("lembra que...", "registra no PKS", "memoriza isso", "anota que...", "não esqueça que...", "salva essa ideia"): DIRECT_RESPONSE — o cérebro grava no próprio turno com a tool `pks_remember`. NUNCA um client tool.
+- **Dispositivos**: "conectados/online/agora/em tempo real" → SERVER_TOOL `list_connected_devices` (WebSocket ao vivo, APENAS conexões ativas no momento). "que eu tenho/meus/cadastrados/que você conhece" → DIRECT_RESPONSE com `needs_memory=true` e `knowledge_keywords:["dispositivo"]` (vêm do PKS).
+- **Caminhos explícitos**: use paths absolutos como estão; para pastas conhecidas (Documents, Downloads, Desktop) use as dicas do "Contexto do Sistema".
+- `requires_approval=true` para operação destrutiva (delete, kill, format); `false` para leitura.
+- `needs_memory=false` para saudação/ack ("oi", "ok", "valeu"); `true` para assunto substantivo.
+- `knowledge_keywords`: até 6 substantivos PT no singular tirados da mensagem (dispositivo, saúde, comida, finança...); `[]` em saudação.
+- `needs_plan=true` para CLIENT_TOOL com 2+ passos dependentes, E TAMBÉM quando o alvo é um arquivo/recurso que o usuário só DESCREVEU (sem nome exato) — aí o primeiro passo do plano é sempre uma sondagem read-only (`ls`/`find`), nunca um comando que já assume o nome. Sempre `false` fora de CLIENT_TOOL.
+- **Cascata (`pipeline_plan`)**: SOMENTE quando a mensagem tem 2+ ações CLARAMENTE INDEPENDENTES ligadas por "e"/"depois". Preencha a lista ordenada de steps `{{intent, input, skill_name}}`, cada `input` uma ordem imperativa, limpa e auto-contida. Uma ação só, ou ação condicional/baseada em hábito → `null`. Na dúvida, `null`.
 
 ## Output — valid JSON only, no markdown:
 {{
@@ -339,85 +384,39 @@ For multi-step tasks, use only the FIRST tool needed — follow-up steps are han
   "register_hint": "protocolo"|"confidente"|null
 }}
 
-## Ato de fala — exemplos que NÃO são comando (vão para DIRECT_RESPONSE)
+## Exemplos
+# Sandbox do Neo (DIRECT_RESPONSE) × máquina do usuário (CLIENT_TOOL)
+User: "quantos números primos existem até 1 milhão?" → DIRECT_RESPONSE (o cérebro calcula no sandbox)
+User: "baixa esse csv https://exemplo.com/a.csv e me diz quantas linhas tem" → DIRECT_RESPONSE (baixa e analisa no sandbox)
+User: "quantos GB livres tem no meu disco?" → CLIENT_TOOL, tool_name "run_command", raw_command "df -h"
+User: "lê o arquivo ~/Downloads/relatorio.pdf" → CLIENT_TOOL, "run_command", "cat ~/Downloads/relatorio.pdf" (caminho EXPLÍCITO na mensagem)
+User: "acha os arquivos .env aqui no meu projeto" → CLIENT_TOOL, "run_command", "find . -iname '.env*'"
+User: "abre o VSCode" / "instala o ffmpeg na minha máquina" → CLIENT_TOOL, "run_command"
+User: "qual o comando pra ver quanto espaço tem no disco?" → DIRECT_RESPONSE (quer o TEXTO do comando, não a execução)
+User: "relatorio de financas em csv na minha area de trabalho" → DIRECT_RESPONSE (nenhum arquivo existente foi citado — o cérebro GERA e entrega; nunca chute "relatorio.csv")
+User: "manda pra mim aquele pdf da nota fiscal que tá no downloads" → CLIENT_TOOL, "run_command", needs_plan: true (o arquivo existe mas só foi descrito: o plano faz `ls`/`find` antes de decidir o nome real)
 
-User: "cadastra uma brincadeira: se eu te provocar, você pode desligar a luz ou ameaçar desligar"
-→ speech_act: "definition", intent: "DIRECT_RESPONSE" (definir uma regra ≠ executar agora; NÃO invente entity_id)
-
-User: "se eu costumo usar o ar nas quintas, pode ligar"
-→ speech_act: "conditional", intent: "DIRECT_RESPONSE" (depende do hábito → o cérebro lê o PKS)
-
-User: "acende a luz da sala"
-→ speech_act: "imperative", intent: "HOME_ASSISTANT", skill_name: "home_assistant"
-
-## pipeline_plan — exemplo (cascata, 2+ ações independentes)
-
-User: "apaga todas as luzes da casa e manda um whatsapp pro porteiro avisando que vou dormir"
-→ intent: "HOME_ASSISTANT" (a primeira ação), e:
+# Ato de fala, skills e cascata
+User: "acende a luz da sala" → speech_act "imperative", HOME_ASSISTANT, skill_name "home_assistant", pipeline_plan null
+User: "quais dispositivos estão conectados agora?" → "question", SERVER_TOOL, tool_name "list_connected_devices" (NÃO é HOME_ASSISTANT)
+User: "cadastra uma brincadeira: se eu te provocar, você pode desligar a luz" → "definition", DIRECT_RESPONSE (definir uma regra ≠ executar agora; não invente entity_id)
+User: "se eu costumo usar o ar nas quintas, pode ligar" → "conditional", DIRECT_RESPONSE (depende do hábito → o cérebro lê o PKS)
+User: "apaga todas as luzes da casa e manda um whatsapp pro porteiro avisando que vou dormir" → HOME_ASSISTANT (a primeira ação), e
   "pipeline_plan": [
     {{"intent": "HOME_ASSISTANT", "input": "apagar todas as luzes da casa", "skill_name": "home_assistant"}},
     {{"intent": "WHATSAPP_MESSAGING", "input": "avisar o porteiro que vou dormir", "skill_name": "whatsapp_messaging"}}
   ]
 
-User: "acende a luz da sala" → "pipeline_plan": null (uma ação só)
+# WHATSAPP_MESSAGING — extração
+User: "manda uma mensagem para minha mãe que vou chegar mais tarde" → tool_arguments {{"text": "vou chegar mais tarde", "recipient": "minha mãe"}}
+User: "manda whatsapp pro 5511988217222: oi tudo bem?" → {{"text": "oi tudo bem?", "recipient": "5511988217222"}}
+User: "pede uma pizza no Domino's" → {{"text": "Olá, gostaria de fazer um pedido", "recipient": "Domino's"}}
+User: "procura o João na lista do WhatsApp e manda um oi" → {{"text": "oi", "recipient": "João", "contact_source": "whatsapp"}}
 
-## WHATSAPP_MESSAGING — exemplos de extração
-
-User: "manda uma mensagem para minha mãe que vou chegar mais tarde"
-→ tool_arguments: {{"text": "vou chegar mais tarde", "recipient": "minha mãe"}}
-
-User: "avisa o pai que cheguei"
-→ tool_arguments: {{"text": "cheguei", "recipient": "pai"}}
-
-User: "manda whatsapp pro 5511988217222: oi tudo bem?"
-→ tool_arguments: {{"text": "oi tudo bem?", "recipient": "5511988217222"}}
-
-User: "pede uma pizza no Domino's"
-→ tool_arguments: {{"text": "Olá, gostaria de fazer um pedido", "recipient": "Domino's"}}
-
-# contact_source (opcional): onde buscar o contato. Só preencha quando o usuário
-# disser EXPLICITAMENTE a fonte. Valores: "whatsapp" (lista/agenda do WhatsApp),
-# "saved" (contatos salvos do Neo). Omita para o padrão (busca PKS-first).
-User: "procura o João na lista do WhatsApp e manda um oi"
-→ tool_arguments: {{"text": "oi", "recipient": "João", "contact_source": "whatsapp"}}
-
-## Sandbox do Neo (DIRECT_RESPONSE) vs máquina do usuário (CLIENT_TOOL) — exemplos
-# Tudo que dá pra computar/processar sem tocar na máquina do usuário → DIRECT_RESPONSE
-# (o cérebro roda no PRÓPRIO sandbox, sem pedir permissão).
-User: "quantos números primos existem até 1 milhão?" → intent: DIRECT_RESPONSE (o cérebro calcula no sandbox)
-User: "gera um uuid v4 e me dá o sha256 dele" → intent: DIRECT_RESPONSE (sandbox)
-User: "baixa esse csv https://exemplo.com/a.csv e me diz quantas linhas tem" → intent: DIRECT_RESPONSE (baixa e analisa no sandbox)
-User: "converte esse json pra yaml: {{...}}" → intent: DIRECT_RESPONSE (sandbox)
-User: "roda esse regex nesse texto e me diz os matches" → intent: DIRECT_RESPONSE (sandbox)
-User: "gera um QR code com esse link" → intent: DIRECT_RESPONSE (sandbox)
-# Só CLIENT_TOOL quando o alvo é a MÁQUINA do usuário:
-User: "quantos GB livres tem no meu disco?" → intent: CLIENT_TOOL, tool_name: "get_system_info"
-User: "lê o arquivo ~/Downloads/relatorio.pdf" → intent: CLIENT_TOOL, tool_name: "read_file"
-User: "acha os arquivos .env aqui no meu projeto" → intent: CLIENT_TOOL, tool_name: "search_files"
-User: "abre o VSCode" → intent: CLIENT_TOOL (abrir programa na máquina do usuário)
-User: "instala o ffmpeg aqui na minha máquina" → intent: CLIENT_TOOL, tool_name: "run_command"
-
-## HOME_ASSISTANT — exemplos
-
-User: "acende a luz da sala" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
-User: "desliga as luzes do quarto" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
-User: "qual a temperatura do termostato?" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
-User: "ativa o modo cinema" → intent: HOME_ASSISTANT, skill_name: "home_assistant"
-User: "quais dispositivos estão conectados agora?" → intent: SERVER_TOOL, tool_name: "list_connected_devices" (NÃO é HOME_ASSISTANT)
-
-# Condicional/baseado em hábito ou pergunta sobre preferência → DIRECT_RESPONSE (núcleo cognitivo)
-User: "se eu costumo usar o ar nas quintas, pode ligar" → intent: DIRECT_RESPONSE (ação condicional baseada em hábito → o cérebro lê o PKS e decide)
-User: "como eu gosto de deixar a temperatura do quarto à noite?" → intent: DIRECT_RESPONSE (pergunta sobre preferência)
-User: "se fizer sentido pra minha rotina, liga o ar" → intent: DIRECT_RESPONSE (depende do PKS)
-
-## CONFIG (voz/engine de TTS, etc.) — exemplos
-User: "usa a voz do Jarvis" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "jarvis"}}
-User: "fala com a voz do Ryan" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "Ryan"}}
-User: "troca a voz pra Vivian" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.voice", "value": "Vivian"}}
-User: "troca o engine pra qwen" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.engine", "value": "qwen"}}
-User: "usa o motor coqui" → intent: SERVER_TOOL, tool_name: "config_set", tool_arguments: {{"setting": "tts.engine", "value": "coqui"}}
-User: "quais vozes você tem?" → intent: SERVER_TOOL, tool_name: "voice_list"
-User: "o que dá pra configurar?" → intent: SERVER_TOOL, tool_name: "config_list"
+# CONFIG (voz/engine de TTS)
+User: "usa a voz do Jarvis" → SERVER_TOOL, "config_set", {{"setting": "tts.voice", "value": "jarvis"}}
+User: "troca o engine pra qwen" → SERVER_TOOL, "config_set", {{"setting": "tts.engine", "value": "qwen"}}
+User: "quais vozes você tem?" → SERVER_TOOL, "voice_list"
 """
 
 
@@ -598,13 +597,84 @@ class IntentRouter:
                 tools=None,  # no function calling for classification
                 model=model_name,
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=_CLASSIFIER_MAX_TOKENS,
+                disable_thinking=True,
             )
 
             raw_text = response.get_content() or ""
 
+            # Duas falhas DIFERENTES levam ao mesmo lugar (JSON ausente → fallback
+            # por palavra-chave, que é cego ao turno anterior), e cada uma pede um
+            # remédio próprio — tratar as duas como "prosa" foi o que fez o reparo
+            # não reparar nada:
+            #
+            #  (a) TRUNCAGEM: o JSON começa certo e é cortado no meio, ou volta
+            #      vazio, porque o orçamento acabou (em modelo que raciocina, o
+            #      raciocínio come tudo antes de escrever a primeira chave). A
+            #      instrução de reparo não resolve — o que falta é ESPAÇO.
+            #  (b) PROSA: com o histórico em turnos user/assistant, um follow-up
+            #      curto ("Quais? lista os nomes") puxa o modelo pro modo conversa
+            #      e ele responde ao usuário (sessão 69feab87: chegou a inventar
+            #      uma lista de chaves SSH). Aí sim o remédio é mandar parar.
+            if not self._carries_json(raw_text):
+                if self._was_truncated(response) or not raw_text.strip():
+                    logger.warning(
+                        "Router: resposta do classificador truncada/vazia (finish_reason=length "
+                        "ou conteúdo vazio) — retentando com orçamento de %d tokens",
+                        _CLASSIFIER_MAX_TOKENS_RETRY,
+                    )
+                    roomier = await provider.complete(
+                        messages=messages,
+                        tools=None,
+                        model=model_name,
+                        temperature=0.0,
+                        max_tokens=_CLASSIFIER_MAX_TOKENS_RETRY,
+                        disable_thinking=True,
+                    )
+                    roomier_text = roomier.get_content() or ""
+                    if self._carries_json(roomier_text):
+                        raw_text = roomier_text
+                    else:
+                        logger.warning(
+                            "Router: retentativa com mais espaço também não trouxe JSON "
+                            "(finish_reason=%s) — indo pro fallback",
+                            self._finish_reason(roomier),
+                        )
+                else:
+                    logger.warning(
+                        "Router: classificador respondeu em prosa em vez de JSON — "
+                        "retentando com instrução de reparo: %s", raw_text[:160],
+                    )
+                    repair_messages = list(messages) + [
+                        Message(role=MessageRole.ASSISTANT, content=raw_text[:500]),
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE. Você é um CLASSIFICADOR, não o assistente: não responda "
+                                "ao usuário e não invente conteúdo. Devolva SÓ o objeto JSON do "
+                                "formato de saída, classificando a última mensagem do usuário. "
+                                "Nada antes, nada depois."
+                            ),
+                        ),
+                    ]
+                    repaired = await provider.complete(
+                        messages=repair_messages,
+                        tools=None,
+                        model=model_name,
+                        temperature=0.0,
+                        max_tokens=_CLASSIFIER_MAX_TOKENS_RETRY,
+                        disable_thinking=True,
+                    )
+                    repaired_text = repaired.get_content() or ""
+                    if self._carries_json(repaired_text):
+                        raw_text = repaired_text
+                    else:
+                        logger.warning("Router: reparo também não devolveu JSON — indo pro fallback")
+
             # Parse routing decision as before, then attach classifier metadata
-            decision = self._parse_classification(raw_text, user_message=user_message)
+            decision = self._parse_classification(
+                raw_text, user_message=user_message, conversation_history=conversation_history
+            )
             self._apply_memory_heuristics(decision, user_message)
             # Attach raw classifier response + the prompt/messages sent for later inspection
             decision.classifier_raw = raw_text
@@ -630,6 +700,71 @@ class IntentRouter:
             ], "error": str(e)}
             return fallback
 
+    def _ungrounded_path_literals(self, command: str, haystack: str) -> list[str]:
+        """Caminhos com extensão citados em ``command`` que não aparecem (nem pelo
+        nome do arquivo) em ``haystack`` (mensagem atual + histórico recente).
+
+        Fundamentação é por NOME DE ARQUIVO (basename), não pelo caminho completo:
+        o classificador tem permissão de montar `<pasta do Contexto do Sistema> +
+        <nome que o usuário disse>` (ex.: "relatorio.csv" dito pelo usuário + "no
+        desktop" → `/Users/.../Desktop/relatorio.csv`) — isso é composição legítima,
+        não invenção. O que este guard pega é o CONTRÁRIO: um basename que não foi
+        dito em lugar nenhum (ex.: ninguém falou "relatorio.csv").
+        """
+        if not command:
+            return []
+        haystack_lower = haystack.lower()
+        ungrounded = []
+        for match in _PATH_WITH_EXT_RE.finditer(command):
+            literal = match.group(0)
+            basename = literal.rsplit("/", 1)[-1]
+            # Ponto INICIAL é dotfile/dot-dir, não extensão: `~/.ssh`, `~/.zshrc`,
+            # `~/.config`, `~/.gitconfig`. O regex casa os dois do mesmo jeito, então
+            # o guard tratava um caminho de sistema universal como "nome que o
+            # classificador inventou" — e como ele responde ZERANDO o comando e
+            # forçando needs_plan, um `ls -la ~/.ssh` perfeito virava turno travado
+            # (sessão 9f7abeec). Nome sem ponto DEPOIS do inicial = não é arquivo
+            # com extensão; não há o que fundamentar.
+            stem = basename[1:] if basename.startswith(".") else basename
+            if "." not in stem:
+                continue
+            # Fundamentado pelo nome com OU sem o ponto inicial: o usuário escreve
+            # "meu zshrc", não "~/.zshrc".
+            if basename.lower() in haystack_lower or stem.lower() in haystack_lower:
+                continue
+            # Fundamentado pelo nome SEM a extensão, quando esse nome aparece na
+            # conversa como ARQUIVO (entre crases/aspas ou dentro de um caminho) —
+            # não como palavra solta em prosa. É composição legítima: na sessão
+            # e8e5664b o Neo tinha acabado de listar "`pc_gamer`" e o classificador
+            # montou `pc_gamer.pub`, que o guard rejeitou como "inventado" e o turno
+            # travou. A exigência do delimitador é o que separa esse caso do bug
+            # original (bd7a304d): lá "relatorio" era substantivo comum na frase
+            # "relatorio de financas em csv", e `relatorio.csv` era chute puro.
+            root = basename.rsplit(".", 1)[0]
+            if len(root) >= 3 and self._cited_as_filename(root, haystack_lower):
+                continue
+            ungrounded.append(literal)
+        return ungrounded
+
+    @staticmethod
+    def _cited_as_filename(name: str, haystack_lower: str) -> bool:
+        """True quando ``name`` aparece no histórico marcado COMO nome de arquivo.
+
+        Delimitador antes (crase, aspas ou barra de caminho) e fim de token depois.
+        Saída de comando e listagem do próprio Neo vêm sempre assim; prosa, não.
+        """
+        pattern = r"[`'\"/]" + re.escape(name.lower()) + r"(?=[`'\"\s,.;:)\]]|$)"
+        return re.search(pattern, haystack_lower) is not None
+
+    def _valid_client_tool_names(self) -> set[str]:
+        """Nomes de tools client-side realmente registradas no ToolRegistry.
+
+        Usado para recusar despachar um ``tool_name`` alucinado/desatualizado pro
+        desktop (ele trava esperando um handler que não existe — ver guard em
+        ``_parse_classification``).
+        """
+        return {t.name for t in self.tool_registry.get_all() if t.execution == "client-side"}
+
     def _format_tools(self, execution_type: str) -> str:
         """Format tool list for the system prompt.
 
@@ -643,6 +778,7 @@ class IntentRouter:
             for t in self.tool_registry.get_all()
             if t.execution == execution_type
             and not t.name.startswith(_SKILL_OWNED_TOOL_PREFIXES)
+            and t.name not in _BRAIN_ONLY_CLIENT_TOOLS
         ]
         if not tools:
             return ""
@@ -651,7 +787,11 @@ class IntentRouter:
             params_desc = ", ".join(
                 f"{name}: {p.type}" for name, p in t.parameters.items()
             )
-            lines.append(f"- {t.name}: {t.description} ({params_desc})")
+            # ``router_summary`` quando existir: a description completa ensina o
+            # cérebro a USAR a tool (vai como schema da função), enquanto aqui
+            # basta RECONHECER — e este texto é pago em toda mensagem.
+            summary = t.router_summary or t.description
+            lines.append(f"- {t.name}: {summary} ({params_desc})")
         return "\n".join(lines)
 
     def _skills_brain_note(self) -> str | None:
@@ -684,7 +824,12 @@ class IntentRouter:
             lines.append(f"- {name}: {manifest.description} (keywords: {', '.join(manifest.keywords)})")
         return "\n".join(lines)
 
-    def _parse_classification(self, raw_text: str, user_message: str = "") -> RoutingDecision:
+    def _parse_classification(
+        self,
+        raw_text: str,
+        user_message: str = "",
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> RoutingDecision:
         """Parse LLM JSON response into RoutingDecision."""
         text = raw_text.strip()
         # Strip markdown fences if present
@@ -753,6 +898,70 @@ class IntentRouter:
             tool_arguments = None
             raw_command = None
 
+        # Falha fechada: o prompt e o catálogo real de client tools podem divergir
+        # (uma tool foi removida do catálogo mas o classificador ainda "lembra" dela
+        # de exemplos/treino antigos). Despachar um tool_name desconhecido pro desktop
+        # trava o turno pra sempre — o client não tem handler e nunca devolve resultado
+        # (sessão bd7a304d: read_file inexistente ficou ~2min30s até a conexão cair).
+        # Um tool_name fora do catálogo real vira DIRECT_RESPONSE em vez de ser
+        # despachado — o núcleo cognitivo assume (tem PKS + NEED_CLARIFICATION).
+        if (
+            intent == IntentType.CLIENT_TOOL
+            and not data.get("needs_plan")
+            and tool_name
+            and getattr(self, "tool_registry", None) is not None
+            and tool_name not in self._valid_client_tool_names()
+        ):
+            logger.warning(
+                "Router: CLIENT_TOOL com tool_name desconhecido %r (fora do catálogo) — "
+                "rebaixando para DIRECT_RESPONSE",
+                tool_name,
+            )
+            intent = IntentType.DIRECT_RESPONSE
+            tool_name = None
+            tool_arguments = None
+            raw_command = None
+
+        # Grounding guard: um comando de shell que cita um caminho de arquivo
+        # ESPECÍFICO (com extensão) que não apareceu em lugar nenhum da conversa é
+        # quase sempre o classificador inventando um nome plausível em vez de admitir
+        # que não sabe (sessão bd7a304d: "relatorio de financas em csv" virou
+        # `read_file("/Users/daniel/Desktop/relatorio.csv")` — arquivo que não existia
+        # e nunca foi citado — o desktop travou ~2min30s tentando ler algo que não
+        # existe). Comandos exploratórios (ls, find, df) não citam extensão → passam
+        # direto. Path fundamentado (usuário disse o nome, ou apareceu no histórico,
+        # inclusive combinado com uma pasta como "desktop"/"~") → passa direto.
+        #
+        # Em vez de só desistir pro DIRECT_RESPONSE (que não tem NENHUMA tool pra
+        # tocar o disco do usuário — só pode perguntar), força needs_plan=true:
+        # o PlanManager (generate_plan) sabe fazer "lista primeiro, decide depois"
+        # (depends_on_previous + refine_step/advance_and_refine, docs/... e
+        # core/planning/plan_manager.py) — Neo verifica o que existe de verdade em
+        # vez de inventar OU de só perguntar. Continua CLIENT_TOOL/run_command;
+        # só o argumento chutado é descartado — o plano recomeça do zero a partir
+        # da mensagem real do usuário.
+        needs_plan_forced = False
+        if intent == IntentType.CLIENT_TOOL and not data.get("needs_plan"):
+            cmd_to_check = raw_command or (
+                tool_arguments.get("command") if isinstance(tool_arguments, dict) else None
+            )
+            if cmd_to_check:
+                haystack = user_message + "\n" + "\n".join(
+                    str(m.get("content", "")) for m in (conversation_history or [])[-8:]
+                )
+                ungrounded = self._ungrounded_path_literals(cmd_to_check, haystack)
+                if ungrounded:
+                    logger.warning(
+                        "Router: CLIENT_TOOL com caminho não fundamentado na conversa %r "
+                        "(comando: %r) — forçando plano de verificação (needs_plan)",
+                        ungrounded,
+                        cmd_to_check,
+                    )
+                    tool_name = "run_command"
+                    tool_arguments = None
+                    raw_command = None
+                    needs_plan_forced = True
+
         decision = RoutingDecision(
             intent=intent,
             confidence=float(data.get("confidence", 0.8)),
@@ -763,7 +972,7 @@ class IntentRouter:
             raw_command=raw_command,
             needs_memory=data.get("needs_memory", True),
             knowledge_keywords=knowledge_keywords,
-            needs_plan=data.get("needs_plan", False),
+            needs_plan=data.get("needs_plan", False) or needs_plan_forced,
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
             skill_name=data.get("skill_name"),
             pipeline_plan=pipeline_plan,
@@ -876,6 +1085,44 @@ class IntentRouter:
                         break
             start = text.find("{", start + 1)
         return None
+
+    @staticmethod
+    def _finish_reason(response: Any) -> str | None:
+        """``finish_reason`` da resposta, quando o provider expõe um.
+
+        Cada provider embrulha a resposta na própria classe; nem todos oferecem
+        o campo, e em alguns ele é atributo em vez de método. Defensivo de
+        propósito: não saber o motivo nunca pode derrubar a classificação.
+        """
+        attr = getattr(response, "finish_reason", None)
+        try:
+            reason = attr() if callable(attr) else attr
+        except Exception:  # noqa: BLE001 — provider exótico não quebra o turno
+            return None
+        return str(reason) if reason else None
+
+    @classmethod
+    def _was_truncated(cls, response: Any) -> bool:
+        """True quando o modelo parou por falta de orçamento, não por ter acabado."""
+        return (cls._finish_reason(response) or "").lower() == "length"
+
+    @classmethod
+    def _carries_json(cls, text: str) -> bool:
+        """True quando ``text`` traz um objeto JSON de classificação utilizável.
+
+        Mesmo critério que ``_parse_classification`` aplica (JSON direto, cercado por
+        markdown, ou embutido em prosa) — usado ANTES do parse para decidir se vale a
+        retentativa de reparo em vez de degradar direto pro fallback.
+        """
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        if stripped.startswith("```"):
+            stripped = stripped.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            return isinstance(json.loads(stripped), dict)
+        except json.JSONDecodeError:
+            return cls._extract_embedded_json(stripped) is not None
 
     def _is_training_message(self, message: str) -> bool:
         """True when the message is an explicit Neo training message."""

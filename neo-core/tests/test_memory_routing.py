@@ -32,6 +32,12 @@ _router = object.__new__(IntentRouter)
         "não esqueça que minha reunião é às 15h",
         "salva isso na memória",
         "remember that my birthday is in June",
+        # Fase 2 — casos reais que o detector antigo NÃO pegava (backstop):
+        "salva essa ideia para quando eu pedir de novo",
+        "coloca essa alternativa tb nas nossas anotações",
+        "guarda essa receita",
+        "anota essa dica pra mim",
+        "salva isso pra eu lembrar depois",
     ],
 )
 def test_memory_directives_detected(message):
@@ -45,6 +51,9 @@ def test_memory_directives_detected(message):
         "lista os arquivos da pasta Downloads",
         "escreve o relatório no arquivo report.txt",
         "oi tudo bem?",
+        # Save de ARQUIVO não pode virar diretiva de memória (Fase 2 não regride):
+        "salva o arquivo no desktop",
+        "salva isso em downloads",
     ],
 )
 def test_non_memory_messages_not_flagged(message):

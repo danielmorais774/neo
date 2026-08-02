@@ -28,6 +28,29 @@ def _is_rate_limit(error: Exception) -> bool:
     return type(error).__name__ == "RateLimitError" or "429" in str(error)
 
 
+def forces_tool_call(tool_choice: Any) -> bool:
+    """O ``tool_choice`` EXIGE uma tool (vs. deixar o modelo escolher)?
+
+    Vale tanto para ``"required"`` quanto para o dict que nomeia uma função —
+    as duas formas obrigam, e as duas batem nas mesmas restrições de API.
+    """
+    return tool_choice is not None and tool_choice not in ("auto", "none")
+
+
+def _rejects_forced_tool_choice(error: Exception) -> bool:
+    """A API recusou a REQUISIÇÃO por causa do ``tool_choice`` forçado?
+
+    Caso conhecido: DeepSeek v4 em thinking mode devolve 400 "Thinking mode does
+    not support this tool_choice" (o DeepSeekProvider já evita isso desligando o
+    thinking). Isto aqui é a rede: se um provider/modelo novo tiver a mesma
+    limitação, o turno degrada para ``auto`` em vez de morrer — perder a
+    GARANTIA da tool é ruim, perder o turno inteiro é pior.
+    """
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    text = str(error).lower()
+    return (status == 400 or "400" in text) and "tool_choice" in text
+
+
 class OpenAICompletionResponse(CompletionResponse):
     """Wrapper para resposta da OpenAI."""
 
@@ -87,6 +110,13 @@ class OpenAIProvider(LLMProvider):
     ) -> CompletionResponse:
         """Realiza completion com OpenAI."""
         try:
+            # `disable_thinking` é uma INTENÇÃO do chamador ("preciso da saída
+            # estruturada, não do raciocínio"), não um parâmetro da API. Cada
+            # provider que sabe traduzi-la consome antes de chegar aqui (ver
+            # DeepSeekProvider); para os demais é ruído e precisa sumir — indo
+            # junto no corpo, a API responde 400 e derruba o turno.
+            kwargs.pop("disable_thinking", None)
+
             # Converte mensagens para formato OpenAI
             openai_messages = [
                 {"role": msg.role.value, "content": msg.content} for msg in messages
@@ -114,12 +144,29 @@ class OpenAIProvider(LLMProvider):
             # retry, o turno morria virando "Erro ao processar: 429" — que ainda por
             # cima entra no histórico e envenena os turnos seguintes.
             last_error: Exception | None = None
+            downgraded_tool_choice = False
             for attempt in range(_RATE_LIMIT_RETRIES + 1):
                 try:
                     response = await self.client.chat.completions.create(**params)
                     return OpenAICompletionResponse(response)
-                except Exception as e:  # noqa: BLE001 — só o 429 é retentável
+                except Exception as e:  # noqa: BLE001 — só 429/tool_choice são retentáveis
                     last_error = e
+                    # Modelo que não aceita tool forçada: refaz com "auto" em vez
+                    # de derrubar o turno. Uma vez só — se falhar de novo, o erro
+                    # é outro. Não consome tentativa de rate limit.
+                    if (
+                        not downgraded_tool_choice
+                        and forces_tool_call(params.get("tool_choice"))
+                        and _rejects_forced_tool_choice(e)
+                    ):
+                        downgraded_tool_choice = True
+                        logger.warning(
+                            "[OpenAI] modelo %r recusou tool_choice=%r — refazendo com "
+                            "'auto' (a obrigação da tool fica só no texto da mensagem)",
+                            params.get("model"), params.get("tool_choice"),
+                        )
+                        params["tool_choice"] = "auto"
+                        continue
                     if not _is_rate_limit(e) or attempt == _RATE_LIMIT_RETRIES:
                         raise
                     delay = _RATE_LIMIT_BACKOFF[attempt]

@@ -18,6 +18,7 @@ VOICE_TOOLS: list[ToolSchema] = [
             "conferir os nomes antes de trocar, ou para saber quais vozes/personagens "
             "dá pra IMITAR (clones do coqui — passe engine=\"coqui\")."
         ),
+        router_summary="Lista as vozes de TTS disponíveis.",
         module="voice",
         execution="server-side",
         timeout=15,

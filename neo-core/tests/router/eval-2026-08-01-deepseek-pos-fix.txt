@@ -1,0 +1,52 @@
+Eval do router — 46 casos, 1x cada
+
+atual
+  ✓ sandbox-primos → DIRECT_RESPONSE
+  ✓ sandbox-uuid-hash → DIRECT_RESPONSE
+  ✓ sandbox-download-csv → DIRECT_RESPONSE
+  ✓ sandbox-converte-json → DIRECT_RESPONSE
+  ✓ sandbox-qrcode → DIRECT_RESPONSE
+  ✓ cliente-disco-livre → CLIENT_TOOL/run_command
+  ✓ cliente-le-path-explicito → CLIENT_TOOL/run_command
+  ✓ cliente-find-env → CLIENT_TOOL/run_command
+  ✓ cliente-abre-vscode → CLIENT_TOOL/run_command
+  ✓ cliente-instala-ffmpeg → CLIENT_TOOL/run_command
+  ✓ texto-do-comando → DIRECT_RESPONSE
+  ✓ arquivo-inexistente-nao-inventa → DIRECT_RESPONSE
+  ✓ arquivo-descrito-precisa-plano → CLIENT_TOOL
+  ✓ followup-executa → CLIENT_TOOL
+  ✓ ha-acende-luz → HOME_ASSISTANT
+  ✓ ha-desliga-quarto → HOME_ASSISTANT
+  ✗ ha-termostato — intent=cognitive (esperado HOME_ASSISTANT); skill=None (esperado home_assistant)
+  ✓ ha-cena → HOME_ASSISTANT
+  ✓ ha-definicao-nao-executa → DIRECT_RESPONSE
+  ✓ ha-condicional-habito [guard] → DIRECT_RESPONSE
+  ✓ ha-pergunta-preferencia [guard] → DIRECT_RESPONSE
+  ✓ cascata-luz-whatsapp → HOME_ASSISTANT
+  ✓ wpp-mae → WHATSAPP_MESSAGING
+  ✓ wpp-telefone → WHATSAPP_MESSAGING
+  ✓ wpp-comercial → WHATSAPP_MESSAGING
+  ✓ wpp-contact-source → WHATSAPP_MESSAGING
+  ✓ config-voz-jarvis → SERVER_TOOL/config_set
+  ✓ config-voz-ryan → SERVER_TOOL/config_set
+  ✓ config-engine-qwen → SERVER_TOOL/config_set
+  ✓ config-motor-coqui → SERVER_TOOL/config_set
+  ✓ config-lista-vozes → SERVER_TOOL/voice_list
+  ✓ config-lista-ajustes → SERVER_TOOL/config_list
+  ✓ devices-conectados → SERVER_TOOL/list_connected_devices
+  ✓ devices-conhecidos [guard] → DIRECT_RESPONSE
+  ✓ clima → SERVER_TOOL/get_weather
+  ✓ anexo-pergunta → DIRECT_RESPONSE
+  ✓ imagem-mostra → DIRECT_RESPONSE
+  ✓ evento-atual → DIRECT_RESPONSE
+  ✓ duvida-resposta-anterior [guard] → DIRECT_RESPONSE
+  ✓ memoria-lembra [guard] → DIRECT_RESPONSE
+  ✓ memoria-salva-ideia [guard] → DIRECT_RESPONSE
+  ✓ saudacao → DIRECT_RESPONSE
+  ✓ continuidade-jogo → DIRECT_RESPONSE
+  ✓ dados-pessoais → DIRECT_RESPONSE
+  ✓ assistente-estrangeiro [guard] → DIRECT_RESPONSE
+  ✗ gravidade-alta — intent=client_tool (esperado DIRECT_RESPONSE); gravity=critica (esperado alta)
+
+Resumo
+  atual      44/46 (95.7%)  prompt: 14,645 chars ≈ 3,661 tokens

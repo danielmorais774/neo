@@ -339,6 +339,39 @@ def test_build_system_updates_routes_projects_with_memory_intent():
     assert "active-projects" in entities
 
 
+def test_is_reference_only_save_detects_referential_command():
+    writer = object.__new__(PKSWriter)
+    # O fato está no turno anterior, não no comando (session-d41ed0fa).
+    assert writer._is_reference_only_save(
+        "voce consegue salvar lá no pós, tem um workspace do usuário com meu nome, tenta de novo"
+    )
+    assert writer._is_reference_only_save("salva essa ideia para quando eu pedir de novo")
+    assert writer._is_reference_only_save("guarda isso pra depois")
+    # Fato inline (não é referência) — deve continuar sendo fabricado normalmente.
+    assert not writer._is_reference_only_save(
+        "salva na sua memoria que minha meta principal eh dobrar o MRR no Q3"
+    )
+    assert not writer._is_reference_only_save("qual meu treino hoje?")
+
+
+def test_build_system_updates_ignores_reference_only_save_no_garbage_profile():
+    """Regressão do bug session-d41ed0fa: 'salvar... com meu nome, tenta de novo'
+    NÃO pode virar stable_fact em daniel-profile — o comando não é um fato."""
+    writer = object.__new__(PKSWriter)
+    updates = writer._build_system_updates(
+        user_message=(
+            "voce consegue salvar lá no pós, tem um workspace do usuário com meu "
+            "nome, tenta de novo"
+        ),
+        assistant_response=None,
+        allow_confirmation_fallback=False,
+    )
+    names = {item["name"] for item in updates}
+    assert "daniel-profile" not in names
+    # Nenhuma entidade de sistema deve ser fabricada a partir do comando cru.
+    assert updates == []
+
+
 def test_extract_entertainment_habit_persists_stable_series_preference():
     writer = object.__new__(PKSWriter)
 

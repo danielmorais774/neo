@@ -49,6 +49,7 @@ from observability.session_file_logger import get_session_logger
 from core.memory import ConversationMemory
 from shared import (
     IntentType,
+    MemorySearchResult,
     Message,
     MessageRole,
     RoutingDecision,
@@ -90,6 +91,15 @@ def _strip_mission_marker(text: str) -> tuple[str, dict[str, Any] | None]:
 NEED_CLARIFICATION_SENTINEL = "[[NEED_CLARIFICATION]]"
 MAX_CLARIFICATION_ROUNDS = 2
 
+# Fecha um turno que morreu por falha de infraestrutura (provider fora, 400,
+# timeout). Tem que ser uma frase CURTA e humana, nunca o texto do erro: o que
+# fecha o turno é salvo como a fala do assistant e volta no histórico do próximo
+# turno — um stack trace ali envenena o contexto e ainda vaza pros pipelines de
+# memória (preferências, PKS). O prefixo é reconhecido por
+# core/agent/affect_updater._ERROR_RESPONSE_PREFIXES para não virar insumo de
+# emoção. O erro de verdade fica no log e no log .md da sessão.
+TURN_FAILED_REPLY = "Não consegui responder agora — deu erro do meu lado. Tenta de novo?"
+
 # Injetado no prompt da resposta final quando o turno vem do modo Live (voz):
 # o texto será FALADO por TTS e mostrado como legenda, então pedimos texto corrido
 # sem markdown/emojis (que soam mal falados e poluem a legenda). Ativado por
@@ -104,6 +114,36 @@ _LIVE_STYLE_INSTRUCTION = (
     "NÃO use markdown, títulos, listas/bullets, negrito, tabelas, blocos de código "
     "ou emojis. Seja conciso, porém completo o suficiente para responder. "
     "Evite ler em voz alta URLs longas, caminhos de arquivo e símbolos."
+)
+
+# Marcador de imagem inline: o cliente (neo-desktop-tauri) troca cada
+# `[[IMAGE:origem]]` da resposta por a imagem RENDERIZADA na bolha do chat,
+# lendo os bytes direto do disco do usuário (ou do File Store) — o conteúdo
+# NUNCA passa pelo prompt. Nasceu de um turno real: pedido "carrega a imagem
+# aqui no chat pra eu ver" → o modelo rodou `base64 -i foto.jpeg`, despejou o
+# blob no contexto e ainda assim o usuário não viu imagem nenhuma.
+# Convenção idêntica à do [[VOICE:…]]/[[HANDOFF:…]] (tolerante a espaços no
+# caminho, ao contrário de `![](markdown)`).
+INLINE_IMAGE_MARKER_PREFIX = "[[IMAGE:"
+
+_INLINE_IMAGE_INSTRUCTION = (
+    "## Mostrar imagem no chat\n"
+    "O chat deste usuário RENDERIZA imagens. Para exibir uma, escreva numa linha só:\n"
+    "`[[IMAGE:/caminho/absoluto/da/imagem.jpg]]` — pode ter espaços no caminho, "
+    "sem aspas e sem escapes. Para um arquivo do SEU catálogo (File Store), use "
+    "`[[IMAGE:file:<file_id>]]`. Legenda opcional depois de `|`: "
+    "`[[IMAGE:/caminho/foto.png|a foto de ontem]]`.\n"
+    "Regras:\n"
+    "- Use SEMPRE que o usuário pedir para ver/mostrar/carregar/exibir uma imagem, "
+    "ou quando uma imagem for a melhor resposta (um print, um gráfico que você gerou).\n"
+    "- NUNCA converta imagem em base64/xxd/data-uri para \"mostrar\": isso não exibe "
+    "nada, só polui a conversa. O marcador é o único jeito.\n"
+    "- O caminho tem que ser REAL: só use um que apareça nesta conversa (mensagem do "
+    "usuário, saída de um comando, anexo). NUNCA invente ou adivinhe caminho/nome — se "
+    "não souber, ache primeiro (ex.: `ls`/`find`) ou pergunte.\n"
+    "- Escreva o marcador junto de uma frase curta ('aqui está:'), não sozinho, e um "
+    "marcador por imagem (várias linhas = várias imagens). O marcador não é falado nem "
+    "lido em voz alta — é substituído pela imagem."
 )
 
 _CLARIFICATION_INSTRUCTION = (
@@ -224,6 +264,250 @@ def _claims_action_without_tool(text: str) -> bool:
     return False
 
 
+# "vou zipar e já te mando" / "assim que estiver pronto, te entrego" / "segue o
+# próximo passo" — o modelo narra o resto da entrega como se fosse acontecer,
+# encerra o turno, e nada do que prometeu roda de verdade (sessões 7b0956de e
+# 918e515d: escreveu 1-3 arquivos, prometeu zipar/baixar imagens, nunca fez).
+_PENDING_PROMISE = re.compile(
+    r"\b(vou|vamos)\s+\w*\s*(zipar|compactar|baixar|montar|gerar|escrever|mandar|enviar"
+    r"|entregar|terminar|finalizar|preparar|criar|construir)\w*"
+    r"|\bj[áa]\s+te\s+(mando|envio|entrego)\b"
+    r"|\bpr[óo]ximo\s+passo\b"
+    r"|\bassim\s+que\s+estiver\s+(tudo\s+)?pronto\b"
+    r"|\bs[óo]\s+um\s+instante\b",
+    re.IGNORECASE,
+)
+
+# Tools legítimas pra ADIAR de verdade (job assíncrono) — se alguma rodou neste
+# turno, uma resposta "vou avisar quando terminar" é o comportamento CERTO, não
+# o bug: o workbench pede exatamente isso pra trabalho demorado.
+_LEGITIMATE_DEFERRAL_TOOLS = {
+    "neo_bash_background", "job_status", "job_list", "job_logs", "job_cancel",
+    "deep_research", "browser_task",
+}
+
+
+def _promises_pending_action(text: str) -> bool:
+    """A resposta narra o que ainda VAI fazer (zipar/baixar/mandar) em vez de
+    fazer — sinal de que o turno terminou no meio de uma entrega."""
+    return bool(_PENDING_PROMISE.search(text or ""))
+
+
+# ── Guarda anti-alegação-de-download ────────────────────────────────────────
+# "Arquivo está pronto. Você pode baixar pelo botão abaixo." — sem ter chamado
+# file_save nenhuma vez (sessão 95ccd52d: só neo_write_file, nunca file_save).
+# Diferente de _PENDING_PROMISE (futuro: "vou fazer"), aqui é afirmação no
+# presente/passado de que JÁ dá pra baixar — nem o anti-mentira (verbos
+# registrei/criei/salvei, escopado a skill_tool_names) nem o anti-promessa
+# pegam essa frase. Combinado com produced_files vazio, é sempre falso: não
+# existe entrega catalogada pro usuário clicar.
+#
+# A checagem era UM regex com `\bdownload\b` solto. Medido contra as 1450
+# mensagens reais de assistant do banco, isso dava 20 disparos: ~7 falsos
+# positivos E 11 alegações reais NÃO pegas — ruim nos dois eixos. O pior FP
+# derrubava o turno inteiro: "[[IMAGE:/Users/daniel/Downloads/download.png]]"
+# (entrega inline correta) casava pela palavra dentro do CAMINHO, forçava
+# tool_choice="required" e tomava 400 do DeepSeek em thinking mode (sessão
+# 1aec71b8) — ou seja, pedir qualquer coisa da pasta Downloads quebrava.
+#
+# Desenho novo: alegação = AFORDÂNCIA ∧ ÂNCORA, afirmativa. Nenhuma palavra
+# sozinha decide. (Uma camada "menciona artefato?" foi testada e REMOVIDA: nas
+# 1450 mensagens ela não barrava um único caso que a âncora já não barrasse, e
+# em compensação matava "Está pronto, pode baixar pelo botão abaixo." — resposta
+# sem o nome do arquivo, que é alegação legítima.) Ver tests/test_download_claim_guard.py — o corpus de
+# lá é rotulado à mão a partir desses disparos reais.
+
+# Camada 0 — MÁSCARA: o que o modelo apenas CITA não é o que ele AFIRMA.
+# REGRA DE OURO: a máscara só pode comer literal inequívoco. Máscara que come
+# prosa faz a guarda parar de guardar EM SILÊNCIO — falha pior que o FP. (Uma
+# versão intermediária aceitava `/` solto como início de caminho e engolia
+# "julho/2026 está pronto. Você pode baixar pelo botão abaixo." inteiro.)
+_FENCED_CODE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+_CLIENT_MARKER = re.compile(r"\[\[[A-Z_]+:[^\]]*\]\]")
+_MD_LINK_ANY = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_URL_LITERAL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_FS_PATH_LITERAL = re.compile(
+    r"(?:~|\.{1,2})/[\w.\-]+(?:/[\w.\-]+)*"      # ~/x, ./x, ../x
+    r"|/[\w.\-]+(?:/[\w.\-]+)+"                   # /Users/daniel/… (2+ segmentos)
+    r"|[A-Za-z]:\\[\w.\-]+(?:\\[\w.\-]+)*"        # C:\…
+)
+_FILE_EXT = (
+    r"png|jpe?g|gif|webp|heic|bmp|tiff|svg|pdf|csv|xlsx?|docx?|pptx?"
+    r"|zip|tar|gz|rar|txt|md|json|ya?ml|mp3|wav|mp4|mov"
+)
+_FILENAME_LITERAL = re.compile(rf"\b[\w.\-]+\.(?:{_FILE_EXT})\b", re.IGNORECASE)
+
+# Camada 1 — AFORDÂNCIA. FORTE: a construção sozinha já é a alegação.
+_READY_STATE = r"(?:pronto|prontinho|dispon[íi]vel|gerado|criado|salvo|guardado|terminei|segue)"
+_DOWNLOAD_CLAIM_STRONG = re.compile(
+    rf"\b{_READY_STATE}\b[^.!?\n]{{0,40}}?\b(?:para|pra|pro)\s+download\b"
+    r"|\bbot[ãa]o\s+(?:de\s+)?download\b"
+    r"|\bbot[ãa]o\s+(?:abaixo|acima|embaixo|a[íi])\b"
+    r"|\bcliqu(?:e|ar|ando)\s+no\s+bot[ãa]o\b"
+    r"|\bpode\s+ser\s+baixad[oa]\b"
+    r"|\b(?:em|no)\s+anexo\b|\banexei\b|\bsegue\s+o\s+arquivo\b",
+    re.IGNORECASE,
+)
+# FRACA: "pode baixar" só é alegação NOSSA se estiver ancorada numa superfície
+# do Neo — senão pega "pode baixar essas imagens manualmente em cdn.pixabay.com"
+# (instrução pro usuário puxar da internet). O `(?!…)` no preenchimento impede
+# que a negação entre DENTRO do match ("Só não consegui baixar as imagens") e
+# escape da checagem de polaridade, que só olha o que vem ANTES.
+_DOWNLOAD_CLAIM_WEAK = re.compile(
+    r"\b(?:pode|podes|d[áa]\s+pra|[ée]\s+s[óo]|s[óo]|para|pra|pro)\s+"
+    r"(?:(?!n[ãa]o\b|nem\b|sem\b)\w+\s+){0,2}?baix(?:ar|e|á-?l[oa])\b"
+    # "…pra download na interface" — mesma afirmação com o substantivo no lugar
+    # do verbo. Sem ready-state antes não é forte o bastante pra valer sozinha
+    # (a oferta "quer que eu gere o arquivo pra download?" tem a mesma forma e
+    # só se distingue pela interrogação), então entra aqui, exigindo âncora.
+    r"|\b(?:para|pra|pro)\s+download\b",
+    re.IGNORECASE,
+)
+_DELIVERY_SURFACE = re.compile(
+    r"\bbot[ãa]o|\binterface\b|\bpainel\b|\bconversa\b|\bchat\b|\banexo\b"
+    r"|\bcat[áa]logo\b|\baba\s+arquivos\b|\blink\b|\babaixo\b|\bacima\b|\bembaixo\b",
+    re.IGNORECASE,
+)
+# Link markdown pro sandbox / caminho absoluto: o usuário não tem como abrir.
+# Oferecer isso como clicável é falso com ou sem verbo — dispara sozinho.
+_FAKE_DELIVERY_LINK = re.compile(
+    r"\[[^\]]*\]\(\s*(?:sandbox:|file://|/|~/)[^)]*\)", re.IGNORECASE
+)
+
+# Camada 2 — POLARIDADE.
+_CLAIM_NEGATOR = re.compile(
+    r"\b(?:n[ãa]o|nem|sem|nenhum|falh(?:ou|ei|a))\b|\berro\b", re.IGNORECASE
+)
+_CLAIM_CONDITIONAL = re.compile(r"\b(?:se|caso|quando)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
+# "vou zipar e te entrego o link pra baixar" é PROMESSA — quem trata é
+# _promises_pending_action, que tem a correção certa pro caso. Só a intenção do
+# PRÓPRIO assistente conta: "o botão vai aparecer" é afirmação sobre o artefato.
+_FUTURE_INTENT = re.compile(r"\b(?:vou|vamos)\s+\w", re.IGNORECASE)
+_SENTENCE_SPLIT = re.compile(r"[^.!?\n]+[.!?]?")
+
+
+def _prose_only(text: str) -> str:
+    """Texto sem os literais que o modelo cita (código, caminho, URL, marcador)."""
+    for pat in (
+        _FENCED_CODE, _INLINE_CODE, _CLIENT_MARKER, _MD_LINK_ANY,
+        _URL_LITERAL, _FS_PATH_LITERAL, _FILENAME_LITERAL,
+    ):
+        text = pat.sub(" ", text)
+    return text
+
+
+def _claim_is_negated(sentence: str, upto: int) -> bool:
+    """Negação REGENDO a alegação? "não tem botão" nega; "se não aparecer" não."""
+    for neg in _CLAIM_NEGATOR.finditer(sentence[:upto]):
+        if _CLAIM_CONDITIONAL.search(sentence[: neg.start()]):
+            continue
+        return True
+    return False
+
+
+# O prompt do planner manda usar um placeholder como comando de um passo
+# DEPENDENTE ("[SERÁ GERADO COM BASE NOS ARQUIVOS LIDOS]") — o comando real só
+# existe depois que o passo anterior devolve saída, e quem monta é o
+# `advance_and_refine`. Quando esse refinamento falha (o vazio do DeepSeek —
+# ver deepseek-empty-response-reasoning), o fallback é "continua com o passo
+# como está" e o placeholder ia pro shell do usuário como comando literal:
+# roda, dá "command not found" e o plano fecha com lixo. Um placeholder não é
+# comando; vale a mesma trava do comando vazio.
+_PLACEHOLDER_COMMAND = re.compile(
+    r"^\s*[\[<]\s*(ser[áa]\s+gerado|to\s+be\s+generated|conte[úu]do|comando)\b[^\]>]*[\]>]\s*$",
+    re.IGNORECASE,
+)
+
+
+def _dispatch_would_hang(tool_name: str | None, arguments: dict[str, Any] | None) -> bool:
+    """True quando o ``tool_request`` sairia sem nada de real pro cliente executar.
+
+    `run_command` sem `command` é travamento GARANTIDO: o desktop recebe o pedido,
+    não tem o que rodar e nunca devolve `tool_result` — o turno fica "Executando"
+    até a conexão cair (sessões 9f7abeec e e8e5664b). Existem DOIS despachos de
+    client tool (o direto e o de passo de plano) e ambos já produziram esse estado;
+    por isso a checagem é uma função só, usada nos dois.
+
+    Um placeholder não-refinado entra na mesma conta: não trava o turno, mas
+    despacha um comando que nunca foi para ser executado.
+    """
+    if tool_name != "run_command":
+        return False
+    args = arguments or {}
+    command = str(args.get("command") or args.get("cmd") or "").strip()
+    return not command or bool(_PLACEHOLDER_COMMAND.match(command))
+
+
+def _claims_downloadable_delivery(text: str) -> bool:
+    """A resposta AFIRMA que existe uma entrega baixável pronta?
+
+    Combinado com produced_files vazio (checado pelo chamador), isso é sempre
+    mentira: não há nada catalogado pro usuário clicar. Ver o bloco de regexes
+    acima para o desenho em camadas e por que a palavra "download" sozinha não
+    serve como sinal.
+    """
+    text = text or ""
+    # Link clicável pra um caminho que só existe do meu lado: falso por
+    # construção, não precisa de verbo nenhum em volta.
+    if _FAKE_DELIVERY_LINK.search(text):
+        return True
+    for sent in _SENTENCE_SPLIT.finditer(_prose_only(text)):
+        sentence = sent.group(0)
+        match = _DOWNLOAD_CLAIM_STRONG.search(sentence)
+        if not match:
+            match = _DOWNLOAD_CLAIM_WEAK.search(sentence)
+            if not match or not _DELIVERY_SURFACE.search(sentence):
+                continue
+        if sentence.rstrip().endswith("?"):      # oferta ("quer que eu gere?")
+            continue
+        if _FUTURE_INTENT.search(sentence[: match.start()]):
+            continue
+        if _claim_is_negated(sentence, match.start()):
+            continue
+        return True
+    return False
+
+
+# Os DeepSeek raciocinam ANTES de responder e cobram esse raciocínio do MESMO
+# max_tokens: em ~1 de 4 chamadas o teto acaba durante o raciocínio e a API
+# devolve content VAZIO + zero tool_calls (finish_reason=length). Vazio aqui não
+# é "não tenho o que dizer" — é orçamento curto. Sem retry o turno morre no
+# fallback "Desculpe, não consegui gerar uma resposta" (foi exatamente o que
+# derrubou "como tu tá? ta calmo"). Uma retentativa com o dobro do teto resolve.
+# Ver memória deepseek-empty-response-reasoning e ResearchAgent._complete.
+_EMPTY_RETRY_MAX_TOKENS_CEILING = 16384
+
+
+def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[str, Any]:
+    """Resumo compacto de uma tool call pro ``tool_trace`` (nunca o payload cru).
+
+    Guardado em ``conversation_message.extra_metadata`` e reinjetado no contexto
+    do PRÓXIMO turno (session_manager.get_history) — precisa caber em poucas
+    linhas, nunca o conteúdo de um arquivo inteiro ou um stdout gigante.
+    """
+    if tr.error:
+        return {"tool": name, "ok": False, "error": str(tr.error)[:200]}
+    result = tr.result
+    if name == "neo_write_file":
+        content = arguments.get("content") or ""
+        return {"tool": name, "ok": True, "path": arguments.get("path"), "bytes": len(content.encode("utf-8"))}
+    if name == "neo_bash":
+        stdout = ""
+        exit_code = None
+        if isinstance(result, dict):
+            stdout = str(result.get("stdout", ""))[:300]
+            exit_code = result.get("exit_code")
+        return {"tool": name, "ok": True, "command": arguments.get("command"), "exit_code": exit_code, "stdout_preview": stdout}
+    if name == "file_save" and isinstance(result, dict):
+        return {
+            "tool": name, "ok": True,
+            "name": result.get("name"), "file_id": result.get("file_id"),
+            "size_bytes": result.get("size_bytes"),
+        }
+    return {"tool": name, "ok": True, "summary": str(result)[:200]}
+
+
 _HANDOFF_INSTRUCTION_RULES = (
     "\nRegras:\n"
     "- O texto dentro do bloco deve ser uma ordem COMPLETA e sem ambiguidade "
@@ -287,7 +571,42 @@ _WORKBENCH_INSTRUCTION = (
     "script. Depois de rodar, explique o resultado ao usuário em "
     "linguagem natural; não cole saídas cruas enormes. Para trabalho demorado, "
     "prefira rodar em background (quando disponível) e avise que vai avisar ao "
-    "terminar — não segure a conversa esperando."
+    "terminar — não segure a conversa esperando.\n\n"
+    "**NUNCA** tente `neo_bash cp`/`mv`/escrever um arquivo pra fora de "
+    "/workspace (ex.: caminhos tipo `/Users/...`, `/home/...`, `~/Desktop`) — "
+    "essa máquina não enxerga o disco do usuário de jeito nenhum, sempre falha "
+    "(\"No such file or directory\"). Se o pedido for entregar um arquivo que "
+    "você gerou no disco/área de trabalho/pasta do usuário: chame `file_save` "
+    "nele (ganha um `file_id`) e diga que está pronto pra baixar — a entrega em "
+    "si acontece pelo botão que a interface mostra sozinha, ou, se o usuário "
+    "quiser especificamente colocado num lugar do disco dele, isso vira uma "
+    "chamada `save_generated_file` do lado do cliente (fora do seu alcance "
+    "direto: você só garante que o `file_id` existe e informa o nome do "
+    "arquivo)."
+)
+
+# Injetado só quando neo_file_actuation_enabled: dá ao cérebro as duas mãos de
+# arquivo (puxar do disco do usuário / entregar no disco dele) POR CONTA PRÓPRIA,
+# no mesmo turno. Ver plano "arquivos sob iniciativa do cérebro".
+_FILE_ACTUATION_INSTRUCTION = (
+    "## Arquivos: você pode PEGAR e ENTREGAR sozinho\n"
+    "Você NÃO depende mais do usuário anexar nem de um turno separado pra mexer em "
+    "arquivos dele:\n"
+    "- **Precisa de um arquivo que só existe na máquina do usuário** (ele não anexou)? "
+    "Chame `request_user_file`. Padrão `mode=\"pick\"` (abre o seletor; ele escolhe — "
+    "seguro e sem chute). Use `mode=\"path\"` SÓ se ele citou um caminho literal nesta "
+    "conversa — NUNCA invente um caminho a partir do nome. Passe `stage=true` se você "
+    "vai RODAR/processar o arquivo (ele já vem materializado no /workspace pro neo_bash); "
+    "`stage=false` se só vai LER (file_read). O arquivo chega ao seu catálogo e você "
+    "continua a resposta lendo/processando — não peça de novo.\n"
+    "- **Gerou um arquivo e quer ENTREGAR no disco dele** (Desktop/Downloads/pasta)? "
+    "Depois do `file_save`, chame `save_generated_file` com o `file_id`, o nome e o "
+    "`destination`. Se já existir um arquivo lá, ela devolve `status=\"conflict\"` com os "
+    "dados do existente (NÃO sobrescreve): decida sozinho só quando for claramente seguro "
+    "(o arquivo que você acabou de gerar) reenviando com `overwrite=true`, senão PERGUNTE "
+    "citando nome/tamanho/data antes de sobrescrever.\n"
+    "Ainda vale o botão de download automático do `file_save` pra entregas simples — use "
+    "`save_generated_file` quando o pedido for pra colocar num LUGAR específico do disco."
 )
 
 # Music turns (decision.skill_hint == "music") get a STRICTER handoff contract so the
@@ -325,6 +644,46 @@ _MUSIC_HANDOFF_INSTRUCTION = (
 # Client tools the music skill dispatches to the desktop (Etapa 2). process_tool_result
 # confirms these truthfully and skips the generic recovery flow.
 _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
+
+# Tools "client-actuating" que o NÚCLEO COGNITIVO aciona no meio do turno para
+# OBTER/ENTREGAR arquivos (plano "arquivos sob iniciativa do cérebro"): elas não
+# executam no processo do core (o disco/picker do usuário só existe no cliente).
+# Quando o modelo chama uma delas no loop cognitivo, o executor levanta
+# ``ClientActuationRequested``; ``_handle_direct_response`` quebra o turno e emite
+# um ``tool_request`` — o desktop executa e o resultado volta em
+# ``process_tool_result`` (mesmo round-trip de save_generated_file/execute_command).
+_CLIENT_ACTUATION_TOOLS = frozenset({"request_user_file", "save_generated_file"})
+
+# Shell na máquina do usuário pela iniciativa do CÉREBRO (neo_brain_shell_enabled).
+# Fica num set próprio, e não dentro de _CLIENT_ACTUATION_TOOLS, porque o nome
+# `run_command` também é o do caminho CLIENT_TOOL do classificador: misturar os dois
+# faria o resultado de um `tool_request(run_command)` comum cair no ramo de retomada
+# cognitiva. O ramo do cérebro é reconhecido pelo estado em _pending_actuations,
+# nunca pelo nome sozinho.
+_SHELL_ACTUATION_TOOLS = frozenset({"run_command"})
+
+# Tudo que quebra o loop cognitivo para atuar no cliente.
+_ALL_ACTUATION_TOOLS = _CLIENT_ACTUATION_TOOLS | _SHELL_ACTUATION_TOOLS
+
+# Teto de round-trips de atuação encadeados num mesmo pedido (pull→responde→push,
+# ou conflito→sobrescreve): evita um laço se o modelo insistir em atuar sem parar.
+_MAX_ACTUATION_DEPTH = 3
+
+
+class ClientActuationRequested(Exception):
+    """Sinaliza que o cérebro chamou uma tool que precisa rodar NO CLIENTE.
+
+    Carrega o suficiente para montar o ``tool_request`` e, depois, retomar o
+    turno cognitivo quando o ``tool_result`` voltar. Levantada de dentro do loop
+    cognitivo (antes de qualquer execução in-process) e capturada em
+    ``_handle_direct_response``.
+    """
+
+    def __init__(self, tool_name: str, arguments: dict[str, Any], tool_call_id: str | None) -> None:
+        super().__init__(f"client actuation: {tool_name}")
+        self.tool_name = tool_name
+        self.arguments = arguments or {}
+        self.tool_call_id = tool_call_id or str(uuid4())
 
 
 def _extract_clarification_question(text: str) -> str | None:
@@ -581,10 +940,20 @@ class AIService:
         # turnos seguintes da conversa — ver _remember_session_attachments.
         self._session_attachments: dict[str, list[str]] = {}
         self._pending_traces: dict[str, MessageTrace] = {}
+        # Estado para retomar um turno cognitivo depois de uma tool de arquivo
+        # client-actuating (request_user_file/save_generated_file). O gRPC só
+        # encaminha campos fixos (user_message/command/…) entre tool_request e
+        # tool_result, então guardamos aqui o resto (metadata original, user_id,
+        # stage, args) por sessão. Ver _emit_client_actuation / process_tool_result.
+        self._pending_actuations: dict[str, dict[str, Any]] = {}
         # Sessões cujo último turno veio do modo Live — usado para estilizar a
         # resposta de um client tool (process_tool_result), onde o metadata["mode"]
         # original se perde no round-trip. Atualizado em process_user_input.
         self._live_sessions: set[str] = set()
+        # Sessões cujo cliente RENDERIZA `[[IMAGE:…]]` (hoje o neo-desktop-tauri).
+        # Mesmo motivo do set acima: a resposta de um client tool
+        # (process_tool_result → _format_tool_result) perde o metadata do turno.
+        self._image_capable_sessions: set[str] = set()
         # Registro da situação (docs/context-register-plan.md): gravidade sticky
         # por sessão (RAM, decai sozinha) + registro do último turno — este último
         # cobre as continuações (process_tool_result) que perdem o metadata.
@@ -599,6 +968,21 @@ class AIService:
         # create_task results can be garbage-collected mid-flight.
         self._bg_tasks: set[asyncio.Task] = set()
         self.planner = PlanManager(llm_router)
+
+    @staticmethod
+    def _client_renders_inline_images(metadata: dict[str, Any] | None) -> bool:
+        """O cliente deste turno troca `[[IMAGE:…]]` pela imagem renderizada?
+
+        Hoje só o neo-desktop-tauri (que lê o arquivo do disco do usuário). Outros
+        clientes podem optar mandando ``supports_inline_images`` no metadata — mas
+        quem não renderiza NÃO recebe a instrução, senão o usuário lê o marcador cru.
+        """
+        if not metadata:
+            return False
+        opt_in = str(metadata.get("supports_inline_images", "")).strip().lower()
+        if opt_in in {"1", "true", "yes"}:
+            return True
+        return str(metadata.get("client", "")).strip() == "neo-desktop-tauri"
 
     @staticmethod
     def _parse_attachment_ids(metadata: dict[str, Any] | None) -> list[str]:
@@ -797,6 +1181,130 @@ class AIService:
             return None
 
     # ---------------------------------------------------------------
+    # Read-only prompt preview (panel debug tool — no writes, no LLM)
+    # ---------------------------------------------------------------
+
+    def _preview_register(
+        self,
+        *,
+        decision: "RoutingDecision",
+        user_message: str,
+        live: bool,
+    ) -> "Register | None":
+        """Side-effect-free register derivation for the preview.
+
+        Mirrors ``_derive_turn_register`` but WITHOUT the sticky-gravity mutation
+        (no session state to touch in a stateless debug call). Returns None when
+        the feature is off. Fail-open: never raises.
+        """
+        if self.settings.neo_register_enabled is not True:
+            return None
+        try:
+            skill_register: str | None = None
+            skill_name = decision.skill_name or decision.skill_hint
+            if skill_name:
+                from core.skills.manifest import SkillManifest
+
+                manifest = SkillManifest.all().get(skill_name)
+                if manifest is not None:
+                    skill_register = getattr(manifest, "tone_register", "") or None
+            session_gravity = max_gravity(decision.gravity, detect_gravity_floor(user_message))
+            register, _reason = derive_register(
+                decision,
+                user_message=user_message,
+                live=live,
+                skill_register=skill_register,
+                session_gravity=session_gravity,
+            )
+            return register
+        except Exception:  # noqa: BLE001 — preview must never crash on register
+            logger.warning("[preview] register derivation failed", exc_info=True)
+            return None
+
+    async def preview_prompt(
+        self,
+        *,
+        user_id: UUID,
+        user_message: str,
+        metadata: dict[str, Any] | None = None,
+        live: bool = False,
+    ) -> dict[str, Any]:
+        """Reproduce the real turn's prompt assembly for the panel, read-only.
+
+        Runs the SAME pre-processing as ``_handle_direct_response`` — real intent
+        classification (so ``knowledge_keywords``/``needs_memory`` are the real
+        ones), the hybrid cross-session memory recovery (the RETRIEVED layer) and
+        the situational register — then ``build_prompt``. Deliberately omits the
+        two side effects the live turn has: it does NOT run ``learn_before_response``
+        (that WRITES to the PKS) and it never calls the LLM. So the panel shows the
+        exact system prompt + selection trace + semantic-memory layer the model
+        actually receives, instead of the stripped-down preview the old endpoint
+        produced.
+
+        Returns a dict with keys: ``system_prompt``, ``candidates`` (full trace),
+        ``prompt_tokens_est``, ``decision``, ``recovered`` (RETRIEVED layer),
+        ``contexts_found`` (PKS neighborhoods), ``context_text``, ``keywords``.
+        """
+        sys_context = self._build_system_context(metadata) if metadata else None
+        is_training = self.pks.is_training_message(user_message) if self.pks else False
+
+        # Real routing decision — its keywords drive PKS retrieval and its
+        # needs_memory gates the cross-session recovery below.
+        decision = await self.router.classify(
+            user_message, conversation_history=None, system_context=sys_context
+        )
+
+        # RETRIEVED layer: hybrid vector+FTS+temporal search over past sessions.
+        # Same gate the live turn uses (needs_memory + not a training message).
+        recovered: list[MemorySearchResult] = []
+        if decision.needs_memory and not is_training:
+            try:
+                recovered = await self.sessions.recover_context(user_message, user_id=user_id)
+            except Exception as e:  # noqa: BLE001 — recovery never breaks the preview
+                logger.warning("[preview] recover_context failed: %s", e)
+
+        register = self._preview_register(decision=decision, user_message=user_message, live=live)
+
+        system_prompt, candidates = await self.context_selector.build_prompt(
+            user_message=user_message,
+            user_id=user_id,
+            decision=decision,
+            system_context=sys_context,
+            recovered_context=recovered,
+            is_neo_training=is_training,
+            pks_prewrite=None,        # read-only: prewrite WRITES to the PKS
+            pks_system_prewrite=None,
+            mission_context=None,
+            register=register,
+        )
+
+        # PKS neighborhoods for the entity cards, using the SAME keywords
+        # build_prompt used — so the cards match the injected PKS block.
+        contexts_found: list[dict[str, Any]] = []
+        context_text = ""
+        if self.pks and user_id and not is_training:
+            try:
+                pks_result, context_text = await self.pks.retrieve_context(
+                    user_id=user_id,
+                    user_message=user_message,
+                    keywords=decision.knowledge_keywords,
+                )
+                contexts_found = pks_result.get("neighborhoods", [])
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[preview] retrieve_context failed: %s", e)
+
+        return {
+            "system_prompt": system_prompt,
+            "candidates": candidates,
+            "prompt_tokens_est": sum(c.est_tokens for c in candidates if c.included),
+            "decision": decision,
+            "recovered": recovered,
+            "contexts_found": contexts_found,
+            "context_text": context_text,
+            "keywords": decision.knowledge_keywords or [],
+        }
+
+    # ---------------------------------------------------------------
     # Main entry point — called by gRPC controller
     # ---------------------------------------------------------------
 
@@ -953,6 +1461,17 @@ class AIService:
             sys_context = "\n\n".join(part for part in (sys_context, _LIVE_STYLE_INSTRUCTION) if part)
         else:
             self._live_sessions.discard(str(sid))
+        # Imagens no chat: a instrução do marcador `[[IMAGE:…]]` só vai pro cliente
+        # que sabe renderizá-lo (senão o usuário veria o marcador cru). Mesmo seam
+        # do estilo Live acima — chega ao cognitivo E ao classificador (que recebe o
+        # mesmo sys_context), o que é o que tira o `base64 -i foto.jpg` da mesa.
+        if self._client_renders_inline_images(metadata):
+            self._image_capable_sessions.add(str(sid))
+            sys_context = "\n\n".join(
+                part for part in (sys_context, _INLINE_IMAGE_INSTRUCTION) if part
+            )
+        else:
+            self._image_capable_sessions.discard(str(sid))
         # Anexos (docs/file-store-plan.md §5): só o MANIFESTO entra no prompt; o
         # modelo lê por fatia/materializa com as tools file_*. Mesmo seam do estilo
         # Live acima — chega ao cognitivo via system_context E ao classificador
@@ -1225,7 +1744,7 @@ class AIService:
                     yield resp
 
             elif decision.intent == IntentType.CLIENT_TOOL:
-                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id, metadata=metadata):
+                async for resp in self._handle_client_tool(sid, user_message, decision, trace, slog=slog, user_id=user_id, metadata=metadata, history=history):
                     yield resp
 
             elif decision.intent == IntentType.WHATSAPP_MESSAGING:
@@ -1426,6 +1945,7 @@ class AIService:
             elif intent == IntentType.CLIENT_TOOL:
                 gen = self._handle_client_tool(
                     sid, msg, dec, trace, slog=slog, user_id=user_id, metadata=step_metadata,
+                    history=history,
                 )
             elif intent == IntentType.WHATSAPP_MESSAGING:
                 gen = self._handle_whatsapp_messaging(
@@ -1516,6 +2036,49 @@ class AIService:
     # Handler: DIRECT_RESPONSE — conversational, no tools
     # ---------------------------------------------------------------
 
+    async def _fail_turn(
+        self,
+        session_id: UUID,
+        exc: BaseException,
+        *,
+        user_id: UUID | None = None,
+        slog: "SessionFileLogger | None" = None,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Fecha um turno derrubado por falha de infraestrutura.
+
+        Falha de provider NÃO é resposta. Antes, o texto cru do erro virava o
+        `full_response` e seguia o fluxo normal: era salvo como a fala do
+        assistant, voltava no histórico do turno seguinte E era mandado pro
+        extrator de preferências e pro PKS planner como se fosse conteúdo — dá
+        pra ver as duas chamadas no app.log da sessão 1aec71b8, com um 400 do
+        DeepSeek no lugar da resposta.
+
+        O que sai daqui é uma frase curta e humana; o erro real fica no log da
+        aplicação e no log .md da sessão. Nada de trabalho de memória roda: não
+        há conteúdo nenhum pra aprender.
+        """
+        if slog:
+            slog.log_event("Erro LLM", f"```\n{exc}\n```")
+        try:
+            await self.sessions.add_message(
+                session_id=session_id,
+                role="assistant",
+                content=TURN_FAILED_REPLY,
+                generate_embedding=False,
+                user_id=user_id,
+            )
+        except Exception:  # noqa: BLE001 — o turno já falhou; não falhar de novo aqui
+            logger.warning("[fail-turn] não consegui salvar o fecho do turno", exc_info=True)
+        if slog:
+            slog.log_final_response(TURN_FAILED_REPLY, "COGNITIVE", iterations=1)
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE,
+            session_id=session_id,
+            message=TURN_FAILED_REPLY,
+            is_final=True,
+            iterations=1,
+        )
+
     async def _handle_direct_response(
         self,
         session_id: UUID,
@@ -1532,6 +2095,7 @@ class AIService:
         clarification_round: int = 1,
         enable_handoff: bool = False,
         register: "Register | None" = None,
+        _actuation_depth: int = 0,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM.
 
@@ -1727,6 +2291,16 @@ class AIService:
             and not is_neo_training
         ):
             messages.append(Message(role=MessageRole.SYSTEM, content=_WORKBENCH_INSTRUCTION))
+            # Arquivos sob iniciativa do cérebro: só quando as tools de atuação
+            # estão no toolset (neo_files + neo_file_actuation), senão a instrução
+            # apontaria pra tools que o modelo não tem.
+            if (
+                getattr(self.settings, "neo_files_enabled", False)
+                and getattr(self.settings, "neo_file_actuation_enabled", False)
+            ):
+                messages.append(
+                    Message(role=MessageRole.SYSTEM, content=_FILE_ACTUATION_INSTRUCTION)
+                )
 
         # Skills library: catálogo de 1 linha por skill (nível 0 da progressive
         # disclosure) — o corpo só é pago quando o modelo chama skill_read. Sem
@@ -1856,6 +2430,7 @@ class AIService:
 
         # Stream response
         produced_files: list[dict[str, Any]] = []
+        tool_trace: list[dict[str, Any]] = []
         try:
             _req_model = (metadata or {}).get("model")
             _req_provider = (metadata or {}).get("provider")
@@ -1917,6 +2492,7 @@ class AIService:
                     skill_tool_names=_skill_tool_names,
                     used_tools=_used_tools,
                     produced_files=produced_files,
+                    tool_trace=tool_trace,
                 )
                 llm_ms = (time.monotonic() - t0) * 1000
                 # Usou a skill de verdade → o assunto está vivo: renova o prazo dela
@@ -1937,6 +2513,27 @@ class AIService:
                     elif chunk.event == StreamEventType.ERROR:
                         logger.error(f"LLM stream error: {chunk.content}")
                         break
+                # Mesmo buraco do tool-loop: o stream pode terminar VAZIO quando o
+                # raciocínio do DeepSeek consome o max_tokens (finish_reason=length).
+                # Retenta UMA vez, bufferizado, com o dobro do teto antes de aceitar
+                # o vazio (que viraria "não consegui gerar uma resposta").
+                if not full_response.strip():
+                    bigger = min(
+                        self.settings.default_max_tokens * 2,
+                        _EMPTY_RETRY_MAX_TOKENS_CEILING,
+                    )
+                    logger.warning(
+                        "[Cognitive] stream vazio (orçamento consumido no "
+                        "raciocínio) — retentando com max_tokens=%d", bigger,
+                    )
+                    _retry_resp = await provider.complete(
+                        messages=messages,
+                        tools=None,
+                        model=_req_model or None,
+                        temperature=0.9,
+                        max_tokens=bigger,
+                    )
+                    full_response = _retry_resp.get_content() or ""
                 llm_ms = (time.monotonic() - t0) * 1000
                 if slog:
                     slog.log_llm_response("COGNITIVE", full_response, duration_ms=llm_ms, model=model_name)
@@ -1956,11 +2553,82 @@ class AIService:
             if not full_response:
                 full_response = "Desculpe, não consegui gerar uma resposta."
 
+            # Rede de segurança pós-loop: mesmo com as guardas DENTRO do loop, a
+            # resposta final ainda pode sair errada de dois jeitos sem produzir
+            # nada de fato: (a) promessa futura — "vou gerar o zip... aguenta um
+            # segundo" (sessão 8f0cd0fa) — ou (b) afirmação de entrega pronta sem
+            # nunca ter chamado file_save — "está pronto, pode baixar pelo botão
+            # abaixo" (sessão 95ccd52d: só neo_write_file rodou, file_save nunca).
+            # Nenhuma das guardas de dentro do loop pega (b): não é mentira sobre
+            # AÇÃO passada (verbos de _claims_action_without_tool) nem promessa no
+            # futuro. Em vez de confiar cegamente no texto, força mais UMA passada.
+            _lying_about_delivery = _promises_pending_action(full_response) or (
+                _claims_downloadable_delivery(full_response)
+            )
+            if use_tools and not produced_files and _lying_about_delivery:
+                logger.warning(
+                    "[Cognitive] resposta final alegou entrega sem produzir "
+                    "arquivo — forçando segunda passada"
+                )
+                if slog:
+                    slog.log_event(
+                        "Anti-promessa (pós-loop)",
+                        "A resposta final alegava entrega pronta/prometida sem ter "
+                        f"produzido nada — forçando mais uma passada.\n\n> {full_response[:200]}",
+                    )
+                messages.append(Message(role=MessageRole.ASSISTANT, content=full_response))
+                messages.append(
+                    Message(
+                        role=MessageRole.USER,
+                        content=(
+                            "PARE: você disse que o arquivo está pronto/vai ficar "
+                            "pronto, mas nenhum file_save rodou — nada foi entregue de "
+                            "verdade e a frase é falsa. Não repita esse texto. Continue "
+                            "AGORA chamando as tools (inclusive file_save) até a "
+                            "entrega estar pronta de verdade."
+                        ),
+                    )
+                )
+                full_response = await self._run_cognitive_tool_loop(
+                    provider=provider, messages=messages, req_model=_req_model,
+                    model_name=model_name, provider_name=provider_name,
+                    tools=cognitive_tools, tool_executor=cog_executor,
+                    slog=slog, trace=trace, force_tool_first=True,
+                    skill_tool_names=_skill_tool_names, used_tools=_used_tools,
+                    produced_files=produced_files, tool_trace=tool_trace,
+                )
+                if not full_response:
+                    full_response = "Desculpe, não consegui gerar uma resposta."
+
+        except ClientActuationRequested as car:
+            # O cérebro pediu uma ação de arquivo NO CLIENTE (puxar/entregar). Emite
+            # o tool_request e encerra ESTE turno cognitivo; o desktop executa e o
+            # turno retoma em process_tool_result. Estado para a retomada fica em
+            # _pending_actuations (o gRPC só encaminha user_message/command/etc.).
+            async for resp in self._emit_client_actuation(
+                car,
+                session_id=session_id,
+                user_message=user_message,
+                user_id=user_id,
+                metadata=metadata,
+                trace=trace,
+                slog=slog,
+                depth=_actuation_depth,
+            ):
+                yield resp
+            return
         except Exception as e:
+            # Falha de provider NÃO é resposta. Antes o texto cru do erro virava
+            # `full_response` e seguia o fluxo normal: era salvo como a fala do
+            # assistant, reinjetado no histórico do turno seguinte E mandado pro
+            # extrator de preferências e pro PKS planner como se fosse conteúdo
+            # (visto na sessão 1aec71b8, onde um 400 do DeepSeek virou "resposta"
+            # e foi parar nos dois pipelines de memória). Fecha o turno com uma
+            # frase curta e humana; o erro real fica no log e no slog.
             logger.exception("Direct response LLM call failed")
-            full_response = f"Erro ao processar: {str(e)}"
-            if slog:
-                slog.log_event("Erro LLM", f"```\n{str(e)}\n```")
+            async for resp in self._fail_turn(session_id, e, user_id=user_id, slog=slog):
+                yield resp
+            return
 
         # Clarification loop: the model signalled it lacks context and asked a
         # question. Persist the pending state and return the question — the user's
@@ -2071,13 +2739,18 @@ class AIService:
 
         # Save assistant response
         t0_save = time.monotonic()
+        _msg_metadata: dict[str, Any] = {}
+        if produced_files:
+            _msg_metadata["files"] = produced_files
+        if tool_trace:
+            _msg_metadata["tool_trace"] = tool_trace
         await self.sessions.add_message(
             session_id=session_id,
             role="assistant",
             content=full_response,
             generate_embedding=False,
             user_id=user_id,
-            metadata={"files": produced_files} if produced_files else None,
+            metadata=_msg_metadata or None,
         )
         save_ms = round((time.monotonic() - t0_save) * 1000, 1)
         logger.info(f"[TIMING-DIRECT] recover={recover_ms}ms prefs={prefs_ms}ms pks={pks_ms}ms llm={llm_ms:.0f}ms save_assistant={save_ms}ms")
@@ -2179,8 +2852,39 @@ class AIService:
                 # identity was already written deterministically; skip the LLM
                 # planner so it can't re-ingest a hallucinated id/specs from the
                 # assistant's reply.
+                # Se o cognitivo já chamou pks_remember/pks_forget neste turno, a
+                # gravação user-scope explícita É a fonte de verdade do turno — a
+                # extração automática aqui só duplicaria/atrapalharia
+                # (session-b7e3985d: a tool atualizou a entidade canônica e o
+                # _bg_pks criou uma 2ª quase-idêntica; num "esquece" ela tentaria
+                # re-salvar o que acabou de ser removido).
+                pks_tool_used = any(
+                    (e or {}).get("tool") in ("pks_remember", "pks_forget")
+                    for e in tool_trace
+                )
+                # Fase 2 — backstop determinístico (docs/pks-write-on-demand-plan.md
+                # §Fase 2): o usuário emitiu uma diretiva de memória CLARA ("salva
+                # essa ideia", "coloca nas anotações") mas o cognitivo NÃO chamou
+                # pks_remember. A extração best-effort (confirmed_save=False) poderia
+                # devolver [] achando que é "sugestão do assistente". Então aqui a
+                # gente FORÇA o modo confirmado — a rede de segurança que garante que
+                # o pedido explícito não caia no vazio. Só ADICIONA cobertura; quando
+                # a tool rodou (pks_tool_used) este bloco nem executa.
+                force_save = (
+                    IntentRouter._is_memory_directive(user_message) and not pks_tool_used
+                )
                 applied = []
-                if not is_neo_training and not device_memory_handled and not skill_owns_turn:
+                if (
+                    not is_neo_training
+                    and not device_memory_handled
+                    and not skill_owns_turn
+                    and not pks_tool_used
+                ):
+                    if force_save:
+                        logger.info(
+                            "[PKS] Fase-2 backstop: diretiva de memória sem pks_remember "
+                            "no turno — forçando save confirmado."
+                        )
                     applied = await self.pks.learn(
                         user_id=user_id,
                         user_message=user_message,
@@ -2191,6 +2895,7 @@ class AIService:
                         recent_history=recent_history_str,
                         recent_messages=history[-12:],
                         source_message_id=source_message_id,
+                        confirmed_save=force_save,
                     )
                 system_applied = await self.pks.learn(
                     user_id=user_id,
@@ -2363,6 +3068,7 @@ class AIService:
         skill_tool_names: set[str] | None = None,
         used_tools: set[str] | None = None,
         produced_files: list[dict[str, Any]] | None = None,
+        tool_trace: list[dict[str, Any]] | None = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -2385,6 +3091,12 @@ class AIService:
         ``{file_id, name, size_bytes}`` por ``file_save`` bem-sucedido neste turno —
         é como o chamador entrega um anexo clicável na mensagem final sem o modelo
         precisar (e sem poder) inventar uma URL.
+
+        ``tool_trace`` (in/out): se passado, recebe um resumo compacto (via
+        ``_summarize_tool_call``) de CADA tool call bem-sucedida deste turno — não
+        só ``file_save``. É salvo em ``extra_metadata`` da mensagem e reinjetado no
+        próximo turno (session_manager.get_history) pra evitar que um follow-up
+        ("cade os arquivos?") refaça do zero um trabalho que já foi feito.
         """
         max_rounds = self.settings.cognitive_max_tool_rounds
         seen: set[tuple[str, str]] = set()
@@ -2399,6 +3111,8 @@ class AIService:
         used: set[str] = used_tools if used_tools is not None else set()
         force_next = False
         lie_retried = False
+        promise_retried = False
+        download_claim_retried = False
 
         for round_idx in range(max_rounds + 1):
             round_tools = tools if (tools and round_idx < max_rounds) else None
@@ -2421,6 +3135,39 @@ class AIService:
             content = resp.get_content() or ""
             tool_calls = resp.get_tool_calls() if round_tools else []
 
+            # Resposta vazia + zero tool_calls = orçamento consumido no raciocínio
+            # (finish_reason=length), não "nada a dizer". Retenta UMA vez com o
+            # dobro do teto antes de aceitar o vazio — sem isso o turno cai no
+            # fallback "não consegui gerar uma resposta". Ver constante acima.
+            if not content.strip() and not tool_calls:
+                bigger = min(
+                    self.settings.default_max_tokens * 2,
+                    _EMPTY_RETRY_MAX_TOKENS_CEILING,
+                )
+                logger.warning(
+                    "[Cognitive] round %d resposta vazia (orçamento consumido no "
+                    "raciocínio) — retentando com max_tokens=%d",
+                    round_idx, bigger,
+                )
+                if slog:
+                    slog.log_event(
+                        "Retry resposta vazia",
+                        f"round {round_idx}: content vazio + zero tool_calls "
+                        f"(raciocínio consumiu o teto) — retentando com "
+                        f"max_tokens={bigger}.",
+                    )
+                resp = await provider.complete(
+                    messages=messages,
+                    tools=round_tools,
+                    model=req_model or None,
+                    temperature=0.9,
+                    max_tokens=bigger,
+                    **extra,
+                )
+                llm_ms = (time.monotonic() - t0) * 1000
+                content = resp.get_content() or ""
+                tool_calls = resp.get_tool_calls() if round_tools else []
+
             if trace:
                 payload = []
                 for m in messages:
@@ -2433,6 +3180,14 @@ class AIService:
                 )
 
             if not tool_calls:
+                logger.info(
+                    "[Cognitive] round %d sem tool_calls — round_tools=%s "
+                    "promise_retried=%s download_claim_retried=%s used=%s "
+                    "files_out=%s promises_pending=%s claims_download=%s content=%r",
+                    round_idx, bool(round_tools), promise_retried, download_claim_retried,
+                    used, bool(files_out), _promises_pending_action(content),
+                    _claims_downloadable_delivery(content), content[:150],
+                )
                 # Guarda anti-mentira: ele afirmou ter EXECUTADO algo da skill sem ter
                 # chamado tool nenhuma. Não devolve o texto — dá um round extra com a
                 # tool obrigatória. Uma vez só, para não virar laço.
@@ -2466,6 +3221,79 @@ class AIService:
                         )
                     )
                     continue
+
+                # Guarda anti-promessa: ele descreveu o que AINDA vai fazer
+                # (zipar, baixar, mandar) em vez de fazer, e sobra rodada de tool.
+                # Sem isso o turno termina com a entrega pela metade (sessões
+                # 7b0956de, 918e515d) e o usuário precisa cobrar. Não se aplica
+                # quando ele já adiou de verdade via job assíncrono — aí "vou
+                # avisar quando terminar" é o comportamento certo, não o bug.
+                if (
+                    round_tools
+                    and not promise_retried
+                    and not (used & _LEGITIMATE_DEFERRAL_TOOLS)
+                    and _promises_pending_action(content)
+                ):
+                    promise_retried = True
+                    force_next = True
+                    if slog:
+                        slog.log_event(
+                            "Anti-promessa",
+                            "A resposta descreveu o que ainda vai fazer em vez de fazer — "
+                            f"round extra com tool obrigatória.\n\n> {content[:200]}",
+                        )
+                    logger.warning("[Cognitive] resposta prometeu ação futura sem terminar — forçando tool")
+                    messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE: você descreveu o que ainda vai fazer, mas não fez — "
+                                "não termine o turno assim. Continue AGORA chamando as tools "
+                                "até a entrega estar de fato pronta (só responda depois de "
+                                "ver o resultado). Se for realmente demorado, use a tool de "
+                                "job em background e avise que vai notificar ao terminar — "
+                                "mas não descreva um plano no lugar de executar."
+                            ),
+                        )
+                    )
+                    continue
+
+                # Guarda anti-alegação-de-download: ele disse "está pronto, pode
+                # baixar pelo botão" sem NUNCA ter chamado file_save neste turno
+                # (sessão 95ccd52d: só neo_write_file rodou). Diferente da
+                # anti-promessa (futuro — "vou fazer"), aqui é afirmação de que
+                # JÁ dá pra baixar — sem file_save isso é sempre falso, não
+                # existe nada catalogado pro usuário clicar.
+                if (
+                    round_tools
+                    and not download_claim_retried
+                    and not files_out
+                    and _claims_downloadable_delivery(content)
+                ):
+                    download_claim_retried = True
+                    force_next = True
+                    if slog:
+                        slog.log_event(
+                            "Anti-alegação-de-download",
+                            "A resposta alegou entrega baixável sem ter chamado "
+                            f"file_save — round extra com tool obrigatória.\n\n> {content[:200]}",
+                        )
+                    logger.warning("[Cognitive] resposta alegou download sem file_save — forçando tool")
+                    messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE: você disse que dá pra baixar, mas nunca chamou "
+                                "file_save — não existe nada catalogado pro usuário "
+                                "clicar e a frase é falsa. Chame file_save AGORA (fazendo "
+                                "antes o que faltar) e só responda depois de ver o resultado."
+                            ),
+                        )
+                    )
+                    continue
+
                 final_text = content
                 if slog:
                     slog.log_llm_response("COGNITIVE", final_text, duration_ms=llm_ms, model=model_name)
@@ -2475,6 +3303,15 @@ class AIService:
             messages.append(Message(role=MessageRole.ASSISTANT, content=content))
             result_lines: list[str] = []
             for tc in tool_calls:
+                # Tool client-actuating (request_user_file/save_generated_file): o
+                # disco/picker do usuário só existe no cliente — não dá para rodar
+                # in-process. Quebra o loop AGORA (antes de qualquer bookkeeping) e
+                # deixa _handle_direct_response emitir o tool_request; o turno retoma
+                # em process_tool_result quando o desktop devolver o resultado.
+                if tc.name in _ALL_ACTUATION_TOOLS:
+                    if slog:
+                        slog.log_event("Cognitive Tool (client-actuating)", f"→ `{tc.name}` {tc.arguments}")
+                    raise ClientActuationRequested(tc.name, dict(tc.arguments or {}), tc.id)
                 key = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False))
                 if key in seen:
                     result_lines.append(f"Tool: {tc.name}\nResult: (já consultado neste turno — não repita; use o resultado anterior)")
@@ -2488,6 +3325,8 @@ class AIService:
                     result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
                 else:
                     result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
+                if tool_trace is not None:
+                    tool_trace.append(_summarize_tool_call(tc.name, tc.arguments, tr))
                 if tc.name == "file_save" and not tr.error and isinstance(tr.result, dict):
                     fid = tr.result.get("file_id")
                     if fid:
@@ -2807,7 +3646,10 @@ class AIService:
         if hardware_id:
             lines.append(f"- hardware_id: {hardware_id}")
         if os_platform and os_platform != "unknown":
-            lines.append(f"- sistema: {os_platform}")
+            # Mesmo motivo do _build_system_context: o Rust manda "macos"/"windows".
+            pretty = {"darwin": "macOS", "win32": "Windows", "linux": "Linux"}
+            normalized = AIService._normalize_os_platform(os_platform)
+            lines.append(f"- sistema: {pretty.get(normalized, os_platform)}")
         if os_arch:
             lines.append(f"- arquitetura: {os_arch}")
         if device_type:
@@ -3602,6 +4444,128 @@ class AIService:
     # Handler: CLIENT_TOOL — tools running on user's desktop
     # ---------------------------------------------------------------
 
+    def _known_client_tool_names(self) -> set[str]:
+        """Nomes de tools client-side realmente registradas no ToolRegistry.
+
+        Um passo de plano (``PlanManager``, LLM próprio) pode nomear um
+        ``tool_name`` fora do catálogo real — a mesma classe de bug do
+        classificador (``intent_router._valid_client_tool_names``), só que
+        vinda do planner em vez do router. Despachar isso pro desktop trava
+        o turno esperando um handler que não existe. ``getattr`` defensivo:
+        alguns testes constroem ``AIService`` via ``object.__new__`` sem
+        wireiar ``self.tools`` — nesse caso a checagem é pulada (fail open),
+        igual ao padrão já usado para ``self.file_store``.
+        """
+        registry = getattr(self, "tools", None)
+        if registry is None:
+            return set()
+        return {t.name for t in registry.get_all() if t.execution == "client-side"}
+
+    def _client_tool_name_is_unknown(self, tool_name: str) -> bool:
+        """True só quando o registry está wireado E o nome não está nele.
+
+        Empty-set (``self.tools`` ausente — testes com ``object.__new__``)
+        significa "não sei validar", não "nada é válido" — por isso não basta
+        checar ``tool_name not in known``.
+        """
+        known = self._known_client_tool_names()
+        return bool(known) and tool_name not in known
+
+    def _plan_step_dispatch(
+        self,
+        plan: "ExecutionPlan",
+        step: "PlanStep",
+        *,
+        session_id: UUID,
+        user_message: str,
+    ) -> list[AIServiceResponse]:
+        """Respostas que despacham UM passo do plano, na ordem de envio.
+
+        São sempre DUAS mensagens separadas, nunca uma só:
+
+        1. **`plan_update`** (sem texto) — é o que desenha a timeline numerada no
+           desktop (``PlanTracker``). Tem que ir sozinha porque o ``oneof`` do
+           proto só carrega um conteúdo por ``CoreMessage``: se o mesmo response
+           trouxer `message` E `plan_update` na metadata, o `_to_core_message`
+           manda o plano e **descarta o texto**. Era por isso que o usuário via
+           o plano cru (``plan.to_summary()``, com ⬜/✅ em markdown) numa bolha
+           de "Pensando" em vez do cartão: o cartão nunca era emitido na criação
+           do plano, só o texto.
+        2. **o pedido em si** — `command_request` quando o passo é destrutivo
+           (``requires_approval``), `tool_request` quando não é.
+
+        A distinção do item 2 é o que impede o travamento: o desktop **não tem
+        UI para aprovar um `tool_request`**. Mandar um com `requires_approval=true`
+        é esperar por um resultado que ninguém pode autorizar. O `command_request`,
+        sim, já tem o card de aprovar/recusar — e o `_has_plan` sobrevive à
+        aprovação porque o gRPC funde a metadata pendente antiga com a nova.
+        """
+        arguments = step.tool_arguments or {}
+        command = step.raw_command or arguments.get("command") or step.tool_name
+        common_meta = {
+            "user_message": user_message,
+            "tool_arguments": arguments,
+            "command": command,
+            "_has_plan": True,
+        }
+
+        if step.requires_approval:
+            command_id = str(uuid4())
+            dispatch = AIServiceResponse(
+                intent=IntentType.CLIENT_TOOL,
+                session_id=session_id,
+                command_request={
+                    "command_id": command_id,
+                    "command": command,
+                    "explanation": step.description,
+                    "is_background": False,
+                },
+                is_final=False,
+                metadata={**common_meta, "flow": "client_command", "command_id": command_id},
+            )
+        else:
+            tool_call_id = str(uuid4())
+            dispatch = AIServiceResponse(
+                intent=IntentType.CLIENT_TOOL,
+                session_id=session_id,
+                tool_request={
+                    "tool_call_id": tool_call_id,
+                    "tool_name": step.tool_name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                    "requires_approval": False,
+                },
+                is_final=False,
+                metadata={
+                    **common_meta,
+                    "flow": "client_tool",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": step.tool_name,
+                },
+            )
+
+        return [
+            AIServiceResponse(
+                intent=IntentType.CLIENT_TOOL,
+                session_id=session_id,
+                is_final=False,
+                metadata={"plan_update": self.planner.build_plan_update(plan)},
+            ),
+            dispatch,
+        ]
+
+    def _plan_final_update(self, plan: "ExecutionPlan", session_id: UUID) -> AIServiceResponse:
+        """Último `plan_update` de um plano — fecha a timeline no cliente.
+
+        Sem isso o cartão fica congelado com o passo final em "running" (bolinha
+        pulsando) mesmo depois da resposta final chegar.
+        """
+        return AIServiceResponse(
+            intent=IntentType.CLIENT_TOOL,
+            session_id=session_id,
+            is_final=False,
+            metadata={"plan_update": self.planner.build_plan_update(plan)},
+        )
+
     async def _handle_client_tool(
         self,
         session_id: UUID,
@@ -3611,6 +4575,7 @@ class AIService:
         slog: "SessionFileLogger | None" = None,
         user_id: UUID | None = None,
         metadata: dict[str, Any] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle client-side tool — sends request to desktop for execution.
 
@@ -3631,6 +4596,7 @@ class AIService:
             plan = await self.planner.generate_plan(
                 user_message=user_message,
                 system_context=sys_context,
+                conversation_history=history,
             )
 
             if plan and plan.steps:
@@ -3645,48 +4611,130 @@ class AIService:
                         + "\n".join(f"{i+1}. {s.description}" for i, s in enumerate(plan.steps)),
                     )
 
-                # Send plan summary to user
-                yield AIServiceResponse(
-                    intent=IntentType.CLIENT_TOOL,
-                    session_id=session_id,
-                    message=plan.to_summary(),
-                    is_final=False,
-                )
-
                 # Send first step
                 first_step = plan.get_current_step()
                 if first_step:
+                    # Mesma trava do despacho direto: um passo `run_command` sem
+                    # comando dentro trava o turno pra sempre. O planner monta o passo
+                    # a partir de JSON de LLM, então `tool_arguments` pode vir vazio e
+                    # `_validate_plan` (que só olha descrição/contagem) deixa passar —
+                    # foi assim na sessão e8e5664b.
+                    if _dispatch_would_hang(first_step.tool_name, first_step.tool_arguments):
+                        logger.error(
+                            "[PLAN] passo 1 é run_command SEM comando — abortando plano "
+                            "(evita turno infinito). step=%r", first_step.tool_arguments,
+                        )
+                        self.planner.clear_plans(sid_str)
+                        if slog:
+                            slog.log_event(
+                                "Plano abortado (passo sem comando)",
+                                "O primeiro passo do plano era `run_command` sem nenhum "
+                                "comando — despachar isso prenderia o turno em "
+                                "'Executando' até a conexão cair.",
+                            )
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            message=(
+                                "Montei um plano furado pra isso — o primeiro passo saiu "
+                                "sem comando nenhum. Repete o pedido que eu faço direto."
+                            ),
+                            is_final=True,
+                        )
+                        return
+                    if self._client_tool_name_is_unknown(first_step.tool_name):
+                        logger.warning(
+                            "[PLAN] passo com tool_name desconhecido %r (fora do catálogo) — abortando plano",
+                            first_step.tool_name,
+                        )
+                        self.planner.clear_plans(sid_str)
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            message=(
+                                "Não consigo executar esse plano — um dos passos usa uma "
+                                "ferramenta que não existe mais no meu catálogo. Peça de novo "
+                                "que eu tento resolver de outro jeito."
+                            ),
+                            is_final=True,
+                        )
+                        return
                     first_step.status = "running"
-                    step_tool_call_id = str(uuid4())
+                    for resp in self._plan_step_dispatch(
+                        plan, first_step, session_id=session_id, user_message=user_message
+                    ):
+                        yield resp
 
-                    yield AIServiceResponse(
-                        intent=IntentType.CLIENT_TOOL,
-                        session_id=session_id,
-                        message=f"{plan.progress_text}: {first_step.description}",
-                        is_final=False,
-                    )
-
-                    yield AIServiceResponse(
-                        intent=IntentType.CLIENT_TOOL,
-                        session_id=session_id,
-                        tool_request={
-                            "tool_call_id": step_tool_call_id,
-                            "tool_name": first_step.tool_name,
-                            "arguments": json.dumps(first_step.tool_arguments, ensure_ascii=False),
-                            "requires_approval": first_step.requires_approval,
-                        },
-                        is_final=False,
-                        metadata={
-                            "flow": "client_tool",
-                            "tool_call_id": step_tool_call_id,
-                            "tool_name": first_step.tool_name,
-                            "user_message": user_message,
-                            "tool_arguments": first_step.tool_arguments,
-                            "command": first_step.raw_command or first_step.tool_arguments.get("command", first_step.tool_name),
-                            "_has_plan": True,
-                        },
-                    )
+                    self._pending_traces[str(session_id)] = trace
                     return  # Flow continues in process_tool_result
+
+            # ── Plano exigido mas NÃO gerado → cognitivo, nunca o dispatch abaixo ──
+            # O `needs_plan` chega aqui de dois jeitos: do classificador, ou FORÇADO
+            # pelo guard de grounding — que, ao forçar, zera `raw_command` e
+            # `tool_arguments` de propósito. Se `generate_plan` devolve None (LLM
+            # vazio/JSON inválido: deepseek-empty-response-reasoning), o fluxo caía no
+            # despacho genérico lá embaixo e mandava `run_command` com `{}` pro
+            # desktop — que não tem o que executar e NUNCA devolve resultado: turno
+            # infinito (sessão 9f7abeec, "quais chaves de ssh eu tenho?").
+            # O cognitivo é o destino certo: ele tem histórico, PKS e o próprio
+            # `run_command` client-actuating pra descobrir o que o plano descobriria.
+            logger.warning(
+                "[PLAN] needs_plan sem plano utilizável — delegando ao núcleo cognitivo "
+                "(em vez de despachar comando vazio)"
+            )
+            if slog:
+                slog.log_event(
+                    "Plano não gerado — fallback cognitivo",
+                    "O passo exigia um plano de verificação e o planner não devolveu "
+                    "nenhum passo utilizável. Em vez de despachar um comando vazio "
+                    "(que trava o turno), o núcleo cognitivo assume — ele descobre o "
+                    "que precisa com `run_command`.",
+                )
+            brain_decision = RoutingDecision(
+                intent=IntentType.DIRECT_RESPONSE,
+                confidence=decision.confidence,
+                explanation="plano não gerado — núcleo cognitivo assume",
+                needs_memory=decision.needs_memory,
+                knowledge_keywords=decision.knowledge_keywords,
+                needs_plan=False,
+                speech_act=decision.speech_act,
+                gravity=decision.gravity,
+                register_hint=decision.register_hint,
+            )
+            async for resp in self._handle_direct_response(
+                session_id, user_message, history or [], brain_decision, trace,
+                sys_context, slog=slog, user_id=user_id, metadata=metadata,
+            ):
+                yield resp
+            return
+
+        # ── Trava determinística: nenhum comando cruza sandbox↔disco do usuário ──
+        # O classificador às vezes ignora a instrução de prompt sobre isso (sessão
+        # ef4f723c: a explicação estava no contexto dessa MESMA chamada e ele
+        # gerou `mv /workspace/...` mesmo assim — prosa não é 100% confiável).
+        # Checagem de string é: bloqueia aqui, sem depender só do prompt.
+        _cmd_to_check = decision.raw_command or (decision.tool_arguments or {}).get("command")
+        if _cmd_to_check and "/workspace/" in _cmd_to_check:
+            logger.warning(f"[CLIENT_TOOL] comando referenciando /workspace bloqueado: {_cmd_to_check}")
+            if slog:
+                slog.log_event(
+                    "Comando bloqueado (sandbox ≠ disco do usuário)",
+                    "O classificador gerou um comando referenciando `/workspace/` "
+                    "— caminho do sandbox remoto, inacessível do disco do usuário. "
+                    f"Bloqueado antes de despachar.\n\n> {_cmd_to_check}",
+                )
+            yield AIServiceResponse(
+                intent=IntentType.CLIENT_TOOL,
+                session_id=session_id,
+                message=(
+                    "Não dá pra mover isso por comando direto — esse arquivo existe "
+                    "só no meu sandbox, não no seu disco. Baixe pelo botão que "
+                    "aparece na conversa, ou peça de novo pra eu colocar na área de "
+                    "trabalho que uso a ferramenta certa pra isso."
+                ),
+                is_final=True,
+            )
+            return
 
         # ── No plan needed — existing single-step flow ──
         if decision.raw_command:
@@ -3722,7 +4770,71 @@ class AIService:
             # Named tool request
             tool_name = decision.tool_name or "run_command"
             arguments = decision.tool_arguments or {}
-            
+
+            # O classificador não tem como saber o file_id real — ele só existe
+            # depois de um `file_save` do núcleo cognitivo. Sem essa checagem, um
+            # file_id truncado/alucinado (sessão bd7a304d: "f8d", visto uma vez como
+            # prefixo do id de uma TRANSAÇÃO financeira não relacionada que aparecia
+            # no histórico) chega intacto no client e só falha depois — 404, já tendo
+            # prometido o arquivo pro usuário. Falha fechada: sem file_id válido E
+            # existente no catálogo, nem despacha.
+            if tool_name == "save_generated_file" and self.file_store is not None:
+                file_id = arguments.get("file_id")
+                stored = await self.file_store.get(file_id) if file_id else None
+                if stored is None:
+                    logger.warning(
+                        "[CLIENT_TOOL] save_generated_file com file_id inválido/inexistente: %r",
+                        file_id,
+                    )
+                    if slog:
+                        slog.log_event(
+                            "save_generated_file bloqueado (file_id não fundamentado)",
+                            f"O classificador pediu file_id={file_id!r}, que não existe "
+                            "no catálogo de arquivos. Bloqueado antes de despachar pro "
+                            "desktop — dispatchar isso só resultaria num 404 depois de "
+                            "já ter prometido o arquivo pro usuário.",
+                        )
+                    yield AIServiceResponse(
+                        intent=IntentType.CLIENT_TOOL,
+                        session_id=session_id,
+                        message=(
+                            "Não achei esse arquivo no meu catálogo — ou ele ainda não "
+                            "foi gerado de verdade, ou o id que eu ia usar não é válido. "
+                            "Peça de novo que eu gero e te entrego certo."
+                        ),
+                        is_final=True,
+                    )
+                    return
+
+            # ── Falha fechada: `run_command` sem comando é travamento garantido ──
+            # O desktop recebe o tool_request, não tem o que executar e nunca devolve
+            # tool_result — o turno fica "Executando" até a conexão cair (mesmo modo de
+            # falha das tools fantasma documentadas em modules/desktop/tools.py). Vale
+            # como rede: as origens conhecidas já foram fechadas acima, mas nenhuma
+            # delas pode voltar a vazar um dispatch vazio pro cliente.
+            if _dispatch_would_hang(tool_name, arguments):
+                logger.error(
+                    "[CLIENT_TOOL] run_command sem 'command' — bloqueado antes do "
+                    "dispatch (evita turno infinito). arguments=%r", arguments,
+                )
+                if slog:
+                    slog.log_event(
+                        "run_command bloqueado (sem comando)",
+                        "Ia despachar `run_command` sem nenhum comando dentro — o "
+                        "desktop não teria o que executar e o turno ficaria preso em "
+                        "'Executando' até a conexão cair. Bloqueado.",
+                    )
+                yield AIServiceResponse(
+                    intent=IntentType.CLIENT_TOOL,
+                    session_id=session_id,
+                    message=(
+                        "Me embananei montando o comando e ia mandar um vazio. "
+                        "Repete o pedido que eu faço direito."
+                    ),
+                    is_final=True,
+                )
+                return
+
             logger.info(f"[DEBUG] _handle_client_tool: tool_name='{tool_name}', arguments={arguments}")
             if slog:
                 slog.log_tool_request(tool_name, arguments=arguments, requires_approval=decision.requires_approval, execution="client-side")
@@ -3754,6 +4866,489 @@ class AIService:
                     "command": arguments.get("command") or arguments.get("cmd") or tool_name,
                 },
             )
+
+    # ---------------------------------------------------------------
+    # Arquivos sob iniciativa do cérebro (client-actuating: pull/push)
+    # ---------------------------------------------------------------
+
+    async def _file_path_is_grounded(
+        self, path: str, session_id: UUID, user_message: str
+    ) -> bool:
+        """True se ``path`` (ou seu nome-base) foi citado LITERALMENTE pelo usuário.
+
+        Mesma família da guarda do CLIENT_TOOL (``_ungrounded_path_literals``): o
+        cérebro nunca deve subir um caminho que ELE inventou a partir do nome do
+        arquivo — só um que o usuário escreveu nesta conversa. Confere a mensagem
+        do turno e o histórico recente (o caminho pode ter sido dito antes).
+        """
+        needle = (path or "").strip()
+        if not needle:
+            return False
+        base = needle.rsplit("/", 1)[-1]
+        haystacks = [user_message or ""]
+        try:
+            history = await self.sessions.get_history(session_id, limit=12, max_tokens_budget=1500)
+            haystacks += [m.get("content", "") for m in history if m.get("role") == "user"]
+        except Exception as exc:  # noqa: BLE001 — sem histórico ⇒ só o turno atual
+            logger.warning("[files] grounding: histórico indisponível: %s", exc)
+        blob = "\n".join(haystacks)
+        # Caminho inteiro citado, ou o nome-base (o usuário costuma dizer só o nome).
+        return needle in blob or (len(base) >= 3 and base in blob)
+
+    async def _emit_client_actuation(
+        self,
+        car: "ClientActuationRequested",
+        *,
+        session_id: UUID,
+        user_message: str,
+        user_id: UUID | None,
+        metadata: dict[str, Any] | None,
+        trace: "MessageTrace | None",
+        slog: "SessionFileLogger | None",
+        depth: int = 0,
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Emite o ``tool_request`` de uma tool de arquivo client-actuating.
+
+        Faz as guardas determinísticas (file_id fundamentado no push; caminho
+        fundamentado no pull por path), guarda o estado de retomada em
+        ``_pending_actuations`` e devolve um turno NÃO-final com o ``tool_request``.
+        O desktop executa e o turno retoma em ``process_tool_result``.
+        """
+        tool_name = car.tool_name
+        args = dict(car.arguments or {})
+        tool_call_id = car.tool_call_id
+        sid = str(session_id)
+
+        if depth >= _MAX_ACTUATION_DEPTH:
+            final_text = (
+                "Fiz várias idas e vindas seguidas na sua máquina e vou parar aqui pra não "
+                "entrar em laço. Me diga em uma frase o que você quer que eu faça."
+            )
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+            )
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        # ── Shell pedido pelo CÉREBRO: vira o mesmo command_request do CLIENT_TOOL ──
+        # (aprovação do usuário inclusa; o resultado volta como `execute_command` e
+        # _resume_after_command retoma o turno cognitivo com a saída real).
+        if tool_name in _SHELL_ACTUATION_TOOLS:
+            command = str(args.get("command") or "").strip()
+            if not command:
+                final_text = (
+                    "Ia rodar um comando aqui pra te responder, mas montei ele vazio. "
+                    "Me repete o que você quer que eu verifique."
+                )
+                await self.sessions.add_message(
+                    session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+                )
+                yield AIServiceResponse(
+                    intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                    message=final_text, is_final=True, iterations=1,
+                )
+                return
+            # Mesma trava determinística do _handle_client_tool: o sandbox do cérebro
+            # e o disco do usuário são máquinas diferentes, e o modelo às vezes esquece.
+            if "/workspace/" in command:
+                final_text = (
+                    "Esse caminho existe só no meu sandbox, não no seu disco — não dá pra "
+                    "alcançar por comando na sua máquina. Me diga o caminho do seu lado, "
+                    "ou peça pra eu te entregar o arquivo."
+                )
+                logger.warning("[brain-shell] comando referenciando /workspace bloqueado: %s", command)
+                await self.sessions.add_message(
+                    session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+                )
+                yield AIServiceResponse(
+                    intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                    message=final_text, is_final=True, iterations=1,
+                )
+                return
+
+            command_id = str(uuid4())
+            self._pending_actuations[sid] = {
+                "tool_name": "run_command",
+                "kind": "shell",
+                "command": command,
+                "user_message": user_message,
+                "user_id": str(user_id) if user_id else None,
+                "metadata": metadata or {},
+                "depth": depth,
+            }
+            if trace is not None:
+                self._pending_traces[sid] = trace
+            if slog:
+                slog.log_tool_request(
+                    "run_command (cérebro)", command=command, requires_approval=True,
+                    execution="client-side",
+                )
+            reason = str(args.get("reason") or "").strip()
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                message=reason or "Preciso de permissão para executar um comando no seu terminal.",
+                is_final=False,
+            )
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                command_request={
+                    "command_id": command_id,
+                    "command": command,
+                    "explanation": reason or "Executar comando no terminal local.",
+                    "is_background": False,
+                },
+                is_final=False,
+                metadata={
+                    "flow": "client_command",
+                    "command_id": command_id,
+                    "command": command,
+                    "user_message": user_message,
+                },
+            )
+            return
+
+        # ── Guarda: push com file_id fundamentado (mesma trava do _handle_client_tool) ──
+        if tool_name == "save_generated_file":
+            args.setdefault("destination", "desktop")
+            if self.file_store is not None:
+                file_id = args.get("file_id")
+                stored = await self.file_store.get(file_id) if file_id else None
+                if stored is None:
+                    logger.warning("[files] save_generated_file (cérebro) com file_id inválido: %r", file_id)
+                    final_text = (
+                        "Não achei esse arquivo no meu catálogo pra entregar — talvez ele ainda "
+                        "não tenha sido gerado de verdade. Deixa eu gerar primeiro e aí te entrego."
+                    )
+                    await self.sessions.add_message(
+                        session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+                    )
+                    yield AIServiceResponse(
+                        intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                        message=final_text, is_final=True, iterations=1,
+                    )
+                    return
+
+        # ── Guarda: pull por caminho citado (nunca um caminho inventado) ──
+        if tool_name == "request_user_file":
+            mode = str(args.get("mode") or "pick").strip().lower()
+            if mode not in ("pick", "path"):
+                mode = "pick"
+            if mode == "path":
+                path = str(args.get("path") or "").strip()
+                if not await self._file_path_is_grounded(path, session_id, user_message):
+                    # Não sobe um chute: cai pro picker (o usuário escolhe o arquivo certo).
+                    logger.info("[files] request_user_file path %r não fundamentado — caindo pro picker", path)
+                    if slog:
+                        slog.log_event(
+                            "request_user_file — caminho não fundamentado",
+                            f"O caminho `{path}` não foi citado pelo usuário; abrindo o seletor em vez de chutar.",
+                        )
+                    mode = "pick"
+                    args.pop("path", None)
+            args["mode"] = mode
+
+        # ── Estado de retomada (o gRPC só encaminha user_message/command/…) ──
+        self._pending_actuations[sid] = {
+            "tool_name": tool_name,
+            "user_message": user_message,
+            "user_id": str(user_id) if user_id else None,
+            "metadata": metadata or {},
+            "stage": bool(args.get("stage")),
+            "destination": args.get("destination"),
+            "depth": depth,
+        }
+        if trace is not None:
+            self._pending_traces[sid] = trace
+
+        if slog:
+            slog.log_tool_request(tool_name, arguments=args, requires_approval=False, execution="client-side")
+
+        reason = str(args.get("reason") or "").strip()
+        if reason:
+            thinking = reason
+        elif tool_name == "request_user_file":
+            thinking = "Vou precisar de um arquivo seu — abrindo o seletor…"
+        else:
+            thinking = "Salvando o arquivo no seu computador…"
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            message=thinking, is_final=False,
+        )
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            tool_request={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+                "requires_approval": False,
+            },
+            is_final=False,
+            metadata={
+                # flow=client_tool reusa a limpeza de turno órfão do gRPC (finally)
+                # se o desktop cair antes de devolver o resultado.
+                "flow": "client_tool",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "user_message": user_message,
+                "command": tool_name,
+            },
+        )
+
+    async def _reenter_cognitive(
+        self,
+        session_id: UUID,
+        *,
+        user_message: str,
+        pend: dict[str, Any],
+        extra_note: str | None,
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Roda de novo o turno DIRECT_RESPONSE com o arquivo já disponível.
+
+        Reconstrói decisão/histórico/contexto (agora com o manifesto do anexo
+        recém-chegado + ``extra_note``) e delega ao ``_handle_direct_response`` —
+        assim o cérebro lê/entrega o arquivo e responde o pedido original. A
+        profundidade (``depth``) sobe pra cortar um eventual laço de atuação.
+        """
+        sid = session_id
+        metadata = (pend or {}).get("metadata") or {}
+        uid_raw = (pend or {}).get("user_id")
+        user_id: UUID | None = None
+        if uid_raw:
+            try:
+                user_id = UUID(str(uid_raw))
+            except (ValueError, TypeError):
+                user_id = None
+        history = await self.sessions.get_history(sid, limit=20, max_tokens_budget=3000)
+        base_ctx = self._build_system_context(metadata)
+        manifest = await self._build_attachments_manifest(None, session_id=sid)
+        sys_context = "\n\n".join(p for p in (base_ctx, manifest, extra_note) if p)
+        decision = RoutingDecision(
+            intent=IntentType.DIRECT_RESPONSE,
+            confidence=1.0,
+            needs_memory=True,
+            needs_plan=False,
+            explanation="retomada após ação de arquivo no cliente",
+        )
+        depth = int((pend or {}).get("depth", 0)) + 1
+        # enable_handoff=False: a retomada existe pra LER/ENTREGAR o arquivo e
+        # responder o pedido original — não pra encadear pra outra skill (music/HA).
+        # Sem orquestrador consumindo aqui, um [[HANDOFF]] só seria descartado.
+        async for resp in self._handle_direct_response(
+            sid, user_message, history, decision, trace, sys_context,
+            slog=slog, user_id=user_id, metadata=metadata,
+            enable_handoff=False,
+            _actuation_depth=depth,
+        ):
+            yield resp
+
+    async def _resume_after_user_file(
+        self,
+        session_id: UUID,
+        *,
+        success: bool,
+        result: str | None,
+        error: str | None,
+        user_message: str,
+        pend: dict[str, Any],
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Resultado do ``request_user_file``: cataloga o arquivo puxado e responde."""
+        sid = str(session_id)
+        if not success:
+            low = (error or "").lower()
+            if "cancel" in low or "não escolheu" in low or "nao escolheu" in low:
+                final_text = "Sem problema — não recebi nenhum arquivo. Quando quiser, é só me mandar."
+            else:
+                final_text = f"Não consegui trazer o arquivo: {error or 'o envio falhou'}."
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+            )
+            slog.log_final_response(final_text, "DIRECT_RESPONSE", iterations=1) if slog else None
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        file_id = None
+        name = None
+        try:
+            payload = json.loads(result) if result else {}
+            if isinstance(payload, dict):
+                file_id = payload.get("file_id") or payload.get("id")
+                name = payload.get("name")
+        except (ValueError, TypeError):
+            payload = {}
+        if not file_id:
+            final_text = "O arquivo chegou, mas não consegui catalogá-lo direito. Pode tentar de novo?"
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+            )
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        # Anexo sticky: o arquivo puxado vale pro resto da conversa (manifesto).
+        self._remember_session_attachments(sid, [str(file_id)])
+        logger.info("[files] request_user_file trouxe %s (%s) — sticky + resume", file_id, name)
+
+        # Auto-stage quando o cérebro sinalizou que vai MANIPULAR o arquivo.
+        stage_note = ""
+        if (pend or {}).get("stage") and self.file_store is not None:
+            try:
+                staged = await self.file_store.stage(str(file_id), target="workbench")
+                path = staged.get("path") if isinstance(staged, dict) else staged
+                if path:
+                    stage_note = f" Ele já está materializado no seu /workspace em `{path}` (use neo_bash)."
+            except Exception as exc:  # noqa: BLE001 — stage é conveniência, não pode derrubar o turno
+                logger.warning("[files] auto-stage de %s falhou: %s", file_id, exc)
+
+        extra_note = (
+            "## ARQUIVO RECÉM-RECEBIDO\n"
+            f"O arquivo que você pediu ({name or 'sem nome'}) chegou e está no seu catálogo "
+            f"(id={file_id}).{stage_note} Agora responda o pedido original lendo/processando "
+            "este arquivo com as tools file_*/neo_bash — não peça o arquivo de novo."
+        )
+        async for resp in self._reenter_cognitive(
+            session_id, user_message=user_message, pend=pend,
+            extra_note=extra_note, slog=slog, trace=trace,
+        ):
+            yield resp
+
+    async def _resume_after_command(
+        self,
+        session_id: UUID,
+        *,
+        success: bool,
+        result: str | None,
+        error: str | None,
+        user_message: str,
+        pend: dict[str, Any],
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Saída do comando que o CÉREBRO pediu: re-entra no turno cognitivo com ela.
+
+        Diferente do caminho CLIENT_TOOL do classificador (que termina em
+        ``_format_tool_result``, um tiro só, sem histórico e sem tools), aqui a saída
+        volta pro núcleo cognitivo: ele tem o histórico, a persona, o PKS e as tools —
+        inclusive ``run_command`` de novo. Ou seja, um comando que devolveu a coisa
+        errada pode ser corrigido no MESMO turno, sem o usuário ter que pedir de novo.
+        """
+        command = (pend or {}).get("command") or "o comando"
+        if success:
+            output = self._truncate_output(result or "", max_lines=200)
+            extra_note = (
+                "## SAÍDA DO COMANDO QUE VOCÊ RODOU\n"
+                f"Você executou na máquina do usuário: `{command}`\n"
+                f"Saída real:\n```\n{output or '(vazia)'}\n```\n"
+                "Responda AGORA o pedido original com base nesta saída — direto, sem "
+                "recontar o que você fez. Só os fatos que estão aí: não invente linha "
+                "que não apareceu, e se a saída não responde o que foi pedido (veio "
+                "vazia, veio agregada demais, faltou um campo), rode outro `run_command` "
+                "em vez de entregar meia resposta ou de pedir pro usuário rodar."
+            )
+        else:
+            extra_note = (
+                "## O COMANDO QUE VOCÊ RODOU FALHOU\n"
+                f"Comando: `{command}`\nErro: {error or 'desconhecido'}\n"
+                "Diagnostique e, se der pra corrigir (binário/flag/caminho errado), rode "
+                "outro `run_command` já corrigido. Se não der, diga em uma frase o que "
+                "falhou — sem pedir pro usuário rodar nada por você."
+            )
+        if slog:
+            slog.log_event(
+                "Retomada cognitiva (shell do cérebro)",
+                f"`{command}` → {'saída devolvida ao cérebro' if success else f'ERRO: {error}'}",
+            )
+        async for resp in self._reenter_cognitive(
+            session_id, user_message=user_message, pend=pend,
+            extra_note=extra_note, slog=slog, trace=trace,
+        ):
+            yield resp
+
+    async def _confirm_file_delivery(
+        self,
+        session_id: UUID,
+        *,
+        success: bool,
+        result: str | None,
+        error: str | None,
+        user_message: str,
+        pend: dict[str, Any],
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Resultado do ``save_generated_file``: confirma, ou trata a colisão.
+
+        ``status='saved'`` → confirma em uma frase. ``status='conflict'`` → re-entra
+        no cognitivo com os dados do arquivo existente pro cérebro decidir (só
+        quando for obviamente seguro) ou perguntar antes de reenviar com overwrite.
+        """
+        status = None
+        path = None
+        existing: dict[str, Any] | None = None
+        try:
+            payload = json.loads(result) if result else {}
+            if isinstance(payload, dict):
+                status = payload.get("status")
+                path = payload.get("path")
+                existing = payload.get("existing") if isinstance(payload.get("existing"), dict) else None
+        except (ValueError, TypeError):
+            payload = {}
+
+        if not success:
+            final_text = f"Não consegui salvar o arquivo aí: {error or 'erro desconhecido'}."
+            await self.sessions.add_message(
+                session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+            )
+            yield AIServiceResponse(
+                intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                message=final_text, is_final=True, iterations=1,
+            )
+            return
+
+        if status == "conflict":
+            when = existing.get("modified_at") or existing.get("created_at") if existing else None
+            size = existing.get("size_bytes") if existing else None
+            human_size = f"{size/1024:.0f} KB" if isinstance(size, (int, float)) and size else "?"
+            desc = existing.get("name") if existing else (path or "o arquivo")
+            extra_note = (
+                "## CONFLITO AO SALVAR NO DISCO DO USUÁRIO\n"
+                f"Já existe um arquivo em `{path}` (nome: {desc}, tamanho: {human_size}"
+                + (f", modificado em {when}" if when else "")
+                + "). NÃO foi sobrescrito. Decida: se for claramente seguro (ex.: é o "
+                "arquivo que VOCÊ acabou de gerar nesta conversa), reenvie chamando "
+                "save_generated_file com overwrite=true. Se houver qualquer dúvida, "
+                "PERGUNTE ao usuário citando esses dados antes de sobrescrever, ou "
+                "ofereça salvar com outro nome."
+            )
+            async for resp in self._reenter_cognitive(
+                session_id, user_message=user_message, pend=pend,
+                extra_note=extra_note, slog=slog, trace=trace,
+            ):
+                yield resp
+            return
+
+        # status == "saved" (ou desconhecido, mas sucesso)
+        where = f" em {path}" if path else ""
+        final_text = f"Pronto, salvei o arquivo no seu computador{where}."
+        await self.sessions.add_message(
+            session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+        )
+        slog.log_final_response(final_text, "DIRECT_RESPONSE", iterations=1) if slog else None
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            message=final_text, is_final=True, iterations=1,
+        )
 
     # ---------------------------------------------------------------
     # Continue flow after tool result from desktop
@@ -3814,6 +5409,57 @@ class AIService:
                 intent=IntentType.MUSIC, session_id=session_id,
                 message=final_text, is_final=True, iterations=1,
             )
+            return
+
+        # ── CLIENT-ACTUATION DE ARQUIVO (plano "arquivos sob iniciativa do cérebro") ──
+        # request_user_file (pull) / save_generated_file (push). Tratados aqui no topo,
+        # fora de toda a máquina genérica de retry/plano/diagnóstico abaixo. Cobre TANTO
+        # o disparo pelo cérebro (via _emit_client_actuation) QUANTO o pelo classificador
+        # (save_generated_file por "salva aí") — o estado de retomada, quando existe,
+        # está em _pending_actuations.
+        # request_user_file só ocorre com a flag on (pull do cérebro) → sempre tratado
+        # aqui. save_generated_file: intercepta quando é o formato NOVO (JSON com
+        # "status": saved/conflict) OU a flag de atuação está on; senão cai no fluxo
+        # genérico antigo (rollout conservador: desktop velho devolve string simples).
+        # ── SHELL PEDIDO PELO CÉREBRO (neo_brain_shell_enabled) ──
+        # Chega como `execute_command` (passou pela aprovação) ou `run_command`. O que
+        # distingue do CLIENT_TOOL do classificador não é o nome e sim o estado deixado
+        # por _emit_client_actuation — sem ele, cai na máquina genérica de sempre.
+        _pend_shell = self._pending_actuations.get(str(session_id))
+        if (
+            _pend_shell
+            and _pend_shell.get("kind") == "shell"
+            and tool_name in ("execute_command", "run_command")
+        ):
+            pend = self._pending_actuations.pop(str(session_id))
+            async for resp in self._resume_after_command(
+                session_id, success=success, result=result, error=error,
+                user_message=user_message or pend.get("user_message", ""),
+                pend=pend, slog=slog, trace=trace,
+            ):
+                yield resp
+            return
+
+        _new_delivery_fmt = isinstance(result, str) and '"status"' in result
+        if tool_name in _CLIENT_ACTUATION_TOOLS and (
+            tool_name == "request_user_file"
+            or _new_delivery_fmt
+            or getattr(self.settings, "neo_file_actuation_enabled", False)
+        ):
+            pend = self._pending_actuations.pop(str(session_id), {})
+            resume_msg = user_message or pend.get("user_message", "")
+            if tool_name == "request_user_file":
+                async for resp in self._resume_after_user_file(
+                    session_id, success=success, result=result, error=error,
+                    user_message=resume_msg, pend=pend, slog=slog, trace=trace,
+                ):
+                    yield resp
+            else:  # save_generated_file
+                async for resp in self._confirm_file_delivery(
+                    session_id, success=success, result=result, error=error,
+                    user_message=resume_msg, pend=pend, slog=slog, trace=trace,
+                ):
+                    yield resp
             return
 
         # ── DIAGNOSTIC RESULT: this was an auto-diagnostic command ──
@@ -4023,41 +5669,30 @@ class AIService:
                             self.planner.clear_plans(sid_str)
                             if slog:
                                 slog.log_event("Plano Concluído (skip)", f"**Status:** {active_plan.status}")
+                        elif self._client_tool_name_is_unknown(next_step.tool_name) or _dispatch_would_hang(
+                            next_step.tool_name, next_step.tool_arguments
+                        ):
+                            # Marca o passo como falho e deixa o fallthrough abaixo
+                            # (linha ~"Plan complete") montar a resposta final via
+                            # build_final_response — não despacha um tool_name que
+                            # o desktop não sabe executar (trava esperando resultado),
+                            # nem um `run_command` sem comando (mesmo efeito).
+                            logger.warning(
+                                "[PLAN] próximo passo indespachável (tool_name=%r, args=%r) — abortando plano",
+                                next_step.tool_name, next_step.tool_arguments,
+                            )
+                            next_step.status = "failed"
+                            next_step.error = "passo indespachável (ferramenta fora do catálogo, ou comando vazio/ainda em placeholder porque o refinamento não devolveu o comando real)"
+                            active_plan.step_results[next_step.id] = f"ERRO: {next_step.error}"
+                            active_plan.status = "failed"
                         else:
                             # Send next step directly
                             next_step.status = "running"
-                            step_tool_call_id = str(uuid4())
-
-                            # Emit plan update
-                            plan_update = self.planner.build_plan_update(active_plan)
-                            yield AIServiceResponse(
-                                intent=IntentType.CLIENT_TOOL,
-                                session_id=session_id,
-                                message=f"{active_plan.progress_text}: {next_step.description}",
-                                is_final=False,
-                                metadata={"plan_update": plan_update},
-                            )
-
-                            yield AIServiceResponse(
-                                intent=IntentType.CLIENT_TOOL,
-                                session_id=session_id,
-                                tool_request={
-                                    "tool_call_id": step_tool_call_id,
-                                    "tool_name": next_step.tool_name,
-                                    "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
-                                    "requires_approval": next_step.requires_approval,
-                                },
-                                is_final=False,
-                                metadata={
-                                    "flow": "client_tool",
-                                    "tool_call_id": step_tool_call_id,
-                                    "tool_name": next_step.tool_name,
-                                    "user_message": user_message,
-                                    "tool_arguments": next_step.tool_arguments,
-                                    "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
-                                    "_has_plan": True,
-                                },
-                            )
+                            for resp in self._plan_step_dispatch(
+                                active_plan, next_step,
+                                session_id=session_id, user_message=user_message,
+                            ):
+                                yield resp
 
                             self._pending_traces[str(session_id)] = trace
                             return  # Flow continues when desktop sends next tool_result
@@ -4096,13 +5731,11 @@ class AIService:
                                     self.planner.store_plan(sid_str, subplan)
                                     active_plan = subplan
                                     next_step = subplan.get_current_step()
-
-                                    yield AIServiceResponse(
-                                        intent=IntentType.CLIENT_TOOL,
-                                        session_id=session_id,
-                                        message=f"📋 Sub-plano: {subplan.goal}\n" + subplan.to_summary(),
-                                        is_final=False,
-                                    )
+                                    # O cartão do sub-plano é emitido pelo
+                                    # _plan_step_dispatch logo abaixo (o cliente
+                                    # aninha pelo parent_plan_id). Mandar
+                                    # `to_summary()` aqui só repetiria o plano em
+                                    # markdown cru numa bolha de "Pensando".
                             # If subplan rejected, fall through to continue with next_step
 
                         elif decision == "retry":
@@ -4124,39 +5757,27 @@ class AIService:
                                 next_step.requires_approval = refined.get("requires_approval", next_step.requires_approval)
 
                         # If decision was continue/retry/subplan and we have a next step, send it
-                        if decision in ("continue", "retry", "subplan") and next_step:
+                        # (refine_step/advance_and_refine podem ter trocado o tool_name — valida
+                        # DEPOIS do refinamento, não antes, senão passa um nome já sobrescrito).
+                        if decision in ("continue", "retry", "subplan") and next_step and (
+                            self._client_tool_name_is_unknown(next_step.tool_name)
+                            or _dispatch_would_hang(next_step.tool_name, next_step.tool_arguments)
+                        ):
+                            logger.warning(
+                                "[PLAN] passo refinado indespachável (tool_name=%r, args=%r) — abortando plano",
+                                next_step.tool_name, next_step.tool_arguments,
+                            )
+                            next_step.status = "failed"
+                            next_step.error = "passo indespachável (ferramenta fora do catálogo, ou comando vazio/ainda em placeholder porque o refinamento não devolveu o comando real)"
+                            active_plan.step_results[next_step.id] = f"ERRO: {next_step.error}"
+                            active_plan.status = "failed"
+                        elif decision in ("continue", "retry", "subplan") and next_step:
                             next_step.status = "running"
-                            step_tool_call_id = str(uuid4())
-
-                            plan_update = self.planner.build_plan_update(active_plan)
-                            yield AIServiceResponse(
-                                intent=IntentType.CLIENT_TOOL,
-                                session_id=session_id,
-                                message=f"{active_plan.progress_text}: {next_step.description}",
-                                is_final=False,
-                                metadata={"plan_update": plan_update},
-                            )
-
-                            yield AIServiceResponse(
-                                intent=IntentType.CLIENT_TOOL,
-                                session_id=session_id,
-                                tool_request={
-                                    "tool_call_id": step_tool_call_id,
-                                    "tool_name": next_step.tool_name,
-                                    "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
-                                    "requires_approval": next_step.requires_approval,
-                                },
-                                is_final=False,
-                                metadata={
-                                    "flow": "client_tool",
-                                    "tool_call_id": step_tool_call_id,
-                                    "tool_name": next_step.tool_name,
-                                    "user_message": user_message,
-                                    "tool_arguments": next_step.tool_arguments,
-                                    "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
-                                    "_has_plan": True,
-                                },
-                            )
+                            for resp in self._plan_step_dispatch(
+                                active_plan, next_step,
+                                session_id=session_id, user_message=user_message,
+                            ):
+                                yield resp
 
                             self._pending_traces[str(session_id)] = trace
                             return  # Flow continues when desktop sends next tool_result
@@ -4164,6 +5785,11 @@ class AIService:
                 # Plan complete — format final unified response
                 if not active_plan.is_complete:
                     active_plan.status = "completed"
+                # Fecha a timeline no cliente ANTES da resposta final: sem esse
+                # último plan_update o cartão fica com o passo corrente em
+                # "running" (bolinha pulsando) pra sempre, mesmo com a conversa
+                # já resolvida.
+                yield self._plan_final_update(active_plan, session_id)
                 final_text = await self.planner.build_final_response(active_plan, user_message)
                 self.planner.clear_plans(sid_str)
 
@@ -4176,6 +5802,7 @@ class AIService:
                     user_message, command or tool_name, raw_output, trace=trace,
                     live=str(session_id) in self._live_sessions,
                     register=self._session_registers.get(str(session_id)),
+                    can_show_images=str(session_id) in self._image_capable_sessions,
                 )
 
             # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
@@ -4279,39 +5906,50 @@ class AIService:
                             next_step.tool_arguments = refined.get("tool_arguments", next_step.tool_arguments)
                             next_step.raw_command = next_step.tool_arguments.get("command", next_step.raw_command)
 
-                    next_step.status = "running"
-                    step_tool_call_id = str(uuid4())
+                    # Valida DEPOIS do refinamento acima (que pode ter trocado o tool_name).
+                    if self._client_tool_name_is_unknown(next_step.tool_name):
+                        logger.warning(
+                            "[PLAN] passo de recovery com tool_name desconhecido %r — abortando plano",
+                            next_step.tool_name,
+                        )
+                        next_step.status = "failed"
+                        next_step.error = "ferramenta fora do catálogo (tool_name desconhecido)"
+                        active_plan.step_results[next_step.id] = f"ERRO: {next_step.error}"
+                        active_plan.status = "failed"
+                    else:
+                        next_step.status = "running"
+                        step_tool_call_id = str(uuid4())
 
-                    yield AIServiceResponse(
-                        intent=IntentType.CLIENT_TOOL,
-                        session_id=session_id,
-                        message=f"⚠️ Passo anterior falhou. {active_plan.progress_text}: {next_step.description}",
-                        is_final=False,
-                    )
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            message=f"⚠️ Passo anterior falhou. {active_plan.progress_text}: {next_step.description}",
+                            is_final=False,
+                        )
 
-                    yield AIServiceResponse(
-                        intent=IntentType.CLIENT_TOOL,
-                        session_id=session_id,
-                        tool_request={
-                            "tool_call_id": step_tool_call_id,
-                            "tool_name": next_step.tool_name,
-                            "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
-                            "requires_approval": next_step.requires_approval,
-                        },
-                        is_final=False,
-                        metadata={
-                            "flow": "client_tool",
-                            "tool_call_id": step_tool_call_id,
-                            "tool_name": next_step.tool_name,
-                            "user_message": user_message,
-                            "tool_arguments": next_step.tool_arguments,
-                            "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
-                            "_has_plan": True,
-                        },
-                    )
+                        yield AIServiceResponse(
+                            intent=IntentType.CLIENT_TOOL,
+                            session_id=session_id,
+                            tool_request={
+                                "tool_call_id": step_tool_call_id,
+                                "tool_name": next_step.tool_name,
+                                "arguments": json.dumps(next_step.tool_arguments, ensure_ascii=False),
+                                "requires_approval": next_step.requires_approval,
+                            },
+                            is_final=False,
+                            metadata={
+                                "flow": "client_tool",
+                                "tool_call_id": step_tool_call_id,
+                                "tool_name": next_step.tool_name,
+                                "user_message": user_message,
+                                "tool_arguments": next_step.tool_arguments,
+                                "command": next_step.raw_command or next_step.tool_arguments.get("command", next_step.tool_name),
+                                "_has_plan": True,
+                            },
+                        )
 
-                    self._pending_traces[str(session_id)] = trace
-                    return
+                        self._pending_traces[str(session_id)] = trace
+                        return
 
                 # All steps done or failed — format whatever we have
                 final_text = await self.planner.build_final_response(active_plan, user_message)
@@ -4503,6 +6141,13 @@ class AIService:
 
         if not approved:
             msg = "Execução cancelada: permissão para comando local foi negada."
+            # Comando pedido pelo CÉREBRO e negado: descarta o estado de retomada,
+            # senão ele fica pendurado e o próximo `execute_command` da sessão (de
+            # qualquer origem) seria confundido com a retomada deste turno.
+            _pend = self._pending_actuations.get(str(actual_sid))
+            if _pend and _pend.get("kind") == "shell":
+                self._pending_actuations.pop(str(actual_sid), None)
+                self._pending_traces.pop(str(actual_sid), None)
 
             # Log rejection to trace
             if trace:
@@ -4593,7 +6238,27 @@ class AIService:
                 return "gui_launched"
             if any(k in err_lower for k in ("flatpak", "snap run", "xdg")):
                 return "gui_launched"
-        if any(k in err_lower for k in ("command not found", "not found", "código 127", "code 127", "no such file")):
+        # "No such file or directory" é o erro padrão do Unix quando um ARGUMENTO
+        # (caminho) do comando não existe — o binário em si roda normalmente. É
+        # bem diferente de "command not found"/código 127 (o BINÁRIO que não
+        # existe). Tratar os dois como a mesma coisa manda o playbook de
+        # flatpak/snap/dpkg/rpm (pensado pra achar um APP que sumiu) procurar um
+        # coreutil comum (ex: "cp") no sistema inteiro — nunca acha nada (o `cp`
+        # sempre existe) e o comando de diagnóstico (find recursivo em vários
+        # diretórios, grep em .desktop files etc) é caro o bastante pra travar o
+        # turno até o timeout do client (sessão c7e2d5ed: `cp /workspace/...`
+        # falhou porque o caminho só existe no sandbox remoto, não porque "cp"
+        # sumiu — e ainda assim disparou a busca de app inteira).
+        if "no such file" in err_lower:
+            return "path_not_found"
+        # Igual acima, "not found" sozinho é substring demais — um HTTP "404 Not
+        # Found" (ex: save_generated_file com file_id inválido, sessão 74539cf0)
+        # também casava aqui e mandava o MESMO playbook de flatpak/snap procurar
+        # um "programa" chamado "save_generated_file" no sistema — nunca acha
+        # nada (não é um binário, é um tool_name) e trava o turno do mesmo jeito.
+        # Só a frase exata do shell ("command not found") ou os códigos de saída
+        # convencionais contam como binário ausente.
+        if any(k in err_lower for k in ("command not found", "código 127", "code 127")):
             return "command_not_found"
         if any(k in err_lower for k in ("permission denied", "permissão negada", "operation not permitted")):
             return "permission_denied"
@@ -4816,6 +6481,28 @@ class AIService:
         """
         error_type = self._detect_error_type(error, command=command, tool_arguments=tool_arguments)
 
+        # ── SPECIAL CASE: missing PATH argument, not a missing binary ──
+        # Nada aqui (diagnóstico flatpak/snap/dpkg, ou o LLM de recovery — cujo
+        # prompt inteiro assume "achar onde o app está instalado") ajuda quando
+        # o problema é um caminho que não existe (ex: referência a /workspace/
+        # do sandbox, que o client nunca alcança). Reporta o erro direto — mais
+        # rápido e mais honesto que arrastar isso pelo playbook de app ausente.
+        if error_type == "path_not_found":
+            return None
+
+        # ── SPECIAL CASE: tool nomeada (não run_command) ──
+        # Todo o resto desta função (busca flatpak/snap/dpkg/rpm, prompt de
+        # recovery) foi pensado pra UMA coisa: achar onde um PROGRAMA sumido
+        # está instalado, quando o pedido original era rodar um comando shell.
+        # Pra uma tool nomeada tipo save_generated_file/list_directory/write_file
+        # isso não faz sentido nenhum — não é um binário, é uma chamada
+        # estruturada; procurar "save_generated_file" no flatpak nunca acha nada
+        # (sessão 74539cf0: um 404 do download virou "auto-diagnosing
+        # save_generated_file" e travou o turno até o timeout do client, do
+        # mesmo jeito que o bug do path_not_found). Reporta o erro direto.
+        if tool_name and tool_name != "run_command":
+            return None
+
         # ── SPECIAL CASE: GUI app launched successfully (exit 255 from flatpak/snap) ──
         # Apps gráficos ficam em foreground e retornam 255 quando o executor os mata.
         # Verificar se o processo está rodando antes de tratar como erro real.
@@ -4882,12 +6569,17 @@ class AIService:
                         target_path = redirect_match.group(1)
 
                 if target_path:
-                    logger.info(f"[Diagnostic] permission_denied but path doesn't exist: {target_path}. Switching to write_file tool.")
+                    # write_file nunca teve execução real (mesmo bug da sessão bd7a304d) —
+                    # o equivalente real hoje é run_command com mkdir -p + touch.
+                    logger.info(f"[Diagnostic] permission_denied but path doesn't exist: {target_path}. Criando via run_command (mkdir -p + touch).")
+                    quoted = target_path.replace("'", "'\\''")
                     return {
                         "action": "retry",
-                        "tool_name": "write_file",
-                        "tool_arguments": {"path": target_path, "content": "", "mode": "write"},
-                        "explanation": f"O diretório não existe. Criando o arquivo {target_path} usando write_file (cria diretórios automaticamente)...",
+                        "tool_name": "run_command",
+                        "tool_arguments": {
+                            "command": f"mkdir -p \"$(dirname '{quoted}')\" && : > '{quoted}'"
+                        },
+                        "explanation": f"O diretório não existe. Criando {target_path} (mkdir -p + touch)...",
                         "requires_approval": False,
                     }
                 logger.info(f"[Diagnostic] permission_denied + path doesn't exist but couldn't extract target path")
@@ -5142,6 +6834,101 @@ class AIService:
         return sp
 
     @staticmethod
+    def _normalize_os_platform(platform: str | None) -> str:
+        """Normaliza o token de plataforma para o vocabulário do ``sys.platform``.
+
+        O desktop (Rust) manda ``std::env::consts::OS`` — ``"macos"``/``"windows"`` —
+        e não o vocabulário do Python (``"darwin"``/``"win32"``). Todo lookup por
+        igualdade exata errava: o prompt saía com o token cru ``macos`` e o shell caía
+        no default genérico ``bash``, sem nenhum sinal de que o userland é BSD. Com
+        isso o modelo escrevia comando de GNU/Linux no Mac — ``free -h``, que não
+        existe lá, e como a cadeia era ``&&`` abortava todo o resto do diagnóstico.
+        No Windows o furo era pior: ``"windows" != "win32"`` mandava "Shell padrão:
+        bash" pra um cliente PowerShell.
+        """
+        p = (platform or "").strip().lower()
+        return {
+            "macos": "darwin",
+            "osx": "darwin",
+            "mac": "darwin",
+            "windows": "win32",
+            "win": "win32",
+        }.get(p, p)
+
+    @staticmethod
+    def _build_shell_rules(platform: str, can_show_images: bool = False) -> str:
+        """Regras de shell por plataforma para quem vai ESCREVER o comando.
+
+        ``can_show_images`` só acrescenta a alternativa (o marcador `[[IMAGE:…]]`) à
+        regra que proíbe usar shell para exibir imagem — a proibição em si vale para
+        qualquer cliente; a alternativa, só para quem renderiza o marcador.
+
+        O bloco de ambiente dava SO e paths e nada sobre o idioma da ferramenta, então
+        o modelo errava o dialeto e — pior — afirmava o resultado errado como fato. Os
+        dois casos que motivaram cada regra:
+
+        - ``free -h`` no macOS (não existe; userland é BSD, não GNU).
+        - ``find ... \\( -iname "*.jpg" ... \\) -name "*whatsapp*" -o -name "*whats*"``
+          devolveu 0 de 9 imagens do WhatsApp: ``-name`` é case-sensitive e os arquivos
+          são ``WhatsApp Image ...``, e o AND implícito liga mais forte que ``-o``, o
+          que grudou o filtro de nome só no primeiro ramo. O modelo respondeu "não
+          existe nenhuma" — falso negativo afirmado com convicção. No retry o filtro
+          virou ``-iname "*.whatsapp*"`` dentro do grupo de extensões (casa nada),
+          listou as 55 imagens da pasta cortadas por ``head -20`` e o texto final
+          relatou "encontrei 20 arquivos" — o 20 era o limite do ``head``.
+        """
+        rules = [
+            "\n## Como escrever o comando (obrigatório)",
+            "- Busca por NOME de arquivo é sempre case-insensitive: use `-iname`, nunca "
+            "`-name`. Nomes reais vêm em CamelCase (`WhatsApp Image ...`, `IMG_...`).",
+            "- No `find`, o AND implícito liga mais forte que `-o`: SEMPRE parentize o "
+            "grupo de alternativas — `\\( -iname A -o -iname B \\)` — e mantenha cada "
+            "critério (tipo, extensão, nome) em seu próprio grupo. Misturar `-o` solto "
+            "com outros testes silenciosamente filtra a coisa errada.",
+            "- Nunca corte a saída sem contar: se usar `head -N`, emita a contagem real "
+            "junto (`... | wc -l`). O número que você relatar tem que vir do `wc -l`, "
+            "NUNCA do limite do `head` — senão você reporta o corte como se fosse o total.",
+            "- Traga os DADOS, não o número pronto: para \"quantos/quais/tem algum X\", "
+            "liste (`ls -la`, `find`) e conte na RESPOSTA. Um `| wc -l` sozinho joga fora "
+            "tudo que a próxima pergunta vai precisar e ainda responde errado quando o "
+            "critério não é 'linhas' (`ls ~/.ssh | wc -l` = 19 arquivos, mas 'quantas "
+            "CHAVES' eram 7 pares — a contagem certa só sai olhando os nomes). Só agregue "
+            "no shell quando a saída crua for grande demais para ser útil.",
+            "- Se o resultado vier VAZIO, isso é hipótese, não fato: antes de afirmar que "
+            "não existe, refaça com critério mais largo (só `-iname \"*parte*\"`, sem "
+            "filtro de extensão) ou liste o diretório. Só afirme ausência depois que a "
+            "busca larga também vier vazia.",
+            "- Prefira `;` a `&&` ao encadear coletas de diagnóstico: com `&&` um único "
+            "binário ausente aborta todo o resto da linha.",
+            "- Comando NUNCA serve para EXIBIR imagem: `base64`, `xxd`, `cat` de um "
+            ".jpg/.png não mostram nada ao usuário — só despejam um blob gigante na "
+            "conversa. Use o shell apenas para DESCOBRIR o caminho (`ls`, `find`) ou "
+            "converter/redimensionar de fato (`sips`, `convert`)."
+            + (
+                " Para o usuário VER a imagem, responda com o marcador "
+                "`[[IMAGE:/caminho/da/imagem.ext]]` (ver \"Mostrar imagem no chat\")."
+                if can_show_images
+                else ""
+            ),
+        ]
+        if platform == "darwin":
+            rules.append(
+                "- É macOS: userland BSD, NÃO GNU/Linux. Não existe `free`, `nproc`, "
+                "`stat -c`, `readlink -f`, `sed -i` sem sufixo. Use: memória "
+                "`vm_stat` ou `sysctl -n hw.memsize`; versão do SO `sw_vers`; CPUs "
+                "`sysctl -n hw.ncpu`; processos `top -l 1` ou `ps aux`. Para busca "
+                "ampla por nome, `mdfind -onlyin <dir> <termo>` (Spotlight) é mais "
+                "rápido e já é case-insensitive."
+            )
+        elif platform == "win32":
+            rules.append(
+                "- É Windows: o shell é PowerShell/cmd.exe. Não use `find`, `ls`, "
+                "`grep` nem pipes de coreutils — use `Get-ChildItem -Recurse -Filter`, "
+                "`Select-String`, `Measure-Object`."
+            )
+        return "\n".join(rules) + "\n"
+
+    @staticmethod
     def _build_system_context(metadata: dict[str, Any] | None) -> str | None:
         """Build a compact system context string from metadata sent by the desktop client.
 
@@ -5154,6 +6941,8 @@ class AIService:
         if not platform:
             return None
 
+        platform = AIService._normalize_os_platform(platform)
+
         platform_names = {"linux": "Linux", "darwin": "macOS", "win32": "Windows"}
         os_name = platform_names.get(platform, platform)
         release = metadata.get("os_release", "")
@@ -5163,20 +6952,25 @@ class AIService:
         documents = metadata.get("documents_dir", f"{home}/Documents")
         desktop_dir = metadata.get("desktop_dir", f"{home}/Desktop")
 
-        shell_default = (
-            "PowerShell/cmd.exe"
-            if platform == "win32"
-            else {"linux": "bash/zsh", "darwin": "zsh/bash"}.get(platform, "bash")
-        )
+        shell_default = {
+            "win32": "PowerShell/cmd.exe",
+            "darwin": "zsh",
+            "linux": "bash",
+        }.get(platform, "bash")
+
+        # Espaço duplo quando os_release vem vazio (o desktop não manda esse campo)
+        # fazia a linha sair "macos  (aarch64)". Monta só com o que existe.
+        os_line = " ".join(p for p in (os_name, release) if p)
 
         return (
-            f"Sistema operacional do usuário: {os_name} {release} ({arch}).\n"
+            f"Sistema operacional do usuário: {os_line} ({arch}).\n"
             f"Diretório home: {home}\n"
             f"Diretório de documentos do usuário: {documents}\n"
             f"Diretório de downloads do usuário: {downloads}\n"
             f"Diretório desktop do usuário: {desktop_dir}\n"
             f"Shell padrão: {shell_default}.\n"
-            f"IMPORTANTE: Quando o usuário mencionar 'pasta de documentos', 'meus documentos' ou similar, "
+            f"{AIService._build_shell_rules(platform, AIService._client_renders_inline_images(metadata))}"
+            f"\nIMPORTANTE: Quando o usuário mencionar 'pasta de documentos', 'meus documentos' ou similar, "
             f"use SEMPRE o caminho '{documents}' como working_dir. "
             f"Quando mencionar 'downloads', use '{downloads}'. "
             f"Quando mencionar 'desktop' ou 'área de trabalho', use '{desktop_dir}'.\n"
@@ -5191,6 +6985,7 @@ class AIService:
         trace: MessageTrace | None = None,
         live: bool = False,
         register: "Register | None" = None,
+        can_show_images: bool = False,
     ) -> str:
         """Use LLM to format tool output into a user-friendly response.
 
@@ -5198,6 +6993,9 @@ class AIService:
         resposta será falada por TTS. ``register`` anexa a diretiva de tom da
         situação ao system prompt (continuações recuperam-no de
         ``_session_registers``, pois o metadata original se perde no round-trip).
+        ``can_show_images`` libera o marcador `[[IMAGE:…]]` (cliente que renderiza),
+        para que o passo que ACHOU a imagem (`ls`/`find`) já possa exibi-la em vez de
+        descrever o caminho — o mesmo dado vindo do ``_image_capable_sessions``.
         """
         format_rule = (
             "Responda em TEXTO CORRIDO, natural e direto (será falado em voz alta): "
@@ -5205,16 +7003,39 @@ class AIService:
             if live
             else "Use markdown se necessário."
         )
+        # O caminho da imagem geralmente aparece AQUI (saída de um ls/find). Sem esta
+        # regra o turno terminava descrevendo o arquivo ("está em ~/Downloads") ou,
+        # pior, pedindo um base64 no passo seguinte.
+        image_rule = (
+            "\nSe o usuário quer VER uma imagem e o caminho dela está na saída acima, "
+            "exiba-a escrevendo `[[IMAGE:/caminho/absoluto/da/imagem.ext]]` numa linha "
+            "própria (o chat troca o marcador pela imagem). Copie o caminho EXATO da "
+            "saída, nunca invente; nunca use base64 para mostrar imagem."
+            if can_show_images
+            else ""
+        )
         prompt = (
             f'O usuário perguntou: "{user_message}"\n'
             f"Foi executado o comando: `{command}`\n"
             f"Saída do comando:\n```\n{output}\n```\n\n"
-            "Formate uma resposta clara e amigável em português para o usuário, "
-            "resumindo o resultado do comando de forma legível. "
+            "Responda o que ele perguntou usando esta saída. Responda a PERGUNTA, não "
+            "a saída: se ele perguntou 'quantas chaves' e a saída lista arquivos, dê o "
+            "número certo (e os nomes) — não descreva o comando nem narre o que você fez. "
             f"{format_rule} Não invente dados — use apenas o que está na saída."
+            f"{image_rule}"
         )
 
-        system_msg = "Você é Neo, um assistente de desktop. Responda de forma clara e concisa em português."
+        # Persona: sem isto a resposta do caminho CLIENT_TOOL saía com emoji e
+        # "Se quiser, posso..." — as duas coisas que o prompt do Neo proíbe. A
+        # formatação da saída de um comando é resposta do Neo como outra qualquer.
+        system_msg = (
+            "Você é Neo, um assistente de desktop. Responda de forma clara e concisa "
+            "em português.\n"
+            "- Direto e declarativo: entrega o que foi pedido e para.\n"
+            "- Sem emoji, sem bajulação ('Tudo certo!', 'Claro'), sem disclaimer.\n"
+            "- Sem ofertas de rodapé ('Se quiser, posso...', 'É só dizer', "
+            "'Posso ajudar em mais alguma coisa?') — encerre na informação."
+        )
         if register is not None:
             system_msg = f"{system_msg}\n\n{render_register_directive(register)}"
         messages = [
@@ -5227,13 +7048,33 @@ class AIService:
             provider_name = type(provider).__name__.replace("Provider", "").lower()
             model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
             t0 = time.monotonic()
+            # 600 tokens era um teto de era pré-raciocínio: os DeepSeek pensam ANTES de
+            # escrever e cobram isso do MESMO orçamento, então a resposta saía cortada
+            # no meio de uma frase (sessão 69feab87: "⚠️ **Importante" — 125 chars, e
+            # esse toco foi pro histórico). Ver deepseek-empty-response-reasoning.
+            base_max_tokens = max(int(getattr(self.settings, "default_max_tokens", 8192)), 2000)
             response = await provider.complete(
                 messages=messages,
                 temperature=0.3,
-                max_tokens=600,
+                max_tokens=base_max_tokens,
             )
             llm_ms = (time.monotonic() - t0) * 1000
-            response_text = response.get_content() or f"Resultado de `{command}`:\n```\n{output}\n```"
+            response_text = response.get_content() or ""
+            # Vazio = o raciocínio consumiu o teto inteiro (finish_reason=length), não
+            # "nada a dizer". Uma retentativa com o dobro resolve; sem ela o turno
+            # despejava a saída crua do comando na cara do usuário.
+            if not response_text.strip():
+                bigger = min(base_max_tokens * 2, _EMPTY_RETRY_MAX_TOKENS_CEILING)
+                logger.warning(
+                    "[format_tool_result] resposta vazia (teto consumido pelo raciocínio) "
+                    "— retentando com max_tokens=%d", bigger,
+                )
+                retry = await provider.complete(
+                    messages=messages, temperature=0.3, max_tokens=bigger,
+                )
+                response_text = retry.get_content() or ""
+            if not response_text.strip():
+                response_text = f"Resultado de `{command}`:\n```\n{output}\n```"
 
             # Log this LLM call in the trace
             if trace:

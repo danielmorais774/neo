@@ -631,6 +631,60 @@ async def list_tools(
     return ListToolsResponse(tools=tool_schemas, count=len(tool_schemas))
 
 
+@router.get("/sessions", response_model=dict)
+async def list_sessions(
+    service_name: str = Query(default="neo-desktop-tauri", alias="service"),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    """Lista sessões anteriores (mais recentes primeiro) para o seletor de sessões.
+
+    `topic_summary` é quase sempre NULL na prática, então o título exibido vem da
+    primeira mensagem do usuário da sessão. Sessões sem mensagem nenhuma são
+    omitidas: o cliente cria a sessão ao abrir o app, então listá-las encheria a
+    lista de conversas vazias.
+    """
+    from sqlalchemy import text
+
+    stmt = text(
+        """
+        SELECT s.id,
+               s.message_count,
+               s.last_activity_at,
+               COALESCE(
+                   s.topic_summary,
+                   (SELECT m.content
+                      FROM conversation_message m
+                     WHERE m.session_id = s.id
+                       AND m.role = 'user'
+                       AND m.content <> ''
+                     ORDER BY m.created_at ASC
+                     LIMIT 1)
+               ) AS title
+          FROM conversation_session s
+         WHERE s.service = :service
+           AND s.message_count > 0
+         ORDER BY s.last_activity_at DESC
+         LIMIT :limit
+        """
+    )
+
+    async with db.get_session() as session:
+        rows = (await session.execute(stmt, {"service": service_name, "limit": limit})).all()
+
+    sessions = [
+        {
+            "session_id": str(row.id),
+            "title": (row.title or "").strip()[:80] or None,
+            "message_count": row.message_count,
+            "last_activity_at": row.last_activity_at.isoformat() if row.last_activity_at else None,
+        }
+        for row in rows
+    ]
+
+    return {"sessions": sessions, "count": len(sessions)}
+
+
 @router.get("/session/{session_id}", response_model=SessionHistoryResponse)
 async def get_session_history(
     session_id: UUID,

@@ -13,6 +13,11 @@ PKS_SEARCH_TOOLS: list[ToolSchema] = [
             "específico. Retorna as entidades reais encontradas com score — nunca "
             "afirme que algo está salvo sem confirmar aqui."
         ),
+        # Classificar não é usar: a política "nunca afirme sem confirmar"
+        # é do cérebro e fica na description.
+        router_summary=(
+            "Busca fatos salvos na memória persistente do usuário (PKS)."
+        ),
         module="pks_search",
         execution="server-side",
         timeout=15,

@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, voice_config, spotify, skills, research, files, connections
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -421,6 +421,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         skill_library=_skill_library,
         file_store=_file_store,
     )
+    # Panel /context/prompt-preview reproduces the real turn's prompt assembly
+    # (classify → recover_context → register → build_prompt) read-only.
+    context.set_ai_service(_ai_service)
 
     # ── Skills + Notifications ─────────────────────────────────────
     _notification_broker = NotificationBroker()
@@ -469,6 +472,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire intent classifier config route (neo-panel → Config page)
     intent_config.set_dependencies(_db, _llm_router)
+
+    # Wire subsystem model config route (neo-panel → Modelos: memory planner +
+    # Deep Research volume/writer)
+    model_config.set_dependencies(_db, _llm_router)
 
     # Wire voice (TTS) config route (neo-panel → Settings page)
     voice_config.set_dependencies(_db)
@@ -596,6 +603,7 @@ app.include_router(devices.router, prefix="/api/v1", dependencies=[Depends(requi
 app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop, sem JWT
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);

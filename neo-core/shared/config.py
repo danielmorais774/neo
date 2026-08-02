@@ -98,10 +98,29 @@ class Settings(BaseSettings):
         "(search_pks, list_connected_devices, get_weather). Set false to revert to "
         "the tool-less streaming reply.",
     )
+    # Escrita sob demanda no PKS (docs/pks-write-on-demand-plan.md) — a tool
+    # pks_remember que o cognitivo chama quando o usuário pede explicitamente
+    # para lembrar de algo. Por baixo delega ao PKSMemoryPlanner (subagente).
+    pks_write_enabled: bool = Field(
+        default=True,
+        description="Liga a tool pks_remember (escrita sob demanda no PKS via "
+        "subagente de memória). Off → a tool some do read set do cognitivo.",
+    )
+    pks_planner_model: str = Field(
+        default="deepseek-v4-flash",
+        description="Modelo do PKSMemoryPlanner (subagente que estrutura a "
+        "escrita no PKS). Explícito porque o default do provider já foi "
+        "'deepseek-chat' (aposentado, dava 400 e quebrava TODA gravação).",
+    )
     cognitive_max_tool_rounds: int = Field(
-        default=3, ge=1, le=6,
+        default=32, ge=1, le=100,
         description="Max tool-call rounds the cognitive core may run before it must "
-        "produce a final answer.",
+        "produce a final answer. Default (3) e teto (6) originais eram calibrados só "
+        "pras read tools (search_pks/get_weather); depois que o workbench "
+        "(neo_write_file/neo_bash/file_save) entrou no mesmo loop, tarefas de "
+        "vários arquivos/downloads estouravam o budget. Alinhado com "
+        "max_iterations (o teto que o AgentExecutor já usa) — uma rodada extra só "
+        "custa latência quando o modelo REALMENTE chama tool.",
     )
 
     # Workbench — o sandbox de execução do próprio Neo (docs/workbench-background-jobs-plan.md)
@@ -416,7 +435,11 @@ class Settings(BaseSettings):
     neo_affect_pressure_window_min: float = Field(default=15.0, gt=0.0)
     # Hard cap on the post-turn LLM appraisal; on timeout the deterministic
     # detectors still persist their floors, so the reaction is never lost.
-    neo_affect_appraisal_timeout_s: float = Field(default=12.0, gt=0.0)
+    # This runs fire-and-forget OFF the reply hot-path, so a generous cap costs
+    # nothing on latency — 12s was too tight for a remote LLM under load and the
+    # appraisal was timing out on nearly every turn (panel "Appraiser degradado"),
+    # which froze the affect state at baseline because only the floors ever landed.
+    neo_affect_appraisal_timeout_s: float = Field(default=25.0, gt=0.0)
 
     # ── Neo situational register (tone-regulation layer) ────────────────
     # Second tone regulator, orthogonal to affect: Caráter × Registro × Afeto.
@@ -485,6 +508,23 @@ class Settings(BaseSettings):
     neo_files_gc_interval_s: int = Field(
         default=3600, ge=60,
         description="Intervalo do tick do GC de arquivos temporários expirados",
+    )
+    neo_file_actuation_enabled: bool = Field(
+        default=False,
+        description="Deixa o núcleo cognitivo OBTER/ENTREGAR arquivos por conta própria: "
+        "as tools client-actuating request_user_file (puxa um arquivo do disco do "
+        "usuário pro File Store) e save_generated_file (entrega no disco) entram no "
+        "toolset do cérebro e viajam pelo round-trip tool_request/tool_result. "
+        "Requer neo_files_enabled. Off → o cérebro não vê essas tools.",
+    )
+    neo_brain_shell_enabled: bool = Field(
+        default=True,
+        description="Deixa o núcleo cognitivo RODAR comando no terminal do usuário por "
+        "conta própria (tool client-actuating `run_command`, mesmo round-trip de "
+        "save_generated_file, com a mesma aprovação do fluxo CLIENT_TOOL). Sem isso o "
+        "cérebro é um beco sem saída quando o classificador manda pra ele um pedido que "
+        "precisa da máquina do usuário: ele responde 'não tenho acesso ao terminal, roda "
+        "aí e me manda a saída' (sessão 69feab87). Off → o cérebro volta a só sugerir.",
     )
 
     # Panel auth (temporary without login flow)

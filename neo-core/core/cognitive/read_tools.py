@@ -22,6 +22,7 @@ from modules.devices.tools import DEVICES_TOOLS
 from modules.finance import FINANCE_TOOL_NAMES
 from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
+from modules.pks_write import PKS_WRITE_TOOL_NAMES, PKS_WRITE_TOOLS
 from modules.services.tools import SERVICE_TOOLS
 from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.voice.tools import VOICE_TOOLS
@@ -73,13 +74,21 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     # uso é o manifesto do anexo injetado no system_context (§5) — tool disponível
     # não é tool usada (lição da skill financas).
     *FILE_TOOLS,
+    # Escrita sob demanda no PKS (docs/pks-write-on-demand-plan.md): pks_remember
+    # é a ÚNICA tool com efeito colateral no read set — o cognitivo a chama quando
+    # o usuário pede explicitamente pra lembrar de algo. Gated por pks_write_enabled;
+    # user-scoped; despacho inline por este executor. Por baixo é o subagente
+    # (PKSMemoryPlanner) que estrutura — a tool não escreve cru.
+    *PKS_WRITE_TOOLS,
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
 # As fin_* NÃO entram no read set default (são gated pela skill 'financas' via
 # tool gating), mas o dispatch delas passa por este executor e exige usuário.
 _USER_SCOPED = frozenset(
-    {"search_pks", "list_connected_devices", "get_user_location"} | FINANCE_TOOL_NAMES
+    {"search_pks", "list_connected_devices", "get_user_location"}
+    | FINANCE_TOOL_NAMES
+    | PKS_WRITE_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -110,6 +119,38 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
         tools = [t for t in tools if t.name not in _SERVICE_TOOL_NAMES]
     if not getattr(settings, "neo_files_enabled", False):
         tools = [t for t in tools if t.name not in _FILE_TOOL_NAMES]
+    if not getattr(settings, "pks_write_enabled", True):
+        tools = [t for t in tools if t.name not in PKS_WRITE_TOOL_NAMES]
+    # Tools client-actuating de arquivo (plano "arquivos sob iniciativa do
+    # cérebro"): request_user_file (puxa um arquivo do disco do usuário) e
+    # save_generated_file (entrega no disco). Só entram com o File Store ligado E
+    # a flag de atuação. Import lazy: evita o ciclo core.cognitive ↔ modules.desktop
+    # (modules.desktop.__init__ → ai_service → core.cognitive). NÃO executam
+    # in-process — o loop cognitivo levanta ClientActuationRequested.
+    if getattr(settings, "neo_files_enabled", False) and getattr(
+        settings, "neo_file_actuation_enabled", False
+    ):
+        from modules.desktop.tools import DESKTOP_TOOLS, FILE_ACTUATION_TOOL_NAMES
+
+        have = {t.name for t in tools}
+        tools += [
+            t
+            for t in DESKTOP_TOOLS
+            if t.name in FILE_ACTUATION_TOOL_NAMES and t.name not in have
+        ]
+    # Shell na máquina do usuário (`run_command`), mesmo trilho client-actuating.
+    # Independe do File Store: o buraco que ela fecha é outro — sem ela, TODO pedido
+    # que precisa do terminal e cai no cognitivo (classificador que errou, follow-up
+    # curto, fallback) morre em "não tenho acesso, roda aí e me manda a saída".
+    if getattr(settings, "neo_brain_shell_enabled", True):
+        from modules.desktop.tools import DESKTOP_TOOLS, SHELL_ACTUATION_TOOL_NAMES
+
+        have = {t.name for t in tools}
+        tools += [
+            t
+            for t in DESKTOP_TOOLS
+            if t.name in SHELL_ACTUATION_TOOL_NAMES and t.name not in have
+        ]
     if user_id is None:
         tools = [t for t in tools if t.name not in _USER_SCOPED]
     return tools
@@ -129,6 +170,7 @@ class CognitiveReadExecutor:
         self._pks_search: Any = None
         self._location: Any = None
         self._finance: Any = None
+        self._pks_write: Any = None
         # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
         # user-scoped executor avoids mutating the shared global one (no race).
         from modules.voice import VoiceExecutor
@@ -158,6 +200,12 @@ class CognitiveReadExecutor:
 
                 self._location = LocationExecutor(pks_service=pks_service)
                 self._location.set_context(user_id)
+                # Escrita sob demanda (pks_remember) — delega ao subagente de
+                # memória via PKSService.learn(confirmed_save=True).
+                from modules.pks_write import PKSWriteExecutor
+
+                self._pks_write = PKSWriteExecutor(pks_service=pks_service)
+                self._pks_write.set_context(user_id)
 
     async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         start = asyncio.get_event_loop().time()
@@ -177,6 +225,8 @@ class CognitiveReadExecutor:
                 result = await self._config.execute(name, tool_call.arguments)
             elif name in FINANCE_TOOL_NAMES and self._finance is not None:
                 result = await self._finance.execute(name, tool_call.arguments)
+            elif name in PKS_WRITE_TOOL_NAMES and self._pks_write is not None:
+                result = await self._pks_write.execute(name, tool_call.arguments)
             else:
                 # Read-only globals (e.g. get_weather) go through the global executor.
                 return await self._global.execute_tool_call(tool_call)
