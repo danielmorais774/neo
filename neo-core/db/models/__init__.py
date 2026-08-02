@@ -31,6 +31,7 @@ from .finance import (
 from .credential import Credential
 from .gateway import ServiceConnection, ServiceRequestLog
 from .stored_file import StoredFile
+from .birra_act import BirraAct
 
 __all__ = [
     "User",
@@ -63,4 +64,5 @@ __all__ = [
     "ServiceConnection",
     "ServiceRequestLog",
     "StoredFile",
+    "BirraAct",
 ]

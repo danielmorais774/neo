@@ -174,6 +174,10 @@ CREATE INDEX ix_working_note_active ON working_note (user_id, status, updated_at
 Migração: `alembic/versions/q0r1s2t3u4v5_create_working_note_table.py`,
 `down_revision = "p9q0r1s2t3u4"` (head atual).
 
+> ⚠️ **2026-08-02:** este plano ficou para depois do `modo-birra-plan.md`, que
+> assumiu o id `q0r1s2t3u4v5`. Quando a memória de trabalho entrar, rebaseie para
+> o head da época (provavelmente `r1s2t3u4v5w6`, sobre `q0r1s2t3u4v5`).
+
 ### 4.1 Formato do corpo
 
 ```markdown

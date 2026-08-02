@@ -285,6 +285,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.files_gc_task = _files_gc_task
         print(f"✅ File Store wired (root={settings.neo_files_root}, tools file_*)")
 
+    # Modo Birra (docs/modo-birra-plan.md §3.3): o sweeper desfaz os atos no
+    # prazo. Roda uma varredura já no start — o core recarrega a cada save, e um
+    # ato pendente de antes do reload precisa ser recuperado, senão a luz fica
+    # apagada. Sobe junto com a flag; sem ela não há ato para desfazer.
+    _birra_sweeper_task = None
+    if settings.neo_birra_enabled:
+        from core.agent.birra.revert import sweeper_loop
+        from core.agent.birra.store import BirraStore
+
+        def _ha_adapter_factory():
+            from core.skills.home_assistant.adapter import HomeAssistantAdapter
+
+            return HomeAssistantAdapter()
+
+        _birra_sweeper_task = asyncio.create_task(
+            sweeper_loop(BirraStore(_db), _ha_adapter_factory)
+        )
+        app.state.birra_sweeper_task = _birra_sweeper_task
+        print("✅ Modo Birra: sweeper de reversão ativo")
+
     # Register whatsapp_messaging tools in the global registry (for discovery / routing)
     from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
     _tool_registry.register_many(WHATSAPP_MESSAGING_TOOLS)
@@ -545,6 +565,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except (asyncio.CancelledError, Exception):
             pass
         print("✅ File Store GC stopped")
+
+    if _birra_sweeper_task is not None:
+        _birra_sweeper_task.cancel()
+        try:
+            await _birra_sweeper_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        print("✅ Modo Birra sweeper stopped")
 
     grpc_server = getattr(app.state, "grpc_server", None)
     if grpc_server is not None:

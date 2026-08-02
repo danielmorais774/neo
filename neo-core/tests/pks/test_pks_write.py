@@ -49,7 +49,12 @@ class _FakeRouter:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run, e não get_event_loop().run_until_complete: o segundo só
+    # funciona enquanto NENHUM teste async tiver rodado antes neste processo
+    # (pytest-asyncio fecha o loop ao terminar, e aí get_event_loop levanta
+    # "There is no current event loop"). Estes testes são síncronos, então
+    # dependiam da ordem de coleta para passar.
+    return asyncio.run(coro)
 
 
 def test_planner_confirmed_mode_injects_override_and_structures():

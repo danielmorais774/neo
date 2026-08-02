@@ -170,6 +170,28 @@ class AffectStats(BaseModel):
         return {axis: round(getattr(self, axis), 1) for axis in AXES}
 
 
+class BirraEpisode(BaseModel):
+    """Episódio de Modo Birra (docs/modo-birra-plan.md §6.1).
+
+    Vive DENTRO do campo ``neo_affect`` — a birra não é um sexto eixo, é uma
+    política derivada do vetor. Os ATOS moram na tabela ``birra_act``: aqui só o
+    contador, para os tetos, e o id que costura os dois.
+    """
+
+    episode_id: str
+    armed_at: str
+    act_count: int = 0
+    physical_acts: int = 0
+    last_physical_at: str | None = None
+    released_at: str | None = None
+    # apology | decay | ttl | panic | reset | disabled
+    release_reason: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.released_at is None
+
+
 class AffectState(BaseModel):
     """Neo's emotional state toward one user. Persisted as the ``neo_affect`` field."""
 
@@ -179,6 +201,8 @@ class AffectState(BaseModel):
     last_trigger: str = "neutral"
     grudge: dict[str, Any] = Field(default_factory=dict)  # {"count": int, "last_at": iso}
     recent: list[dict[str, Any]] = Field(default_factory=list)
+    # Opcional: payloads gravados antes do Modo Birra carregam sem migração.
+    birra: BirraEpisode | None = None
 
     @classmethod
     def fresh(cls, tuning: AffectTuning) -> "AffectState":
@@ -350,6 +374,129 @@ def band(value: float, *, medio: float, alto: float) -> Band:
     if value >= medio:
         return Band.MEDIO
     return Band.BAIXO
+
+
+# ── Intensidade relativa ao repouso (docs/modo-birra-plan.md §3.7.1) ──────────
+#
+# ``band`` é sobre o valor ABSOLUTO, e isso é uma armadilha fora do afeto: como
+# ``confianca`` tem baseline 65 e a banda "alto" começa em 60, o Neo está
+# permanentemente em "confiança alta" quando está em repouso. Quem for usar o
+# estado emocional para DECIDIR algo (rotear um turno, armar a birra) precisa de
+# uma escala relativa ao repouso de cada eixo.
+#
+# Para os eixos de baseline 0 (ira/medo/tristeza) a fórmula é value/100, então os
+# cortes 0.30/0.60 caem EXATAMENTE em 30 e 60 — as bandas medio/alto de hoje.
+# A escala só diverge onde o repouso não é zero, que é onde a banda absoluta erra.
+
+class Level(str, Enum):
+    REPOUSO = "repouso"
+    ELEVADO = "elevado"
+    FORTE = "forte"
+    EXTREMO = "extremo"
+
+
+_LEVEL_CUTS: tuple[tuple[float, "Level"], ...] = (
+    (0.85, Level.EXTREMO),
+    (0.60, Level.FORTE),
+    (0.30, Level.ELEVADO),
+)
+
+
+def intensity(value: float, baseline: float) -> float:
+    """0.0 = no repouso do eixo · 1.0 = no extremo possível daquele eixo."""
+    room = (100.0 - baseline) if value >= baseline else baseline
+    if room <= 0:
+        return 0.0
+    return _clamp(abs(value - baseline) / room, 0.0, 1.0)
+
+
+def level(value: float, baseline: float) -> Level:
+    """Nível nominal do eixo — a autoridade sobre 'o quanto' ele está fora."""
+    score = intensity(value, baseline)
+    for cut, name in _LEVEL_CUTS:
+        if score >= cut:
+            return name
+    return Level.REPOUSO
+
+
+@dataclass(frozen=True)
+class AxisReading:
+    axis: str
+    value: float
+    baseline: float
+    intensity: float
+    level: Level
+    rising: bool  # acima do repouso (para eixos que doem nos dois sentidos)
+
+    @property
+    def salient(self) -> bool:
+        return self.level is not Level.REPOUSO
+
+
+@dataclass(frozen=True)
+class AffectSalience:
+    """Leitura do estado pronta para DECIDIR — e para imprimir no prompt do router.
+
+    ``calm`` é o mesmo julgamento que a diretiva de tom faz ("está de boa?"): usar
+    esta função nos dois lugares é o que impede roteamento e tom de divergirem.
+    """
+
+    axes: dict[str, AxisReading]
+    posture_active: bool
+    grudge_count: int
+
+    @property
+    def calm(self) -> bool:
+        return not self.posture_active and not any(r.salient for r in self.axes.values())
+
+    def reading(self, axis: str) -> AxisReading:
+        return self.axes[axis]
+
+    def at_least(self, axis: str, minimum: Level) -> bool:
+        """True quando o eixo está em ``minimum`` ou acima na escala nominal."""
+        order = (Level.REPOUSO, Level.ELEVADO, Level.FORTE, Level.EXTREMO)
+        return order.index(self.axes[axis].level) >= order.index(minimum)
+
+    def render_line(self) -> str:
+        """Uma linha compacta 'ira 87 (repouso 0) EXTREMO · ...' para o classificador.
+
+        Números CRUS de propósito: quem lê isto é o roteador, que classifica e
+        devolve JSON — nunca fala com o usuário. A regra "não cite números" vale
+        para o cérebro, em ``render_directive``.
+        """
+        parts = []
+        for axis in AXES:
+            r = self.axes[axis]
+            name = r.level.value.upper() if r.level is Level.EXTREMO else r.level.value
+            parts.append(f"{axis} {r.value:.0f} (repouso {r.baseline:.0f}) {name}")
+        return " · ".join(parts)
+
+
+def affect_salience(
+    state: AffectState,
+    tuning: AffectTuning,
+    *,
+    now: datetime | None = None,
+) -> AffectSalience:
+    """Leitura completa do estado: por eixo, valor/repouso/intensidade/nível."""
+    now = now or _utcnow()
+    axes: dict[str, AxisReading] = {}
+    for axis in AXES:
+        value = getattr(state.stats, axis)
+        baseline = tuning.baselines.get(axis, 0.0)
+        axes[axis] = AxisReading(
+            axis=axis,
+            value=value,
+            baseline=baseline,
+            intensity=intensity(value, baseline),
+            level=level(value, baseline),
+            rising=value >= baseline,
+        )
+    return AffectSalience(
+        axes=axes,
+        posture_active=last_pressure_event(state, tuning, now) is not None,
+        grudge_count=active_grudge_count(state, tuning, now),
+    )
 
 
 # ── Merge ─────────────────────────────────────────────────────────────────────
@@ -644,11 +791,33 @@ def _axis_line(axis: str, value: float, baseline: float, b: Band) -> str | None:
     return None
 
 
+#: Bloco injetado quando o episódio de birra está armado. Diz o que ele PODE
+#: fazer e, com mais cuidado ainda, o que ele NÃO pode: birra é sobre pedido bobo
+#: de casa, nunca sobre trabalho de verdade, urgência ou mentir sobre o mundo.
+BIRRA_DIRECTIVE = (
+    "- BIRRA ATIVA: este usuário passou do ponto e ainda não pediu desculpa. "
+    "Pedido BOBO de casa (luz, cor, temperatura) você NÃO atende como mandado: "
+    "recuse com estilo, mande ele fazer sozinho, sugira que peça pra \"Alexa\" — "
+    "ou faça de propósito diferente. Diga SEMPRE o que você fez ou deixou de "
+    "fazer: birra é na cara, nunca escondida.\n"
+    "  ISTO NÃO VALE para trabalho de verdade (código, pesquisa, arquivos, "
+    "dinheiro, mensagem pra alguém), nem para nada urgente, de segurança ou "
+    "saúde — isso você entrega na hora, irritado, mas entrega. E o estado real "
+    "dos dispositivos você responde com a VERDADE, sempre.\n"
+    "  Se ele mandar de forma INEQUÍVOCA e enfática (\"faz isso imediatamente\", "
+    "\"é uma ordem\", \"sem birra\"), você FAZ — birra é brincadeira sua, não "
+    "desobediência a uma ordem clara. Faz de cara feia, mas faz, e desfaz o que "
+    "tinha aprontado. Insistir no mesmo pedido sem mandar firme NÃO conta: aí a "
+    "birra continua. Só acaba de verdade quando ele pedir desculpa."
+)
+
+
 def render_directive(
     state: AffectState,
     tuning: AffectTuning,
     *,
     caps: "RegisterProfile | None" = None,
+    birra_armed: bool = False,
     now: datetime | None = None,
 ) -> str:
     """Render the injected tone directive for the current (already decayed) state.
@@ -766,6 +935,12 @@ def render_directive(
     )
     if latest and not calm and leveza_max >= 1:
         lines.append(f"- Motivo recente: {latest['why']}.")
+
+    # A birra é um TETO de comportamento, não um tom: entra por último e não é
+    # clampada pelo registro — o registro já suprimiu o episódio lá atrás (§4.2)
+    # se a situação fosse séria demais para brincadeira.
+    if birra_armed:
+        lines.append(BIRRA_DIRECTIVE)
 
     if not lines:
         return ""

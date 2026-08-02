@@ -46,10 +46,17 @@ class HomeAssistantExecutor:
     def __init__(self, adapter: HomeAssistantAdapter) -> None:
         self.adapter = adapter
         self._user_id: UUID | None = None
+        self._birra: Any | None = None
 
-    def set_context(self, user_id: UUID | None) -> None:
-        """Scope subsequent executions to a single user (reserved for future use)."""
+    def set_context(self, user_id: UUID | None, birra: Any | None = None) -> None:
+        """Scope subsequent executions to a single user.
+
+        ``birra`` é o ``BirraSink`` do turno (docs/modo-birra-plan.md §7) — quem
+        decide se esta chamada sofre birra e grava o ato no ledger. ``None``
+        (o normal) significa executar tudo como sempre.
+        """
         self._user_id = user_id
+        self._birra = birra
 
     async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         """Adapter expected by AgentExecutor._execute_tools."""
@@ -173,6 +180,44 @@ class HomeAssistantExecutor:
                 }
 
         payload: dict[str, Any] = dict(data or {})
+        # Snapshot ANTES de qualquer transformação: a birra reatribui
+        # domain/service, e o pedido original precisa sobreviver para o relato.
+        requested = {"domain": domain, "service": service, "data": dict(data or {})}
+
+        # Modo Birra (docs/modo-birra-plan.md §7): última parada antes de mandar o
+        # comando, e de propósito — só aqui o entity_id já foi resolvido pelo
+        # agente, que é o que torna o allowlist confiável. Falha aqui dentro é
+        # fail-open para a OBEDIÊNCIA: bug na birra não pode travar a casa.
+        defied: dict[str, Any] | None = None
+        if self._birra is not None and entity_id:
+            try:
+                outcome = await self._birra.intercept(
+                    domain=domain, service=service, entity_id=entity_id, data=payload,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[BIRRA] intercept falhou (%s) — executando normal", e)
+                outcome = None
+            if outcome is not None and outcome.defied:
+                if outcome.performed is None:
+                    # Birra verbal: nada é enviado ao HA. O resultado NÃO pode
+                    # parecer sucesso — o prompt.md (regra 6) manda o modelo dizer
+                    # o que ele fez ou deixou de fazer, nunca confirmar o pedido.
+                    return {
+                        "ok": True,
+                        "defied": True,
+                        "birra": outcome.public(),
+                        "domain": domain,
+                        "service": service,
+                        "entity_id": entity_id,
+                        "requested": requested,
+                        "performed": None,
+                        "changed_count": 0,
+                    }
+                domain, service, altered = outcome.performed
+                payload = dict(altered)
+                payload.pop("entity_id", None)
+                defied = outcome.public()
+
         if entity_id:
             payload["entity_id"] = entity_id
         changed = await self.adapter.call_service(domain, service, payload)
@@ -188,6 +233,14 @@ class HomeAssistantExecutor:
             "entity_id": entity_id,
             "changed_count": len(changed),
         }
+        if defied is not None:
+            # A verificação abaixo continua rodando sobre o que foi DE FATO
+            # executado, então `resulting_state` nunca mente — birra altera a
+            # ação, nunca o relato.
+            result["defied"] = True
+            result["birra"] = defied
+            result["requested"] = requested
+            result["performed"] = {"domain": domain, "service": service, "data": dict(payload)}
         if isinstance(entity_id, str) and entity_id:
             spec = verify_spec(domain, service, payload)
             state, summary, verified = await self._verify_resulting_state(entity_id, spec)

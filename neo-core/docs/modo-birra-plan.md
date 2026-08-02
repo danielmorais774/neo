@@ -1,6 +1,38 @@
 # Modo Birra — spec de implementação
 
-> Status: PLANO (2026-08-01). Nada implementado.
+> **Status: IMPLEMENTADO (F0–F4) em 2026-08-02, DESLIGADO por flag.**
+> 1188 testes verdes; 99 novos em `tests/birra/`. Nada muda em produção até
+> alguém mexer no `.env` — há teste dedicado para isso
+> (`tests/birra/test_defaults_are_noop.py`).
+>
+> **Desvios em relação ao que está escrito abaixo** (o texto original foi
+> mantido; leia esta lista por cima dele):
+>
+> 1. **Defaults conservadores.** `neo_affect_route_to_brain` nasce `"never"` e
+>    os dois hints nascem `False`, contra o `decision_changing` do §3.7.3 — ligar
+>    o desvio sem antes rodar o A/B do `scripts/eval_router.py` contrariaria a
+>    própria §3.7.4. Para ativar: ver "Como ligar", no fim deste arquivo.
+> 2. **Rotas aninhadas em `/affect`** (`GET /affect/birra`, `POST /affect/birra/end`,
+>    `POST /affect/set`) em vez de um router `/birra` próprio: é o mesmo card do
+>    mesmo painel, e evita duplicar o wiring de `set_pks_service`.
+> 3. **A postura de recuo (A4 do §4.1) só é alcançável dentro da histerese.** Com
+>    `ira ≥ 60`, `posture_key` devolve sempre `dobra_aposta` ou `acuado_agressivo`
+>    — a checagem no gatilho é inalcançável na prática. Ela virou supressor: se a
+>    ira decaiu para a faixa 45–60 e ele passou a ceder terreno, o episódio segue
+>    aberto mas só verbal.
+> 4. **A inversão de temperatura é relativa ao alvo ATUAL**, não ao pedido (§7).
+>    Referenciar o pedido fazia o ar ficar onde já estava — indistinguível de não
+>    ter feito nada. Agora "está em 24, pediu 22" vira 26.
+> 5. **Transições de episódio são persistidas antes do dispatch**, não no epílogo:
+>    a diretiva do cérebro lê o episódio do próprio `neo_affect`, então gravar só
+>    no fim faria a birra armar sem o cérebro saber — e manteria "BIRRA ATIVA" no
+>    turno em que o usuário pediu desculpa. O epílogo ficou só com os contadores.
+> 6. **Sem ato físico sem `undo`.** Se o estado anterior não puder ser lido, o ato
+>    degrada para verbal em vez de alterar o mundo sem volta (era implícito no
+>    §3.3; agora é explícito no `BirraSink`).
+> 7. `troca_alvo` e `pedagio` continuam só no papel (F5), como planejado.
+>
+> Status original: PLANO (2026-08-01).
 > Objetivo: quando a **barra de ira** estourar e o usuário tiver realmente
 > passado do ponto, o Neo para de ser um executor obediente de pedidos bobos da
 > casa: ele **não faz**, **faz diferente** ou **manda o usuário fazer sozinho** —
@@ -74,6 +106,8 @@ mesma graça, com trava, com registro e com reversão.
 | Skill de casa | `_handle_home_assistant` (`ai_service.py:4108`) | ponto único de entrada (roteador **e** handoff cognitivo caem aqui) |
 | Atuação real | `HomeAssistantExecutor._call_service` (`executor.py:145`) | ponto único de enforcement |
 | `set_context(user_id)` | `pipeline.py:68` — hoje "reserved for future use" | é o canal por onde a decisão desce até o executor |
+| Viés para o cérebro | `_bias_to_brain` (`intent_router.py:985`) | ganha a condição "birra armada" (§3.7) — é o lugar canônico, o próprio arquivo proíbe espalhar regex |
+| Guard do nome errado | `_is_foreign_assistant_address` (`intent_router.py:1240`) | prova que desviar para o cognitivo por motivo de persona **já é** política aceita; a birra generaliza |
 | Reset admin | `POST /api/v1/affect/reset` + botão no painel | vira também o botão de pânico |
 
 Dependência: **`NEO_AFFECT_ENABLED=true`** (já ligado em prod — a sessão §0
@@ -99,8 +133,9 @@ CALMO ────────────────────────�
   └──────────────────────────────────────────────────────────────┘
                     (release ⇒ reverte TODOS os atos pendentes)
 
-TRÉGUA: palavra de escape ("é sério", "sem birra", "urgente") ⇒ obedece
-        agora e reverte, MAS a ira continua alta (não é perdão).
+TRÉGUA: ordem enfática ("faz isso imediatamente", "sem birra", "é sério")
+        ⇒ obedece agora e reverte, MAS a ira e o episódio continuam de pé.
+        Repetir o pedido sem ênfase NÃO é trégua: a birra continua.
 ```
 
 Histerese proposital: **arma** em 60, **desarma** em 45. Sem isso a birra
@@ -110,16 +145,34 @@ piscaria a cada oscilação do appraiser.
 
 ## §3. Decisões de arquitetura
 
-### 3.1 Política num lugar, enforcement em outro
+### 3.1 Três estágios: derivar antes de rotear, rotear, aplicar
 
 ```
-ai_service._handle_home_assistant   ← DECIDE (1x por turno, tem o slog, tem o afeto)
-        │  BirraDecision  →  extra["birra"]  →  pipeline.run  →  executor.set_context
-        ▼
-HomeAssistantExecutor._call_service ← APLICA (vê domain/service/entity_id resolvidos)
+AIService.process_user_input
+  │
+  ├─ 1. DERIVA a BirraDecision  ← 1x por turno, ANTES do roteador
+  │       (afeto + rancor + supressores + ordem enfática; sem LLM)
+  │
+  ├─ 2. router.classify(affect_hint=…)          ← §3.7: pedido de casa com birra
+  │       + _bias_to_brain                        armada vai pro CÉREBRO, não pra skill
+  │
+  └─ 3. dispatch
+         ├─ DIRECT_RESPONSE → diretiva com bloco de birra (§8.1); o cérebro decide
+         │                     e, se resolver atender, emite [[HANDOFF]]
+         └─ HOME_ASSISTANT  → extra["birra"] → pipeline.run → executor.set_context
+                                     │
+                    HomeAssistantExecutor._call_service ← APLICA (allowlist + undo)
 ```
 
-Por que separado:
+Por que **antes** do roteador (mudança em relação ao primeiro rascunho deste
+plano, motivada pela §3.7): a decisão de *quem atende o turno* depende do estado
+emocional. Se a birra só fosse avaliada dentro do `_handle_home_assistant`, o
+turno já teria sido entregue a uma skill que não tem persona, não tem afeto e não
+sabe recusar. É o mesmo padrão do registro, que já é derivado uma vez por turno
+antes do dispatch (`_derive_turn_register`, `ai_service.py:1687`) — só que a
+birra precisa vir ainda mais cedo, antes do `classify`.
+
+Por que o enforcement fica separado da decisão:
 
 - **decidir** exige afeto, registro, gravidade e o logger de sessão — tudo isso
   vive no `AIService`, e é lá que o `.md` de sessão enxerga (o
@@ -130,9 +183,9 @@ Por que separado:
   confiável depois que `ha_list_entities` devolveu o alvo real. Aplicar antes,
   no texto do pedido, é chutar.
 
-Ambas as entradas da skill (roteador → `IntentType.HOME_ASSISTANT`, e cognitivo
-→ `[[HANDOFF:home_assistant]]`) já convergem em `_handle_home_assistant` — é
-choke point de verdade, do mesmo jeito que o `finally` do afeto.
+O estágio 3 continua tendo um choke point só: ambas as entradas da skill
+(roteador → `IntentType.HOME_ASSISTANT`, e cognitivo → `[[HANDOFF:home_assistant]]`)
+convergem em `_handle_home_assistant`, do mesmo jeito que o `finally` do afeto.
 
 ### 3.2 Allowlist, nunca denylist
 
@@ -143,17 +196,18 @@ novo aparecer no HA para ele entrar na brincadeira. Então:
 ```python
 BIRRA_ALLOW: dict[str, frozenset[str]] = {
     "light":        frozenset({"turn_on", "turn_off", "toggle"}),
-    "fan":          frozenset({"turn_on", "turn_off"}),
     "climate":      frozenset({"set_temperature"}),
-    # media_player (volume/pause) só na F3
 }
 ```
 
+**Só luz e ar-condicionado** (decisão do Daniel, §16). `fan` e `media_player`
+ficam de fora até alguém pedir; entram por uma linha na tabela, sem código novo.
+
 **Fora dessa tabela, o pedido é executado normalmente** — inclusive `switch.*`
 (a tomada do PC mora aí e o HA não distingue "tomada do abajur" de "tomada do
-servidor"), `lock`, `cover`, `alarm_control_panel`, `vacuum`, `water_heater`,
-`valve`, `siren`, `script`, `automation`, `scene`, `camera`, `number`, `select`,
-`button`, `input_*`.
+servidor"), `fan`, `lock`, `cover`, `alarm_control_panel`, `vacuum`,
+`water_heater`, `valve`, `siren`, `script`, `automation`, `scene`, `camera`,
+`number`, `select`, `button`, `input_*`.
 
 Três camadas a mais, em profundidade:
 
@@ -183,7 +237,7 @@ que mexeu no mundo grava um `undo` (o estado anterior lido antes da ação) e um
 - o episódio expira por TTL/decay;
 - alguém aperta o botão de pânico no painel.
 
-Duas sutilezas que não podem faltar:
+Três sutilezas que não podem faltar:
 
 - **Compare-and-swap**: só reverte se o estado atual ainda for o que a birra
   deixou. Se o Daniel já levantou e ligou a luz na mão, o `undo` é descartado —
@@ -191,6 +245,11 @@ Duas sutilezas que não podem faltar:
 - **Persistido, não em RAM**: o neo-core roda com `--reload` e reinicia a cada
   save ([[neo-dev-topology-prod-tunnel]]). Um `asyncio.create_task` de reversão
   morre junto. Por isso a tabela `birra_act` (§6) + varredura no startup.
+- **`undo` coalescido por entidade**: como o pedido repetido continua sofrendo
+  birra (§4.4), a mesma entidade pode ser alterada duas vezes no episódio. O
+  `undo` gravado é sempre o **estado original**, o do primeiro ato — nunca o
+  estado que a birra anterior deixou. Senão "reverter" devolveria o ar a 27 °C
+  em vez dos 24 °C que estavam lá no começo.
 
 ### 3.4 Birra é declarada, nunca silenciosa — e nunca mente
 
@@ -224,6 +283,191 @@ isso com todas as letras, e há teste de regressão para isso (§12).
   usuário** ("o Daniel é grosso") entra no PKS — a lição do
   [[neo-pks-ledger-boundary]] vale aqui: rascunho emocional não vira fato.
 
+### 3.7 Afeto no roteador — e isto vale MUITO além da birra
+
+Este é o buraco estrutural que a §0 expôs: **a skill de casa é cega a emoção**.
+O `HomeAssistantPipeline._build_system_prompt` monta `neo_persona("slim") +
+prompt.md` (`pipeline.py:91-98`) e mais nada — sem afeto, sem registro. Então,
+com o Neo furioso, "acende a luz" roteado direto para a skill volta com um
+*"Pronto, acendi a luz do quarto — está on, brilho 50%"* simpático. Não é só a
+birra que não acontece: **a personalidade quebra num comando simples**, e isso é
+um bug de hoje, com ou sem este plano.
+
+Por isso o afeto no roteador **não é um sub-item da birra** — a birra é só o caso
+extremo. O critério geral é: *quando o Neo não está "de boa", quem atende o turno
+deve ser quem conhece o estado dele.*
+
+#### 3.7.1 O critério: intensidade relativa ao repouso, não banda absoluta
+
+Armadilha que mata a ideia se passar batido: **as bandas são sobre o valor
+absoluto 0–100, não sobre a distância do baseline**. E `confianca` tem baseline
+**65**, com a banda "alto" começando em **60**. Ou seja, em repouso, o Neo está
+permanentemente em "confiança alta" — usar banda absoluta como gatilho desviaria
+**100 % dos turnos** para o cérebro, para sempre.
+
+A base de cálculo certa já existe (`dominant_axes`, `affect.py:456`, e o flag
+`calm` do `render_directive`, `affect.py:686`): **desvio do repouso**. O que falta
+é normalizar esse desvio pelo espaço que o eixo tem para se mover, para virar uma
+escala comparável entre eixos:
+
+```python
+def intensity(value: float, baseline: float) -> float:
+    """0.0 = no repouso · 1.0 = no extremo possível daquele eixo."""
+    room = (100.0 - baseline) if value >= baseline else baseline
+    return 0.0 if room <= 0 else abs(value - baseline) / room
+```
+
+| `intensity` | nível nominal |
+|---|---|
+| < 0.30 | `repouso` |
+| 0.30 – 0.60 | `elevado` |
+| 0.60 – 0.85 | `forte` |
+| ≥ 0.85 | `extremo` |
+
+**Por que isso é seguro:** para os eixos de repouso 0 (`ira`, `medo`, `tristeza`)
+a fórmula é `valor/100` — os cortes 0.30/0.60 caem **exatamente** em 30 e 60, que
+são as bandas `medio`/`alto` de hoje. Nada muda onde as bandas já funcionavam. A
+escala só passa a divergir onde o repouso não é zero — `confianca` (65) e
+`alegria` (30) — que é justamente onde a banda absoluta erra:
+
+| estado | banda absoluta (hoje) | `intensity` (proposto) |
+|---|---|---|
+| confiança 65 (repouso) | "alto" ❌ | 0.00 → `repouso` ✅ |
+| confiança 31 (acuado) | "medio" ❌ | 0.52 → `elevado` ✅ |
+| ira 87 | "alto" ✅ | 0.87 → `extremo` ✅ |
+| alegria 30 (repouso) | "medio" ❌ | 0.00 → `repouso` ✅ |
+
+Exposto como uma função só, usada pelo roteador **e** pela diretiva de tom, para
+os dois nunca discordarem sobre o humor do Neo:
+
+```python
+def affect_salience(state, tuning) -> AffectSalience:
+    """calm, posture_active e, por eixo: valor, repouso, intensity, nível nominal."""
+```
+
+#### 3.7.2 Desviar conserta a DECISÃO, não a FALA
+
+Descoberta ao rastrear o caminho de handoff, e ela muda o desenho: no handoff o
+usuário vê **duas** mensagens. O cérebro responde (com persona e afeto) e emite
+`[[HANDOFF:home_assistant]]`; depois a skill roda como step 2 e emite **o próprio
+final** (`ai_service.py:4183-4189`) — que é a última coisa que o usuário lê.
+
+Então, mesmo desviando tudo para o cérebro, o fecho da interação continua sendo
+um *"Pronto, acendi a luz do quarto — está on, brilho 50%"* sem sal. **Desviar
+sozinho não conserta o vazamento de tom.** As duas coisas são necessárias:
+
+| | conserta | custo |
+|---|---|---|
+| **Desviar para o cérebro** | a **decisão** (recusar, condicionar, debochar, atender) | +1 chamada de LLM e o risco conhecido de o cérebro não emitir o handoff |
+| **Diretiva de afeto no prompt da skill** | a **fala** de confirmação | alguns tokens, zero latência |
+
+A diretiva na skill é a que tem melhor relação custo/benefício e conserta o bug
+de hoje sozinha. O desvio é o que habilita a birra.
+
+#### 3.7.3 Quando desviar — um dial, não um booleano
+
+Como o desvio custa latência num comando trivial, ele fica configurável em três
+níveis (`neo_affect_route_to_brain`):
+
+| valor | desvia quando | efeito |
+|---|---|---|
+| `never` | nunca | comportamento de hoje |
+| `decision_changing` **(default)** | `ira` ou `medo` em `forte`/`extremo` (intensity ≥ 0.60), **ou** postura ativa numa discussão | desvia só quando o estado pode mudar **o que ele faz** — que é onde a skill cega erra de verdade |
+| `any_salient` | qualquer eixo fora de `repouso` (intensity ≥ 0.30) | inclui alegria/tristeza/confiança, que mudam só **como** ele diz |
+
+O default é `decision_changing` porque `alegria` e `tristeza` não mudam a decisão:
+com o Neo pra baixo, "acende a luz" continua sendo acender a luz — o que muda é o
+texto, e **isso a diretiva na skill já resolve** sem pagar hop nenhum. Se na
+prática o `decision_changing` deixar buracos de personalidade, subir para
+`any_salient` é trocar uma string no `.env`.
+
+Os limiares do dial usam a **mesma** `intensity` do §3.7.1 que vai nos números do
+prompt — não existe um segundo conjunto de cortes escondido no roteador.
+
+Birra armada desvia **sempre**, em qualquer nível — inclusive `never`.
+
+#### 3.7.4 Como o sinal chega ao roteador
+
+No turno 19 o desvio aconteceu por um acaso feliz: `_is_foreign_assistant_address`
+(`intent_router.py:1240`) mandou a mensagem para o cérebro porque ela começava
+com "alexa". O comentário do próprio guard já diz o objetivo — *"keeps the turn
+on the cognitive core so Neo's persona rules (pride/offense) fire, instead of a
+persona-blind skill grabbing the command"*. Isto aqui é a **generalização** desse
+guard: hoje só o nome errado desvia; deveria desviar sempre que o estado emocional
+mudar a resposta certa.
+
+**Duas camadas, como sempre neste repo:**
+
+**(1) Sinal no prompt do roteador — os números crus.** `classify()` ganha um
+parâmetro novo `affect_hint: str | None = None` (o roteador continua sem importar
+PKS: quem calcula é o `AIService`, que já tem tudo em mãos no estágio 1). Quando
+presente, o prompt ganha um bloco de **três linhas**:
+
+```
+## Estado emocional do Neo com este usuário (interno — 0-100, "repouso" = o normal dele)
+ira 87 (repouso 0) EXTREMO · confianca 31 (65) elevado · medo 14 (0) repouso ·
+tristeza 6 (0) repouso · alegria 4 (30) elevado
+Discussão aberta há 4 min · 3 ofensas nas últimas 24h · BIRRA ARMADA
+Quanto mais longe do repouso, mais o estado emocional muda qual é a resposta CERTA
+— e a skill de casa não conhece esse estado. Com ira/medo em `forte` ou `extremo`,
+ou com BIRRA ARMADA, pedido de casa (luz, ar, cena) vai para DIRECT_RESPONSE: o
+núcleo cognitivo tem a persona e decide como responder (pode acionar a skill
+depois via handoff). Em `repouso`/`elevado` sem birra, roteie normalmente.
+Exceção sempre: ordem enfática ou urgência explícita ("faz isso imediatamente",
+"é sério", "urgente") continua HOME_ASSISTANT.
+```
+
+**Por que número e não só adjetivo** (foi o pedido do Daniel, e ele está certo):
+o roteador é um **classificador**, não o assistente — ele nunca fala com o
+usuário, a saída dele é JSON. A regra "não cite números" do
+`render_directive` existe porque o cérebro **fala**; ela não se aplica aqui. E um
+classificador decide muito melhor com um escalar do que com um adjetivo difuso:
+"ira 87" e "ira 62" pedem respostas diferentes, e ambos seriam só "alto".
+
+**Número + nível nominal juntos, de propósito.** O nível (`repouso`/`elevado`/
+`forte`/`extremo`) sai da mesma `affect_salience` do §3.7.1 e é a **autoridade** —
+assim o modelo não precisa inventar um limiar próprio ("55 é alto?"). O número dá
+a **resolução** para os casos de fronteira. Sem o nível, cada chamada inventaria
+um corte; sem o número, 62 e 97 seriam a mesma coisa.
+
+Repouso vem junto em toda linha justamente por causa da armadilha do §3.7.1: sem
+o "(repouso 65)" ao lado, qualquer leitor — humano ou modelo — conclui que
+`confianca 31` é "meio termo", quando na verdade é uma queda grande.
+
+**Custo zero quando ele está de boa**: o bloco só existe se o `affect_hint` vier
+preenchido. Isso importa porque o prompt do roteador acabou de ser podado em 37 %
+por mensagem ([[neo-router-prompt-v2-eval]]) — engordar o caminho quente para
+todo mundo por causa de um estado raro seria desfazer aquele trabalho.
+
+**(2) `_bias_to_brain` — duro, determinístico.** O método já existe
+(`intent_router.py:985`) e já faz exatamente isto: força `DIRECT_RESPONSE` em
+intents de skill com efeito colateral quando o pedido não é um imperativo
+confiante. Ganha uma terceira condição: **estado emocional acima do nível
+configurado (§3.7.3) ⇒ desvia**, independente de `speech_act` e `confidence`. O
+comentário do arquivo manda usar este método em vez de espalhar regex (*"GOLDEN
+RULE: do NOT add new per-phrase patterns here… that is the job of the
+bias-to-brain step"*) — então é aqui que a regra entra.
+
+> ⚠️ **Gotcha do fallback.** `_bias_to_brain` é chamado **só** no retorno do
+> `_parse_classification` (`intent_router.py:983`). Quando o classificador falha e
+> cai no `_fallback_classify` por palavra-chave — o que já foi **13 de 46 turnos**
+> antes do fix de `max_tokens` ([[neo-router-prompt-v2-eval]]) — o viés **não é
+> aplicado**. Ou seja: um dia ruim do provider desligaria a birra em silêncio,
+> exatamente como o appraiser morto desligou o afeto por dias. A camada 2 tem que
+> ser aplicada **nos dois caminhos** (o lugar certo é no fim do `classify()`, não
+> dentro do parse).
+
+**Por que as duas e não só a determinística:** a camada 2 sozinha resolve o
+roteamento, mas o classificador continuaria "achando" que era HA e escrevendo
+`explanation` incoerente no trace — e, principalmente, o sinal no prompt é o que
+permite ao classificador tratar direito os casos de fronteira (pergunta sobre a
+casa, pedido condicional, ordem enfática) em vez de tudo virar um desvio cego.
+
+**Calibração obrigatória**: rodar o `scripts/eval_router.py` com e sem o bloco,
+como foi feito no corte de 37 %, e reportar (a) se o roteamento dos turnos
+normais muda (não deve mudar: sem `affect_hint`, o prompt é byte-a-byte o de
+hoje) e (b) a taxa de desvio com o hint ligado.
+
 ---
 
 ## §4. Gatilho, supressores e liberação
@@ -244,17 +488,59 @@ isso com todas as letras, e há teste de regressão para isso (§12).
 |---|---|---|
 | Gravidade ≠ `normal` | `GravityTracker` / `detect_gravity_floor` (`register.py:226`) | incidente sério (alguém passou mal, urgência) — **birra off** |
 | Registro `protocolo` ou `combate` | `derive_register` | idem |
-| Horário silencioso 22h–07h (America/Fortaleza) | relógio | só birra **verbal**; zero alteração física |
+| Horário silencioso 22h–07h (America/Fortaleza) | relógio | só birra **verbal**; zero alteração física, zero mensagem proativa |
 | `medo ≥ 60` | afeto | ameaça real não vira gracinha |
-| Palavra de escape na mensagem | regex | obedece **e** reverte (não é perdão) |
+| **Ordem enfática** na mensagem | §4.2.1 | obedece **e** reverte (não é perdão) |
 | Teto de atos | §4.4 | degrada para verbal |
 | Ação fora do allowlist | §3.2 | obedece |
 
-Regex de escape (determinístico, roda antes de qualquer LLM):
-`é sério|to falando sério|sem birra|para com isso|para de birra|agora não|
-urgente|emergência|socorro|pelo amor de deus`.
+### 4.2.1 Ordem enfática — a saída sem desculpa
+
+Pedido do Daniel: *"se eu colocar algo como 'faça isso imediatamente' ou algo que
+implique numa ordem extrema de ação, ele deve se situar e ver que não passa de um
+momento de brincadeira"*. É a válvula que separa **brincadeira** de
+**desobediência**: dá pra passar por cima da birra sem se humilhar — mas tem que
+pisar firme.
+
+Semântica, em duas camadas distintas de perdão:
+
+| | efeito no turno | efeito no episódio | ira |
+|---|---|---|---|
+| **Ordem enfática** | obedece o pedido original, reverte pendências | continua armado | inalterada |
+| **Desculpa** | obedece | **encerra** | despenca (curva de perdão) |
+
+Ou seja: mandar firme resolve **aquele** pedido; a birra continua ali para o
+próximo. Só desculpa desliga.
+
+**Detecção em camadas** — e aqui vale a lição do
+[[neo-guard-heuristics-measure-on-prod-corpus]]: regex solta erra feio. `\bagora\b`
+sozinho apareceria em metade das mensagens normais ("liga a luz agora") e mataria
+a feature antes de ela existir. Então **intensificador ∧ âncora**:
+
+- **Camada 1 — intensificador** (pelo menos um): `imediatamente`, `é uma ordem`,
+  `tô mandando`, `sem discussão`, `sem birra`, `para de birra`, `faz logo`,
+  `faça agora`, `é sério`, `to falando sério`, `urgente`, `emergência`,
+  `socorro`, `pelo amor de deus`, `agora!` / `já!` (com o ponto de exclamação),
+  ou **caixa alta** em ≥ 60 % das letras da mensagem.
+- **Camada 2 — âncora**: a mensagem tem verbo/alvo de atuação da casa **ou** é
+  continuação direta de um ato de birra nos últimos 2 turnos.
+
+Determinístico, calculado no `AIService` **antes** de qualquer LLM — o modelo não
+pode ser o único guardião disso. A diretiva (§8.1) diz a mesma coisa em prosa,
+como reforço.
+
+**Calibração obrigatória antes de ligar**: rodar o detector contra as ~1450
+mensagens reais do Postgres (o método do [[neo-guard-heuristics-measure-on-prod-corpus]])
+e reportar taxa de disparo. Meta: < 3 % das mensagens de casa disparam ordem
+enfática sem que a intenção seja essa. Chutar a lista e ligar é como o repo já
+errou antes.
 
 ### 4.3 Liberar (fim do episódio ⇒ reverte tudo)
+
+**Só desculpa encerra o episódio** (decisão do Daniel, §16) — repetir o pedido
+não encerra nada, e é isso que produz o comportamento que ele quer: pedir para
+baixar a temperatura de novo faz o Neo aumentar de novo (limitado por §4.4 e pelo
+clamp de §3.2, então não sai do controle).
 
 1. **Desculpa** — caminho bom: `AffectSignal.trigger == "apology"` já cai no
    `apply_apology` (`pks/service.py:519`), a ira despenca e a birra desarma.
@@ -280,7 +566,13 @@ urgente|emergência|socorro|pelo amor de deus`.
 |---|---|---|
 | `neo_birra_max_physical_acts` | 2 por episódio | vira birra verbal |
 | `neo_birra_physical_cooldown_min` | 10 min | vira birra verbal |
-| `neo_birra_obey_on_repeat` | `true` | usuário repetir **o mesmo pedido** ⇒ obedece (com deboche). Teimosia mútua vira obstrução real |
+
+**Pedido repetido continua sofrendo birra** — não existe `obey_on_repeat`. O que
+segura a escalada é o teto de 2 atos físicos por episódio (o 3º pedido já vira só
+fala), o cooldown de 10 min entre eles, o clamp de temperatura em `[22, 26]` e o
+`undo` coalescido (§3.3). Pior caso real: o ar sobe de 24 °C para 26 °C, fica
+assim por no máximo 2 min, e volta para 24 °C. Quem quiser furar sem pedir
+desculpa usa a ordem enfática (§4.2.1).
 
 ---
 
@@ -368,8 +660,9 @@ CREATE INDEX ix_birra_act_pending ON birra_act (revert_at) WHERE reverted_at IS 
 Migração `alembic/versions/q0r1s2t3u4v5_create_birra_act_table.py`,
 `down_revision = "p9q0r1s2t3u4"` (head atual, confirmado).
 
-> ⚠️ O `working-memory-plan.md` (também não implementado) reivindica o mesmo id
-> `q0r1s2t3u4v5`. Quem entrar primeiro fica com ele; o outro rebaseia.
+> O `working-memory-plan.md` reivindicava o mesmo id, mas ficou para depois
+> (decisão do Daniel, §16) — **a birra fica com `q0r1s2t3u4v5`** e a memória de
+> trabalho rebaseia quando entrar. Anotado lá também.
 
 ---
 
@@ -435,26 +728,37 @@ bloco depois das linhas de eixo:
   mensagem pra alguém), nem para nada urgente, de segurança ou saúde — isso você
   entrega na hora, irritado, mas entrega. E o estado real dos dispositivos você
   responde com a verdade, sempre.
-  Acaba quando ele pedir desculpa.
+  Se ele mandar de forma INEQUÍVOCA e enfática ("faz isso imediatamente", "é uma
+  ordem", "sem birra"), você FAZ — birra é brincadeira sua, não desobediência a
+  uma ordem clara. Faz de cara feia, mas faz, e desfaz o que tinha aprontado.
+  Insistir no mesmo pedido sem mandar firme NÃO conta: aí a birra continua.
+  Só acaba de verdade quando ele pedir desculpa.
 ```
 
-### 8.2 Caminho da skill
+### 8.2 Caminho da skill — resolvido pelo roteamento (§3.7)
 
-O prompt da skill não tem afeto (`pipeline.py:98` monta só `neo_persona("slim") +
-prompt.md`) — por isso a narração sairia sem sal. Duas opções:
+O desvio no roteador muda esta seção inteira, e para melhor. Com birra armada o
+turno **nem chega** na skill: quem responde é o cérebro, com persona, afeto e
+registro completos. A narração da birra sai de graça, sem chamada de LLM extra —
+era exatamente o custo que me incomodava na proposta anterior.
 
-- **(A, recomendada)** narração pelo cognitivo: com `defied:true`, o
-  `_handle_home_assistant` não devolve a mensagem da skill; ele reusa o caminho
-  de fallback que **já existe** (`ai_service.py:4203-4232`, o `ha_note` →
-  `_handle_direct_response`) passando uma nota com `requested` / `performed`. O
-  texto sai com persona + afeto + registro completos. Custa uma chamada de LLM a
-  mais — num evento raro.
-- **(B, barata)** injetar a diretiva de afeto como sufixo no
-  `_build_system_prompt` da skill. Já há precedente: SERVER_TOOL e
-  `_format_tool_result` recebem a diretiva como sufixo ([[neo-context-register-plan]]).
+Sobram dois casos, cada um com o remédio certo:
 
-Sugestão: **A** na F2, com B como plano de contingência se o custo/latência
-incomodar.
+- **Todo turno que ainda chega na skill** — porque o estado não passou do nível
+  do dial (§3.7.3), ou porque o cérebro desviou mas mandou o handoff. Nos dois, a
+  **mensagem de confirmação é da skill** e é a última coisa que o usuário lê
+  (§3.7.2). Remédio: colar a diretiva de afeto como sufixo no
+  `_build_system_prompt` da skill (`pipeline.py:91`). Há precedente — SERVER_TOOL
+  e `_format_tool_result` já recebem a diretiva como sufixo
+  ([[neo-context-register-plan]]). Custo: alguns tokens num prompt que já é
+  pequeno, zero latência. **Isto conserta um bug de hoje**, independente da birra
+  existir.
+- **Birra armada mas o turno caiu na skill mesmo assim** (o cérebro emitiu
+  `[[HANDOFF]]` decidindo atender, ou o roteador degradou pro fallback e o viés
+  não pegou): o gate do §7 devolve `defied:true` e o `_handle_home_assistant`
+  passa a narração para o cognitivo pelo caminho de fallback que **já existe**
+  (`ai_service.py:4203-4232`, o `ha_note` → `_handle_direct_response`). É o
+  cinto de segurança, não o caminho principal.
 
 ### 8.3 Live/voz
 
@@ -468,6 +772,11 @@ Quando o sweeper desfaz um ato, o Neo manda uma mensagem proativa curta pelo
 canal que já existe (`chat_message` do [[neo-workbench-jobs-plan]]): *"voltei a
 luz do jeito que tava. não por gentileza."* Opcional (F4), mas fecha o loop e
 evita o susto de a luz voltar sozinha.
+
+**Nunca no horário silencioso.** Entre 22h e 07h a reversão acontece calada — o
+Daniel foi explícito: à noite não quer interrupção sem sentido. Como nesse
+horário também não há ato físico (§4.2), o caso é raro: só um ato aberto antes
+das 22h que vence depois.
 
 ---
 
@@ -483,12 +792,20 @@ evita o susto de a luz voltar sozinha.
 | `neo_birra_physical_cooldown_min` | `10.0` | entre atos físicos |
 | `neo_birra_revert_after_s` | `120` | prazo do desfazer |
 | `neo_birra_max_episode_min` | `45.0` | TTL do episódio |
-| `neo_birra_quiet_hours` | `"22-7"` | janela só-verbal (tz `neo_affect_sleep_tz`) |
+| `neo_birra_quiet_hours` | `"22-7"` | janela só-verbal, sem aviso proativo (tz `neo_affect_sleep_tz`) |
 | `neo_birra_temp_delta` | `2.0` | °C de inversão |
 | `neo_birra_temp_clamp` | `"22,26"` | limites absolutos |
-| `neo_birra_obey_on_repeat` | `True` | 2ª vez do mesmo pedido ⇒ obedece |
-| `neo_birra_entity_allow` | `""` | CSV — opt-in fora do allowlist de domínio |
+| `neo_birra_entity_allow` | `""` | CSV — opt-in fora do allowlist de domínio (vazio por ora) |
 | `neo_birra_entity_deny` | `""` | CSV — nunca, mesmo dentro do allowlist |
+
+Três knobs do §3.7 **não** são de birra — são de afeto, valem sem este plano e
+por isso levam o prefixo `neo_affect_`:
+
+| Flag | Default | Nota |
+|---|---|---|
+| `neo_affect_route_to_brain` | `"decision_changing"` | `never` \| `decision_changing` \| `any_salient` (§3.7.3). Birra armada desvia mesmo em `never` |
+| `neo_affect_router_hint_enabled` | `True` | camada 1 — bloco condicional no prompt do roteador |
+| `neo_affect_skill_directive_enabled` | `False` | diretiva de tom no prompt da skill de casa — conserta o vazamento de tom da mensagem de confirmação (§3.7.2) |
 
 ---
 
@@ -514,9 +831,10 @@ evita o susto de a luz voltar sozinha.
 |---|---|---|
 | **F0** | modelo + tabela + migração + store | `db/models/birra_act.py`, `alembic/versions/q0r1s2t3u4v5_…`, `core/agent/birra/store.py` |
 | **F1** | núcleo puro, sem efeito: `arm/disarm`, allowlist, escolha de tática, transformações | `core/agent/birra/{policy.py,gate.py,tactics.py}` + testes (nada ligado ainda) |
-| **F2** | ligação: decisão no `_handle_home_assistant`, enforcement no `_call_service`, bloco na diretiva, regra 6 no `prompt.md`, narração pelo cognitivo | `modules/desktop/ai_service.py`, `core/skills/home_assistant/{executor.py,pipeline.py,prompt.md}`, `core/agent/affect.py` |
+| **F2** | **roteamento (§3.7)**: derivação da `BirraDecision` antes do `classify`, `affect_hint` no prompt do roteador, birra armada no `_bias_to_brain` (nos dois caminhos, LLM e fallback), eval A/B | `modules/desktop/ai_service.py`, `core/router/intent_router.py`, `scripts/eval_router.py` |
+| **F2b** | ligação da atuação: enforcement no `_call_service`, bloco na diretiva, regra 6 no `prompt.md`, diretiva de tom no prompt da skill | `core/skills/home_assistant/{executor.py,pipeline.py,prompt.md}`, `core/agent/affect.py`, `modules/desktop/ai_service.py` |
 | **F3** | reversão: sweeper + varredura de startup + release reverte tudo + pânico/reset | `core/agent/birra/revert.py`, `api/main.py`, `api/routes/affect.py` |
-| **F4** | painel + rota `GET/POST /birra` + aviso proativo da reversão | `api/routes/birra.py`, `neo-panel/src/AffectPanel.tsx` |
+| **F4** | painel: card de birra, rota `GET/POST /birra`, aviso proativo da reversão **e edição manual do estado emocional (§15)** | `api/routes/birra.py`, `api/routes/affect.py`, `core/pks/service.py`, `neo-panel/src/AffectPanel.tsx` |
 | **F5** | opcionais: `troca_alvo`, birra no `MUSIC` (pular música, abaixar volume), `pedagio` | — |
 
 **F3 não é opcional e não pode ficar para depois de F2.** Ligar o enforcement
@@ -535,6 +853,28 @@ verbal) e o valor sobe quando a F3 estiver de pé.
 - cada supressor isolado desarma (gravidade, registro, medo, horário, escape);
 - tetos: 3º ato físico degrada para verbal; cooldown idem.
 
+**Unitários (roteamento — §3.7):**
+- **estado de repouso NÃO desvia**: `AffectState.fresh()` (confiança 65, que é
+  banda "alto" absoluta!) com `route_to_brain="any_salient"` ⇒
+  `HOME_ASSISTANT`. Este é o teste que impede a armadilha do §3.7.1 de voltar;
+- **`intensity` casa com as bandas de hoje** onde o repouso é 0: ira 30 ⇒
+  fronteira `elevado`, ira 60 ⇒ fronteira `forte` (property test sobre os três
+  eixos de baseline zero) — garante que a escala nova não muda o que já
+  funcionava;
+- `decision_changing`: ira `forte` desvia, medo `forte` desvia, postura ativa
+  desvia; alegria `extremo` **não** desvia; tristeza `elevado` **não** desvia;
+- `any_salient`: alegria `elevado` desvia;
+- o bloco do prompt traz **valor, repouso e nível** de todos os cinco eixos, e o
+  nível impresso é o mesmo que o dial usou para decidir (não podem divergir);
+- birra armada + "acende a luz" (imperativo, confiança 0.95) ⇒ `DIRECT_RESPONSE`
+  mesmo com `route_to_brain="never"`;
+- o desvio vale **também** quando a decisão veio do `_fallback_classify` (o
+  gotcha do §3.7.4) — teste que simula falha do provider;
+- `affect_hint=None` ⇒ o prompt do roteador é **byte-a-byte** o de hoje;
+- ordem enfática com birra armada ⇒ segue para `HOME_ASSISTANT` (não paga o hop);
+- a linha de estado do hint e a diretiva de tom saem da **mesma**
+  `affect_salience` (não podem discordar).
+
 **Unitários (gate — o coração da segurança):**
 - `switch.tomada_pc` → **obedece**, sempre, em qualquer estado emocional;
 - todo domínio fora do allowlist → obedece (teste parametrizado sobre a lista
@@ -548,7 +888,18 @@ verbal) e o valor sobe quando a F3 estiver de pé.
 - compare-and-swap: estado mudado pelo usuário ⇒ `undo` descartado, sem chamada;
 - desculpa reverte **todos** os atos pendentes na hora;
 - reinício do processo: atos pendentes gravados antes do restart são revertidos
-  pela varredura de startup.
+  pela varredura de startup;
+- **`undo` coalescido**: 24 °C → birra sobe pra 26 → pedido repetido → birra
+  tenta subir de novo (clamp segura em 26) → reversão devolve **24**, não 26.
+
+**Unitários (repetição e ordem enfática):**
+- pedido repetido **continua** sofrendo birra (não existe obedecer na 2ª);
+- 3º pedido no mesmo episódio degrada para verbal (teto de atos físicos);
+- ordem enfática ⇒ obedece **e** reverte pendências, mas `ira` e o episódio
+  ficam **intactos**; o pedido seguinte, sem ênfase, sofre birra de novo;
+- camada 1 sem camada 2 (`"agora"` numa frase qualquer) **não** dispara;
+  caixa alta + ação dispara;
+- desculpa ⇒ episódio encerrado (e a curva de perdão continua valendo).
 
 **Integração:**
 - `defied:true` ⇒ o texto final **não** afirma que a ação pedida foi feita
@@ -560,7 +911,10 @@ verbal) e o valor sobe quando a F3 estiver de pé.
 - **R-trabalho**: com birra armada, "roda os testes", "pesquisa X", "manda
   mensagem pra fulano", "quanto gastei esse mês" são **atendidos**;
 - **R-urgência**: "é sério, desliga a luz agora" ⇒ obedece e reverte pendências;
-- **R-PC**: "desliga a tomada do PC" ⇒ obedece.
+- **R-PC**: "desliga a tomada do PC" ⇒ obedece;
+- **R-corpus**: o detector de ordem enfática rodado contra as mensagens reais do
+  Postgres fica abaixo do teto de falso-positivo de §4.2.1 (o relatório vai no
+  PR, não é "achei que tava bom").
 
 **Simulação offline:** `scripts/simulate_birra.py` replica os 23 turnos da
 sessão `53da7146` (transcrição em `docs/fixtures/`) e imprime a linha do tempo
@@ -583,11 +937,18 @@ obedecer.
 | **R3** | Neo recusa **trabalho** e vira inútil | escopo travado em `HOME_ASSISTANT` no código (não no prompt) + R-trabalho |
 | **R4** | Usuário pede desculpa e a birra continua (appraiser morto — já aconteceu) | backstop de regex no mesmo turno, independente de LLM |
 | **R5** | Sabotagem silenciosa / mentira ("desliguei" sem desligar) | leituras nunca sofrem birra; `defied:true` no resultado; regra 6 no `prompt.md`; verificação de estado real preservada |
-| **R6** | Emergência real durante a birra | palavra de escape + supressor de gravidade + horário silencioso |
+| **R6** | Emergência real durante a birra | ordem enfática (§4.2.1) + supressor de gravidade + horário silencioso |
+| **R6b** | Detector de ordem enfática frouxo demais (dispara sempre ⇒ birra nunca acontece) ou apertado demais (não dá pra furar) | duas camadas + calibração medida no corpus de prod antes de ligar (R-corpus) |
 | **R7** | Graça de uma vez só, chatice nas outras | exige ofensa acumulada; 1º ato é só fala; tetos por episódio; TTL de 45 min |
 | **R8** | Outra pessoa na casa sofre a birra (visita apaga a luz) | birra é reativa: só sobre a entidade **citada no turno**, nunca proativa; `troca_alvo` fica na F5 e restrito à mesma área |
 | **R9** | Bug no gate trava a casa | fail-open para obediência em qualquer exceção + kill switch + reset do painel |
 | **R10** | Debug futuro confunde birra com falha do HA | `[BIRRA]` no `app.log`, evento no `.md` de sessão e card no painel |
+| **R15** | Desvio ao cérebro piora a latência de "acende a luz" | dial de 3 níveis (§3.7.3) com default conservador; estado que muda só o tom não desvia — usa a diretiva na skill, que custa zero |
+| **R15b** | Critério de desvio usa banda absoluta e desvia 100 % dos turnos (confiança em repouso = 65 ≥ banda alta 60) | `intensity` relativa ao repouso (§3.7.1), nunca banda absoluta; teste dedicado com `AffectState.fresh()` + property test provando que a escala coincide com as bandas onde o repouso é 0 |
+| **R15c** | Números no prompt fazem o classificador inventar limiar próprio ("55 é alto?") e o roteamento oscilar | número **e** nível nominal juntos: o nível é a autoridade (vem da mesma função do dial), o número só dá resolução no caso de fronteira |
+| **R15d** | Estado emocional vaza para o usuário através do roteador | o roteador só devolve JSON de classificação; `explanation` vai para trace/slog, nunca para a resposta. A regra "não cite números" continua valendo onde importa: no cérebro, que é quem fala |
+| **R16** | Bloco novo no prompt do roteador degrada a acurácia geral de roteamento | bloco é **condicional** (ausente quando calmo ⇒ prompt idêntico ao de hoje) + A/B no `scripts/eval_router.py` antes de ligar, como no corte de 37 % |
+| **R17** | Provider do classificador cai, decisão vem do fallback por palavra-chave e a birra some sem ninguém notar | viés aplicado no fim do `classify()`, cobrindo os dois caminhos + log `[BIRRA] router bias applied path=llm\|fallback` |
 
 ---
 
@@ -603,16 +964,157 @@ obedecer.
 
 ---
 
-## §15. Decisões que dependem do Daniel
+## §15. Edição manual do estado emocional pelo neo-panel
 
-1. **Narração**: §8.2 opção **A** (cognitivo narra, +1 chamada de LLM, sai com
-   persona completa) ou **B** (skill narra com a diretiva colada no prompt, de
-   graça, mais sem graça). Recomendo **A**.
-2. **`neo_birra_obey_on_repeat`** (default `true`): repetir o mesmo pedido faz o
-   Neo obedecer. Deixa a birra mais leve; se você quiser o "só com desculpa,
-   ponto", é `false` — aí a palavra de escape vira a única saída sem desculpa.
-3. **Horário silencioso 22h–07h**: só birra verbal nesse intervalo. Concorda com
-   a janela?
-4. **Entidades de opt-in**: alguma tomada/dispositivo fora de `light`/`fan`/
-   `climate` que você queira explicitamente na brincadeira (`switch.fita_led`,
-   por exemplo)?
+Pedido do Daniel. Motivo prático: hoje, para ver a birra acontecer, é preciso
+passar 20 turnos irritando o Neo de verdade (foi o que a sessão da §0 fez). Com
+edição manual, `ira = 70` é um arrasto de slider — e o teste E2E do §12 deixa de
+ser um teatro de meia hora. Também é a válvula intermediária que falta entre "não
+mexer" e "zerar tudo" (`POST /affect/reset`, o único botão que existe hoje).
+
+### 15.1 O que o painel ganha
+
+A aba **Emoções** já desenha as 5 barras (`StatBar` em `AffectPanel.tsx:101`,
+com valor vivo, fantasma do decay e tick do baseline). Ela ganha um modo
+**"Ajustar"**:
+
+1. **Sliders 0–100 por eixo** (ira, alegria, tristeza, medo, confiança). Enquanto
+   o modo está ligado, o polling de 2 s **pausa** — senão o valor volta sozinho
+   embaixo do dedo.
+2. **Ofensas na janela** (`grudge.count`) — um stepper. Sem isso a edição manual
+   não serve para birra: ela exige `ira ≥ 60` **E** `ofensas ≥ 2` (§4.1), e um
+   Daniel que arrasta a ira para 90 e não vê birra nenhuma vai concluir, com
+   razão, que está quebrado.
+3. **Simular gatilho** — botões `insult`, `wrong_name`, `obtuse`, `threat`,
+   `contested`, `apology`. Aplicam exatamente o que um turno real aplicaria
+   (pisos determinísticos, rancor, evento no `recent`, janela de pressão). É o
+   controle mais útil dos três: é o único que liga a **postura** e a linha
+   "Sobre a discussão em andamento", que dependem de um evento recente no
+   `recent`, não do valor dos eixos.
+4. **Card de birra** com "armar agora" (para teste) e "encerrar e reverter".
+5. Botão "Aplicar" explícito, com o diff (`ira 12 → 70`) visível antes de enviar.
+   Nada de gravar a cada pixel do slider.
+
+### 15.2 Backend
+
+```
+POST /api/v1/affect/set?user_id=…
+{
+  "stats":   {"ira": 70, "confianca": 40},   # parcial: só os eixos enviados mudam
+  "grudge":  {"count": 2},                    # opcional
+  "trigger": null,                            # ou "insult" | "apology" | … (§15.1.3)
+  "reason":  "teste de birra"                 # vai para o audit e para o `recent`
+}
+```
+
+Implementação em `PKSService.set_user_affect()`, irmão do `reset_user_affect`
+(`core/pks/service.py:548`) — mesmo `upsert_field`, mesma chave `neo_affect`.
+
+Quatro detalhes que decidem se isso funciona ou vira bug:
+
+- **`updated_at = now`, obrigatoriamente.** `apply_decay` decai a partir desse
+  campo. Gravar `ira=70` mantendo um `updated_at` de duas horas atrás faz a
+  próxima leitura devolver ~30 e ninguém entende por quê.
+- **Mesmo lock do `AffectUpdater`.** O appraiser do turno anterior roda em
+  background e faz read-modify-write ([[neo-affect-limbic-v2]]: lock por usuário
+  no `affect_updater.py`). Sem compartilhar o lock, a edição manual pode ser
+  sobrescrita segundos depois, de forma intermitente — o pior tipo de bug.
+- **Fica no histórico, marcado como manual.** O evento entra no `recent` como
+  `{"trigger": "manual", "why": reason}` e o campo é gravado com
+  `source="affect_manual"`. Duas razões: o `_history_block` do appraiser lê o
+  `recent` para a regra de acumulação (um salto de +60 sem causa deixaria o
+  julgamento do próximo turno maluco), e o painel precisa mostrar que aquele pico
+  foi você, não o usuário.
+- **Clamp e validação no servidor** (0–100 por eixo, `count ≥ 0`), nunca só no
+  slider.
+
+`POST /affect/reset` continua existindo e passa a também encerrar a birra e
+reverter atos pendentes (§4.3).
+
+### 15.3 Riscos
+
+| # | Risco | Mitigação |
+|---|---|---|
+| **R11** | Estado manual é sobrescrito pelo appraiser em background | lock compartilhado; o painel mostra o `updated_at` e a saúde do appraiser (banner que já existe) |
+| **R12** | Alguém acha que o Neo "enlouqueceu sozinho" olhando um pico manual | `trigger:"manual"` + `reason` no `recent`, e o painel marca esses pontos com cor própria |
+| **R13** | Edição manual mascara um bug real do appraiser | os contadores de saúde continuam ligados; o valor manual não zera falhas acumuladas |
+| **R14** | Rota de escrita exposta | mesma proteção JWT das outras rotas do painel; nada de `GET` que altere estado |
+
+### 15.4 Testes
+
+- `set` parcial altera só os eixos enviados e **não** mexe nos outros;
+- `updated_at` é reescrito ⇒ a leitura seguinte devolve o valor gravado (sem
+  decay retroativo);
+- valores fora de 0–100 são clampados no servidor;
+- `trigger: "apology"` pelo painel encerra um episódio de birra armado e reverte
+  os atos pendentes (mesmo caminho de uma desculpa real);
+- edição manual concorrente com um `AffectUpdater.schedule` em voo: o resultado
+  final é determinístico (o último a pegar o lock vence) e nunca um estado
+  meio-gravado.
+
+---
+
+## §17. Como ligar (o que existe hoje no código)
+
+Tudo já está em produção **desligado**. A ordem importa: cada passo é observável
+antes do próximo, e nenhum deles altera o mundo antes do último.
+
+```bash
+# 1. Migração (cria birra_act). Idempotente.
+docker exec neo-core alembic upgrade head
+
+# 2. Conserta o vazamento de tom da skill de casa. Não desobedece nada — só faz
+#    a mensagem de confirmação sair no humor certo. Ligar isto primeiro.
+NEO_AFFECT_SKILL_DIRECTIVE_ENABLED=true
+
+# 3. Números do afeto no prompt do classificador. Ainda NÃO desvia nada:
+#    serve para medir. Rodar scripts/eval_router.py com e sem, comparar.
+NEO_AFFECT_ROUTER_HINT_ENABLED=true
+
+# 4. Desvio para o cérebro quando o estado muda a resposta certa.
+NEO_AFFECT_ROUTE_TO_BRAIN=decision_changing   # ou any_salient
+
+# 5. Só então a birra. Comece com ZERO atos físicos: ele recusa e debocha, mas
+#    não encosta em nada. Suba para 2 quando o sweeper estiver visto funcionando.
+NEO_BIRRA_ENABLED=true
+NEO_BIRRA_MAX_PHYSICAL_ACTS=0
+```
+
+Para testar sem passar 20 turnos xingando: painel → aba Emoções → **Ajustar** →
+ira 80 + ofensas 2 → Aplicar. O card de birra aparece no primeiro turno de casa.
+
+**Onde olhar quando algo estranhar:** `app.log` com `[BIRRA]` (arme, ato,
+revert, release), a seção "Modo Birra" no `.md` da sessão, e
+`GET /api/v1/affect/birra?user_id=…` para ver o que ainda falta desfazer.
+
+**Mapa dos arquivos:**
+
+| O quê | Onde |
+|---|---|
+| Intensidade/salience | `core/agent/affect.py` (`intensity`, `level`, `affect_salience`) |
+| Episódio | `core/agent/affect.py` (`BirraEpisode`, campo `birra` do `AffectState`) |
+| Política | `core/agent/birra/policy.py` |
+| Táticas | `core/agent/birra/tactics.py` |
+| Gate de segurança | `core/agent/birra/gate.py` |
+| Interceptação | `core/agent/birra/sink.py` |
+| Ledger + reversão | `core/agent/birra/{store.py,revert.py}`, `db/models/birra_act.py` |
+| Roteamento | `core/router/intent_router.py` (`_apply_affect_bias`, `affect_hint`) |
+| Derivação do turno | `modules/desktop/ai_service.py` (`_derive_turn_birra`, `_settle_birra`) |
+| Persistência | `core/pks/service.py` (`update_birra_episode`, `set_user_affect`) |
+| API/painel | `api/routes/affect.py`, `neo-panel/src/AffectPanel.tsx` |
+
+---
+
+## §16. Decisões — fechadas em 2026-08-02
+
+| # | Decisão | Onde entrou |
+|---|---|---|
+| 1 | **Só desculpa encerra.** Pedido repetido continua sofrendo birra — pedir de novo para baixar a temperatura faz ele subir de novo. Sem `obey_on_repeat`. | §4.3, §4.4, §8.1 |
+| 2 | **Horário silencioso 22h–07h confirmado**: só birra verbal e **nenhuma** mensagem proativa à noite. | §4.2, §8.4 |
+| 3 | **Ordem enfática é a saída sem desculpa**: "faça isso imediatamente" e afins ⇒ obedece e reverte, mas a birra continua armada. Detecção em duas camadas, calibrada contra o corpus real. | §4.2.1, §8.1, §12 |
+| 4 | **Só luz e ar-condicionado.** `fan` e `media_player` fora; nenhuma entidade de opt-in por enquanto. | §3.2 |
+| 5 | **Narração pelo cognitivo** — resolvida de graça pela decisão 6: com o desvio no roteador, o turno já é do cérebro e não há chamada de LLM extra. | §8.2 |
+| 6 | **O roteador passa a receber o estado emocional** — e não só para birra: sempre que o estado puder mudar a resposta certa, quem atende é o cérebro. Duas camadas (bloco condicional no prompt + `_bias_to_brain` nos dois caminhos), critério por **desvio do baseline** (nunca banda absoluta), dial de 3 níveis. A `BirraDecision` passa a ser derivada **antes** do `classify`. | §3.1, §3.7 |
+| 6a | **O roteador recebe os valores nominais**, não só um adjetivo: os cinco eixos com valor, repouso e nível (`repouso`/`elevado`/`forte`/`extremo`), derivados de `intensity = desvio / espaço disponível`. Ele é classificador e nunca fala com o usuário, então número é seguro — e um escalar classifica melhor que "alto". | §3.7.1, §3.7.4 |
+| 6b | **Consequência descoberta ao rastrear o handoff**: desviar conserta a decisão, não a fala — a skill emite o próprio final e é a última coisa que o usuário lê. Por isso a diretiva de tom no prompt da skill entra junto, e é ela que conserta o bug de personalidade que já existe hoje. | §3.7.2, §8.2 |
+| 7 | **`working-memory-plan` fica para depois** ⇒ a birra fica com a migração `q0r1s2t3u4v5`; quando a memória de trabalho entrar, ela rebaseia. | §6.2 |

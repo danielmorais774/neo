@@ -472,6 +472,8 @@ class IntentRouter:
         user_message: str,
         conversation_history: list[dict[str, str]] | None = None,
         system_context: str | None = None,
+        affect_hint: str | None = None,
+        affect_force_brain: bool = False,
     ) -> RoutingDecision:
         """Classify user intent and return a routing decision.
 
@@ -479,6 +481,14 @@ class IntentRouter:
             user_message: The user's message text.
             conversation_history: Recent messages as [{role, content}] for context.
             system_context: Optional OS/environment context string to append to the prompt.
+            affect_hint: Bloco de estado emocional do Neo para o prompt do
+                classificador (docs/modo-birra-plan.md §3.7). ``None`` quando ele
+                está no repouso — aí o prompt é byte-a-byte o de sempre. Números
+                crus são seguros aqui: o roteador CLASSIFICA e devolve JSON, nunca
+                fala com o usuário.
+            affect_force_brain: Desvio determinístico para o núcleo cognitivo. O
+                hint sozinho é sugestão a um LLM; isto é a garantia. Quem calcula
+                é o AIService — o roteador não conhece PKS nem afeto.
 
         Returns:
             RoutingDecision with intent, tool info, etc.
@@ -563,6 +573,12 @@ class IntentRouter:
         brain_note = self._skills_brain_note()
         if brain_note:
             base_prompt += f"\n\n{brain_note}"
+
+        # Estado emocional do Neo (§3.7 do modo-birra-plan). Bloco CONDICIONAL: só
+        # existe quando ele está fora do repouso, então o caminho quente de todo
+        # dia continua com o prompt enxuto que o corte de 37% deixou.
+        if affect_hint:
+            base_prompt += f"\n\n{affect_hint}"
 
         # Inject system context (OS, paths) when provided by the client
         if system_context:
@@ -687,7 +703,7 @@ class IntentRouter:
                 ],
                 "raw_response": raw_text,
             }
-            return decision
+            return self._apply_affect_bias(decision, affect_force_brain)
 
         except Exception as e:
             logger.exception(f"Intent classification failed: {e}")
@@ -698,7 +714,7 @@ class IntentRouter:
                 {"role": m.role.value if hasattr(m.role, 'value') else str(m.role), "content": m.content[:4000]}
                 for m in messages
             ], "error": str(e)}
-            return fallback
+            return self._apply_affect_bias(fallback, affect_force_brain)
 
     def _ungrounded_path_literals(self, command: str, haystack: str) -> list[str]:
         """Caminhos com extensão citados em ``command`` que não aparecem (nem pelo
@@ -981,6 +997,41 @@ class IntentRouter:
             register_hint=register_hint,
         )
         return self._bias_to_brain(decision)
+
+    def _apply_affect_bias(
+        self, decision: RoutingDecision, force_brain: bool
+    ) -> RoutingDecision:
+        """Desvio por estado emocional — aplicado nos DOIS caminhos do classify.
+
+        Deliberadamente aqui, e não dentro de ``_parse_classification``: aquele
+        ponto só é atingido quando o LLM devolveu JSON. Quando o provider cai e a
+        decisão vem do ``_fallback_classify`` por palavra-chave (já foram 13 de 46
+        turnos num dia ruim), o viés precisa valer igual — senão um problema de
+        infra desliga a personalidade em silêncio.
+
+        A skill de casa não conhece o estado emocional do Neo (monta só
+        ``neo_persona("slim") + prompt.md``), então com ele irritado quem tem que
+        atender o turno é o núcleo cognitivo — que decide se atende, recusa ou
+        responde atravessado, e ainda pode acionar a skill via handoff.
+        """
+        if not force_brain or decision.intent not in _SIDE_EFFECT_SKILL_INTENTS:
+            return decision
+        logger.info(
+            "Intent: %s → DIRECT_RESPONSE (affect-bias; conf=%.2f speech_act=%s)",
+            decision.intent.value, decision.confidence, decision.speech_act,
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.skill_name = None
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.needs_memory = True
+        decision.explanation = (
+            "Roteado ao núcleo cognitivo: o estado emocional do Neo com este usuário "
+            "muda qual é a resposta certa, e a skill não conhece esse estado "
+            "(o cérebro decide e pode acionar a skill via handoff)."
+        )
+        return decision
 
     def _bias_to_brain(self, decision: RoutingDecision) -> RoutingDecision:
         """Fire a side-effecting skill only on a confident imperative (Workstream B).

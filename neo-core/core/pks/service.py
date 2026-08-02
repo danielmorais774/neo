@@ -545,6 +545,138 @@ class PKSService:
             await session.commit()
             return merged
 
+    async def update_birra_episode(
+        self,
+        *,
+        user_id: UUID,
+        decision,
+        acts: int = 0,
+        physical_acts: int = 0,
+        release_reason: str | None = None,
+    ):
+        """Persiste o episódio de birra dentro do campo ``neo_affect``.
+
+        Read-modify-write curto: o vetor emocional NÃO é tocado aqui (quem mexe
+        nele é o appraiser) — só o bloco ``birra``, que guarda os contadores dos
+        quais saem os tetos de §4.4 do plano.
+        """
+        from core.agent.affect import AFFECT_FIELD_KEY, AffectState, BirraEpisode
+
+        episode = getattr(decision, "episode", None)
+        if episode is None and release_reason is None:
+            return None
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
+            state: AffectState = AffectState.from_field(field.value if field else None)
+
+            current = state.birra
+            if release_reason:
+                if current is None or not current.active:
+                    return None
+                current.released_at = datetime.now(timezone.utc).isoformat()
+                current.release_reason = release_reason[:16]
+                state.birra = current
+            elif episode is not None:
+                merged = BirraEpisode(**episode.model_dump()) if current is None else current
+                merged.act_count += acts
+                merged.physical_acts += physical_acts
+                if physical_acts:
+                    merged.last_physical_at = datetime.now(timezone.utc).isoformat()
+                state.birra = merged
+            else:
+                return None
+
+            await self.repository.upsert_field(
+                session,
+                UpsertFieldInput(
+                    entity_id=primary.id,
+                    key=AFFECT_FIELD_KEY,
+                    value_type="json",
+                    value=state.to_field(),
+                    source="birra",
+                    source_message_id=None,
+                    actor="system",
+                ),
+            )
+            await session.commit()
+            return state.birra
+
+    async def set_user_affect(
+        self,
+        *,
+        user_id: UUID,
+        stats: dict[str, float] | None = None,
+        grudge_count: int | None = None,
+        trigger: str | None = None,
+        reason: str = "",
+    ):
+        """Escrita MANUAL do estado emocional (painel — docs/modo-birra-plan.md §15).
+
+        Três detalhes decidem se isto funciona ou vira bug intermitente:
+
+        * ``updated_at`` é reescrito para AGORA. O ``apply_decay`` decai a partir
+          desse campo — gravar ira=70 mantendo um carimbo de duas horas atrás faz
+          a leitura seguinte devolver ~30 e ninguém entende por quê.
+        * o evento entra no ``recent`` marcado como ``manual``. O appraiser lê o
+          ``recent`` para a regra de acumulação; um salto de +60 sem causa
+          deixaria o julgamento do próximo turno maluco. E o painel precisa
+          mostrar que aquele pico foi o operador, não o usuário.
+        * clamp no SERVIDOR, nunca só no slider.
+        """
+        from core.agent.affect import AXES, AFFECT_FIELD_KEY, AffectState
+
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            field = await self.repository.get_field(session, primary.id, AFFECT_FIELD_KEY)
+            state: AffectState = AffectState.from_field(field.value if field else None)
+
+            now = datetime.now(timezone.utc)
+            for axis, value in (stats or {}).items():
+                if axis not in AXES:
+                    continue
+                try:
+                    setattr(state.stats, axis, max(0.0, min(100.0, float(value))))
+                except (TypeError, ValueError):
+                    continue
+            if grudge_count is not None:
+                count = max(0, int(grudge_count))
+                state.grudge = (
+                    {"count": count, "last_at": now.isoformat()} if count else {}
+                )
+            state.updated_at = now.isoformat()
+            state.last_trigger = trigger or "manual"
+            event = {
+                "t": now.isoformat(),
+                "trigger": trigger or "manual",
+                "deltas": {k: round(float(v), 1) for k, v in (stats or {}).items() if k in AXES},
+                "why": (reason or "ajuste manual pelo painel")[:160],
+                "manual": True,
+            }
+            state.recent = [*state.recent, event][-8:]
+
+            await self.repository.upsert_field(
+                session,
+                UpsertFieldInput(
+                    entity_id=primary.id,
+                    key=AFFECT_FIELD_KEY,
+                    value_type="json",
+                    value=state.to_field(),
+                    source="affect_manual",
+                    source_message_id=None,
+                    actor="panel",
+                ),
+            )
+            await session.commit()
+            return state
+
     async def reset_user_affect(self, *, user_id: UUID):
         """Reset Neo's emotional state toward this user to the personality baselines.
 

@@ -167,10 +167,18 @@ class PromptContextSelector:
         if affect_state is not None:
             from core.agent.affect import AXES, AffectTuning, render_directive
 
+            # O episódio de birra vive no próprio estado, então o seletor não
+            # precisa de mais um parâmetro vindo de fora (docs/modo-birra-plan.md).
+            _birra = getattr(affect_state, "birra", None)
             directive = render_directive(
                 affect_state,
                 AffectTuning.from_settings(self._settings),
                 caps=register_profile,
+                birra_armed=bool(
+                    _birra is not None
+                    and _birra.active
+                    and getattr(self._settings, "neo_birra_enabled", False)
+                ),
             )
             if directive:
                 candidates.append(ContextCandidate(

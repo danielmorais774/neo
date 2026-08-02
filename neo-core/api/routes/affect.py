@@ -8,6 +8,7 @@ válvula de escape admin: volta tudo para os baselines de personalidade.
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from core.pks import PKSService
 from shared.config import get_settings
@@ -96,6 +97,41 @@ def _appraiser_health() -> dict:
     return get_affect_health()
 
 
+class AffectSetPayload(BaseModel):
+    """Ajuste manual. Campos ausentes NÃO são tocados."""
+
+    stats: dict[str, float] | None = None
+    grudge_count: int | None = None
+    trigger: str | None = None
+    reason: str = ""
+
+
+@router.post("/set")
+async def set_affect(payload: AffectSetPayload, user_id: str = Query(...)):
+    """Escreve o estado emocional na mão (sliders do painel).
+
+    Existe porque testar humor exigia 20 turnos irritando o Neo de verdade — e
+    porque entre "não mexer" e "zerar tudo" (o /reset) não havia nada.
+    """
+    if _pks is None:
+        raise HTTPException(status_code=503, detail="PKS service not ready")
+    try:
+        uid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="user_id must be a UUID") from exc
+
+    state = await _pks.set_user_affect(
+        user_id=uid,
+        stats=payload.stats,
+        grudge_count=payload.grudge_count,
+        trigger=payload.trigger,
+        reason=payload.reason,
+    )
+    if state is None:
+        raise HTTPException(status_code=404, detail="No primary entity for this user")
+    return {"ok": True, "stats": state.stats.as_dict(), "updated_at": state.updated_at}
+
+
 @router.post("/reset")
 async def reset_affect(user_id: str = Query(...)):
     """Zera o estado para os baselines; limpa histórico recente e rancor."""
@@ -106,7 +142,80 @@ async def reset_affect(user_id: str = Query(...)):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="user_id must be a UUID") from exc
 
+    # Zerar o afeto tem que desfazer o que a birra aprontou: senão o estado volta
+    # ao normal e a luz continua apagada.
+    reverted = await _revert_birra(uid, reason="reset")
     fresh = await _pks.reset_user_affect(user_id=uid)
     if fresh is None:
         raise HTTPException(status_code=404, detail="No primary entity for this user")
-    return {"ok": True, "stats": fresh.stats.as_dict()}
+    return {"ok": True, "stats": fresh.stats.as_dict(), "birra_reverted": reverted}
+
+
+# ── Modo Birra (docs/modo-birra-plan.md §10) ─────────────────────────────────
+# Sob /affect de propósito: é um estado derivado do afeto e mora no mesmo card do
+# painel. (O plano dizia /api/v1/birra; ficou aninhado para não duplicar wiring.)
+
+async def _revert_birra(user_id: UUID, *, reason: str) -> int:
+    """Desfaz os atos pendentes deste usuário. Nunca levanta."""
+    try:
+        from core.agent.birra.revert import revert_pending
+        from core.agent.birra.store import BirraStore
+        from core.skills.home_assistant.adapter import HomeAssistantAdapter
+
+        adapter = HomeAssistantAdapter()
+        if not adapter.is_configured:
+            return 0
+        return await revert_pending(
+            BirraStore(_pks.db), adapter, user_id=user_id, reason=reason
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@router.get("/birra")
+async def get_birra(user_id: str = Query(...)):
+    """Episódio atual + atos, incluindo o que ainda falta desfazer."""
+    if _pks is None:
+        raise HTTPException(status_code=503, detail="PKS service not ready")
+    try:
+        uid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="user_id must be a UUID") from exc
+
+    from core.agent.birra.store import BirraStore
+
+    state = await _pks.get_user_affect(user_id=uid)
+    episode = getattr(state, "birra", None)
+    pending = await BirraStore(_pks.db).pending(user_id=uid)
+    return {
+        "enabled": get_settings().neo_birra_enabled,
+        "episode": episode.model_dump() if episode else None,
+        "active": bool(episode and episode.active),
+        "pending": [
+            {
+                "id": str(a.id),
+                "entity_id": a.entity_id,
+                "mecanica": a.mecanica,
+                "fala": a.fala,
+                "requested": a.requested,
+                "performed": a.performed,
+                "revert_at": a.revert_at.isoformat() if a.revert_at else None,
+            }
+            for a in pending
+        ],
+    }
+
+
+@router.post("/birra/end")
+async def end_birra(user_id: str = Query(...)):
+    """Botão de pânico: encerra o episódio e desfaz tudo que estiver pendente."""
+    if _pks is None:
+        raise HTTPException(status_code=503, detail="PKS service not ready")
+    try:
+        uid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="user_id must be a UUID") from exc
+
+    reverted = await _revert_birra(uid, reason="panic")
+    await _pks.update_birra_episode(user_id=uid, decision=None, release_reason="panic")
+    return {"ok": True, "reverted": reverted}

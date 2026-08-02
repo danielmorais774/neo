@@ -441,6 +441,59 @@ class Settings(BaseSettings):
     # which froze the affect state at baseline because only the floors ever landed.
     neo_affect_appraisal_timeout_s: float = Field(default=25.0, gt=0.0)
 
+    # ── Afeto no roteamento (docs/modo-birra-plan.md §3.7) ──────────────
+    # A skill de casa é CEGA a emoção (só neo_persona("slim") + prompt.md), então
+    # com o Neo irritado "acende a luz" volta simpático e a personalidade quebra
+    # num comando simples. Duas correções, independentes do Modo Birra:
+    #   1. desviar o turno para o núcleo cognitivo quando o estado pode mudar a
+    #      RESPOSTA CERTA (não só o tom);
+    #   2. colar a diretiva de afeto no prompt da skill, para a mensagem de
+    #      confirmação — que é a última coisa que o usuário lê — ter tom.
+    # Default conservador: nada muda em prod até medir com scripts/eval_router.py.
+    neo_affect_route_to_brain: str = Field(
+        default="never",
+        description="never | decision_changing (ira/medo fortes ou postura ativa) | "
+        "any_salient (qualquer eixo fora do repouso). Birra armada desvia mesmo em 'never'.",
+    )
+    neo_affect_router_hint_enabled: bool = Field(
+        default=False,
+        description="Injeta o bloco de estado emocional (valores + níveis) no prompt do "
+        "classificador. Ausente quando o Neo está no repouso — prompt idêntico ao de hoje.",
+    )
+    neo_affect_skill_directive_enabled: bool = Field(
+        default=False,
+        description="Cola a diretiva de tom do afeto no prompt da skill home_assistant",
+    )
+
+    # ── Modo Birra (docs/modo-birra-plan.md) ────────────────────────────
+    # Com a ira no teto E maltrato acumulado, pedido BOBO de casa pode ser
+    # recusado ou feito diferente até o usuário pedir desculpa. Só light e
+    # climate.set_temperature, sempre declarado, sempre reversível.
+    neo_birra_enabled: bool = Field(
+        default=False, description="Kill switch geral do Modo Birra"
+    )
+    neo_birra_arm_ira: float = Field(default=60.0, ge=0.0, le=100.0)
+    # Histerese: arma em 60, desarma em 45 — sem isso a birra piscaria a cada
+    # oscilação do appraiser.
+    neo_birra_disarm_ira: float = Field(default=45.0, ge=0.0, le=100.0)
+    # Ofensas na janela de rancor. Discussão chata (trigger "obtuse") NÃO abre
+    # rancor, então teimosia sozinha nunca arma birra — só maltrato.
+    neo_birra_min_offenses: int = Field(default=2, ge=1)
+    neo_birra_max_physical_acts: int = Field(default=2, ge=0)
+    neo_birra_physical_cooldown_min: float = Field(default=10.0, ge=0.0)
+    neo_birra_revert_after_s: int = Field(default=120, ge=10)
+    neo_birra_max_episode_min: float = Field(default=45.0, gt=0.0)
+    # Janela só-verbal: nada de alteração física nem aviso proativo de madrugada.
+    neo_birra_quiet_hours: str = Field(default="22-7")
+    neo_birra_temp_delta: float = Field(default=2.0, ge=0.0)
+    neo_birra_temp_clamp: str = Field(default="22,26")
+    neo_birra_entity_allow: str = Field(
+        default="", description="CSV de entity_ids liberados FORA do allowlist de domínio"
+    )
+    neo_birra_entity_deny: str = Field(
+        default="", description="CSV de entity_ids nunca sujeitos a birra"
+    )
+
     # ── Neo situational register (tone-regulation layer) ────────────────
     # Second tone regulator, orthogonal to affect: Caráter × Registro × Afeto.
     # The register is derived deterministically per turn (no new LLM call) and

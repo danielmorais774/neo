@@ -15,7 +15,7 @@ import time
 import unicodedata
 from collections.abc import AsyncIterator
 from datetime import date, datetime  # date kept for _build_legacy_prompt fallback
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
 from core.agent.agent_executor import AgentExecutor
@@ -844,6 +844,19 @@ def _build_mission_card_metadata(
     }
 
 
+class TurnAffect(NamedTuple):
+    """Leitura emocional do turno, derivada uma vez antes do roteador.
+
+    ``decision`` é o veredito do Modo Birra; ``hint`` é o bloco que vai no prompt
+    do classificador (None quando o Neo está no repouso — aí o prompt é o de
+    sempre); ``force_brain`` é o desvio determinístico para o núcleo cognitivo.
+    """
+
+    decision: Any  # core.agent.birra.policy.BirraDecision
+    hint: str | None
+    force_brain: bool
+
+
 class AIServiceResponse:
     """Response from AIService — wraps the different types of responses."""
 
@@ -959,6 +972,13 @@ class AIService:
         # cobre as continuações (process_tool_result) que perdem o metadata.
         self._gravity_tracker = GravityTracker()
         self._session_registers: dict[str, Register] = {}
+        # Modo Birra (docs/modo-birra-plan.md): decisão do turno por sessão — o
+        # handler de casa precisa dela, e ela é derivada antes do roteador. O set
+        # de pendências alimenta a âncora da ordem enfática ("para com isso").
+        self._session_birra: dict[str, TurnAffect] = {}
+        self._birra_pending: dict[str, str] = {}
+        self._birra_sinks: dict[str, Any] = {}
+        self._birra_store_cache: Any | None = None
         self._skill_executor: "SkillExecutor | None" = None
         # Lazily-built HA adapter for the cognitive-core live snapshot injection.
         self._ha_adapter: "HomeAssistantAdapter | None" = None
@@ -1179,6 +1199,241 @@ class AIService:
         except Exception:  # noqa: BLE001 — o registro nunca derruba o turno
             logger.warning("[Register] derivation failed; turn continues without it", exc_info=True)
             return None
+
+    # ---------------------------------------------------------------
+    # Afeto no roteamento + Modo Birra (docs/modo-birra-plan.md §3.1/§3.7)
+    # ---------------------------------------------------------------
+
+    async def _derive_turn_birra(
+        self,
+        *,
+        user_message: str,
+        user_id: UUID | None,
+        session_id: UUID,
+        slog: "SessionFileLogger | None" = None,
+    ) -> "TurnAffect":
+        """Estado emocional do turno, derivado ANTES do roteador. Nunca levanta.
+
+        Vem antes do ``classify`` de propósito: é o estado emocional que decide
+        QUEM atende o turno. Avaliar isso dentro do handler de casa seria tarde —
+        o turno já teria sido entregue a uma skill que não tem persona, não tem
+        afeto e não sabe recusar.
+        """
+        from core.agent.birra.policy import BirraDecision
+
+        empty = TurnAffect(decision=BirraDecision(), hint=None, force_brain=False)
+        if user_id is None or not self.settings.neo_affect_enabled:
+            return empty
+        try:
+            from core.agent.affect import AffectTuning, Level, apply_decay
+            from core.agent.birra.policy import evaluate as evaluate_birra
+            from core.agent.register import detect_gravity_floor, max_gravity
+
+            tuning = AffectTuning.from_settings(self.settings)
+            state = apply_decay(await self.pks.get_user_affect(user_id=user_id), tuning)
+
+            sid = str(session_id)
+            gravity = max_gravity(
+                self._gravity_tracker.current(sid), detect_gravity_floor(user_message)
+            )
+            register = self._session_registers.get(sid)
+            has_pending = bool(self._birra_pending.get(sid))
+
+            decision = evaluate_birra(
+                state,
+                tuning,
+                self.settings,
+                user_message=user_message,
+                gravity=gravity,
+                register=register.value if register is not None else None,
+                has_pending_act=has_pending,
+            )
+            sal = decision.salience
+            force_brain = decision.armed and not decision.obey_now
+            mode = str(getattr(self.settings, "neo_affect_route_to_brain", "never"))
+            if sal is not None and not force_brain:
+                if mode == "any_salient":
+                    force_brain = not sal.calm
+                elif mode == "decision_changing":
+                    force_brain = (
+                        sal.at_least("ira", Level.FORTE)
+                        or sal.at_least("medo", Level.FORTE)
+                        or sal.posture_active
+                    )
+
+            hint = None
+            if (
+                sal is not None
+                and getattr(self.settings, "neo_affect_router_hint_enabled", False)
+                and (not sal.calm or decision.armed)
+            ):
+                hint = self._render_router_affect_hint(sal, decision)
+
+            # Transições de episódio são persistidas AQUI, não no epílogo: a
+            # diretiva do cérebro lê o episódio do próprio estado, então gravar só
+            # no fim do turno faria a birra armar sem o cérebro saber no turno em
+            # que ela arma — e, pior, manteria "BIRRA ATIVA" no turno em que o
+            # usuário pediu desculpa. São eventos raros; o custo é irrelevante.
+            was_active = state.birra is not None and state.birra.active
+            if decision.release_reason and was_active:
+                await self.pks.update_birra_episode(
+                    user_id=user_id, decision=decision,
+                    release_reason=decision.release_reason,
+                )
+            elif decision.armed and not was_active:
+                await self.pks.update_birra_episode(user_id=user_id, decision=decision)
+
+            if decision.armed or force_brain:
+                logger.info(
+                    "[BIRRA] %s | route_to_brain=%s hint=%s",
+                    decision.log_line(), force_brain, bool(hint),
+                )
+                if slog:
+                    slog.log_event(
+                        "Modo Birra",
+                        f"**Decisão:** {decision.log_line()}\n"
+                        f"**Desvio para o cognitivo:** {force_brain}\n"
+                        + (f"**Supressores:** {', '.join(decision.notes)}\n" if decision.notes else "")
+                        + (f"**Estado:** {sal.render_line()}" if sal else ""),
+                    )
+            return TurnAffect(decision=decision, hint=hint, force_brain=force_brain)
+        except Exception:  # noqa: BLE001 — afeto nunca derruba o turno
+            logger.warning("[BIRRA] derivação falhou; turno segue normal", exc_info=True)
+            return empty
+
+    async def _settle_birra(self, *, session_id: UUID, user_id: UUID | None) -> None:
+        """Fecha o turno da birra: persiste o episódio e reverte o que for devido.
+
+        Roda em background, depois da resposta já ter saído. Três coisas:
+        1. atualiza os contadores do episódio (é deles que saem os tetos);
+        2. reverte pendências quando o turno pediu (desculpa, ordem enfática, fim);
+        3. mantém a marca de pendência que serve de âncora para "para com isso".
+        """
+        sid = str(session_id)
+        turn = self._session_birra.get(sid)
+        if turn is None or user_id is None:
+            return
+        decision = turn.decision
+        try:
+            store = self._birra_store()
+            adapter = self._get_ha_adapter()
+
+            # 2. Reversão imediata — antes de mexer no episódio, para que uma
+            # falha de persistência não deixe a luz apagada.
+            reason = decision.release_reason or ("escape" if decision.obey_now else None)
+            if reason and adapter is not None:
+                from core.agent.birra.revert import revert_pending
+
+                done = await revert_pending(
+                    store, adapter, user_id=user_id, reason=reason[:16],
+                )
+                if done:
+                    logger.info("[BIRRA] released reason=%s revertidos=%d", reason, done)
+                self._birra_pending.pop(sid, None)
+
+            # 1. Contadores do episódio (é deles que saem os tetos). O ARME e o
+            # ENCERRAMENTO já foram persistidos antes do dispatch, em
+            # _derive_turn_birra — aqui só entra o que este turno consumiu.
+            sink = self._birra_sinks.pop(sid, None)
+            if sink is not None and (sink.acts or sink.physical_acts):
+                await self.pks.update_birra_episode(
+                    user_id=user_id,
+                    decision=decision,
+                    acts=len(sink.acts),
+                    physical_acts=sink.physical_acts,
+                )
+
+            # 3. Âncora da ordem enfática: "para com isso" só conta como ordem
+            # quando vem logo depois de uma birra.
+            if decision.armed and not decision.release_reason:
+                self._birra_pending[sid] = decision.episode_id or "1"
+        except Exception:  # noqa: BLE001 — epílogo nunca derruba nada
+            logger.warning("[BIRRA] epílogo falhou", exc_info=True)
+
+    def _birra_store(self) -> Any | None:
+        from core.agent.birra.store import BirraStore
+
+        if getattr(self, "_birra_store_cache", None) is None:
+            self._birra_store_cache = BirraStore(self.db)
+        return self._birra_store_cache
+
+    async def _build_birra_sink(self, session_id: UUID, user_id: UUID | None) -> Any | None:
+        """Sink do turno para a skill de casa. ``None`` = atuação normal."""
+        turn = self._session_birra.get(str(session_id))
+        if turn is None or user_id is None or not getattr(turn.decision, "armed", False):
+            return None
+        if getattr(turn.decision, "obey_now", False):
+            return None
+        try:
+            from core.agent.birra.sink import BirraSink
+
+            adapter = self._get_ha_adapter()
+            if adapter is None or not adapter.is_configured:
+                return None
+            sink = BirraSink(
+                decision=turn.decision,
+                settings=self.settings,
+                adapter=adapter,
+                store=self._birra_store(),
+                user_id=user_id,
+                session_id=session_id,
+            )
+            # O epílogo (_settle_birra) precisa dos contadores deste sink.
+            self._birra_sinks[str(session_id)] = sink
+            return sink
+        except Exception:  # noqa: BLE001
+            logger.warning("[BIRRA] falha ao montar o sink; skill segue normal", exc_info=True)
+            return None
+
+    async def _affect_directive_for_skill(self, user_id: UUID | None) -> str | None:
+        """Diretiva de tom para o prompt da skill de casa (§3.7.2 do plano)."""
+        if user_id is None or not getattr(
+            self.settings, "neo_affect_skill_directive_enabled", False
+        ):
+            return None
+        if not self.settings.neo_affect_enabled:
+            return None
+        try:
+            from core.agent.affect import AffectTuning, apply_decay, render_directive
+
+            tuning = AffectTuning.from_settings(self.settings)
+            state = apply_decay(await self.pks.get_user_affect(user_id=user_id), tuning)
+            return render_directive(state, tuning) or None
+        except Exception:  # noqa: BLE001
+            logger.warning("[BIRRA] diretiva de tom da skill falhou", exc_info=True)
+            return None
+
+    @staticmethod
+    def _render_router_affect_hint(sal: Any, decision: Any) -> str:
+        """Bloco de estado emocional para o prompt do CLASSIFICADOR.
+
+        Números crus aqui são seguros e desejáveis: o roteador classifica e
+        devolve JSON, nunca fala com o usuário — a regra "não cite números" vale
+        para o cérebro, em ``render_directive``. E um classificador decide muito
+        melhor com um escalar do que com um adjetivo difuso ("ira 87" e "ira 62"
+        pedem respostas diferentes e ambos seriam só "alto"). O NÍVEL nominal vai
+        junto e é a autoridade, para o modelo não inventar um limiar próprio.
+        """
+        flags = []
+        if sal.posture_active:
+            flags.append("discussão aberta")
+        if sal.grudge_count:
+            flags.append(f"{sal.grudge_count} ofensa(s) nas últimas 24h")
+        if decision.armed:
+            flags.append("BIRRA ARMADA")
+        return (
+            "## Estado emocional do Neo com este usuário "
+            "(interno — 0-100, \"repouso\" = o normal dele)\n"
+            f"{sal.render_line()}\n"
+            + (f"{' · '.join(flags)}\n" if flags else "")
+            + "Quanto mais longe do repouso, mais o estado muda qual é a resposta CERTA "
+            "— e a skill de casa não conhece esse estado. Com ira/medo em `forte` ou "
+            "`extremo`, ou com BIRRA ARMADA, pedido de casa (luz, ar, cena) vai para "
+            "DIRECT_RESPONSE: o núcleo cognitivo tem a persona e decide como responder "
+            "(pode acionar a skill depois via handoff). Em `repouso`/`elevado` sem birra, "
+            "roteie normalmente. Exceção sempre: ordem enfática ou urgência explícita "
+            "(\"faz isso imediatamente\", \"é sério\", \"urgente\") continua HOME_ASSISTANT."
+        )
 
     # ---------------------------------------------------------------
     # Read-only prompt preview (panel debug tool — no writes, no LLM)
@@ -1587,6 +1842,13 @@ class AIService:
                     f"Round {clarification_round} — interpretando mensagem como resposta ao esclarecimento.",
                 )
 
+        # 4b. Estado emocional do turno — ANTES do roteador, porque é ele que
+        # decide QUEM atende (docs/modo-birra-plan.md §3.1). Nunca levanta.
+        turn_affect = await self._derive_turn_birra(
+            user_message=user_message, user_id=user_id, session_id=sid, slog=slog,
+        )
+        self._session_birra[str(sid)] = turn_affect
+
         # 5. Classify intent — history já disponível do gather acima
         # Bypass: metadata["force_intent"] = "CLIENT_TOOL"|"DIRECT_RESPONSE"|"SERVER_TOOL"
         # útil para testes sem precisar aguardar o classificador.
@@ -1641,6 +1903,8 @@ class AIService:
                 user_message,
                 conversation_history=history,
                 system_context=sys_context,
+                affect_hint=turn_affect.hint,
+                affect_force_brain=turn_affect.force_brain,
             )
         intent_ms = (time.monotonic() - t0) * 1000
         logger.info(f"[TIMING] session={session_ms}ms embed+hist={embed_ms}ms intent={intent_ms:.0f}ms")
@@ -1800,6 +2064,14 @@ class AIService:
                         source_message_id=str(saved_msg.id) if saved_msg else None,
                         slog=slog,
                     )
+            # Epílogo da birra: persiste o episódio (contadores/tetos) e reverte o
+            # que precisa ser revertido AGORA — desculpa, ordem enfática, fim de
+            # episódio. O prazo normal fica com o sweeper.
+            if not dispatch_error:
+                self._spawn_bg(
+                    self._settle_birra(session_id=sid, user_id=user_id),
+                    name="birra-settle",
+                )
             if decision.intent == IntentType.CLIENT_TOOL and not dispatch_error:
                 # Keep trace alive — continuation in process_tool_result / process_command_approval
                 # Must key by the desktop gRPC session_id (not the DB sid) so process_tool_result can find it
@@ -4152,6 +4424,16 @@ class AIService:
                 extra["tool_arguments"] = decision.tool_arguments
             if decision.tool_name:
                 extra["router_tool_name"] = decision.tool_name
+
+            # Afeto + birra descem para a skill (docs/modo-birra-plan.md §7 e
+            # §3.7.2): o sink intercepta a atuação; a diretiva dá tom à
+            # confirmação, que é a última coisa que o usuário lê no turno.
+            birra_sink = await self._build_birra_sink(session_id, user_id)
+            if birra_sink is not None:
+                extra["birra"] = birra_sink
+            affect_directive = await self._affect_directive_for_skill(user_id)
+            if affect_directive:
+                extra["affect_directive"] = affect_directive
 
             result = await skill_executor.execute(
                 skill_name=skill_name,
