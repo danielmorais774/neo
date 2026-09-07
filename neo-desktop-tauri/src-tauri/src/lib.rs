@@ -8,12 +8,12 @@ mod websocket;
 
 use crate::services::system_info::collect_system_info;
 use crate::websocket::DeviceWsManager;
-use log::info;
+use log::{info, warn};
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Listener, Manager, RunEvent,
+    Emitter, Listener, Manager, RunEvent,
 };
 
 #[cfg(target_os = "macos")]
@@ -62,6 +62,60 @@ fn neo_core_http_url() -> String {
         .to_string()
 }
 
+/// Diretório onde o device guarda sua identidade (`device-id`) e, agora, seu
+/// token de pareamento (`device-token`).
+fn device_config_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("neo-desktop")
+}
+
+/// Token de pareamento deste device, se já pareado.
+///
+/// É a credencial que o desktop nunca teve: sem ela o `user_id` era só o que o
+/// cliente declarava (`NEO_USER_ID`, com fallback hardcoded), e qualquer um que
+/// alcançasse a :8000 podia se dizer dono de qualquer aparelho. O canal de
+/// controle — o único que consegue suspender ou desligar a máquina — exige este
+/// token sem exceção. Ver docs/device-control-plan.md §2.
+pub fn device_token() -> Option<String> {
+    let path = device_config_dir().join("device-token");
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Apaga o token local — usado quando ESTE device é removido da conta.
+///
+/// Sem isto o aparelho ficaria com um token que o core já não reconhece, e o
+/// canal de controle entraria num ciclo de 4401 a cada reconexão.
+pub fn clear_device_token() -> Result<(), String> {
+    let path = device_config_dir().join("device-token");
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("não consegui apagar o token: {}", e)),
+    }
+}
+
+fn store_device_token(token: &str) -> Result<(), String> {
+    let dir = device_config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("não consegui criar {:?}: {}", dir, e))?;
+    let path = dir.join("device-token");
+    std::fs::write(&path, token).map_err(|e| format!("não consegui gravar o token: {}", e))?;
+
+    // 0600: o token vale tanto quanto uma senha da máquina.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 fn resolve_existing_device_id(
     user_id: &str,
     hardware_id: &str,
@@ -94,6 +148,53 @@ fn resolve_existing_device_id(
             None
         }
     })
+}
+
+/// Onde o id da sessão de chat fica entre execuções do app.
+///
+/// O `device_id` sempre foi persistido aqui ao lado; o `session_id` não era, e
+/// cada boot do app entrava no neo-core como uma sessão nova SEM elo com a
+/// anterior — o core só grava `created_after_expired_session_id` quando é ELE
+/// quem fecha a sessão. Resultado medido no corpus: 290 das 536 sessões nasceram
+/// assim, sem histórico e sem nada para o `resolve_continuity_context` puxar.
+/// Um follow-up depois de reabrir o app ("tenta de novo", "converte o preço da
+/// ponte que eu tinha pedido") caía numa conversa em branco.
+fn session_id_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("neo-desktop")
+        .join("session-id")
+}
+
+/// Grava o id da sessão ativa. Chamado pelo `reset_agent`, que é por onde passam
+/// TODAS as trocas de sessão: "Novo chat", o seletor de sessões antigas e a
+/// adoção do id novo quando o próprio core rotaciona (evento `session_changed`).
+/// Sem isto, persistir no boot só congelaria a primeira sessão para sempre.
+pub fn persist_session_id(session_id: &str) {
+    let path = session_id_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, session_id) {
+        warn!("[Neo] não consegui persistir o session_id: {}", e);
+    }
+}
+
+/// Retoma a sessão do último uso do app, ou cria uma se não houver.
+///
+/// Falha de leitura nunca é fatal: no pior caso volta ao comportamento antigo
+/// (sessão nova), que é degradação, não quebra.
+fn get_or_create_session_id() -> String {
+    if let Ok(id) = std::fs::read_to_string(session_id_path()) {
+        let id = id.trim().to_string();
+        if uuid::Uuid::parse_str(&id).is_ok() {
+            info!("[Neo] Retomando sessão anterior: {}", id);
+            return id;
+        }
+    }
+    let new_id = uuid::Uuid::new_v4().to_string();
+    persist_session_id(&new_id);
+    new_id
 }
 
 fn get_or_create_device_id(user_id: &str, hardware_id: &str) -> String {
@@ -129,7 +230,7 @@ pub fn run() {
     let user_id = std::env::var("NEO_USER_ID")
         .unwrap_or_else(|_| "5a998544-c3f3-423f-bebb-1cc42fca6063".to_string());
     let device_id = get_or_create_device_id(&user_id, &hardware_id);
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = get_or_create_session_id();
 
     info!("[Neo] Device ID: {}", device_id);
     if !hardware_id.is_empty() {
@@ -171,6 +272,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::execute_with_loop,
+            commands::pick_attachment_files,
+            commands::upload_attachment,
+            commands::download_generated_file,
+            commands::load_chat_image,
+            commands::reveal_local_file,
             commands::stop_execution,
             commands::respond_to_command,
             commands::reset_agent,
@@ -183,16 +289,29 @@ pub fn run() {
             commands::list_voice_engines,
             commands::voice_engine_health,
             commands::voice_engine_action,
+            commands::audio_route,
+            commands::list_audio_inputs,
+            commands::get_audio_input,
+            commands::set_audio_input,
             commands::wake_start,
             commands::wake_stop,
             commands::wake_status,
             commands::wake_phrases,
             commands::wake_add_sample,
+            commands::wake_audit_samples,
             commands::wake_delete_phrase,
             commands::wake_enroll,
+            commands::device_pairing_status,
+            commands::rename_device,
+            commands::remove_device,
+            commands::pair_device,
+            commands::wake_tts_state,
+            commands::wake_set_test_mode,
             commands::get_conversation_history,
             commands::clear_conversation_history,
             commands::save_conversation_history,
+            commands::list_sessions,
+            commands::get_session_id,
             commands::quick_help_ask_stream,
             commands::ack_notification,
             commands::handle_notification_action,
@@ -349,11 +468,30 @@ pub fn run() {
                     }
                 });
 
-                // Wake word ("Ei Neo") triggers native, hands-free Live Mode in
-                // the notch host. Native capture keeps working even when the main
-                // window is minimized (the webview would be throttled).
-                app.listen("wake-detected", |_event| {
-                    crate::notch_host::live_start();
+                // Wake word ("Ei Neo") routes Live Mode by WHERE the user is
+                // looking:
+                //  - main window FOCUSED (frontmost/key) -> open Live Mode INSIDE
+                //    the app (webview overlay), where the user is actually looking.
+                //    Rust emits `wake-live-inapp`; ChatPage opens the overlay.
+                //  - anything else (minimized, hidden, OR visible but behind
+                //    another window / not focused) -> the native notch chip.
+                // Focus (not mere visibility) is the gate: a window covered by
+                // another app is "on screen" but the user isn't watching it.
+                let wake_handle = app.handle().clone();
+                app.listen("wake-detected", move |_event| {
+                    let focused = wake_handle
+                        .get_webview_window("main")
+                        .map(|w| {
+                            w.is_focused().unwrap_or(false)
+                                && w.is_visible().unwrap_or(false)
+                                && !w.is_minimized().unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if focused {
+                        let _ = wake_handle.emit("wake-live-inapp", ());
+                    } else {
+                        crate::notch_host::live_start();
+                    }
                 });
 
                 // The "stop" word ("pare") interrupts the in-flight Live turn:

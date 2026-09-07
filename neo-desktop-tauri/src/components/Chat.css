@@ -86,12 +86,28 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 8px 16px 16px;
+  overflow-x: hidden;
+  /* A barra de rolagem nasce colada na borda direita do BORDER-BOX (padding
+     não a move). Colada na borda da janela ela ficava debaixo do
+     `.resize-handle-e` (8px, z-index 50, App.css): o mousedown virava
+     "redimensionar janela" (com preventDefault) e o arrasto da barra nunca
+     chegava a acontecer — era o único scroll do app encostado na borda, por
+     isso só ele parecia quebrado. A margem tira a barra de baixo do handle. */
+  margin-right: 12px;
+  padding: 8px 4px 16px 16px;
   display: flex;
   flex-direction: column;
   gap: 4px;
   position: relative;
   z-index: 1;
+}
+
+/* Mais larga que a global (6px): aqui a barra é alvo de arrasto, não só
+   indicador. A cor do thumb fica com as regras globais/de tema (index.css,
+   styles/themes.css) — sobrescrever aqui empataria em especificidade com os
+   `[data-theme=...]` e a barra do chat sairia da paleta do tema. */
+.messages-container::-webkit-scrollbar {
+  width: 10px;
 }
 
 /* ========================================
@@ -195,6 +211,75 @@
   box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.15), 0 0 20px rgba(59, 130, 246, 0.05);
 }
 
+/* Anexos pendentes de envio (File Store): pill acima do campo, some no send. */
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 6px 4px 10px;
+  background: rgba(20, 27, 45, 0.8);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 14px;
+  font-size: 12px;
+  color: var(--text-primary);
+  backdrop-filter: blur(10px);
+}
+
+.attachment-chip.attachment-error {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-size {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.attachment-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.attachment-remove:hover {
+  color: var(--text-primary);
+}
+
+.attachment-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(59, 130, 246, 0.25);
+  border-top-color: rgba(59, 130, 246, 0.9);
+  border-radius: 50%;
+  animation: attachment-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes attachment-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .btn-attachment {
   width: 36px;
   height: 36px;
@@ -210,9 +295,14 @@
   flex-shrink: 0;
 }
 
-.btn-attachment:hover {
+.btn-attachment:hover:not(:disabled) {
   color: var(--text-primary);
   background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-attachment:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .input-wrapper textarea {

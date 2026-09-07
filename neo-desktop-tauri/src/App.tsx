@@ -4,6 +4,7 @@ import { WindowService } from './lib';
 import type { WindowResizeDirection } from './lib';
 import { DevicesTab } from './components/DevicesTab';
 import SettingsModal from './components/SettingsModal';
+import SessionsSidebar from './components/SessionsSidebar';
 import { useTheme } from './themes/useTheme';
 import './App.css';
 import './index.css';
@@ -26,6 +27,7 @@ function App() {
   const [coreStatus, setCoreStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking');
   const [activeTab, setActiveTab] = useState<'chat' | 'devices'>('chat');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
   const [rendered, setRendered] = useState(false);
   const { theme, setTheme } = useTheme();
 
@@ -175,7 +177,7 @@ function App() {
               <line x1="8" y1="21" x2="16" y2="21"/>
               <line x1="12" y1="17" x2="12" y2="21"/>
             </svg>
-            Dispositivos
+            Devices
           </button>
         </div>
         <div className="titlebar-buttons">
@@ -188,6 +190,17 @@ function App() {
               <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
             </svg>
             Novo chat
+          </button>
+          <button
+            className="btn-sessions-header"
+            title="Sessões anteriores"
+            onClick={() => setSessionsOpen(!sessionsOpen)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+              <polyline points="3 3 3 8 8 8" />
+              <polyline points="12 7 12 12 15.5 14" />
+            </svg>
           </button>
           <button
             className="btn-settings-header"
@@ -205,6 +218,15 @@ function App() {
       <div className="app-content">
         {activeTab === 'chat' ? <ChatPage /> : <DevicesTab />}
       </div>
+
+      <SessionsSidebar
+        open={sessionsOpen}
+        onClose={() => setSessionsOpen(false)}
+        onSelectSession={(sessionId) => {
+          setSessionsOpen(false);
+          window.dispatchEvent(new CustomEvent('neo-load-session', { detail: { sessionId } }));
+        }}
+      />
 
       {settingsOpen && (
         <SettingsModal

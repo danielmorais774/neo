@@ -1,0 +1,55 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Questionário</title>
+<style>
+ body{margin:0;font:14px system-ui;display:flex}
+ nav{width:220px;background:#eee}
+ nav a{display:block;padding:12px;height:16px}
+ main{flex:1;padding:16px}
+ .alt{display:flex;align-items:center;gap:12px;border:1px solid #ddd;padding:18px;margin:10px 0;cursor:pointer}
+ /* o padrão que cegou o driver: o input REAL é invisível */
+ .alt input[type=radio]{opacity:0;position:absolute;width:1px;height:1px}
+ .bolinha{width:18px;height:18px;border:2px solid #999;border-radius:50%}
+ aside{width:300px;background:#fafafa}
+ aside li{padding:14px;height:24px;cursor:pointer}
+ .ngopt{border:1px solid #ccc;padding:16px;margin:8px 0;cursor:pointer}
+</style></head><body>
+<nav>
+ <a href="/#!/app/home">Início</a><a href="/#!/extensao">Extensão</a>
+ <a href="/#!/docs">Docs. para Assinatura</a><a href="/#!/estagio">Estágio</a>
+ <a href="/#!/ead">Conheça a EAD</a><a href="/#!/comp">Minhas Competências</a>
+ <a href="/#!/aval">Avaliação Digital</a><a href="/#!/lab">Laboratórios</a>
+ <a href="javascript:">Meu Curso</a><a href="/#!/fin">Financeiro</a>
+ <a href="javascript:">Serviços</a><a href="/#!/atend">Atendimento Eletrônico</a>
+ <a href="javascript:">Bibliotecas</a><a href="/#!/arq">Arquivos Gerais</a>
+ <a href="/#!/rt">Revista dos Tribunais</a><a href="javascript:">Meu Papel no Mundo</a>
+ <a href="https://outlook.com">Office 365</a><a href="https://ajuda">Central de Ajuda</a>
+</nav>
+<main>
+ <h2>QUESTÃO 1</h2>
+ <p>Tendo em vista a relação entre desigualdade econômica e racismo, é correto afirmar:</p>
+ <h3>Alternativas</h3>
+ <!-- padrão A: label + input escondido (o mais comum na web) -->
+ <label class="alt"><input type="radio" name="q1" value="a"><span class="bolinha"></span>
+   <span>O trabalho informal foi uma escolha de muitos negros que, após a abolição, preferiram permanecer fora do mercado formal.</span></label>
+ <label class="alt"><input type="radio" name="q1" value="b"><span class="bolinha"></span>
+   <span>A marginalização dos negros no mercado de trabalho decorre de fatores recentes, ligados à globalização.</span></label>
+ <label class="alt"><input type="radio" name="q1" value="c"><span class="bolinha"></span>
+   <span>O racismo sistemático resultou na exclusão da população negra do mercado formal, relegando-a a empregos informais e precarizados.</span></label>
+ <!-- padrão B: div com ng-click, sem role, sem onclick, sem input -->
+ <div class="ngopt" ng-click="marcar('d')">O racismo sistemático, embora presente, teve impacto reduzido no mercado formal brasileiro.</div>
+ <div class="ngopt" ng-click="marcar('e')">Durante a transição para o trabalho livre, o Estado garantiu políticas de inclusão da população negra.</div>
+ <div style="margin-top:24px">
+   <button type="submit" disabled>Responder</button>
+   <button type="button" disabled>Finalizar</button>
+ </div>
+</main>
+<aside>
+ <h4>10 QUESTÕES</h4>
+ <ul>
+  <li role="link">Questão 1 — TENDO EM VISTA A RELAÇÃO ENTRE DESIGUALDADE ECONÔMICA E RACISMO, APONTANDO QUE O TRABALHO INFORMAL É DUPLAMENTE DISCRIMINADO</li>
+  <li role="link">Questão 2 — UM ESTUDO REALIZADO POR MARC MORGAN E ORIENTADO POR THOMAS PIKETTY CONCLUIU QUE NÃO HOUVE REDUÇÃO SIGNIFICATIVA</li>
+  <li role="link">Questão 3 — O INSTITUTO DE PESQUISA ECONÔMICA APLICADA DESTACA A NECESSIDADE DE RECONHECER AS DIVERSAS FORMAS</li>
+  <li role="link">Questão 4 — TEXTO I CARLOS MORA EM UMA ÁREA PERIFÉRICA DE UMA GRANDE METRÓPOLE BRASILEIRA APESAR DE</li>
+  <li role="link">Questão 5 — O TRABALHO INFORMAL NO BRASIL TEM ORIGENS ANTIGAS HISTORICAMENTE ENTRE SENHORES E ESCRAVOS</li>
+ </ul>
+</aside>
+</body></html>

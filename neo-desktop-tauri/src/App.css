@@ -139,10 +139,10 @@
   border-radius: inherit;
 }
 
-/* All content above the glass layer (resize handles keep their own
-   absolute positioning — including them here would force them into the
-   flex flow and push the titlebar down, creating a gap at the top). */
-.app > *:not(.bg-orbs):not(.resize-handle) {
+/* All content above the glass layer (resize handles and the sessions sidebar
+   keep their own absolute positioning — including them here would force them
+   into the flex flow and push the titlebar down, creating a gap at the top). */
+.app > *:not(.bg-orbs):not(.resize-handle):not(.sessions-sidebar):not(.sessions-sidebar-overlay) {
   position: relative;
   z-index: 2;
 }
@@ -436,6 +436,7 @@
   display: flex;
   align-items: center;
   gap: 5px;
+  margin-left: 4px;
   padding: 5px 12px;
   background: rgba(59, 130, 246, 0.12);
   border: 1px solid rgba(59, 130, 246, 0.22);
@@ -452,6 +453,26 @@
   background: rgba(59, 130, 246, 0.22);
   border-color: rgba(59, 130, 246, 0.4);
   color: #bfdbfe;
+}
+
+/* Sessions button in header */
+.btn-sessions-header {
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-sessions-header:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
 }
 
 /* Settings button in header */
@@ -665,6 +686,119 @@
 .device-model {
   font-size: 12px;
   color: rgba(147, 197, 253, 0.7);
+}
+
+/* ── Pareamento e nome do dispositivo (docs/device-control-plan.md) ── */
+
+.device-badge-control {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.35);
+  color: #93c5fd;
+}
+
+.device-name {
+  cursor: pointer;
+  border-bottom: 1px dashed rgba(147, 197, 253, 0.35);
+}
+
+.device-name:hover {
+  color: rgba(191, 219, 254, 0.95);
+}
+
+.device-name-input,
+.pairing-input {
+  font: inherit;
+  padding: 4px 8px;
+  color: rgba(226, 232, 240, 0.95);
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 6px;
+  outline: none;
+}
+
+.device-name-input:focus,
+.pairing-input:focus {
+  border-color: rgba(59, 130, 246, 0.6);
+}
+
+.pairing-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* O código tem 6 dígitos: largura fixa e tabular para não dançar ao digitar. */
+.pairing-input {
+  width: 110px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 2px;
+}
+
+.pairing-input-name {
+  width: 200px;
+  letter-spacing: normal;
+}
+
+.pairing-fields button {
+  padding: 4px 14px;
+  color: #bfdbfe;
+  cursor: pointer;
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 6px;
+}
+
+.pairing-fields button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pairing-error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.device-remove {
+  margin-top: 8px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: rgba(203, 213, 225, 0.75);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 6px;
+}
+
+.device-remove:hover {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.device-remove.danger {
+  color: #fca5a5;
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.device-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.device-remove-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: rgba(252, 165, 165, 0.9);
+}
+
+.device-remove-confirm .device-remove {
+  margin-top: 0;
 }
 
 .device-meta {

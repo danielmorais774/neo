@@ -1,5 +1,5 @@
 use crate::grpc_gen::neo_desktop::{desktop_message, CommandApproval, DesktopMessage};
-use crate::services::ai_agent::GrpcClient;
+use crate::services::ai_agent::{GrpcClient, VoiceInput};
 use crate::AppState;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ lazy_static::lazy_static! {
 // ============ AGENT EXECUTION ============
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_with_loop(
     app: AppHandle,
     _state: State<'_, AppState>,
@@ -41,9 +42,23 @@ pub async fn execute_with_loop(
     model: Option<String>,
     mode: Option<String>,
     provider: Option<String>,
+    attachments: Option<Vec<String>>,
+    // Origem da ENTRADA (≠ `mode`, que é o estilo da SAÍDA): "voice" quando o
+    // texto veio do STT do neo-voice. Ver docs/voice-input-normalization-plan.md.
+    input_source: Option<String>,
+    asr_raw: Option<String>,
+    asr_engine: Option<String>,
 ) -> Result<(), String> {
-    info!("[Neo] execute_with_loop: {} (model={:?}, mode={:?})", message, model, mode);
-    run_agent_message(app, message, model, mode, provider);
+    info!(
+        "[Neo] execute_with_loop: {} (model={:?}, mode={:?}, anexos={}, origem={:?})",
+        message,
+        model,
+        mode,
+        attachments.as_ref().map_or(0, |a| a.len()),
+        input_source
+    );
+    let voice = VoiceInput::from_parts(input_source, asr_raw, asr_engine);
+    run_agent_message(app, message, model, mode, provider, attachments, voice);
     Ok(())
 }
 
@@ -59,6 +74,8 @@ pub fn run_agent_message(
     model: Option<String>,
     mode: Option<String>,
     provider: Option<String>,
+    attachments: Option<Vec<String>>,
+    voice: Option<VoiceInput>,
 ) {
     let state = app.state::<AppState>();
     let device_id = state.device_id.clone();
@@ -85,6 +102,8 @@ pub fn run_agent_message(
                 model.as_deref(),
                 provider.as_deref(),
                 mode.as_deref(),
+                attachments,
+                voice,
                 cancel_notify,
                 stream_tx_slot,
                 ext_bridge,
@@ -166,6 +185,10 @@ pub fn reset_agent(state: State<'_, AppState>, new_session_id: String) -> Result
     info!("[Neo] reset_agent: new session {}", new_session_id);
     let mut session = state.session_id.lock().unwrap();
     *session = new_session_id.clone();
+    // Único ponto por onde passa toda troca de sessão ("Novo chat", seletor de
+    // sessões antigas e o `session_changed` vindo do core) — é aqui que o disco
+    // acompanha, senão o próximo boot retomaria uma sessão já abandonada.
+    crate::persist_session_id(&new_session_id);
     Ok(new_session_id)
 }
 
@@ -182,32 +205,22 @@ pub struct CommandResult {
 pub async fn execute_command(command: String) -> Result<CommandResult, String> {
     info!("[Neo] execute_command: {}", command);
 
-    use std::process::Command;
-
-    let output = Command::new("/bin/bash")
-        .arg("-c")
-        .arg(&command)
-        .output()
+    // Mesmo shell por plataforma do executor pós-aprovação (services::shell).
+    let output = crate::services::shell::run(&command)
         .map_err(|e| format!("Failed to execute: {}", e))?;
+    let (success, text, error) = crate::services::shell::split_output(output);
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
+    if success {
         Ok(CommandResult {
             success: true,
-            output: Some(if stdout.is_empty() {
-                stderr.clone()
-            } else {
-                stdout
-            }),
+            output: Some(text),
             error: None,
         })
     } else {
         Ok(CommandResult {
             success: false,
             output: None,
-            error: Some(if stderr.is_empty() { stdout } else { stderr }),
+            error: Some(error),
         })
     }
 }
@@ -233,6 +246,867 @@ fn neo_core_http_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:8000".to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+// ============ ANEXOS (File Store) ============
+//
+// Anexar um arquivo ao chat: picker nativo → upload multipart pro File Store do
+// neo-core → o id volta pro front, que o manda em `metadata["attachments"]` na
+// mensagem. O CONTEÚDO nunca passa pelo chat; o Neo lê por fatias com as tools
+// file_* (neo-core/docs/file-store-plan.md §5).
+
+/// Espelha o limite do servidor (NEO_FILES_MAX_FILE_MB) — o core recusa com 413
+/// de qualquer jeito; isto só evita ler um arquivo gigante do disco à toa.
+const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Abre o picker nativo. Lista vazia = o usuário cancelou.
+#[tauri::command]
+pub async fn pick_attachment_files(app: AppHandle) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // blocking_pick_files trava se rodar na thread principal (ela é quem serve o
+    // diálogo) — daí o spawn_blocking.
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app.dialog().file().blocking_pick_files();
+        Ok(picked
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| p.into_path().ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("Falha ao abrir o seletor de arquivos: {}", e))?
+}
+
+/// Sobe um arquivo local pro File Store e devolve o registro do catálogo
+/// (`{id, name, size_bytes, mime, expires_at, ...}`). O `id` é o que vai no
+/// metadata da mensagem.
+#[tauri::command]
+pub async fn upload_attachment(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let session_id = state.session_id.lock().unwrap().clone();
+    let user_id = state.user_id.clone();
+    upload_path_to_store(&path, &session_id, &user_id).await
+}
+
+/// Sobe um caminho local pro File Store (`POST /api/v1/files`) e devolve o
+/// registro do catálogo. Corpo compartilhado por `upload_attachment` (clipe) e
+/// pelo intercept de `request_user_file` em ai_agent.rs (o cérebro puxando um
+/// arquivo do usuário) — o único que sabe resolver a URL do core é o Rust.
+pub async fn upload_path_to_store(
+    path: &str,
+    session_id: &str,
+    user_id: &str,
+) -> Result<serde_json::Value, String> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
+    if !meta.is_file() {
+        return Err("Só dá para anexar arquivo (não pasta).".to_string());
+    }
+    if meta.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Arquivo muito grande ({:.1} MB). O limite é {} MB.",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "arquivo".to_string());
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
+
+    info!(
+        "[Neo] upload_path_to_store: {} ({} bytes, {})",
+        file_name,
+        bytes.len(),
+        mime
+    );
+
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name.clone())
+        .mime_str(&mime)
+        .map_err(|e| format!("Tipo de arquivo inválido: {}", e))?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("retention", "temp")
+        .text("origin", "upload-desktop")
+        .text("session_id", session_id.to_string())
+        .text("user_id", user_id.to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let resp = client
+        .post(format!("{}/api/v1/files", neo_core_http_url()))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Upload falhou: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // O core devolve {"detail": {"error": ..., "message": ...}} nos casos
+        // tratados (arquivo grande demais, quota); mostra a mensagem dele.
+        let friendly = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("detail")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| format!("{} {}", status, body));
+        return Err(friendly);
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
+}
+
+/// Busca os bytes de um arquivo já catalogado (file_save) no neo-core.
+/// Compartilhado por `download_generated_file` (clique manual, com diálogo)
+/// e `save_generated_file_to_desktop` (disparado pelo próprio agente, sem
+/// diálogo) — a URL certa (neo_core_http_url) só o Rust sabe resolver; é por
+/// isso que nenhum comando de shell escrito pelo modelo alcança esse arquivo
+/// (sessão ef4f723c: o modelo chutou 3 hosts/portas errados tentando `curl`).
+async fn fetch_generated_file_bytes(file_id: &str) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let resp = client
+        .get(format!(
+            "{}/api/v1/files/{}/download",
+            neo_core_http_url(),
+            file_id
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("Download falhou: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(format!("Download falhou: {}", status));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Falha ao ler o arquivo: {}", e))
+}
+
+/// Só o nome-base do caminho — nunca escreve fora de onde mandamos, mesmo que
+/// `file_name` venha com `../` (defesa em profundidade: o valor vem do
+/// backend, mas essa função escreve sem diálogo/confirmação do usuário).
+fn sanitize_file_name(name: &str) -> String {
+    std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "arquivo".to_string())
+}
+
+/// Baixa um arquivo que o Neo gerou/catalogou (ex: um .zip via a tool
+/// file_save) do catálogo do neo-core e salva localmente via diálogo nativo
+/// "Salvar como". Espelha o download de um clique do neo-panel (`GET
+/// /api/v1/files/{id}/download`) — o webview do Tauri não tem a mesma UX de
+/// download automático de um browser real, então quem baixa é o Rust.
+#[tauri::command]
+pub async fn download_generated_file(
+    app: AppHandle,
+    file_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let bytes = fetch_generated_file_bytes(&file_id).await?;
+
+    use tauri_plugin_dialog::DialogExt;
+    // blocking_save_file trava se rodar na thread principal — spawn_blocking,
+    // mesmo padrão de pick_attachment_files.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&file_name)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| format!("Falha ao abrir o diálogo de salvar: {}", e))?;
+
+    let Some(picked_path) = picked else {
+        // Usuário cancelou o diálogo — não é um erro real, o front trata esse
+        // texto como cancelamento silencioso.
+        return Err("cancelled".to_string());
+    };
+    let path = picked_path
+        .into_path()
+        .map_err(|e| format!("Caminho inválido: {}", e))?;
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("Falha ao salvar o arquivo: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Resolve `destination` pro diretório real. Atalhos conhecidos (desktop,
+/// downloads, documents, home) ou um caminho literal (absoluto ou com `~/`)
+/// quando o usuário citou uma pasta específica — ver `save_generated_file` no
+/// catálogo de tools (neo-core/modules/desktop/tools.py).
+fn resolve_destination_dir(destination: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = destination.trim();
+    match trimmed.to_lowercase().as_str() {
+        "" | "desktop" | "área de trabalho" | "area de trabalho" => dirs::desktop_dir()
+            .ok_or_else(|| "Não consegui localizar a Área de Trabalho/Desktop.".to_string()),
+        "downloads" | "download" => dirs::download_dir()
+            .ok_or_else(|| "Não consegui localizar a pasta Downloads.".to_string()),
+        "documents" | "documentos" => dirs::document_dir()
+            .ok_or_else(|| "Não consegui localizar a pasta Documentos.".to_string()),
+        "home" | "casa" => {
+            dirs::home_dir().ok_or_else(|| "Não consegui localizar a pasta pessoal (home).".to_string())
+        }
+        _ => {
+            // Caminho literal — expande "~/" pro home; absoluto vai direto.
+            if let Some(rest) = trimmed.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest))
+                    .ok_or_else(|| "Não consegui resolver \"~\" (home).".to_string())
+            } else {
+                Ok(std::path::PathBuf::from(trimmed))
+            }
+        }
+    }
+}
+
+/// Baixa um arquivo do catálogo e escreve DIRETO no destino pedido, sem
+/// diálogo — chamado pelo próprio agente (tool_name="save_generated_file",
+/// despachado em ai_agent.rs) quando o pedido é "bota esse arquivo no meu
+/// [Desktop/Downloads/pasta X]". Diferente de `download_generated_file`
+/// (clique manual do usuário + "Salvar como"), esta roda sem interação:
+/// precisa de destino determinístico, não um diálogo que ninguém vai
+/// responder.
+/// Formata um `SystemTime` como "YYYY-MM-DD HH:MM" no fuso local (pro cérebro
+/// citar a data do arquivo existente ao perguntar sobre sobrescrita).
+fn system_time_iso(t: Option<std::time::SystemTime>) -> Option<String> {
+    t.map(|st| {
+        let dt: chrono::DateTime<chrono::Local> = st.into();
+        dt.format("%Y-%m-%d %H:%M").to_string()
+    })
+}
+
+/// Baixa um arquivo do catálogo e escreve no destino pedido, sem diálogo.
+/// **Nunca sobrescreve às cegas:** se já existir um arquivo no destino e
+/// `overwrite=false`, NÃO baixa nem grava — devolve `status="conflict"` com os
+/// dados do arquivo existente (nome, tamanho, datas) pro cérebro decidir ou
+/// perguntar. Com `overwrite=true` (ou destino livre) grava e devolve
+/// `status="saved"`. Chamado pelo agente (tool_name="save_generated_file",
+/// despachado em ai_agent.rs).
+pub async fn save_generated_file_to_path(
+    file_id: &str,
+    file_name: &str,
+    destination: &str,
+    overwrite: bool,
+) -> Result<serde_json::Value, String> {
+    let dir = resolve_destination_dir(destination)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Falha ao acessar a pasta de destino ({}): {}", dir.display(), e))?;
+
+    let path = dir.join(sanitize_file_name(file_name));
+
+    // Colisão: checa ANTES de baixar/gravar (não paga o download à toa).
+    if !overwrite {
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.is_file() {
+                let existing = serde_json::json!({
+                    "name": path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string()),
+                    "size_bytes": meta.len(),
+                    "created_at": system_time_iso(meta.created().ok()),
+                    "modified_at": system_time_iso(meta.modified().ok()),
+                });
+                return Ok(serde_json::json!({
+                    "status": "conflict",
+                    "path": path.to_string_lossy().to_string(),
+                    "existing": existing,
+                }));
+            }
+        }
+    }
+
+    let bytes = fetch_generated_file_bytes(file_id).await?;
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("Falha ao salvar o arquivo: {}", e))?;
+
+    Ok(serde_json::json!({
+        "status": "saved",
+        "path": path.to_string_lossy().to_string(),
+    }))
+}
+
+/// Escreve conteúdo de texto DIRETO num arquivo do disco do usuário
+/// (tool_name="write_file", despachada em ai_agent.rs).
+///
+/// Existe porque escrever arquivo por shell é frágil: no `run_command` o
+/// conteúdo vira um heredoc (`cat <<EOF`), e aspas, crase, `$` e a própria
+/// palavra EOF dentro do texto quebram ou corrompem o arquivo em silêncio. Aqui
+/// o conteúdo viaja como argumento, não como script — nada é interpretado.
+///
+/// **Nunca sobrescreve às cegas** (mesma regra de `save_generated_file_to_path`):
+/// com `mode="write"`, arquivo existente e `overwrite=false`, devolve
+/// `status="conflict"` com os dados do que já está lá, para o cérebro decidir
+/// ou perguntar. `mode="append"` não conflita — acrescentar não destrói.
+pub async fn write_text_file(
+    path: &str,
+    content: &str,
+    mode: &str,
+    overwrite: bool,
+) -> Result<serde_json::Value, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("caminho vazio".to_string());
+    }
+    // Caminho relativo não tem âncora: o cwd do app não é o do usuário, e
+    // "notas.txt" acabaria em algum lugar que ninguém pediu. Exigir absoluto (ou
+    // `~/`) é a mesma disciplina do guard de caminho fundamentado no core.
+    let resolved = if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(rest))
+            .ok_or_else(|| "Não consegui resolver \"~\" (home).".to_string())?
+    } else if trimmed.starts_with('/') {
+        std::path::PathBuf::from(trimmed)
+    } else {
+        return Err(format!(
+            "caminho relativo não é aceito ({}): use um caminho absoluto ou começando com ~/",
+            trimmed
+        ));
+    };
+
+    let append = mode.eq_ignore_ascii_case("append");
+
+    if !append && !overwrite {
+        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
+            if meta.is_file() {
+                return Ok(serde_json::json!({
+                    "status": "conflict",
+                    "path": resolved.to_string_lossy().to_string(),
+                    "existing": {
+                        "name": resolved.file_name().map(|n| n.to_string_lossy().to_string()),
+                        "size_bytes": meta.len(),
+                        "created_at": system_time_iso(meta.created().ok()),
+                        "modified_at": system_time_iso(meta.modified().ok()),
+                    },
+                }));
+            }
+        }
+    }
+
+    if let Some(parent) = resolved.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Falha ao criar a pasta {}: {}", parent.display(), e))?;
+    }
+
+    let bytes = content.as_bytes();
+    if append {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&resolved)
+            .await
+            .map_err(|e| format!("Falha ao abrir {} para acrescentar: {}", resolved.display(), e))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| format!("Falha ao escrever em {}: {}", resolved.display(), e))?;
+    } else {
+        tokio::fs::write(&resolved, bytes)
+            .await
+            .map_err(|e| format!("Falha ao escrever em {}: {}", resolved.display(), e))?;
+    }
+
+    info!(
+        "[Neo] write_file: {} ({} bytes, mode={})",
+        resolved.display(),
+        bytes.len(),
+        if append { "append" } else { "write" }
+    );
+    Ok(serde_json::json!({
+        "status": "saved",
+        "path": resolved.to_string_lossy().to_string(),
+        "bytes_written": bytes.len(),
+        "mode": if append { "append" } else { "write" },
+    }))
+}
+
+// ============ IMAGENS INLINE NO CHAT ============
+//
+// O núcleo cognitivo pede a exibição de uma imagem escrevendo `[[IMAGE:origem]]`
+// na resposta (ver _INLINE_IMAGE_INSTRUCTION no neo-core); o front extrai o
+// marcador (src/lib/inlineImages.ts) e chama `load_chat_image` para cada um. Os
+// BYTES nunca passam pelo prompt nem pelo LLM: saem do disco do usuário, do
+// File Store ou de uma URL http(s) direto pro webview, como data URL — que é o
+// que a CSP do app já permite em `img-src` ('self' data:), sem abrir o
+// protocolo de assets.
+//
+// A origem remota (foto de anúncio numa busca de produto) é baixada AQUI, pelo
+// Rust: o webview nunca faz GET em terceiro, então a CSP segue fechada. O
+// `source` vem do modelo, então URL é entrada não confiável — ver
+// `is_private_image_host`.
+//
+// Nasceu do turno em que o pedido "carrega a imagem aqui no chat pra eu ver"
+// virou `base64 -i foto.jpeg`: o blob entrou no contexto e o usuário não viu
+// imagem nenhuma.
+
+/// Teto do que vale embutir como data URL numa bolha de chat. Foto de celular
+/// (~5 MB) passa folgado; acima disso a string base64 (~1,33x) pesa mais que o
+/// valor de mostrar, e o erro explica o motivo em vez de travar a UI.
+const MAX_INLINE_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+
+/// Extensões que o webview realmente desenha. HEIC/HEIF (padrão do iPhone) fica
+/// FORA de propósito: o WebKit do Tauri não decodifica, e sem esta checagem o
+/// usuário veria um quadro quebrado sem explicação.
+const RENDERABLE_IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "svg", "avif",
+];
+
+/// camelCase de propósito: as chaves são lidas direto pelo webview
+/// (`ChatImage` em src/lib/tauriApi.ts).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatImage {
+    /// `data:<mime>;base64,…` — pronto pro `src` de um `<img>`.
+    pub data_url: String,
+    pub name: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    /// Caminho absoluto real (só para origem local) — usado no "revelar no Finder"
+    /// e no tooltip. `None` quando a imagem veio do catálogo.
+    pub path: Option<String>,
+}
+
+/// Remove os marcadores `[[IMAGE:…]]` de um texto que vai ser FALADO (notch/TTS)
+/// ou mostrado onde não há renderização. Sem isto o TTS lê o caminho inteiro em
+/// voz alta. O front tem o equivalente em src/lib/inlineImages.ts (que também
+/// devolve as imagens); aqui só interessa o texto limpo.
+pub fn strip_image_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = find_image_marker(rest) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("]]") {
+            Some(end) => rest = &after[end + 2..],
+            None => {
+                // Marcador truncado (resposta cortada): descarta o resto, que é
+                // caminho de arquivo — nunca fala pela metade.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    // Junta o que sobrou dos dois lados sem deixar linha vazia solta no meio.
+    out.lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Índice do próximo `[[IMAGE:` (case-insensitive, tolerando espaços como
+/// `[[ image :`), que é o mesmo formato aceito pelo parser do front.
+///
+/// Varre bytes ASCII do texto ORIGINAL de propósito: `to_lowercase()` pode mudar
+/// o comprimento em bytes de alguns caracteres Unicode, e o índice devolvido
+/// serve para fatiar o original. `[` nunca aparece dentro de um char multibyte,
+/// então o corte cai sempre num limite válido.
+fn find_image_marker(haystack: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let skip_ws = |mut idx: usize| {
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        idx
+    };
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] != b'[' || bytes[i + 1] != b'[' {
+            continue;
+        }
+        let word = skip_ws(i + 2);
+        if bytes.len() < word + 5 || !bytes[word..word + 5].eq_ignore_ascii_case(b"image") {
+            continue;
+        }
+        let colon = skip_ws(word + 5);
+        if colon < bytes.len() && bytes[colon] == b':' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Base64 padrão (RFC 4648) sem quebra de linha. São ~20 linhas em vez de uma
+/// dependência nova só para isto.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Expande `~/` e resolve o caminho pedido pelo cérebro. Não confina a leitura a
+/// um diretório: o usuário pede imagens de qualquer lugar do disco DELE e é o
+/// mesmo alcance que `run_command` já tem neste app — o valor aqui é validar que
+/// o caminho existe e é imagem, para o modelo não conseguir "mostrar" um
+/// caminho inventado (falha visível, em vez de quadro quebrado silencioso).
+fn resolve_local_image_path(raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return Err("Caminho vazio.".to_string());
+    }
+    let expanded = if trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| "Não consegui resolver \"~\".".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| "Não consegui resolver \"~\".".to_string())?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    let canonical = std::fs::canonicalize(&expanded)
+        .map_err(|_| format!("Não achei o arquivo: {}", expanded.display()))?;
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
+    if !meta.is_file() {
+        return Err(format!("{} não é um arquivo.", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+/// Host de rede privada/local — recusado antes de qualquer GET remoto.
+///
+/// O `source` do marcador é escrito pelo MODELO, então tratar como entrada não
+/// confiável: sem isto, um `[[IMAGE:http://192.168.4.x/…]]` faria o app do
+/// usuário varrer a LAN dele. Mesma política do guard de SSRF do `web_fetch` no
+/// neo-core ("internet sim, LAN não").
+fn is_private_image_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']').to_lowercase();
+    if h == "localhost" || h.ends_with(".local") || h.ends_with(".internal") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return !ip_is_global(&ip);
+    }
+    false
+}
+
+/// `IpAddr::is_global` ainda é unstable no stable — a checagem equivalente para
+/// o que importa aqui (loopback, privado, link-local, multicast, reservado).
+fn ip_is_global(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] & 0xf0) == 0xf0)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 (unique local) e fe80::/10 (link local)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Baixa uma imagem de uma URL http(s) e devolve os bytes.
+///
+/// Quem faz o GET é o RUST, não o webview — assim a foto de um anúncio aparece
+/// na bolha sem afrouxar a CSP (`img-src 'self' data:` continua valendo) e sem
+/// o webview conversar com terceiro nenhum.
+async fn fetch_remote_image_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| format!("URL inválida: {}", url))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("Só http(s) no marcador de imagem (veio {}).", parsed.scheme()));
+    }
+    match parsed.host_str() {
+        Some(host) if !is_private_image_host(host) => {}
+        Some(host) => return Err(format!("Host de rede local recusado: {}", host)),
+        None => return Err("URL sem host.".to_string()),
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        // Loja costuma responder 403 pra user-agent de robô; aqui é o app do
+        // usuário buscando a imagem que ele pediu pra ver.
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Falha ao criar cliente HTTP: {}", e))?;
+
+    let resp = client
+        .get(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| format!("Não consegui baixar a imagem: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("A imagem respondeu {}.", resp.status()));
+    }
+    // Corta cedo pelo Content-Length quando o servidor informa, para não puxar
+    // 100 MB só pra descobrir que não cabe.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_INLINE_IMAGE_BYTES {
+            return Err(format!(
+                "Imagem muito grande para exibir ({:.1} MB; limite {} MB).",
+                len as f64 / (1024.0 * 1024.0),
+                MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Falha ao ler a imagem: {}", e))?
+        .to_vec();
+    if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
+        return Err(format!(
+            "Imagem muito grande para exibir ({:.1} MB; limite {} MB).",
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Confere se a extensão é de imagem desenhável pelo webview.
+fn ensure_renderable_image(path: &std::path::Path) -> Result<(), String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if RENDERABLE_IMAGE_EXTS.contains(&ext.as_str()) {
+        return Ok(());
+    }
+    if matches!(ext.as_str(), "heic" | "heif") {
+        return Err(format!(
+            "{} está em HEIC, que o chat não desenha. Converta antes (ex.: `sips -s format jpeg`).",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    Err(format!(
+        "{} não parece ser imagem exibível (extensão .{}).",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        if ext.is_empty() { "?".into() } else { ext }
+    ))
+}
+
+/// Carrega uma imagem para exibir na bolha do chat.
+///
+/// `source` vem do marcador `[[IMAGE:…]]`: um caminho do disco do usuário (com
+/// `~/` ou absoluto) ou `file:<file_id>` para um arquivo do catálogo do neo-core
+/// (ex.: um gráfico que o próprio Neo gerou no sandbox).
+#[tauri::command]
+pub async fn load_chat_image(source: String) -> Result<ChatImage, String> {
+    if let Some(file_id) = source.trim().strip_prefix("file:") {
+        let file_id = file_id.trim();
+        if file_id.is_empty() {
+            return Err("file_id vazio no marcador de imagem.".to_string());
+        }
+        let bytes = fetch_generated_file_bytes(file_id).await?;
+        if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
+            return Err(format!(
+                "Imagem muito grande para exibir ({:.1} MB).",
+                bytes.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        // O catálogo não devolve o nome no download; o mime sai do conteúdo.
+        let mime = infer_image_mime(&bytes)
+            .ok_or_else(|| "O arquivo do catálogo não é uma imagem reconhecida.".to_string())?;
+        return Ok(ChatImage {
+            data_url: format!("data:{};base64,{}", mime, base64_encode(&bytes)),
+            // `chars().take` (não fatia de bytes): um id fora do ASCII não pode
+            // derrubar o comando no meio de um caractere.
+            name: format!(
+                "{}.{}",
+                file_id.chars().take(8).collect::<String>(),
+                mime_ext(mime)
+            ),
+            mime: mime.to_string(),
+            size_bytes: bytes.len() as u64,
+            path: None,
+        });
+    }
+
+    let trimmed = source.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let bytes = fetch_remote_image_bytes(trimmed).await?;
+        // Mime pelos BYTES, nunca pela extensão da URL: link de CDN de loja
+        // costuma terminar em `...jpg_720x720q80.jpg_.webp` ou em nada.
+        let mime = infer_image_mime(&bytes)
+            .ok_or_else(|| "O que veio dessa URL não é uma imagem reconhecida.".to_string())?;
+        let name = reqwest::Url::parse(trimmed)
+            .ok()
+            .and_then(|u| {
+                u.path_segments()
+                    .and_then(|segs| segs.last().map(|s| s.to_string()))
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("imagem.{}", mime_ext(mime)));
+        info!(
+            "[Neo] load_chat_image (remoto): {} ({} bytes, {})",
+            trimmed,
+            bytes.len(),
+            mime
+        );
+        return Ok(ChatImage {
+            data_url: format!("data:{};base64,{}", mime, base64_encode(&bytes)),
+            name,
+            mime: mime.to_string(),
+            size_bytes: bytes.len() as u64,
+            // Não existe arquivo no disco — o lightbox esconde o "Abrir no
+            // sistema" quando `path` é None.
+            path: None,
+        });
+    }
+
+    let path = resolve_local_image_path(&source)?;
+    ensure_renderable_image(&path)?;
+
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
+    if meta.len() > MAX_INLINE_IMAGE_BYTES {
+        return Err(format!(
+            "Imagem muito grande para exibir ({:.1} MB; limite {} MB).",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
+    let mime = infer_image_mime(&bytes)
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| {
+            mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string()
+        });
+    info!(
+        "[Neo] load_chat_image: {} ({} bytes, {})",
+        path.display(),
+        bytes.len(),
+        mime
+    );
+
+    Ok(ChatImage {
+        data_url: format!("data:{};base64,{}", mime, base64_encode(&bytes)),
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "imagem".to_string()),
+        mime,
+        size_bytes: meta.len(),
+        path: Some(path.to_string_lossy().to_string()),
+    })
+}
+
+/// Mime pelos bytes iniciais (magic number) — mais confiável que a extensão, e é
+/// a única pista quando o arquivo vem do catálogo (download sem nome).
+fn infer_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    // SVG é texto: aceita quando começa com <svg ou um XML que o contenha logo.
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).to_lowercase();
+    if head.contains("<svg") {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
+/// Extensão sugerida para um mime de imagem (nome amigável do arquivo do catálogo).
+fn mime_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "jpg",
+    }
+}
+
+/// Abre a imagem no app padrão do sistema (o "ver em tamanho real de verdade").
+#[tauri::command]
+pub async fn reveal_local_file(path: String) -> Result<(), String> {
+    let resolved = resolve_local_image_path(&path)?;
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&resolved).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(&resolved)
+            .spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&resolved).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| format!("Não consegui abrir o arquivo: {}", e))
 }
 
 async fn ack_notification_http(notification_id: &str) -> Result<(), String> {
@@ -325,6 +1199,71 @@ pub fn save_conversation_history(messages: Vec<Message>) -> Result<(), String> {
     Ok(())
 }
 
+// ============ SESSION MANAGEMENT ============
+//
+// As sessões NÃO moram aqui: quem as cria e persiste é o neo-core (tabela
+// `conversation_session`). O desktop só gera o UUID no "Novo chat" e o manda em
+// cada turno — o core registra a sessão e as mensagens sozinho. Por isso listar
+// é um proxy pro core, e não um índice local: um arquivo local só enxergaria as
+// sessões desta máquina desde que o recurso existe, e ficaria vazio no 1º uso.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionInfo {
+    pub session_id: String,
+    /// Título derivado pelo core (1ª mensagem do usuário); None se não houver.
+    pub title: Option<String>,
+    pub message_count: i64,
+    /// ISO-8601 SEM timezone (o core grava `datetime.utcnow()`), ou seja: UTC.
+    /// O front precisa tratar como UTC ao humanizar — ver sessionsService.ts.
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSessionsResponse {
+    sessions: Vec<SessionInfo>,
+}
+
+/// Sessões anteriores, mais recentes primeiro. Erro de rede vira Err para a UI
+/// poder dizer "não deu pra carregar" em vez de mostrar uma lista vazia (que o
+/// usuário leria como "não tenho conversas").
+#[tauri::command]
+pub async fn list_sessions(limit: Option<u32>) -> Result<Vec<SessionInfo>, String> {
+    let base_url = neo_core_http_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let url = format!(
+        "{}/api/v1/desktop/sessions?service=neo-desktop-tauri&limit={}",
+        base_url,
+        limit.unwrap_or(50)
+    );
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("neo-core respondeu {}", resp.status()));
+    }
+
+    let parsed = resp
+        .json::<ListSessionsResponse>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))?;
+
+    Ok(parsed.sessions)
+}
+
+/// Sessão ativa agora — a UI usa para destacar a linha correspondente na lista.
+#[tauri::command]
+pub fn get_session_id(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.session_id.lock().unwrap().clone())
+}
+
 // ============ NEO CORE STATUS ============
 
 #[derive(Debug, Serialize)]
@@ -384,6 +1323,30 @@ pub struct VoiceConfig {
     /// Optional TTS language override. None deixa cada engine usar seu default
     /// (Qwen="Portuguese", Coqui="pt"), evitando acoplar idioma ao backend.
     pub language: Option<String>,
+    /// Segundos de OCIOSIDADE (escutando, sem ninguem falar) ate o Modo Live se
+    /// desligar sozinho na JANELA principal. So corre no estado `listening`: e
+    /// pausado enquanto o Neo pensa ou fala, e rearmado a cada parcial do STT.
+    /// Mais folgado que o do notch porque aqui voce esta olhando a tela, lendo a
+    /// resposta anterior — fechar em 15s seria agressivo. 0 desliga o timeout.
+    pub live_idle_timeout_s: f64,
+    /// Idem para o chip nativo do notch, que e hands-free e fica sobre todas as
+    /// janelas: sem ninguem olhando, o mic aberto a toa incomoda mais, entao o
+    /// default e bem mais curto. Consumido pelo LiveSession do NeoNotchHost.swift.
+    pub notch_idle_timeout_s: f64,
+    /// Microfone escolhido pelo usuario, por NOME (o mesmo string no CoreAudio,
+    /// no AVCaptureDevice e no enumerateDevices). `None` = padrao do sistema.
+    /// Toda captura TENTA este device; se ele sumiu, cai no padrao.
+    pub input_device_name: Option<String>,
+}
+
+/// Le um timeout em segundos do env, caindo no default quando ausente/invalido.
+/// Negativo vira 0 (= sem timeout), p/ um typo nao virar "fecha imediatamente".
+fn idle_timeout_env(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v.max(0.0))
+        .unwrap_or(default)
 }
 
 /// Returns neo-voice connection settings for the Live (voice) mode, read from
@@ -418,6 +1381,9 @@ pub fn get_voice_config() -> VoiceConfig {
         voice,
         backend,
         language,
+        live_idle_timeout_s: idle_timeout_env("NEO_LIVE_IDLE_TIMEOUT_S", 60.0),
+        notch_idle_timeout_s: idle_timeout_env("NEO_NOTCH_IDLE_TIMEOUT_S", 15.0),
+        input_device_name: crate::services::audio_route::preferred_input(),
     }
 }
 
@@ -446,6 +1412,35 @@ pub fn wake_status(state: State<'_, AppState>) -> WakeStatus {
     state.wake.status()
 }
 
+/// Politica de captura para a rota de audio atual (ver `services::audio_route`):
+/// diz ao webview se deve pedir `echoCancellation` e qual mic preferir. Resolvido
+/// na hora da chamada -- o usuario conecta/desconecta o fone a qualquer momento.
+#[tauri::command]
+pub fn audio_route() -> crate::services::audio_route::AudioRoute {
+    crate::services::audio_route::resolve()
+}
+
+/// Microfones disponiveis agora, p/ o seletor do painel de audio.
+#[tauri::command]
+pub fn list_audio_inputs() -> Vec<crate::services::audio_route::AudioInputDevice> {
+    crate::services::audio_route::list_inputs()
+}
+
+/// Microfone escolhido pelo usuario (por nome); `None` = padrao do sistema.
+#[tauri::command]
+pub fn get_audio_input() -> Option<String> {
+    crate::services::audio_route::preferred_input()
+}
+
+/// Grava a escolha e reenvia o config ao notch, p/ a proxima captura ja usar o
+/// device novo sem precisar reiniciar o app.
+#[tauri::command]
+pub fn set_audio_input(name: Option<String>) -> Result<(), String> {
+    crate::services::audio_route::set_preferred_input(name)?;
+    crate::notch_host::resend_config();
+    Ok(())
+}
+
 /// Lista as frases-gatilho cadastradas (com contagem de amostras e status de ref).
 #[tauri::command]
 pub fn wake_phrases(state: State<'_, AppState>) -> Vec<WakePhrase> {
@@ -453,6 +1448,16 @@ pub fn wake_phrases(state: State<'_, AppState>) -> Vec<WakePhrase> {
 }
 
 /// Salva uma amostra gravada (PCM mono 16kHz int16) de uma frase.
+/// Nivel das amostras ja gravadas de uma frase — revela as que estao mudas e
+/// contaminando a referencia (a trava do `wake_add_sample` so protege o futuro).
+#[tauri::command]
+pub fn wake_audit_samples(
+    state: State<'_, AppState>,
+    slug: String,
+) -> Vec<crate::services::wake::SampleAudit> {
+    state.wake.audit_samples(&slug)
+}
+
 /// `role`: `"wake"` (acende o Live) ou `"stop"` (interrompe a fala/o turno).
 #[tauri::command]
 pub fn wake_add_sample(
@@ -488,6 +1493,20 @@ pub async fn wake_enroll(
         wake.start(app);
     }
     Ok(phrase)
+}
+
+/// O webview reporta quando o TTS dele comeca/para de falar, alimentando o
+/// gate anti-eco do wake word (a voz do proprio Neo nao pode acordar o Live).
+#[tauri::command]
+pub fn wake_tts_state(speaking: bool) {
+    crate::services::wake::set_tts_speaking("webview", speaking);
+}
+
+/// Liga/desliga o modo teste do wake (tela "Teste de Wake"): enquanto ligado, o
+/// disparo NAO aciona o Live -- só reporta na tela (evento `wake-test-fire`).
+#[tauri::command]
+pub fn wake_set_test_mode(on: bool) {
+    crate::services::wake::set_wake_test_mode(on);
 }
 
 // ============ VOICE ENGINES (PC gamer) ============
@@ -810,10 +1829,78 @@ pub async fn process_notification_action(
     Ok(())
 }
 
+/// Lista os dispositivos da conta — a aba "Dispositivos".
+///
+/// Era um stub que devolvia lista vazia, então a aba nunca mostrou nada. Agora
+/// consulta `GET /devices/mine`, autenticado pelo TOKEN deste device (a rota
+/// `GET /devices` está atrás do JWT do painel, que o desktop não tem).
+/// Sem pareamento não há token — e aí a aba mostra o cartão de pareamento.
 #[tauri::command]
 pub async fn list_connected_devices() -> Result<Vec<serde_json::Value>, String> {
-    info!("[Neo] list_connected_devices");
-    Ok(vec![])
+    let Some(token) = crate::device_token() else {
+        return Ok(vec![]);
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Falha ao criar cliente: {}", e))?;
+
+    let response = client
+        .get(format!("{}/api/v1/devices/mine", neo_core_http_url()))
+        .query(&[("token", token.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao listar dispositivos: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Falha ao listar dispositivos: {}", response.status()));
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Resposta inválida: {}", e))?;
+
+    Ok(payload
+        .get("devices")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Renomeia um dispositivo da conta ("PC da sala").
+///
+/// É o nome pelo qual o cérebro endereça o aparelho em `device_control` — sem
+/// ele, sobra o modelo do hardware, que ninguém fala em voz alta.
+#[tauri::command]
+pub async fn rename_device(
+    target_device_id: String,
+    display_name: Option<String>,
+) -> Result<(), String> {
+    let token = crate::device_token().ok_or("Dispositivo não pareado")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Falha ao criar cliente: {}", e))?;
+
+    let response = client
+        .patch(format!(
+            "{}/api/v1/devices/mine/{}",
+            neo_core_http_url(),
+            target_device_id
+        ))
+        .query(&[("token", token.as_str())])
+        .json(&serde_json::json!({ "display_name": display_name }))
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao renomear: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Falha ao renomear: {}", response.status()));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -961,4 +2048,262 @@ pub fn set_notification_context(
         ctx.active_tab = active_tab;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inline_image_tests {
+    use super::*;
+
+    #[test]
+    fn strips_marker_and_keeps_the_sentence() {
+        let out = strip_image_markers("Aqui está:\n[[IMAGE:/Users/d/foto 1.jpeg]]");
+        assert_eq!(out, "Aqui está:");
+    }
+
+    #[test]
+    fn strips_multiple_and_mid_sentence_markers() {
+        let out = strip_image_markers("a [[IMAGE:/x.png]] b [[image : file:abc]] c");
+        assert_eq!(out, "a  b  c");
+    }
+
+    #[test]
+    fn truncated_marker_never_leaks_the_path() {
+        // Resposta cortada no meio do marcador: o caminho não pode ser falado.
+        let out = strip_image_markers("Olha só: [[IMAGE:/Users/d/Downloads/WhatsApp Ima");
+        assert_eq!(out, "Olha só:");
+    }
+
+    #[test]
+    fn text_without_marker_is_untouched() {
+        let text = "Resposta normal com [colchete] e [[VOICE:mario]]oi[[/VOICE]]";
+        assert_eq!(strip_image_markers(text), text);
+    }
+
+    #[test]
+    fn accented_text_before_marker_keeps_byte_boundaries() {
+        // Guard do índice em bytes: acentos antes do marcador não podem cortar
+        // no meio de um char (panic) nem comer letra.
+        let out = strip_image_markers("Ação, café e coração [[IMAGE:/tmp/a.png]]");
+        assert_eq!(out, "Ação, café e coração");
+    }
+
+    #[test]
+    fn detects_renderable_extensions_and_explains_heic() {
+        assert!(ensure_renderable_image(std::path::Path::new("/tmp/a.JPG")).is_ok());
+        assert!(ensure_renderable_image(std::path::Path::new("/tmp/a.png")).is_ok());
+        let heic = ensure_renderable_image(std::path::Path::new("/tmp/IMG_1.HEIC")).unwrap_err();
+        assert!(heic.contains("HEIC"), "{heic}");
+        assert!(ensure_renderable_image(std::path::Path::new("/tmp/a.pdf")).is_err());
+    }
+
+    #[test]
+    fn base64_matches_reference_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xFF, 0xD8, 0xFF]), "/9j/");
+    }
+
+    #[test]
+    fn infers_mime_from_magic_bytes() {
+        assert_eq!(infer_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(infer_image_mime(b"\x89PNG\r\n\x1a\n___"), Some("image/png"));
+        assert_eq!(infer_image_mime(b"<svg xmlns=\"...\">"), Some("image/svg+xml"));
+        assert_eq!(infer_image_mime(b"nao sou imagem"), None);
+    }
+
+    #[test]
+    fn invented_path_fails_loudly() {
+        // O modelo "mostrando" um caminho que não existe tem que falhar com
+        // mensagem, não devolver quadro quebrado.
+        let err = resolve_local_image_path("/caminho/que/nao/existe-neo-test.png").unwrap_err();
+        assert!(err.contains("Não achei"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod voice_config_tests {
+    use super::*;
+
+    /// As chaves precisam bater EXATAMENTE com o que o webview (VoiceConfig do
+    /// tauriApi.ts) e o Swift (`v["idleTimeoutS"]`) leem. Um typo aqui nao quebra
+    /// nada visivelmente: os dois lados caem no default e o timeout configurado e
+    /// ignorado em silencio — por isso o teste.
+    #[test]
+    fn serializes_idle_timeouts_as_camel_case() {
+        let json = serde_json::to_value(get_voice_config()).unwrap();
+        assert!(json.get("liveIdleTimeoutS").is_some(), "faltou liveIdleTimeoutS: {json}");
+        assert!(json.get("notchIdleTimeoutS").is_some(), "faltou notchIdleTimeoutS: {json}");
+    }
+
+    #[test]
+    fn idle_timeout_env_falls_back_and_clamps() {
+        // ausente -> default
+        assert_eq!(idle_timeout_env("NEO_TEST_IDLE_ABSENT_XYZ", 60.0), 60.0);
+        // valor valido -> usado
+        std::env::set_var("NEO_TEST_IDLE_OK", "12.5");
+        assert_eq!(idle_timeout_env("NEO_TEST_IDLE_OK", 60.0), 12.5);
+        // lixo -> default (nao vira 0 = "fecha na hora")
+        std::env::set_var("NEO_TEST_IDLE_JUNK", "abc");
+        assert_eq!(idle_timeout_env("NEO_TEST_IDLE_JUNK", 60.0), 60.0);
+        // negativo -> 0 (sem timeout), nunca um prazo negativo
+        std::env::set_var("NEO_TEST_IDLE_NEG", "-5");
+        assert_eq!(idle_timeout_env("NEO_TEST_IDLE_NEG", 60.0), 0.0);
+    }
+
+    #[test]
+    fn defaults_are_60_window_and_15_notch() {
+        std::env::remove_var("NEO_LIVE_IDLE_TIMEOUT_S");
+        std::env::remove_var("NEO_NOTCH_IDLE_TIMEOUT_S");
+        let cfg = get_voice_config();
+        assert_eq!(cfg.live_idle_timeout_s, 60.0);
+        assert_eq!(cfg.notch_idle_timeout_s, 15.0);
+    }
+}
+
+// ============ PAREAMENTO DE DEVICE ============
+
+#[derive(Serialize)]
+pub struct PairingStatus {
+    pub paired: bool,
+    pub device_id: String,
+}
+
+/// Este device já tem token de pareamento?
+///
+/// A UI usa isto para mostrar o campo do código quando ainda não pareou — sem
+/// pareamento o canal de controle não sobe, e "abaixa o volume do PC da sala"
+/// não tem como chegar aqui.
+#[tauri::command]
+pub fn device_pairing_status(state: State<'_, AppState>) -> PairingStatus {
+    PairingStatus {
+        paired: crate::device_token().is_some(),
+        device_id: state.device_id.clone(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PairResponse {
+    device_token: String,
+    display_name: Option<String>,
+}
+
+/// Troca o código de 6 dígitos (gerado no painel) pelo token deste device.
+///
+/// O token volta UMA vez e é gravado em disco; o core só guarda o hash. Depois
+/// disto o canal de controle sobe na próxima conexão.
+#[tauri::command]
+pub async fn pair_device(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    code: String,
+    display_name: Option<String>,
+) -> Result<String, String> {
+    let device_id = state.device_id.clone();
+    let hardware_id = state.hardware_id.clone();
+    let capabilities = crate::services::device_control::capabilities();
+    // Sem nome dado pelo usuário, o hostname é o melhor padrão: reconhecível de
+    // cara, e renomeável depois para "PC da sala".
+    let display_name = display_name
+        .filter(|n| !n.trim().is_empty())
+        .or_else(crate::services::system_info::hostname);
+
+    let body = serde_json::json!({
+        "code": code.trim(),
+        "device_id": device_id,
+        "hardware_id": hardware_id,
+        "device_type": "neo-desktop",
+        "model": crate::services::system_info::hardware_model(),
+        "os_platform": std::env::consts::OS,
+        "os_version": crate::services::system_info::os_release(),
+        "client_version": env!("CARGO_PKG_VERSION"),
+        "display_name": display_name,
+        "capabilities": capabilities,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Falha ao criar cliente: {}", e))?;
+
+    let response = client
+        .post(format!("{}/api/v1/devices/pair", crate::neo_core_http_url()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao parear: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(if status.as_u16() == 403 {
+            "Código inválido ou expirado — gere outro no painel.".to_string()
+        } else {
+            format!("Pareamento falhou: {} {}", status, text)
+        });
+    }
+
+    let payload: PairResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Resposta de pareamento inválida: {}", e))?;
+
+    crate::store_device_token(&payload.device_token)?;
+    info!("[Neo] device pareado: {}", device_id);
+
+    // Reconecta para o canal de controle subir agora, sem esperar um restart.
+    let ws_manager = {
+        let guard = state.ws_manager.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    if let Some(manager) = ws_manager {
+        manager.disconnect().await;
+        manager.connect().await;
+    }
+    let _ = app.emit("device-paired", &payload.display_name);
+
+    Ok(payload.display_name.unwrap_or(device_id))
+}
+
+/// Remove um dispositivo da conta.
+///
+/// Apagar o registro invalida o token junto (o core só guardava o hash) e
+/// derruba o canal de controle aberto. Remover ESTE aparelho equivale a
+/// desparear: o token local vira lixo, então ele também é apagado do disco e a
+/// aba volta a mostrar o cartão de pareamento.
+#[tauri::command]
+pub async fn remove_device(
+    state: State<'_, AppState>,
+    target_device_id: String,
+) -> Result<bool, String> {
+    let token = crate::device_token().ok_or("Dispositivo não pareado")?;
+    let is_self = target_device_id == state.device_id;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Falha ao criar cliente: {}", e))?;
+
+    let response = client
+        .delete(format!(
+            "{}/api/v1/devices/mine/{}",
+            neo_core_http_url(),
+            target_device_id
+        ))
+        .query(&[("token", token.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao remover: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Falha ao remover: {}", response.status()));
+    }
+
+    if is_self {
+        crate::clear_device_token()?;
+        info!("[Neo] este dispositivo foi removido — token local apagado");
+    }
+    Ok(is_self)
 }

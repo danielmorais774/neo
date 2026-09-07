@@ -92,10 +92,21 @@ export default function AudioDevicesPanel() {
     }
   }, [refresh]);
 
-  const onPickInput = useCallback((value: string) => {
-    setInputDeviceId(value);
-    setInputIdState(value);
-  }, []);
+  const onPickInput = useCallback(
+    (value: string) => {
+      setInputDeviceId(value);
+      setInputIdState(value);
+      // O webview escolhe por deviceId (id salgado do WebKit); o notch nativo e o
+      // sidecar da wake word não entendem esse id. Persistimos também o NOME no
+      // Rust, que é a chave comum aos três processos — sem isso, escolher o mic
+      // aqui não teria efeito nenhum no chip do notch.
+      const name = value ? inputs.find((d) => d.deviceId === value)?.label || '' : '';
+      void window.electronAPI?.setAudioInput?.(name || null).catch((e: unknown) => {
+        console.warn('[AudioDevicesPanel] não consegui salvar o mic no Rust:', e);
+      });
+    },
+    [inputs],
+  );
 
   const onPickOutput = useCallback((value: string) => {
     setOutputDeviceId(value); // sem label: limpa o rótulo do picker nativo

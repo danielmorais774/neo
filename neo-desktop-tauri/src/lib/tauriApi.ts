@@ -3,6 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { emit } from '@tauri-apps/api/event';
+import type { AudioRoute } from './audioDevices';
 
 // Types matching the original ElectronAPI interface
 export interface AgentEvent {
@@ -13,6 +14,9 @@ export interface AgentEvent {
 
 export interface DeviceInfo {
   device_id: string;
+  /** Nome exibido — é por ele que o cérebro endereça o aparelho. */
+  name?: string;
+  display_name?: string | null;
   device_type: string;
   model: string;
   hardware_id: string;
@@ -22,6 +26,10 @@ export interface DeviceInfo {
   ip_address: string;
   connected_at_unix: number;
   is_current_device: boolean;
+  is_online?: boolean;
+  /** Canal de controle aberto — mais estrito que is_online (presença). */
+  controllable?: boolean;
+  capabilities?: Record<string, boolean>;
 }
 
 export interface NotificationAction {
@@ -62,12 +70,27 @@ export interface NotificationActionEvent {
   action_payload?: Record<string, unknown>;
 }
 
+/** Um microfone visível ao CoreAudio. `name` é a chave comum aos três processos
+ *  (webview, notch nativo e sidecar da wake word). */
+export interface AudioInputDevice {
+  name: string;
+  /** 'builtin' | 'bluetooth' | 'usb' | 'other' */
+  transport: string;
+}
+
 export interface VoiceConfig {
   wsBaseUrl: string;
   apiKey: string | null;
   voice: string | null;
   backend: string;
   language: string | null;
+  /** Segundos ociosos (escutando, ninguém falando) até o Modo Live se desligar
+   *  sozinho na janela principal; 0 = sem timeout. Ver NEO_LIVE_IDLE_TIMEOUT_S. */
+  liveIdleTimeoutS: number;
+  /** Idem para o chip nativo do notch — mais curto, consumido pelo Swift. */
+  notchIdleTimeoutS: number;
+  /** Microfone escolhido pelo usuário, por nome; null = padrão do sistema. */
+  inputDeviceName: string | null;
 }
 
 // Engine de voz (STT/TTS) controlável no PC gamer via os scripts engine_ctl.
@@ -117,9 +140,71 @@ export interface VoiceOverride {
   label?: string | null;
 }
 
+// Voice imitation: one chunk of a multi-voice reply, carried on the agent's
+// `complete` event as `segments`. Spoken with `voice` if set, otherwise with the
+// reply-level default voice (VoiceOverride above).
+export interface SpeechSegmentOverride {
+  text: string;
+  voice?: VoiceOverride | null;
+}
+
+// Registro do catálogo devolvido pelo File Store no upload (neo-core
+// api/routes/files.py). Só o que a UI usa.
+export interface StoredFileMeta {
+  id: string;
+  name: string;
+  mime: string | null;
+  size_bytes: number;
+  retention: string;
+  expires_at: string | null;
+}
+
+// Imagem carregada para exibir na bolha do chat (marcador `[[IMAGE:…]]`). Os
+// bytes vêm do disco do usuário (ou do File Store) via Rust, já como data URL —
+// nunca passam pelo prompt/LLM. Ver src-tauri: load_chat_image.
+export interface ChatImage {
+  dataUrl: string;
+  name: string;
+  mime: string;
+  sizeBytes: number;
+  /** Caminho absoluto real; ausente quando a imagem veio do catálogo. */
+  path?: string | null;
+}
+
+/** Turno que veio do microfone (STT do neo-voice), não do teclado.
+ *  Vira `input_source`/`asr_raw`/`asr_engine` no metadata do gRPC — é o que faz o
+ *  neo-core tolerar erro de transcrição (docs/voice-input-normalization-plan.md). */
+export interface VoiceInputSource {
+  source: 'voice';
+  /** transcrição antes da correção do nome no neo-voice */
+  raw?: string;
+  engine?: string;
+}
+
 export interface ElectronAPI {
   sendMessage: (message: string, model?: string, mode?: string) => Promise<unknown>;
-  executeWithLoop: (message: string, model?: string, mode?: string, provider?: string) => Promise<void>;
+  executeWithLoop: (
+    message: string,
+    model?: string,
+    mode?: string,
+    provider?: string,
+    attachments?: string[],
+    voice?: VoiceInputSource
+  ) => Promise<void>;
+  // Anexos: picker nativo → upload pro File Store do neo-core. O `id` que volta
+  // é o que se manda em `attachments` no envio da mensagem.
+  pickAttachmentFiles: () => Promise<string[]>;
+  uploadAttachment: (path: string) => Promise<StoredFileMeta>;
+  // Arquivo que o Neo gerou/catalogou (file_save) — baixa do neo-core e salva
+  // localmente via diálogo nativo "Salvar como". Resolve com o path salvo;
+  // rejeita com "cancelled" se o usuário fechou o diálogo sem escolher.
+  downloadGeneratedFile: (fileId: string, fileName: string) => Promise<string>;
+  // Imagem inline: `source` é o conteúdo do marcador `[[IMAGE:source]]` — um
+  // caminho do disco do usuário ou `file:<file_id>` do catálogo. Rejeita com uma
+  // mensagem em português quando o caminho não existe / não é imagem exibível.
+  loadChatImage: (source: string) => Promise<ChatImage>;
+  // Abre o arquivo no app padrão do sistema (ver a imagem em tamanho real).
+  revealLocalFile: (path: string) => Promise<void>;
   stopExecution: () => void;
   resetAgent: (newSessionId: string) => Promise<string>;
   onAgentEvent: (callback: (event: AgentEvent) => void) => UnlistenFn;
@@ -152,24 +237,67 @@ export interface ElectronAPI {
   ackNotification: (notificationId: string) => Promise<{ ok: boolean; error?: string }>;
   onNotificationAction: (callback: (event: NotificationActionEvent) => void) => UnlistenFn;
   listConnectedDevices: () => Promise<DeviceInfo[]>;
+  devicePairingStatus: () => Promise<{ paired: boolean; device_id: string }>;
+  pairDevice: (code: string, displayName?: string) => Promise<string>;
+  renameDevice: (targetDeviceId: string, displayName: string | null) => Promise<void>;
+  /** Resolve com true quando o removido foi ESTE aparelho (= despareou). */
+  removeDevice: (targetDeviceId: string) => Promise<boolean>;
   setNotificationContext: (activeTab: 'chat' | 'devices') => Promise<void>;
   getVoiceConfig: () => Promise<VoiceConfig>;
   // Motores de voz no PC gamer (subir/baixar via engine_ctl por SSH).
   listVoiceEngines: () => Promise<VoiceEngine[]>;
   voiceEngineHealth: (key: string) => Promise<boolean>;
   voiceEngineAction: (key: string, action: VoiceEngineAction) => Promise<string>;
+  // Rota de áudio (CoreAudio): diz se o AEC é necessário e qual mic preferir.
+  audioRoute: () => Promise<AudioRoute>;
+  /** Microfones disponíveis agora, vistos pelo CoreAudio (nome + transporte). */
+  listAudioInputs: () => Promise<AudioInputDevice[]>;
+  /** Microfone escolhido pelo usuário, por nome; null = padrão do sistema. */
+  getAudioInput: () => Promise<string | null>;
+  /** Persiste a escolha (null limpa) e reenvia o config ao notch nativo. */
+  setAudioInput: (name: string | null) => Promise<void>;
   // Wake word local (Estágio 1 do Modo Live).
   wakeStart: () => Promise<WakeStatus>;
   wakeStop: () => Promise<WakeStatus>;
   wakeStatus: () => Promise<WakeStatus>;
   onWakeDetected: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // Monitor de teste: score de cada fala tipo-wake (inclui near-misses abaixo do
+  // limiar). Usado só pela tela "Teste de Wake" nas Configurações.
+  onWakeScore: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // Modo teste: enquanto ligado, o disparo do wake NÃO aciona o Live (igual
+  // "testar microfone" do Discord). Sempre desligar ao sair da tela.
+  wakeSetTestMode: (on: boolean) => Promise<void>;
+  // Disparo ocorrido em modo teste (não acionou o Live) — só a tela de teste ouve.
+  onWakeTestFire: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // Wake word com a janela principal VISÍVEL na tela: o Rust manda abrir o Modo
+  // Live DENTRO do app (overlay), em vez do chip nativo do notch. Sem payload.
+  onWakeLiveInApp: (callback: () => void) => UnlistenFn;
   // Palavra "pare" (papel "stop"): interrompe a fala/o turno no Modo Live.
   onWakeInterrupt: (callback: (detected: WakeDetected) => void) => UnlistenFn;
+  // O chip nativo do notch se fechou (X ou auto-desligar por inatividade): uma
+  // sessão Live aberta na janela também deve encerrar. Sem payload.
+  onLiveCloseRequested: (callback: () => void) => UnlistenFn;
   // Cadastro de frases-gatilho (few-shot pela voz).
   wakePhrases: () => Promise<WakePhrase[]>;
   wakeAddSample: (label: string, samples: number[], role?: 'wake' | 'stop') => Promise<WakePhrase>;
   wakeDeletePhrase: (slug: string) => Promise<void>;
   wakeEnroll: (slug: string) => Promise<WakePhrase>;
+  // Gate anti-eco: o webview avisa quando o TTS dele fala, p/ a voz do próprio
+  // Neo não disparar o wake word ("Ei Neo") no sidecar.
+  wakeTtsState: (speaking: boolean) => Promise<void>;
+  // Sessões anteriores — a fonte é o neo-core (tabela conversation_session);
+  // o desktop não mantém índice local. Rejeita se o core estiver inacessível.
+  listSessions: (limit?: number) => Promise<SessionInfo[]>;
+  /** Sessão ativa agora (para destacar a linha atual na lista). */
+  getSessionId: () => Promise<string>;
+}
+
+export interface SessionInfo {
+  session_id: string;
+  title: string | null;
+  message_count: number;
+  /** ISO-8601 SEM timezone, gravado pelo core como UTC. */
+  last_activity_at: string | null;
 }
 
 let passwordRequestUnlisten: UnlistenFn | null = null;
@@ -179,35 +307,85 @@ let quickHelpChunkUnlisten: UnlistenFn | null = null;
 let quickHelpDoneUnlisten: UnlistenFn | null = null;
 let quickHelpErrorUnlisten: UnlistenFn | null = null;
 
+// ── agent-event fan-out singleton ────────────────────────────────────────────
+// ONE native Tauri listener for 'agent-event', fanned out to every React
+// subscriber via a shared Set. Registering `listen()` per effect leaked a SECOND
+// native listener under React StrictMode's double-mount and Vite HMR/Fast Refresh
+// (the async unlisten resolved too late to cancel the first one), so every event —
+// including `complete` — was delivered twice and the chat rendered DUPLICATE
+// bubbles (two messages with the same Date.now() id). Add/remove on the Set are
+// synchronous, so no remount can leak. The bus lives on globalThis so it also
+// survives HMR of THIS module: exactly one native listener, ever.
+type AgentEventCb = (event: AgentEvent) => void;
+interface AgentEventBus {
+  subs: Set<AgentEventCb>;
+  started: boolean;
+}
+const _agentBus: AgentEventBus = ((
+  globalThis as unknown as { __neoAgentBus?: AgentEventBus }
+).__neoAgentBus ??= { subs: new Set<AgentEventCb>(), started: false });
+
+function ensureAgentEventListener(): void {
+  if (_agentBus.started) return;
+  _agentBus.started = true;
+  void listen<AgentEvent>('agent-event', (event) => {
+    // Snapshot: a subscriber may (un)subscribe while we dispatch.
+    for (const cb of [..._agentBus.subs]) {
+      try {
+        cb(event.payload);
+      } catch (err) {
+        console.error('[tauriApi] agent-event subscriber threw:', err);
+      }
+    }
+  });
+}
+
 export const electronAPI: ElectronAPI = {
   sendMessage: (message: string, model?: string, mode?: string) =>
     invoke('execute_with_loop', { message, model, mode, provider: undefined }),
 
-  executeWithLoop: (message: string, model?: string, mode?: string, provider?: string) =>
-    invoke('execute_with_loop', { message, model, mode, provider }),
+  executeWithLoop: (
+    message: string,
+    model?: string,
+    mode?: string,
+    provider?: string,
+    attachments?: string[],
+    voice?: VoiceInputSource
+  ) =>
+    invoke('execute_with_loop', {
+      message,
+      model,
+      mode,
+      provider,
+      attachments,
+      inputSource: voice?.source,
+      asrRaw: voice?.raw,
+      asrEngine: voice?.engine,
+    }),
+
+  pickAttachmentFiles: () => invoke<string[]>('pick_attachment_files'),
+
+  uploadAttachment: (path: string) => invoke<StoredFileMeta>('upload_attachment', { path }),
+
+  downloadGeneratedFile: (fileId: string, fileName: string) =>
+    invoke<string>('download_generated_file', { fileId, fileName }),
+
+  loadChatImage: (source: string) => invoke<ChatImage>('load_chat_image', { source }),
+
+  revealLocalFile: (path: string) => invoke<void>('reveal_local_file', { path }),
 
   stopExecution: () => invoke('stop_execution'),
 
   resetAgent: (newSessionId: string) => invoke('reset_agent', { newSessionId }),
 
   onAgentEvent: (callback: (event: AgentEvent) => void) => {
-    // Each call owns its own unlisten so multiple subscribers (or React
-    // StrictMode double-mount) don't leak listeners onto a shared global.
-    let cancelled = false;
-    let unlisten: UnlistenFn | null = null;
-    listen<AgentEvent>('agent-event', (event) => callback(event.payload)).then((u) => {
-      if (cancelled) {
-        u();
-      } else {
-        unlisten = u;
-      }
-    });
+    // Join the single shared native listener (see ensureAgentEventListener).
+    // Subscribe/unsubscribe are synchronous, so StrictMode double-mount and HMR
+    // can't leak a duplicate → this is what stopped the doubled chat bubbles.
+    ensureAgentEventListener();
+    _agentBus.subs.add(callback);
     return () => {
-      cancelled = true;
-      if (unlisten) {
-        unlisten();
-        unlisten = null;
-      }
+      _agentBus.subs.delete(callback);
     };
   },
 
@@ -406,6 +584,12 @@ export const electronAPI: ElectronAPI = {
   },
 
   listConnectedDevices: () => invoke('list_connected_devices'),
+  devicePairingStatus: () => invoke('device_pairing_status'),
+  pairDevice: (code: string, displayName?: string) =>
+    invoke('pair_device', { code, displayName: displayName ?? null }),
+  renameDevice: (targetDeviceId: string, displayName: string | null) =>
+    invoke('rename_device', { targetDeviceId, displayName }),
+  removeDevice: (targetDeviceId: string) => invoke('remove_device', { targetDeviceId }),
   setNotificationContext: (activeTab: 'chat' | 'devices') =>
     invoke('set_notification_context', { activeTab }),
 
@@ -415,6 +599,11 @@ export const electronAPI: ElectronAPI = {
   voiceEngineHealth: (key: string) => invoke('voice_engine_health', { key }),
   voiceEngineAction: (key: string, action: VoiceEngineAction) =>
     invoke('voice_engine_action', { key, action }),
+
+  audioRoute: () => invoke('audio_route'),
+  listAudioInputs: () => invoke('list_audio_inputs'),
+  getAudioInput: () => invoke('get_audio_input'),
+  setAudioInput: (name: string | null) => invoke('set_audio_input', { name }),
 
   wakeStart: () => invoke('wake_start'),
   wakeStop: () => invoke('wake_stop'),
@@ -426,6 +615,91 @@ export const electronAPI: ElectronAPI = {
     let cancelled = false;
     let unlisten: UnlistenFn | null = null;
     listen<WakeDetected>('wake-detected', (event) => callback(event.payload)).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
+  onWakeScore: (callback: (detected: WakeDetected) => void) => {
+    // Mesmo padrão por-subscriber do onWakeDetected. Evento frequente (só quando
+    // há fala tipo-wake), mas só há listener com a tela de teste aberta.
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<WakeDetected>('wake-score', (event) => callback(event.payload)).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
+  wakeSetTestMode: (on: boolean) => invoke('wake_set_test_mode', { on }),
+
+  onWakeTestFire: (callback: (detected: WakeDetected) => void) => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<WakeDetected>('wake-test-fire', (event) => callback(event.payload)).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
+  onWakeLiveInApp: (callback: () => void) => {
+    // Mesmo padrão de assinatura-por-subscriber do onWakeDetected (sem vazar no
+    // StrictMode/double-mount). Evento sem payload.
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen('wake-live-inapp', () => callback()).then((u) => {
+      if (cancelled) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+    };
+  },
+
+  // O chip nativo do notch se fechou (X ou auto-desligar por inatividade) e o
+  // Rust reemite `live-close-requested`: uma sessão Live aberta aqui na janela
+  // também deve encerrar, senão o mic continua aberto no webview.
+  onLiveCloseRequested: (callback: () => void) => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    listen('live-close-requested', () => callback()).then((u) => {
       if (cancelled) {
         u();
       } else {
@@ -465,4 +739,9 @@ export const electronAPI: ElectronAPI = {
     invoke('wake_add_sample', { label, samples, role }),
   wakeDeletePhrase: (slug: string) => invoke('wake_delete_phrase', { slug }),
   wakeEnroll: (slug: string) => invoke('wake_enroll', { slug }),
+  wakeTtsState: (speaking: boolean) => invoke('wake_tts_state', { speaking }),
+
+  // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
+  listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),
+  getSessionId: () => invoke<string>('get_session_id'),
 };

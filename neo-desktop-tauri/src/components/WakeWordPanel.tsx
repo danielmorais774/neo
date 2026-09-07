@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { WakePhrase } from '../lib/tauriApi';
-import { recordPcm16k } from '../lib/wakeRecorder';
+import { recordPcm16k, analyzeLevel } from '../lib/wakeRecorder';
 import './WakeWordPanel.css';
 
 const RECORD_MS = 1500; // janela de 1.5s do EfficientWord-Net
@@ -32,6 +32,8 @@ export default function WakeWordPanel() {
   const [recording, setRecording] = useState(false);
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Aviso não-bloqueante: a amostra foi aceita, mas ficou fraca (ver analyzeLevel).
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -57,11 +59,20 @@ export default function WakeWordPanel() {
       return false;
     }
     setError(null);
+    setNotice(null);
     setRecording(true);
     try {
       const samples = await recordPcm16k(RECORD_MS);
+      // Amostra ruim é PIOR que amostra faltando: a referência do detector é
+      // calculada em cima delas, então uma gravação muda contamina a frase toda.
+      const level = analyzeLevel(samples);
+      if (!level.ok) {
+        setError(`${level.reason} (pico ${level.peak.toFixed(2)})`);
+        return false;
+      }
       const updated = await window.electronAPI.wakeAddSample(t, samples, role);
       setPhrases((prev) => upsert(prev, updated));
+      if (level.weak) setNotice(`${level.reason} (pico ${level.peak.toFixed(2)})`);
       return true;
     } catch (e) {
       setError(errMsg(e));
@@ -121,6 +132,7 @@ export default function WakeWordPanel() {
       />
 
       {error && <p className="wake-error">{error}</p>}
+      {notice && <p className="wake-notice">{notice}</p>}
     </div>
   );
 }

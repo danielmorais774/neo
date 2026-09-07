@@ -4,3 +4,4 @@ export * from './useAgentEvents';
 export * from './useAppStartup';
 export * from './useLiveMode';
 export * from './useWakeWord';
+export * from './useSessionManagement';

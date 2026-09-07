@@ -5,6 +5,169 @@ interface Props {
   currentDeviceId?: string;
 }
 
+/**
+ * Cartão de pareamento — aparece enquanto este aparelho não tem token.
+ *
+ * Sem pareamento o canal de controle não sobe, e nada de "abaixa o volume do
+ * PC da sala" chega aqui. O código sai do neo-panel (que tem credencial); este
+ * aparelho não pode se auto-autorizar, senão a autenticação não valeria nada.
+ */
+function PairingCard({ onPaired }: { onPaired: () => void }) {
+  const [code, setCode] = useState('');
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (code.trim().length !== 6) {
+      setError('O código tem 6 dígitos.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await window.electronAPI?.pairDevice(code.trim(), name.trim() || undefined);
+      onPaired();
+    } catch (err: any) {
+      setError(typeof err === 'string' ? err : err?.message || 'Falha ao parear');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="device-card pairing-card">
+      <div className="device-info">
+        <div className="device-header">
+          <span className="device-type">Parear este dispositivo</span>
+        </div>
+        <div className="device-meta">
+          Gere um código no neo-panel e digite aqui. Sem isso o Neo não consegue
+          controlar volume, mídia ou energia desta máquina.
+        </div>
+        <div className="pairing-fields">
+          <input
+            className="pairing-input"
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            placeholder="000000"
+            inputMode="numeric"
+            maxLength={6}
+            disabled={busy}
+          />
+          <input
+            className="pairing-input pairing-input-name"
+            value={name}
+            onChange={(e) => setName(e.target.value.slice(0, 64))}
+            placeholder="Nome (ex: PC da sala)"
+            disabled={busy}
+          />
+          <button onClick={submit} disabled={busy}>
+            {busy ? 'Pareando…' : 'Parear'}
+          </button>
+        </div>
+        {error && <div className="pairing-error">❌ {error}</div>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Botão de remover, com confirmação em dois toques.
+ *
+ * Remover o PRÓPRIO aparelho equivale a desparear (o token vai junto), então
+ * ele avisa disso antes — é uma ação bem diferente de tirar um notebook velho
+ * da lista, e o botão é o mesmo.
+ */
+function RemoveButton({ device, onRemoved }: { device: DeviceInfo; onRemoved: (self: boolean) => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const remove = async () => {
+    setBusy(true);
+    try {
+      const wasSelf = await window.electronAPI?.removeDevice(device.device_id);
+      onRemoved(Boolean(wasSelf));
+    } catch {
+      setBusy(false);
+      setConfirming(false);
+    }
+  };
+
+  if (!confirming) {
+    return (
+      <button
+        className="device-remove"
+        title="Remover este dispositivo da conta"
+        onClick={() => setConfirming(true)}
+      >
+        Remover
+      </button>
+    );
+  }
+
+  return (
+    <div className="device-remove-confirm">
+      <span>
+        {device.is_current_device
+          ? 'Remover ESTE aparelho? Ele será despareado.'
+          : `Remover "${device.name || device.model}"?`}
+      </span>
+      <button className="device-remove danger" onClick={remove} disabled={busy}>
+        {busy ? '…' : 'Confirmar'}
+      </button>
+      <button className="device-remove" onClick={() => setConfirming(false)} disabled={busy}>
+        Cancelar
+      </button>
+    </div>
+  );
+}
+
+/** Nome editável no lugar — é o nome que o usuário vai FALAR com o Neo. */
+function DeviceName({ device, onRenamed }: { device: DeviceInfo; onRenamed: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(device.display_name || '');
+
+  const save = async () => {
+    setEditing(false);
+    const next = value.trim();
+    if (next === (device.display_name || '')) return;
+    try {
+      await window.electronAPI?.renameDevice(device.device_id, next || null);
+      onRenamed();
+    } catch {
+      /* a lista recarrega sozinha; um erro aqui não vale um alerta */
+    }
+  };
+
+  if (editing) {
+    return (
+      <input
+        className="device-name-input"
+        value={value}
+        autoFocus
+        maxLength={64}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') save();
+          if (e.key === 'Escape') setEditing(false);
+        }}
+      />
+    );
+  }
+
+  return (
+    <span
+      className="device-name"
+      title="Clique para renomear — é por este nome que você pede as coisas ao Neo"
+      onClick={() => setEditing(true)}
+    >
+      {device.name || device.model}
+    </span>
+  );
+}
+
 function formatTimestamp(unix: number): string {
   if (!unix) return '—';
   const d = new Date(unix * 1000);
@@ -38,25 +201,38 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [paired, setPaired] = useState<boolean | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
+    let cancelled = false;
+
     const fetchDevices = async () => {
       try {
-        setLoading(true);
         setError(null);
+        const status = await window.electronAPI?.devicePairingStatus();
+        if (cancelled) return;
+        setPaired(status?.paired ?? false);
+
         const result = await window.electronAPI?.listConnectedDevices();
+        if (cancelled) return;
         setDevices(result || []);
       } catch (err: any) {
-        setError(err?.message || 'Falha ao carregar dispositivos');
+        if (!cancelled) setError(err?.message || 'Falha ao carregar dispositivos');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     fetchDevices();
     const interval = setInterval(fetchDevices, 10000); // refresh every 10s
-    return () => clearInterval(interval);
-  }, []);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [reloadKey]);
+
+  const reload = () => setReloadKey((k) => k + 1);
 
   if (loading) {
     return (
@@ -72,6 +248,14 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
       <div className="devices-error">
         <span>❌ {error}</span>
         <button onClick={() => setDevices([])}>Tentar novamente</button>
+      </div>
+    );
+  }
+
+  if (paired === false) {
+    return (
+      <div className="devices-list">
+        <PairingCard onPaired={reload} />
       </div>
     );
   }
@@ -108,15 +292,31 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
               {device.is_current_device && (
                 <span className="device-badge">este dispositivo</span>
               )}
+              {/* Controlável = canal de controle aberto. Mais estrito que
+                  "online": é o que decide se o Neo consegue mexer no volume. */}
+              {device.controllable && (
+                <span className="device-badge device-badge-control">controlável</span>
+              )}
             </div>
-            <div className="device-model">{device.model}</div>
+            <div className="device-model">
+              <DeviceName device={device} onRenamed={reload} />
+            </div>
             <div className="device-meta">
+              <span>{device.model}</span>
               <span>{device.os_platform} {device.os_version}</span>
               {device.client_version && <span>v{device.client_version}</span>}
             </div>
             <div className="device-time">
               Conectado {formatTimestamp(device.connected_at_unix)}
             </div>
+            <RemoveButton
+              device={device}
+              onRemoved={(wasSelf) => {
+                // Removeu a si mesmo = despareou: o cartão de pareamento volta.
+                if (wasSelf) setPaired(false);
+                reload();
+              }}
+            />
           </div>
         </div>
       ))}

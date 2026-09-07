@@ -13,7 +13,10 @@
 //!
 //! notch -> Rust (stdout):
 //!   {"type":"ready"}                            host booted; reply with config
-//!   {"type":"prompt","text":…}                  run the full agent for this text
+//!   {"type":"prompt","text":…,"source":"voice","raw_text":…,"asr_engine":…}
+//!                                               run the full agent for this text
+//!                                               (`source` só vem quando o texto
+//!                                                saiu do microfone/STT)
 //!   {"type":"notification_action","notification_id":…,"action_type":…,"payload":…}
 //!   {"type":"notification_dismiss","notification_id":…}
 
@@ -38,6 +41,7 @@ impl Default for NotchHostState {
 mod imp {
     use crate::commands;
     use crate::notifications::types::NeoNotification;
+    use crate::services::ai_agent::VoiceInput;
     use log::{info, warn};
     use std::io::{BufRead, BufReader, Write};
     use std::process::{ChildStdin, ChildStdout, Command, Stdio};
@@ -97,7 +101,11 @@ mod imp {
         }
         match event_type {
             "complete" => {
-                let text = data.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+                let raw = data.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+                // O marcador `[[IMAGE:…]]` é para a bolha do chat desenhar a imagem;
+                // aqui a resposta é FALADA — sem isto o notch leria o caminho inteiro
+                // em voz alta ("colchete colchete image dois pontos barra Users…").
+                let text = commands::strip_image_markers(raw);
                 let voice = data.get("voice").cloned().unwrap_or(serde_json::Value::Null);
                 send_to_notch(&serde_json::json!({
                     "type": "agent_complete",
@@ -123,6 +131,12 @@ mod imp {
 
     /// Tell the native host to enter hands-free Live Mode (shows the chip and
     /// starts native mic capture). Triggered by the wake word.
+    ///
+    /// A politica de captura (AEC ligado? qual mic?) NAO vai no payload: o host
+    /// nativo resolve a rota de audio ele mesmo, no instante em que abre o mic
+    /// (`AudioRoute` no NeoNotchHost.swift). Fone entra e sai a qualquer momento,
+    /// e uma rota mandada daqui chegaria velha para a captura do proprio host --
+    /// que tambem e disparada pela UI dele, sem passar pelo Rust.
     pub fn live_start() {
         send_to_notch(&serde_json::json!({ "type": "live_start" }));
     }
@@ -132,6 +146,12 @@ mod imp {
     /// Triggered by the "stop" word ("pare").
     pub fn live_interrupt() {
         send_to_notch(&serde_json::json!({ "type": "live_interrupt" }));
+    }
+
+    /// Reenvia o config ao notch (ex.: o usuario trocou o microfone no painel).
+    /// No-op se o host nao estiver rodando.
+    pub fn resend_config() {
+        send_config();
     }
 
     fn send_config() {
@@ -144,6 +164,9 @@ mod imp {
                 "voice": cfg.voice,
                 "backend": cfg.backend,
                 "language": cfg.language,
+                // o chip usa o timeout do NOTCH, nao o da janela principal
+                "idleTimeoutS": cfg.notch_idle_timeout_s,
+                "inputDeviceName": cfg.input_device_name,
             }
         }));
     }
@@ -179,12 +202,27 @@ mod imp {
                         }
                         // Full agent, "live" mode -> neo-core replies with compact
                         // spoken text (no markdown), ideal for the notch + TTS.
+                        // `source` says the INPUT came from the mic: the notch has
+                        // a text field too, and only the mic turns get the ASR
+                        // tolerance (voice-input-normalization-plan.md §3).
+                        let voice = event
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| VoiceInput::from_parts(
+                                Some(s.to_string()),
+                                event.get("raw_text").and_then(|v| v.as_str()).map(str::to_string),
+                                event.get("asr_engine").and_then(|v| v.as_str()).map(str::to_string),
+                            ))
+                            .flatten();
                         commands::run_agent_message(
                             app.clone(),
                             text,
                             None,
                             Some("live".to_string()),
                             None,
+                            None,
+                            voice,
                         );
                     }
                     "notification_action" => {
@@ -234,6 +272,26 @@ mod imp {
                         app.state::<crate::AppState>()
                             .cancel_notify
                             .notify_waiters();
+                    }
+                    "tts_state" => {
+                        // Native TTS started/stopped speaking (live chip or
+                        // notch island). Feeds the wake-word anti-echo gate so
+                        // Neo's own voice can't trigger "Ei Neo".
+                        let source = event
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("notch");
+                        let speaking = event
+                            .get("speaking")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        crate::services::wake::set_tts_speaking(source, speaking);
+                    }
+                    "notch_diag" | "notch_tts_diag" => {
+                        // Diagnostico da captura (STT) ou do playback (TTS) do
+                        // Modo Live nativo. Logado no Neo Desktop.log para depurar
+                        // "capta mas nao transcreve" / "nao fala a resposta".
+                        info!("[NeoNotch][diag] {}", event);
                     }
                     _ => {}
                 }
@@ -330,6 +388,11 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    forward_agent_event, forward_notification, live_interrupt, live_start, start_notch_host,
-    stop_notch_host,
+    forward_agent_event, forward_notification, live_interrupt, live_start, resend_config,
+    start_notch_host, stop_notch_host,
 };
+
+/// Fora do macOS nao ha notch nativo: trocar o microfone no painel nao precisa
+/// avisar ninguem.
+#[cfg(not(target_os = "macos"))]
+pub fn resend_config() {}

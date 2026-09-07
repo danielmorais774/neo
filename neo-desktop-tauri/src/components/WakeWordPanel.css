@@ -78,6 +78,13 @@
   color: #fca5a5;
 }
 
+/* Amostra aceita, porém fraca: avisa sem bloquear (ver analyzeLevel). */
+.wake-notice {
+  margin: 0;
+  font-size: 12px;
+  color: #fcd34d;
+}
+
 .wake-empty {
   margin: 4px 0;
   font-size: 12px;

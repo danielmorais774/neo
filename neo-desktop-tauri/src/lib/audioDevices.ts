@@ -42,12 +42,108 @@ export function getOutputLabel(): string {
 }
 
 /**
- * Devolve as constraints de áudio p/ getUserMedia respeitando o mic escolhido.
- * Passa o resto das opções (channelCount, echoCancellation, …) intocado.
+ * Política de captura para a rota de áudio atual, resolvida pelo Rust
+ * (services/audio_route.rs) via CoreAudio. Ver `getMicStream`.
  */
-export function micConstraints(base: MediaTrackConstraints = {}): MediaTrackConstraints {
-  const id = getInputDeviceId();
-  return id ? { ...base, deviceId: { exact: id } } : base;
+export interface AudioRoute {
+  /** Pedir `echoCancellation` ao getUserMedia? */
+  aec: boolean;
+  /** 'builtin-speaker' | 'headphones' | 'bluetooth' | 'usb' | … */
+  outputTransport: string;
+  /** Nome CoreAudio do mic interno — casa com o `label` do enumerateDevices. */
+  builtinInputName: string;
+  defaultInputIsBluetooth: boolean;
+  reason: string;
+}
+
+const FALLBACK_ROUTE: AudioRoute = {
+  aec: true,
+  outputTransport: 'unknown',
+  builtinInputName: '',
+  defaultInputIsBluetooth: false,
+  reason: 'rota indisponível; mantendo o comportamento padrão',
+};
+
+/** Resolve a rota AGORA — o fone entra e sai o tempo todo, cache aqui mente. */
+export async function getAudioRoute(): Promise<AudioRoute> {
+  try {
+    return (await window.electronAPI?.audioRoute?.()) ?? FALLBACK_ROUTE;
+  } catch {
+    return FALLBACK_ROUTE;
+  }
+}
+
+/**
+ * Mic a usar: a escolha explícita do usuário ganha sempre. Sem escolha, se o mic
+ * padrão do sistema for um fone Bluetooth, preferimos o mic INTERNO — abrir o mic
+ * do fone derruba o dispositivo de A2DP p/ HFP e a música vira som de telefone.
+ * O casamento é pelo nome, que o WebKit expõe igual ao CoreAudio.
+ */
+async function preferredInputId(route: AudioRoute): Promise<string> {
+  const chosen = getInputDeviceId();
+  if (chosen) return chosen;
+
+  // Sem escolha local, mas pode haver uma escolha COMPARTILHADA (gravada no Rust
+  // por nome, que é o que o notch nativo também lê). Isso mantém as três
+  // superfícies no mesmo microfone mesmo que este webview seja novo — o
+  // localStorage é por origem e não sobrevive a tudo.
+  try {
+    const byName = await window.electronAPI?.getAudioInput?.();
+    if (byName) {
+      const id = await deviceIdForName(byName);
+      if (id) return id;
+    }
+  } catch {
+    /* segue para a heurística abaixo */
+  }
+
+  if (!route.defaultInputIsBluetooth || !route.builtinInputName) return '';
+  return (await deviceIdForName(route.builtinInputName)) || '';
+}
+
+/** deviceId do input cujo `label` bate com `name` ('' se não achar). Sem
+ *  permissão de mic os labels vêm vazios, então cai no padrão do sistema. */
+async function deviceIdForName(name: string): Promise<string> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const match = devices.find((d) => d.kind === 'audioinput' && d.label === name);
+    return match?.deviceId || '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Abre o microfone seguindo a rota de áudio atual.
+ *
+ * `echoCancellation` não é mais fixo: no WebKit ele liga o mesmo Voice Processing
+ * I/O do nativo, que é duplex — abre o dispositivo de SAÍDA padrão junto e faz
+ * ducking do áudio dos outros apps. Só vale quando a música volta pelo ar e vaza
+ * no mic (saída em alto-falante); em fone é degradar a música de graça.
+ */
+export async function getMicStream(): Promise<MediaStream> {
+  const route = await getAudioRoute();
+  const base: MediaTrackConstraints = {
+    channelCount: 1,
+    echoCancellation: route.aec,
+    noiseSuppression: route.aec,
+    autoGainControl: true,
+  };
+  const id = await preferredInputId(route);
+  if (!id) return navigator.mediaDevices.getUserMedia({ audio: base });
+
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: { ...base, deviceId: { exact: id } },
+    });
+  } catch (e) {
+    // OverconstrainedError: o device sumiu (fone desconectado) ou o id salgado do
+    // WebKit rodou. Cair no mic padrão é melhor que derrubar o Modo Live com um
+    // "permissão negada" que não tem nada a ver com permissão.
+    if (e instanceof Error && e.name !== 'OverconstrainedError') throw e;
+    console.warn('[audioDevices] mic escolhido indisponível; usando o padrão do sistema');
+    return navigator.mediaDevices.getUserMedia({ audio: base });
+  }
 }
 
 type SinkCapableAudioContext = AudioContext & {

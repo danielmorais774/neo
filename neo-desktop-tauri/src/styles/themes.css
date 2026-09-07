@@ -17,6 +17,8 @@
   --window-titlebar-border: rgba(59, 130, 246, 0.12);
   --window-titlebar-text: rgba(230, 237, 243, 0.76);
   --modal-bg: rgba(12, 16, 30, 0.96);
+  /* Sidebar de sessões: opaca de propósito (não é vidro como os modais). */
+  --sessions-bg: #0c101e;
   --modal-border: rgba(59, 130, 246, 0.2);
   --modal-shadow: 0 24px 70px rgba(0, 0, 0, 0.58);
   --modal-blur: 0px;
@@ -44,6 +46,7 @@
   --assistant-bubble: rgba(15, 23, 42, 0.48);
   --border-color: rgba(255, 255, 255, 0.12);
   --modal-bg: rgba(11, 16, 28, 0.58);
+  --sessions-bg: #0b101c;
   --modal-border: rgba(255, 255, 255, 0.18);
   --modal-shadow: 0 28px 80px rgba(0, 0, 0, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.12);
   --modal-blur: 24px;
@@ -109,3 +112,1082 @@
 [data-theme='glassmorphism'] .titlebar-buttons button:not(.btn-new-chat-header):not(.btn-settings-header):hover {
   background: var(--control-bg-hover);
 }
+
+/* ============================================================================
+   GLASS DARK THEME ("glassdark") — cyberpunk 2077 HUD. Near-black red-tinted
+   glass, a faint red grid + CRT scanline, angular 4px corners, monospace
+   terminal labels, red hairline borders, and a SOLID neon-red accent on the
+   primary actions. Evolved from the Claude Design file "Neo Assistant
+   Cyberpunk". Runs over the same transparent native window as glassmorphism.
+   ============================================================================ */
+
+[data-theme='glassdark'] {
+  /* Base palette (index.css :root overrides) */
+  --bg-primary: transparent;
+  --bg-chat: transparent;
+  --text-primary: rgba(255, 255, 255, 0.95);
+  --text-secondary: rgba(255, 255, 255, 0.5);
+  --accent: #ff2d3d;
+  --accent-hover: #ff5563;
+
+  /* Themed surface tokens (themes.css) */
+  --app-bg: rgba(10, 8, 10, 0.6);
+  --app-border: rgba(255, 30, 45, 0.35);
+  --app-glass-overlay: rgba(9, 6, 8, 0.55);
+  --app-glass-blur: 34px;
+  --app-radius: 6px;
+  --surface-1: rgba(255, 255, 255, 0.04);
+  --surface-2: rgba(255, 255, 255, 0.07);
+  --surface-border: rgba(255, 30, 45, 0.14);
+  --accent-border: rgba(255, 30, 45, 0.4);
+  --accent-border-strong: rgba(255, 30, 45, 0.7);
+  --selected-bg: rgba(255, 20, 40, 0.12);
+  --control-bg: rgba(255, 255, 255, 0.03);
+  --control-bg-hover: rgba(255, 20, 40, 0.12);
+  --window-titlebar-bg: rgba(9, 6, 8, 0.34);
+  --window-titlebar-border: rgba(255, 30, 45, 0.2);
+  --window-titlebar-text: rgba(255, 255, 255, 0.75);
+  --assistant-bubble: rgba(255, 255, 255, 0.04);
+  --border-color: rgba(255, 30, 45, 0.14);
+  --modal-bg: rgba(10, 7, 9, 0.72);
+  --sessions-bg: #0a0709;
+  --modal-border: rgba(255, 30, 45, 0.3);
+  --modal-shadow: 0 30px 90px rgba(0, 0, 0, 0.7), 0 0 50px rgba(255, 20, 40, 0.14), inset 0 0 0 1px rgba(255, 30, 45, 0.18);
+  --modal-blur: 34px;
+  --modal-radius: 6px;
+
+  /* Cyberpunk recipes */
+  --gd-red: #ff2d3d;
+  --gd-red-ink: #0a0708;            /* dark text over the solid red fill */
+  --gd-accent-bg: rgba(255, 20, 40, 0.1);   /* translucent red (tabs, chips) */
+  --gd-accent-border: rgba(255, 30, 45, 0.45);
+  --gd-glow: 0 0 20px rgba(255, 20, 40, 0.55);
+  --gd-glow-sm: 0 0 14px rgba(255, 20, 40, 0.2);
+  --gd-hair: 1px solid rgba(255, 30, 45, 0.14);
+  --gd-blur: blur(24px) saturate(140%);
+  --gd-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+}
+
+[data-theme='glassdark'],
+[data-theme='glassdark'] body,
+[data-theme='glassdark'] #root {
+  background: transparent;
+}
+
+/* Window frame — angular, red rim + outer bloom */
+[data-theme='glassdark'] .app {
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--app-border), 0 0 60px rgba(255, 20, 40, 0.12),
+    0 30px 90px rgba(0, 0, 0, 0.7);
+}
+
+/* No orbs in this theme — the ambiance is a grid + scanline instead. */
+[data-theme='glassdark'] .orb {
+  display: none;
+}
+
+/* Frosted overlay carries the faint red HUD grid (drawn crisp, on top of the
+   backdrop blur rather than behind it). */
+[data-theme='glassdark'] .app::after {
+  background:
+    linear-gradient(rgba(255, 20, 40, 0.05) 1px, transparent 1px) 0 0 / 48px 48px,
+    linear-gradient(90deg, rgba(255, 20, 40, 0.05) 1px, transparent 1px) 0 0 / 48px 48px,
+    var(--app-glass-overlay);
+  backdrop-filter: blur(var(--app-glass-blur)) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--app-glass-blur)) saturate(140%);
+}
+
+/* CRT scanline sweeping the whole surface, above content but non-interactive. */
+[data-theme='glassdark'] .app::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 140px;
+  z-index: 3;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(255, 20, 40, 0.045), transparent);
+  animation: gdScan 9s linear infinite;
+}
+
+@keyframes gdScan {
+  0% { transform: translateY(-140px); }
+  100% { transform: translateY(760px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme='glassdark'] .app::before {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* Chromed frames — titlebar, tab bar, composer, agent progress */
+[data-theme='glassdark'] .window-titlebar,
+[data-theme='glassdark'] .titlebar,
+[data-theme='glassdark'] .input-container,
+[data-theme='glassdark'] .agent-progress {
+  background: rgba(9, 6, 8, 0.28);
+  backdrop-filter: var(--gd-blur);
+  -webkit-backdrop-filter: var(--gd-blur);
+}
+
+/* Thin red accent line along the very top of the window. */
+[data-theme='glassdark'] .window-titlebar {
+  position: relative;
+  border-bottom: 1px solid rgba(255, 20, 40, 0.2);
+}
+
+[data-theme='glassdark'] .window-titlebar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 30, 45, 0.7), transparent);
+  pointer-events: none;
+}
+
+/* Squared window controls — close glows red, the others stay dim. */
+[data-theme='glassdark'] .window-control {
+  border-radius: 2px;
+}
+
+[data-theme='glassdark'] .window-control-close {
+  background: var(--gd-red);
+  box-shadow: 0 0 8px rgba(255, 20, 40, 0.6);
+}
+
+[data-theme='glassdark'] .window-control-minimize,
+[data-theme='glassdark'] .window-control-maximize {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Terminal title */
+[data-theme='glassdark'] .window-title {
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  font-weight: 700;
+}
+
+[data-theme='glassdark'] .titlebar {
+  border-bottom-color: rgba(255, 20, 40, 0.12);
+}
+
+[data-theme='glassdark'] .header-name {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Status readout — mono, uppercase, red (link online) */
+[data-theme='glassdark'] .header-status {
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  font-size: 10px;
+}
+
+[data-theme='glassdark'] .header-status.connected {
+  color: var(--gd-red);
+}
+
+[data-theme='glassdark'] .header-status.connected .status-indicator {
+  background: var(--gd-red);
+  box-shadow: 0 0 8px var(--gd-red);
+}
+
+/* Header avatar — squared, red rim, red glyph */
+[data-theme='glassdark'] .header-avatar {
+  border-radius: 4px;
+  background: rgba(255, 20, 40, 0.08);
+  border: 1px solid rgba(255, 30, 45, 0.4);
+  box-shadow: 0 0 16px rgba(255, 20, 40, 0.15);
+  color: var(--gd-red);
+}
+
+/* Frosted surfaces — cards, bubbles, agent panels, dropdowns (angular) */
+[data-theme='glassdark'] .input-wrapper,
+[data-theme='glassdark'] .live-bar,
+[data-theme='glassdark'] .attachment-chip,
+[data-theme='glassdark'] .device-card,
+[data-theme='glassdark'] .message.assistant .message-text,
+[data-theme='glassdark'] .thinking-indicator,
+[data-theme='glassdark'] .plan-content,
+[data-theme='glassdark'] .step-content,
+[data-theme='glassdark'] .command-box,
+[data-theme='glassdark'] .message-details-panel,
+[data-theme='glassdark'] .mission-message,
+[data-theme='glassdark'] .glass-select-trigger,
+[data-theme='glassdark'] .glass-select-menu {
+  background: var(--surface-1);
+  border-color: var(--surface-border);
+  border-radius: 4px;
+  backdrop-filter: var(--gd-blur);
+  -webkit-backdrop-filter: var(--gd-blur);
+  box-shadow: none;
+}
+
+/* Composer bay — angular, red hairline, red inner bloom; ring on focus */
+[data-theme='glassdark'] .input-wrapper {
+  border-radius: 4px;
+  border: 1px solid rgba(255, 30, 45, 0.3);
+  backdrop-filter: blur(30px) saturate(140%);
+  -webkit-backdrop-filter: blur(30px) saturate(140%);
+  box-shadow: var(--gd-glow-sm);
+}
+
+[data-theme='glassdark'] .input-wrapper:focus-within {
+  border-color: var(--accent-border-strong);
+  box-shadow: 0 0 0 1px rgba(255, 30, 45, 0.4), 0 0 22px rgba(255, 20, 40, 0.3);
+}
+
+[data-theme='glassdark'] .input-wrapper textarea {
+  font-family: var(--gd-mono);
+}
+
+/* Tabs — angular; active = translucent red panel with glow */
+[data-theme='glassdark'] .tab-btn {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.45);
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+[data-theme='glassdark'] .tab-btn:hover {
+  background: var(--control-bg-hover);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+[data-theme='glassdark'] .tab-btn.active {
+  background: var(--gd-accent-bg);
+  border-color: var(--gd-accent-border);
+  color: var(--gd-red);
+  box-shadow: var(--gd-glow-sm);
+}
+
+/* Secondary control buttons — settings, window buttons (angular) */
+[data-theme='glassdark'] .btn-settings-header,
+[data-theme='glassdark'] .btn-settings-top,
+[data-theme='glassdark'] .titlebar-buttons button:not(.btn-new-chat-header):not(.btn-settings-header) {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.6);
+}
+
+[data-theme='glassdark'] .btn-settings-header:hover,
+[data-theme='glassdark'] .btn-settings-top:hover,
+[data-theme='glassdark'] .titlebar-buttons button:not(.btn-new-chat-header):not(.btn-settings-header):hover {
+  background: var(--control-bg-hover);
+  border-color: var(--gd-accent-border);
+  color: #fff;
+}
+
+/* Primary action — SOLID neon red with dark ink + red bloom */
+[data-theme='glassdark'] .btn-new-chat-header,
+[data-theme='glassdark'] .btn-new-chat-top {
+  border-radius: 4px;
+  background: var(--gd-red);
+  border: 1px solid var(--gd-red);
+  color: var(--gd-red-ink);
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  box-shadow: var(--gd-glow);
+}
+
+[data-theme='glassdark'] .btn-new-chat-header svg,
+[data-theme='glassdark'] .btn-new-chat-top svg {
+  stroke: var(--gd-red-ink);
+}
+
+[data-theme='glassdark'] .btn-new-chat-header:hover,
+[data-theme='glassdark'] .btn-new-chat-top:hover:not(:disabled) {
+  background: #ff4553;
+  color: var(--gd-red-ink);
+  box-shadow: 0 0 28px rgba(255, 20, 40, 0.75);
+}
+
+[data-theme='glassdark'] .btn-send {
+  border-radius: 4px;
+  background: var(--gd-red);
+  border: 1px solid var(--gd-red);
+  color: var(--gd-red-ink);
+  box-shadow: var(--gd-glow);
+}
+
+[data-theme='glassdark'] .btn-send svg {
+  fill: var(--gd-red-ink);
+}
+
+[data-theme='glassdark'] .btn-send:hover:not(:disabled) {
+  transform: scale(1.06);
+  background: #ff4553;
+  box-shadow: 0 0 28px rgba(255, 20, 40, 0.75);
+}
+
+/* Suggestion chips (angular) */
+[data-theme='glassdark'] .suggestions button {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: var(--gd-hair);
+  backdrop-filter: var(--gd-blur);
+  -webkit-backdrop-filter: var(--gd-blur);
+}
+
+[data-theme='glassdark'] .suggestions button:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--gd-accent-border);
+}
+
+/* Dropdowns (GlassSelect) */
+[data-theme='glassdark'] .glass-select-trigger {
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+[data-theme='glassdark'] .glass-select-trigger:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--gd-accent-border);
+}
+
+[data-theme='glassdark'] .glass-select.open .glass-select-trigger {
+  border-color: var(--accent-border-strong);
+}
+
+[data-theme='glassdark'] .glass-select-option {
+  border-radius: 3px;
+}
+
+[data-theme='glassdark'] .glass-select-option:hover {
+  background: rgba(255, 20, 40, 0.08);
+}
+
+[data-theme='glassdark'] .glass-select-option.selected {
+  background: var(--selected-bg);
+}
+
+[data-theme='glassdark'] .glass-select-check {
+  color: var(--gd-red);
+}
+
+/* Messages — angular; user bubble reads red, assistant stays neutral glass */
+[data-theme='glassdark'] .message.user .message-text {
+  background: rgba(255, 20, 40, 0.12);
+  border: 1px solid rgba(255, 30, 45, 0.4);
+  border-radius: 4px 4px 0 4px;
+  color: #fff;
+  box-shadow: none;
+}
+
+[data-theme='glassdark'] .message.assistant .message-text {
+  border-radius: 4px 4px 4px 0;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+[data-theme='glassdark'] .message.user .message-avatar {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+[data-theme='glassdark'] .message.assistant .message-avatar {
+  border-radius: 4px;
+  background: rgba(255, 20, 40, 0.08);
+  border: 1px solid rgba(255, 30, 45, 0.35);
+  color: var(--gd-red);
+}
+
+[data-theme='glassdark'] .message-time {
+  font-family: var(--gd-mono);
+  color: rgba(255, 255, 255, 0.35);
+}
+
+[data-theme='glassdark'] .message-text a {
+  color: var(--accent-hover);
+}
+
+/* Agent progress bar in the accent */
+[data-theme='glassdark'] .progress-bar {
+  background: linear-gradient(90deg, #ff2d3d, #ff6a4a);
+  box-shadow: 0 0 10px rgba(255, 20, 40, 0.6);
+}
+
+/* Devices tab muted text */
+[data-theme='glassdark'] .device-model,
+[data-theme='glassdark'] .device-meta,
+[data-theme='glassdark'] .device-time,
+[data-theme='glassdark'] .devices-loading,
+[data-theme='glassdark'] .devices-empty,
+[data-theme='glassdark'] .devices-empty p {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* Scrollbar */
+[data-theme='glassdark'] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 30, 45, 0.3);
+  border-radius: 2px;
+}
+
+[data-theme='glassdark'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 30, 45, 0.55);
+}
+
+/* ============================================================================
+   MINIMAL THEME — subtle, neutral grayscale inspired by the ChatGPT macOS app.
+   Opaque, flat surfaces, hairline borders, no blue accent, no orbs/glass.
+   ============================================================================ */
+
+[data-theme='minimal'] {
+  /* Base palette (index.css :root overrides) */
+  --bg-primary: #212121;
+  --bg-secondary: #2a2a2a;
+  --bg-tertiary: #303030;
+  --bg-chat: #212121;
+  --accent: #b4b4b4;
+  --accent-hover: #d4d4d4;
+  --text-primary: #ececec;
+  --text-secondary: #9b9b9b;
+  --border-color: rgba(255, 255, 255, 0.08);
+  --user-bubble: #303030;
+  --assistant-bubble: transparent;
+  --code-bg: rgba(0, 0, 0, 0.3);
+
+  /* Themed surface tokens (themes.css) */
+  --app-bg: #212121;
+  --app-border: rgba(255, 255, 255, 0.08);
+  --app-glass-overlay: transparent;
+  --app-glass-blur: 0px;
+  --app-radius: 12px;
+  --surface-1: #2f2f2f;
+  --surface-2: #383838;
+  --surface-border: rgba(255, 255, 255, 0.1);
+  --accent-border: rgba(255, 255, 255, 0.14);
+  --accent-border-strong: rgba(255, 255, 255, 0.24);
+  --selected-bg: rgba(255, 255, 255, 0.08);
+  --control-bg: rgba(255, 255, 255, 0.06);
+  --control-bg-hover: rgba(255, 255, 255, 0.12);
+  --window-titlebar-bg: rgba(23, 23, 23, 0.92);
+  --window-titlebar-border: rgba(255, 255, 255, 0.06);
+  --window-titlebar-text: rgba(236, 236, 236, 0.8);
+  --modal-bg: #2a2a2a;
+  --sessions-bg: #2a2a2a;
+  --modal-border: rgba(255, 255, 255, 0.1);
+  --modal-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  --modal-blur: 0px;
+}
+
+/* Flat, opaque shell — kill the animated orbs and the frosted glass overlay. */
+[data-theme='minimal'] .bg-orbs {
+  display: none;
+}
+
+[data-theme='minimal'] .app {
+  border-color: var(--app-border);
+}
+
+[data-theme='minimal'] .app::after {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Header / titlebar chrome */
+[data-theme='minimal'] .titlebar {
+  border-bottom-color: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme='minimal'] .header-avatar,
+[data-theme='minimal'] .message.user .message-avatar,
+[data-theme='minimal'] .message.assistant .message-avatar {
+  background: #4a4a4a;
+}
+
+[data-theme='minimal'] .btn-new-chat-header,
+[data-theme='minimal'] .btn-new-chat-top {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #ececec;
+}
+
+[data-theme='minimal'] .btn-new-chat-header:hover,
+[data-theme='minimal'] .btn-new-chat-top:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+
+/* Tabs */
+[data-theme='minimal'] .tab-btn {
+  color: rgba(236, 236, 236, 0.55);
+}
+
+[data-theme='minimal'] .tab-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(236, 236, 236, 0.85);
+}
+
+[data-theme='minimal'] .tab-btn.active {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: #ececec;
+}
+
+/* Composer */
+[data-theme='minimal'] .input-container {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-top-color: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme='minimal'] .input-wrapper,
+[data-theme='minimal'] .attachment-chip,
+[data-theme='minimal'] .live-bar {
+  background: #2f2f2f;
+  border-color: rgba(255, 255, 255, 0.12);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='minimal'] .input-wrapper:focus-within {
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* Send button — white circle with a dark arrow, ChatGPT style */
+[data-theme='minimal'] .btn-send {
+  background: #ececec;
+  color: #1a1a1a;
+}
+
+[data-theme='minimal'] .btn-send:hover:not(:disabled) {
+  background: #ffffff;
+  box-shadow: none;
+  transform: scale(1.06);
+}
+
+/* Suggestion chips (welcome screen) */
+[data-theme='minimal'] .suggestions button {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.1);
+  backdrop-filter: none;
+}
+
+[data-theme='minimal'] .suggestions button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/* Mode / model dropdowns (GlassSelect) */
+[data-theme='minimal'] .glass-select-trigger {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.1);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='minimal'] .glass-select-trigger:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+[data-theme='minimal'] .glass-select.open .glass-select-trigger {
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='minimal'] .glass-select-menu {
+  background: #2a2a2a;
+  border-color: rgba(255, 255, 255, 0.1);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme='minimal'] .glass-select-option:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='minimal'] .glass-select-option.selected {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Messages — neutral user bubble, borderless assistant (no glass) */
+[data-theme='minimal'] .message.user .message-text {
+  background: #303030;
+  color: #ececec;
+}
+
+[data-theme='minimal'] .message.assistant .message-text {
+  background: transparent;
+  border: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='minimal'] .message-text code {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='minimal'] .message-text a {
+  color: #8ab4d8;
+}
+
+[data-theme='minimal'] .message-text blockquote {
+  border-left-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(236, 236, 236, 0.75);
+}
+
+[data-theme='minimal'] .message-text th,
+[data-theme='minimal'] .message-text td {
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+[data-theme='minimal'] .message-text th {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme='minimal'] .message-text hr {
+  border-top-color: rgba(255, 255, 255, 0.12);
+}
+
+/* Agent surfaces — progress, thinking, plans, steps, commands, details */
+[data-theme='minimal'] .agent-progress {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: none;
+  border-bottom-color: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme='minimal'] .progress-bar-container {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='minimal'] .progress-bar {
+  background: linear-gradient(90deg, #8e8e8e, #cfcfcf);
+}
+
+[data-theme='minimal'] .thinking-indicator,
+[data-theme='minimal'] .plan-content,
+[data-theme='minimal'] .step-content,
+[data-theme='minimal'] .command-box,
+[data-theme='minimal'] .message-details-panel,
+[data-theme='minimal'] .mission-message {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='minimal'] .executing-badge {
+  background: rgba(255, 255, 255, 0.14);
+  color: #ececec;
+}
+
+[data-theme='minimal'] .iteration-badge {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #d4d4d4;
+}
+
+/* Devices tab */
+[data-theme='minimal'] .device-card {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='minimal'] .device-card:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+[data-theme='minimal'] .device-card.current {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+[data-theme='minimal'] .device-icon {
+  background: rgba(255, 255, 255, 0.08);
+  color: #d4d4d4;
+}
+
+[data-theme='minimal'] .device-model,
+[data-theme='minimal'] .device-meta,
+[data-theme='minimal'] .device-time,
+[data-theme='minimal'] .devices-loading,
+[data-theme='minimal'] .devices-empty,
+[data-theme='minimal'] .devices-empty p {
+  color: rgba(236, 236, 236, 0.5);
+}
+
+/* Scrollbar — neutral instead of blue */
+[data-theme='minimal'] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+[data-theme='minimal'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+/* ============================================================================
+   CLAYMORPHISM THEME — a playful "clay/plasticine" take on the gray family.
+   Soft violet ground, puffy inflated surfaces (big radius, no borders) sculpted
+   with a drop shadow for lift + a top highlight and a bottom inner shadow, and
+   a single warm coral accent for the primary action. No glass, no orbs.
+   ============================================================================ */
+
+[data-theme='claymorphism'] {
+  /* Base palette (index.css :root overrides) */
+  --bg-primary: #2a2440;
+  --bg-secondary: #352c4d;
+  --bg-tertiary: #3f345c;
+  --bg-chat: #2a2440;
+  --accent: #ff9e80;
+  --accent-hover: #ffb59e;
+  --text-primary: #f2eefb;
+  --text-secondary: #a79dc2;
+  --border-color: rgba(255, 255, 255, 0.05);
+  --user-bubble: #3f345c;
+  --assistant-bubble: transparent;
+  --code-bg: rgba(0, 0, 0, 0.26);
+
+  /* Themed surface tokens (themes.css) */
+  --app-bg: #2a2440;
+  --app-border: rgba(255, 255, 255, 0.05);
+  --app-glass-overlay: transparent;
+  --app-glass-blur: 0px;
+  --app-radius: 20px;
+  --surface-1: #352c4d;
+  --surface-2: #3f345c;
+  --surface-border: transparent;
+  --accent-border: transparent;
+  --accent-border-strong: transparent;
+  --selected-bg: #3f345c;
+  --control-bg: #352c4d;
+  --control-bg-hover: #3f345c;
+  --window-titlebar-bg: #2a2440;
+  --window-titlebar-border: transparent;
+  --window-titlebar-text: rgba(242, 238, 251, 0.82);
+  --modal-bg: #2a2440;
+  --sessions-bg: #2a2440;
+  --modal-border: transparent;
+  --modal-shadow: 0 24px 60px rgba(8, 4, 20, 0.6), inset 0 3px 6px rgba(255, 255, 255, 0.12), inset 0 -6px 14px rgba(0, 0, 0, 0.28);
+  --modal-blur: 0px;
+
+  /* Clay recipes — drop shadow (lift) + top highlight + bottom inner shadow */
+  --clay-surface: #352c4d;
+  --clay-puff: 0 10px 20px rgba(8, 4, 20, 0.45), inset 0 3px 5px rgba(255, 255, 255, 0.14), inset 0 -6px 11px rgba(0, 0, 0, 0.28);
+  --clay-puff-sm: 0 6px 13px rgba(8, 4, 20, 0.4), inset 0 2px 4px rgba(255, 255, 255, 0.13), inset 0 -4px 8px rgba(0, 0, 0, 0.24);
+  --clay-press: inset 0 4px 9px rgba(0, 0, 0, 0.34), inset 0 -2px 4px rgba(255, 255, 255, 0.07);
+  --clay-accent-puff: 0 8px 18px rgba(255, 120, 80, 0.3), inset 0 3px 5px rgba(255, 255, 255, 0.4), inset 0 -6px 11px rgba(178, 62, 32, 0.4);
+  --clay-accent-ink: #40190d;
+}
+
+/* Flat, opaque shell — no orbs, no frosted glass overlay. */
+[data-theme='claymorphism'] .bg-orbs {
+  display: none;
+}
+
+[data-theme='claymorphism'] .app {
+  border-color: var(--app-border);
+}
+
+[data-theme='claymorphism'] .app::after {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Header / titlebar */
+[data-theme='claymorphism'] .titlebar {
+  border-bottom-color: transparent;
+}
+
+/* Header avatar gets the one coral pop */
+[data-theme='claymorphism'] .header-avatar {
+  background: linear-gradient(160deg, #ffb59e, #ff8a66);
+  box-shadow: var(--clay-accent-puff);
+}
+
+[data-theme='claymorphism'] .message.user .message-avatar,
+[data-theme='claymorphism'] .message.assistant .message-avatar {
+  background: var(--surface-2);
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .btn-new-chat-header,
+[data-theme='claymorphism'] .btn-new-chat-top,
+[data-theme='claymorphism'] .btn-settings-header,
+[data-theme='claymorphism'] .btn-settings-top {
+  background: var(--surface-1);
+  border: none;
+  color: var(--text-primary);
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .btn-new-chat-header:hover,
+[data-theme='claymorphism'] .btn-new-chat-top:hover:not(:disabled),
+[data-theme='claymorphism'] .btn-settings-header:hover,
+[data-theme='claymorphism'] .btn-settings-top:hover {
+  background: var(--surface-2);
+  color: #ffffff;
+  box-shadow: var(--clay-puff);
+}
+
+/* Tabs — puffy when idle, coral clay when active */
+[data-theme='claymorphism'] .tab-btn {
+  background: var(--surface-1);
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .tab-btn:hover {
+  color: var(--text-primary);
+}
+
+[data-theme='claymorphism'] .tab-btn.active {
+  background: linear-gradient(160deg, #ffb59e, #ff8a66);
+  border-color: transparent;
+  color: var(--clay-accent-ink);
+  box-shadow: var(--clay-accent-puff);
+}
+
+/* Composer */
+[data-theme='claymorphism'] .input-container {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-top-color: transparent;
+}
+
+[data-theme='claymorphism'] .input-wrapper,
+[data-theme='claymorphism'] .live-bar,
+[data-theme='claymorphism'] .attachment-chip {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 26px;
+  box-shadow: var(--clay-puff);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .input-wrapper:focus-within {
+  box-shadow: var(--clay-puff), 0 0 0 2px rgba(255, 158, 128, 0.35);
+}
+
+[data-theme='claymorphism'] .btn-mic:hover,
+[data-theme='claymorphism'] .btn-attachment:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Send button — the coral clay puff, the star of the theme */
+[data-theme='claymorphism'] .btn-send {
+  background: linear-gradient(160deg, #ffb59e, #ff8a66);
+  color: var(--clay-accent-ink);
+  box-shadow: var(--clay-accent-puff);
+}
+
+[data-theme='claymorphism'] .btn-send:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 22px rgba(255, 120, 80, 0.4), inset 0 3px 5px rgba(255, 255, 255, 0.45), inset 0 -6px 11px rgba(178, 62, 32, 0.4);
+}
+
+[data-theme='claymorphism'] .btn-send:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: var(--clay-press);
+}
+
+/* Suggestion chips */
+[data-theme='claymorphism'] .suggestions button {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 22px;
+  box-shadow: var(--clay-puff-sm);
+  backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .suggestions button:hover {
+  background: var(--surface-2);
+  transform: translateY(-2px);
+  box-shadow: var(--clay-puff);
+}
+
+[data-theme='claymorphism'] .suggestions button:active {
+  transform: translateY(0);
+  box-shadow: var(--clay-press);
+}
+
+/* Mode / model dropdowns (GlassSelect) */
+[data-theme='claymorphism'] .glass-select-trigger {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--clay-puff-sm);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .glass-select-trigger:hover:not(:disabled) {
+  background: var(--surface-2);
+  box-shadow: var(--clay-puff);
+}
+
+[data-theme='claymorphism'] .glass-select.open .glass-select-trigger {
+  box-shadow: var(--clay-press);
+}
+
+[data-theme='claymorphism'] .glass-select-menu {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--clay-puff);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .glass-select-option {
+  border-radius: 12px;
+}
+
+[data-theme='claymorphism'] .glass-select-option:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme='claymorphism'] .glass-select-option.selected {
+  background: rgba(255, 158, 128, 0.16);
+}
+
+[data-theme='claymorphism'] .glass-select-check {
+  color: var(--accent);
+}
+
+/* Messages — puffy user bubble, calm borderless assistant */
+[data-theme='claymorphism'] .message.user .message-text {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-radius: 20px;
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .message.assistant .message-text {
+  background: transparent;
+  border: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .message-text code {
+  background: var(--surface-1);
+  box-shadow: var(--clay-press);
+}
+
+[data-theme='claymorphism'] .message-text a {
+  color: #ffb59e;
+}
+
+/* Agent surfaces — puffy cards */
+[data-theme='claymorphism'] .thinking-indicator,
+[data-theme='claymorphism'] .plan-content,
+[data-theme='claymorphism'] .step-content,
+[data-theme='claymorphism'] .command-box,
+[data-theme='claymorphism'] .message-details-panel,
+[data-theme='claymorphism'] .mission-message {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--clay-puff);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='claymorphism'] .agent-progress {
+  background: transparent;
+  backdrop-filter: none;
+  border-bottom-color: transparent;
+}
+
+[data-theme='claymorphism'] .progress-bar-container {
+  background: var(--surface-1);
+  box-shadow: var(--clay-press);
+}
+
+[data-theme='claymorphism'] .progress-bar {
+  background: linear-gradient(90deg, #ff8a66, #ffb59e);
+}
+
+[data-theme='claymorphism'] .executing-badge {
+  background: linear-gradient(160deg, #ffb59e, #ff8a66);
+  color: var(--clay-accent-ink);
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .iteration-badge {
+  background: var(--surface-1);
+  border: none;
+  color: var(--text-primary);
+  box-shadow: var(--clay-puff-sm);
+}
+
+/* Devices tab — puffy cards */
+[data-theme='claymorphism'] .device-card {
+  background: var(--surface-1);
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--clay-puff);
+}
+
+[data-theme='claymorphism'] .device-card.current {
+  box-shadow: var(--clay-press);
+}
+
+[data-theme='claymorphism'] .device-icon {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .device-model,
+[data-theme='claymorphism'] .device-meta,
+[data-theme='claymorphism'] .device-time,
+[data-theme='claymorphism'] .devices-loading,
+[data-theme='claymorphism'] .devices-empty,
+[data-theme='claymorphism'] .devices-empty p {
+  color: rgba(242, 238, 251, 0.55);
+}
+
+/* Settings modal — theme swatch cards get puffed too */
+[data-theme='claymorphism'] .theme-option {
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--clay-puff-sm);
+}
+
+[data-theme='claymorphism'] .theme-option:hover {
+  box-shadow: var(--clay-puff);
+}
+
+[data-theme='claymorphism'] .theme-option.selected {
+  box-shadow: var(--clay-press);
+}
+
+/* Scrollbar */
+[data-theme='claymorphism'] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 158, 128, 0.35);
+}
+
+[data-theme='claymorphism'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 158, 128, 0.55);
+}
+

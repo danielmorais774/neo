@@ -1,5 +1,7 @@
 import AppKit
 import AVFoundation
+import CoreGraphics
+import CoreAudio
 import QuartzCore
 
 // MARK: - IPC
@@ -26,6 +28,281 @@ struct VoiceConfig {
     var voice: String?
     var backend: String = "coqui"
     var language: String?
+    /// Segundos de ociosidade ate o chip do Modo Live se fechar sozinho. Vem do
+    /// Rust (NEO_NOTCH_IDLE_TIMEOUT_S); 0 = nunca fecha por inatividade.
+    var idleTimeoutS: Double = 15
+    /// Microfone escolhido pelo usuario no painel, por NOME (o mesmo string no
+    /// CoreAudio, no AVCaptureDevice e no enumerateDevices do webview). nil/vazio
+    /// = padrao do sistema. Toda captura TENTA este device e cai no padrao se ele
+    /// sumiu ou nao entregar audio.
+    var inputDeviceName: String?
+}
+
+// MARK: - Audio route
+
+/// Por onde o som esta SAINDO agora, e o que isso implica para a captura.
+///
+/// Duas coisas que o macOS faz nas nossas costas e que degradavam o audio do
+/// sistema inteiro enquanto o Neo escutava:
+///
+///  1. O Voice Processing I/O (o AEC da Apple, `setVoiceProcessingEnabled`) e
+///     DUPLEX: para cancelar o eco ele abre tambem o dispositivo de SAIDA padrao
+///     e o poe em modo "voice chat" -- taxa forcada e ducking do audio dos outros
+///     apps. So vale a pena quando a saida e um ALTO-FALANTE, porque ai a musica
+///     volta pelo ar e vaza no mic. Em FONE (Bluetooth ou P2) nao ha vazamento --
+///     o som toca no seu ouvido -- e ligar o VPIO e so prejuizo.
+///
+///  2. Abrir o microfone de um fone Bluetooth derruba o dispositivo de A2DP
+///     (estereo, alta fidelidade) para HFP/SCO (mono, ~16 kHz, som de telefone),
+///     nos dois sentidos. Entao, quando o mic padrao e Bluetooth, capturamos pelo
+///     mic INTERNO: o fone continua em A2DP e a musica nao vaza.
+///
+/// `NEO_AUDIO_AEC` = `auto` (default) | `on` | `off` forca a decisao quando o
+/// transporte engana (ex.: caixa de som Bluetooth, onde a musica VAZA mas o
+/// transporte parece fone).
+///
+/// O Rust tem a mesma leitura em `services/audio_route.rs` (para o sidecar da
+/// wake word e para o webview). Sao processos diferentes: cada um resolve a rota
+/// no instante em que abre o mic, que e a unica forma de nunca usar uma leitura
+/// velha -- fone entra e sai a qualquer momento.
+struct AudioRoute {
+    /// Ligar o cancelamento de eco da Apple? Hoje so informativo no notch: a
+    /// captura migrou p/ AVCaptureSession, que nao tem VPIO. Ver beginCapture.
+    let aec: Bool
+    /// `true` se o mic padrao do sistema e um fone Bluetooth -- nesse caso
+    /// preferimos o mic INTERNO (abrir o mic do fone o derruba p/ HFP).
+    let defaultInputIsBluetooth: Bool
+    /// Nome do mic embutido, para casar com o `localizedName` do AVCaptureDevice.
+    let builtinInputName: String
+    /// Para o log: "builtin-speaker", "headphones", "bluetooth", "usb", ...
+    let outputTransport: String
+
+    static func resolve() -> AudioRoute {
+        // AEC (VPIO) DESLIGADO por padrao. Motivo empirico (diag 2026-07-19): com
+        // o sidecar da wake word capturando o mic o tempo todo, o VPIO ou entrega
+        // 0 frames (perde a disputa) ou, quando entrega, manda audio MUDO (o AEC
+        // cancela a propria voz do usuario) -> o VAD do neo-voice nunca ve fala.
+        var aec = false
+        switch ProcessInfo.processInfo.environment["NEO_AUDIO_AEC"]?.lowercased() {
+        case "on", "1", "true": aec = true
+        case "off", "0", "false": aec = false
+        default: break
+        }
+        let builtin = Self.builtinInputID()
+        return AudioRoute(
+            aec: aec,
+            defaultInputIsBluetooth: Self.defaultInputIsBluetooth(),
+            builtinInputName: builtin != 0 ? (Self.deviceName(builtin) ?? "") : "",
+            outputTransport: Self.outputTransport()
+        )
+    }
+
+    /// Transporte da saida padrao agora (para diagnostico do playback do TTS).
+    static func currentOutputTransport() -> String { Self.outputTransport() }
+
+    // ---------------------------------------------------------------- CoreAudio
+
+    /// `kAudioObjectSystemObject` chega como Int32 no Swift; a API quer AudioObjectID.
+    private static let systemObject = AudioObjectID(kAudioObjectSystemObject)
+
+    private static func address(
+        _ selector: AudioObjectPropertySelector,
+        _ scope: AudioObjectPropertyScope
+    ) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    private static func u32(
+        _ object: AudioObjectID,
+        _ selector: AudioObjectPropertySelector,
+        _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) -> UInt32? {
+        var addr = address(selector, scope)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(object, &addr, 0, nil, &size, &value)
+        return status == noErr ? value : nil
+    }
+
+    private static func isBluetooth(_ device: AudioDeviceID) -> Bool {
+        guard let transport = u32(device, kAudioDevicePropertyTransportType) else { return false }
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    private static func outputTransport() -> String {
+        guard let output = u32(systemObject, kAudioHardwarePropertyDefaultOutputDevice),
+              let transport = u32(output, kAudioDevicePropertyTransportType)
+        else { return "unknown" }
+
+        switch transport {
+        case kAudioDeviceTransportTypeBuiltIn:
+            // A saida embutida e duas coisas: o alto-falante ou o fone no P2. O
+            // data source diferencia ('hdpn' = headphones).
+            let source = u32(output, kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeOutput)
+            let headphones: UInt32 = 0x6864_706E // 'hdpn'
+            return source == headphones ? "headphones" : "builtin-speaker"
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE:
+            return "bluetooth"
+        case kAudioDeviceTransportTypeUSB:
+            return "usb"
+        case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort:
+            return "hdmi"
+        case kAudioDeviceTransportTypeAirPlay:
+            return "airplay"
+        default:
+            return "other"
+        }
+    }
+
+    private static func defaultInputIsBluetooth() -> Bool {
+        guard let input = u32(systemObject, kAudioHardwarePropertyDefaultInputDevice)
+        else { return false }
+        return isBluetooth(input)
+    }
+
+    /// Nome CoreAudio do device -- casa com o `localizedName` do AVCaptureDevice,
+    /// que e como escolhemos o microfone (ver VoiceController.pickCaptureDevice).
+    private static func deviceName(_ device: AudioDeviceID) -> String? {
+        var addr = address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal)
+        var cf: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &cf) == noErr,
+              let value = cf?.takeRetainedValue() as String?
+        else { return nil }
+        return value
+    }
+
+    /// O mic embutido do Mac: transporte 'bltn' e com canais de entrada.
+    private static func builtinInputID() -> AudioDeviceID {
+        var addr = address(kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(systemObject, &addr, 0, nil, &size) == noErr,
+              size > 0
+        else { return 0 }
+
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var devices = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(systemObject, &addr, 0, nil, &size, &devices) == noErr
+        else { return 0 }
+
+        for device in devices {
+            guard u32(device, kAudioDevicePropertyTransportType) == kAudioDeviceTransportTypeBuiltIn,
+                  hasInput(device)
+            else { continue }
+            return device
+        }
+        return 0
+    }
+
+    private static func hasInput(_ device: AudioDeviceID) -> Bool {
+        var addr = address(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &addr, 0, nil, &size) == noErr, size > 0
+        else { return false }
+
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, raw) == noErr else { return false }
+
+        let list = raw.assumingMemoryBound(to: AudioBufferList.self)
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        return buffers.contains { $0.mNumberChannels > 0 }
+    }
+}
+
+// MARK: - Cyberpunk Design Tokens
+//
+// Shared palette/type recipe for the notch island + Live chip, ported from
+// the "Cyberpunk" (glassdark) theme applied to the main window (see
+// src/styles/themes.css, `[data-theme='glassdark']`) so all three surfaces
+// read as one system: near-black red-tinted glass, angular 4px corners,
+// monospace uppercase chrome labels, solid neon red on primary actions.
+enum CP {
+    static let red = NSColor(calibratedRed: 1.0, green: 0.176, blue: 0.239, alpha: 1.0)          // #ff2d3d
+    static let redBright = NSColor(calibratedRed: 1.0, green: 0.271, blue: 0.325, alpha: 1.0)     // #ff4553 hover
+    static let redInk = NSColor(calibratedRed: 0.039, green: 0.027, blue: 0.031, alpha: 1.0)      // #0a0708
+    static let glassTint = NSColor(calibratedRed: 0.035, green: 0.027, blue: 0.035, alpha: 0.62)  // app-bg
+    static let surface1 = NSColor(calibratedWhite: 1.0, alpha: 0.05)
+    static let surfaceBorder = NSColor(calibratedRed: 1.0, green: 0.118, blue: 0.176, alpha: 0.16)
+    static let accentBg = NSColor(calibratedRed: 1.0, green: 0.078, blue: 0.157, alpha: 0.12)     // gd-accent-bg
+    static let accentBorder = NSColor(calibratedRed: 1.0, green: 0.118, blue: 0.176, alpha: 0.5)  // gd-accent-border
+    static let hairline = NSColor(calibratedRed: 1.0, green: 0.118, blue: 0.176, alpha: 0.35)     // app-border
+    static let textMuted = NSColor.white.withAlphaComponent(0.38)
+    static let cardRadius: CGFloat = 4
+
+    static func mono(_ size: CGFloat, _ weight: NSFont.Weight = .semibold) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+    }
+}
+
+/// Faint red HUD grid, matching `.app::after` in the web theme — drawn crisp
+/// directly over the glass rather than behind it.
+func cpDrawGrid(in rect: NSRect, cell: CGFloat = 22) {
+    CP.red.withAlphaComponent(0.05).setStroke()
+    let path = NSBezierPath()
+    path.lineWidth = 1
+    var x = rect.minX
+    while x <= rect.maxX {
+        path.move(to: NSPoint(x: x.rounded(), y: rect.minY))
+        path.line(to: NSPoint(x: x.rounded(), y: rect.maxY))
+        x += cell
+    }
+    var y = rect.minY
+    while y <= rect.maxY {
+        path.move(to: NSPoint(x: rect.minX, y: y.rounded()))
+        path.line(to: NSPoint(x: rect.maxX, y: y.rounded()))
+        y += cell
+    }
+    path.stroke()
+}
+
+/// CRT scanline band sweeping top-to-bottom, matching `.app::before`
+/// (`gdScan`) in the web theme. `phase` is 0...1, looped by the caller.
+func cpDrawScanline(in rect: NSRect, phase: CGFloat, bandHeight: CGFloat = 64) {
+    let travel = rect.height + bandHeight * 2
+    let y = rect.minY - bandHeight + phase * travel
+    let band = NSRect(x: rect.minX, y: y, width: rect.width, height: bandHeight)
+    guard band.intersects(rect) else { return }
+    NSGraphicsContext.saveGraphicsState()
+    NSBezierPath(rect: rect).addClip()
+    let gradient = NSGradient(colorsAndLocations:
+        (CP.red.withAlphaComponent(0), CGFloat(0.0)),
+        (CP.red.withAlphaComponent(0.09), CGFloat(0.5)),
+        (CP.red.withAlphaComponent(0), CGFloat(1.0))
+    )
+    gradient?.draw(in: band, angle: 90)
+    NSGraphicsContext.restoreGraphicsState()
+}
+
+/// Thin red accent hairline along the top edge, matching
+/// `.window-titlebar::before`. Assumes an `isFlipped` view (y grows down).
+func cpDrawTopHairline(in rect: NSRect) {
+    let gradient = NSGradient(colorsAndLocations:
+        (CP.red.withAlphaComponent(0), CGFloat(0.0)),
+        (CP.red.withAlphaComponent(0.7), CGFloat(0.5)),
+        (CP.red.withAlphaComponent(0), CGFloat(1.0))
+    )
+    gradient?.draw(in: NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1), angle: 0)
+}
+
+/// Uppercase monospace chrome label — status readouts, tabs, keycaps — matching
+/// the web theme's `text-transform: uppercase; font-family: var(--gd-mono)`.
+func cpDrawLabel(_ text: String, in rect: NSRect, size: CGFloat, weight: NSFont.Weight = .bold, color: NSColor, alignment: NSTextAlignment = .left, tracking: CGFloat = 0.06) {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = alignment
+    paragraph.lineBreakMode = .byTruncatingTail
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: CP.mono(size, weight),
+        .foregroundColor: color,
+        .paragraphStyle: paragraph,
+        .kern: tracking * size
+    ]
+    text.uppercased().draw(in: rect, withAttributes: attrs)
 }
 
 // MARK: - Models
@@ -53,16 +330,88 @@ struct NotchNotification {
     let primaryAction: String? // action_type of the first action, if any
 }
 
+// MARK: - Fullscreen detection
+
+/// "Tem alguem em tela cheia nesta tela?" — a ilha flutua em `.statusBar` com
+/// `.fullScreenAuxiliary`, entao por padrao ela fica POR CIMA de video em tela
+/// cheia (YouTube, Netflix, player). Aqui decidimos quando sumir.
+///
+/// O sinal e a janela em si, nao "tem video tocando": procuramos uma janela de
+/// OUTRO app, na camada normal (layer 0), cobrindo a tela inteira INCLUSIVE a
+/// faixa do menu bar. Essa ultima condicao e o que separa tela cheia de janela
+/// so maximizada — o macOS nao deixa uma janela normal invadir o menu bar, entao
+/// a maximizada sempre para na altura dele.
+enum FullscreenProbe {
+    /// Retangulo da tela em coordenadas do CoreGraphics (origem no topo-esquerdo
+    /// da tela zero, y crescendo pra BAIXO) — `CGWindowListCopyWindowInfo`
+    /// devolve bounds nesse sistema, e o AppKit usa o oposto.
+    private static func cgRect(of screen: NSScreen) -> CGRect {
+        let frame = screen.frame
+        guard let zero = NSScreen.screens.first else { return frame }
+        return CGRect(
+            x: frame.origin.x,
+            y: zero.frame.maxY - frame.maxY,
+            width: frame.width,
+            height: frame.height
+        )
+    }
+
+    static func isCovering(_ screen: NSScreen) -> Bool {
+        let target = cgRect(of: screen)
+
+        // Num espaco de tela cheia o menu bar nao fica reservado, entao
+        // visibleFrame encosta no topo do frame. Isso libera a variante "ajustar
+        // abaixo da camera" dos MacBooks com notch, em que a janela comeca
+        // ABAIXO do notch e, so pelos bounds, seria identica a uma maximizada.
+        let menuBarFree = screen.visibleFrame.maxY >= screen.frame.maxY - 1
+        var topSlack: CGFloat = 1
+        if menuBarFree {
+            if #available(macOS 12.0, *) {
+                topSlack = max(topSlack, screen.safeAreaInsets.top)
+            }
+        }
+
+        // `.optionOnScreenOnly` ja limpa janelas minimizadas/de outro espaco.
+        // Nada aqui depende de kCGWindowName, que e o unico campo que exigiria
+        // permissao de Gravacao de Tela.
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return false }
+
+        let selfPID = Int(ProcessInfo.processInfo.processIdentifier)
+
+        for window in windows {
+            guard (window[kCGWindowLayer as String] as? Int) == 0 else { continue }
+            guard (window[kCGWindowOwnerPID as String] as? Int) != selfPID else { continue }
+            if let alpha = window[kCGWindowAlpha as String] as? Double, alpha <= 0.01 { continue }
+            guard let raw = window[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary)
+            else { continue }
+
+            let slack: CGFloat = 2
+            let coversWidth = bounds.minX <= target.minX + slack && bounds.maxX >= target.maxX - slack
+            let reachesBottom = bounds.maxY >= target.maxY - slack
+            let coversTopStrip = bounds.minY <= target.minY + topSlack
+            if coversWidth && reachesBottom && coversTopStrip { return true }
+        }
+        return false
+    }
+}
+
 // MARK: - Voice (native STT + TTS)
 
 /// Captures the microphone, streams PCM int16 16k to neo-voice `/ws/panel`
 /// (STT), and plays back TTS PCM from `/ws/tts`. Half-duplex: the mic is muted
 /// while Neo speaks. Mirrors the protocol in liveVoiceService.ts.
-final class VoiceController {
+// NSObject: o delegate da AVCaptureSession (AVCaptureAudioDataOutputSampleBufferDelegate)
+// exige NSObjectProtocol, que o Swift so da por heranca.
+final class VoiceController: NSObject {
     var cfg = VoiceConfig()
 
     var onPartial: ((String) -> Void)?
-    var onFinal: ((String) -> Void)?
+    /// (texto corrigido, transcricao crua). O `raw` vem do neo-voice quando o
+    /// corretor de ASR mexeu no texto (stt_text.py) — segue p/ o metadata do turno.
+    var onFinal: ((String, String?) -> Void)?
     var onError: ((String) -> Void)?
     var onListeningChanged: ((Bool) -> Void)?
     var onSpeakingChanged: ((Bool) -> Void)?
@@ -72,12 +421,36 @@ final class VoiceController {
 
     // STT
     private var sttTask: URLSessionWebSocketTask?
-    private let captureEngine = AVAudioEngine()
+    // Captura por AVCaptureSession, nao por AVAudioEngine: o inputNode do
+    // AVAudioEngine NAO troca de dispositivo. `setDeviceID` e aceito (o device
+    // realmente muda) mas o no continua reportando o formato do device antigo e
+    // nunca converge, entao o tap nasce com formato errado e entrega ZERO frames
+    // -- era o "Sem audio do microfone" com fone Bluetooth. A AVCaptureSession
+    // abre o device escolhido de verdade, sem mexer no padrao do sistema.
+    private let captureSession = AVCaptureSession()
+    private let captureQueue = DispatchQueue(label: "com.neo.notch.capture")
+    private var captureOutput: AVCaptureAudioDataOutput?
     private var converter: AVAudioConverter?
     private var outFormat: AVAudioFormat?
+    /// Formato real entregue pelo device, descoberto no PRIMEIRO buffer. O
+    /// conversor p/ 16k e criado ai -- nunca a partir de um formato "declarado",
+    /// que foi exatamente a armadilha do AVAudioEngine.
+    private var inFormat: AVAudioFormat?
     private var micMuted = false
     private(set) var listening = false
     private var framesReceived = 0
+    // Diagnóstico do porquê "capta mas nao transcreve": quantos frames o tap
+    // entregou (framesReceived) vs quantos foram DE FATO enviados ao WS
+    // (framesSent). Divergência = audio capturado mas nao transmitido.
+    private var framesSent = 0
+    private var diagAec = false
+    private var diagInSR: Double = 0
+    private var diagPeakRms: Float = 0 // maior RMS visto -> distingue sinal real de audio mudo
+    private var diagDevice = ""        // microfone realmente aberto
+    /// Segunda tentativa: o device preferido nao entregou audio, entao esta
+    /// captura ignora a preferencia e usa o padrao do sistema. Resetado a cada
+    /// nova sessao de escuta.
+    private var deviceFallback = false
 
     // TTS
     private var ttsTask: URLSessionWebSocketTask?
@@ -87,6 +460,11 @@ final class VoiceController {
     private var pendingBuffers = 0
     private var ttsDone = false
     private(set) var speaking = false
+    // Diagnóstico do playback do TTS: chunks de PCM recebidos, se o playEngine
+    // chegou a tocar, e o erro do start() (hoje engolido por um catch silencioso).
+    private var diagTtsChunks = 0
+    private var diagPlayStarted = false
+    private var diagTtsErr = ""
 
     // ------------------------------------------------------------------ STT
     func toggleListening() {
@@ -94,6 +472,7 @@ final class VoiceController {
     }
 
     private func requestAndStart() {
+        deviceFallback = false // sessao nova sempre tenta o device preferido
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -126,28 +505,65 @@ final class VoiceController {
         let task = session.webSocketTask(with: url)
         sttTask = task
         task.resume()
+        logErr("[NeoNotch] STT WS conectando: \(url.absoluteString)")
         receiveSTT()
 
-        let input = captureEngine.inputNode
-
-        // Voice Processing I/O da Apple: cancelamento de eco + supressao de ruido
-        // + ganho automatico (AGC) no mic nativo. E o equivalente ao
-        // echoCancellation/noiseSuppression/autoGainControl que o caminho webview
-        // (getUserMedia) tinha; sem isso a captura era crua e o STT perdia precisao
-        // (sinal fraco/ruidoso chegando ao Parakeet). Falha -> cai p/ captura crua.
-        do {
-            try input.setVoiceProcessingEnabled(true)
-        } catch {
-            logErr("[NeoNotch] voice processing indisponivel (\(error.localizedDescription)); captura crua")
-        }
-
-        // IMPORTANTE: ler o formato DEPOIS de habilitar o VPIO — ele troca a saida
-        // do input node (passa a entregar Float32 ja processado, no rate do HW).
-        let inFormat = input.outputFormat(forBus: 0)
-        guard inFormat.sampleRate > 0 else {
-            onError?("Microfone indisponível.")
+        // Device a usar, resolvido AGORA (o fone entra e sai o tempo todo):
+        // 1) o que o usuario escolheu no painel (cfg.inputDeviceName);
+        // 2) sumiu/nao achou -> mic INTERNO quando o padrao e Bluetooth (abrir o
+        //    mic do fone o derruba de A2DP p/ HFP e a musica vira som de telefone);
+        // 3) senao -> padrao do sistema.
+        let route = AudioRoute.resolve()
+        diagAec = false // AVCaptureSession nao tem Voice Processing (ver AudioRoute)
+        let device = pickCaptureDevice(route: route)
+        guard let device else {
+            onError?("Nenhum microfone disponível.")
+            cleanupCapture()
             return
         }
+        diagDevice = device.localizedName
+        logErr("[NeoNotch] mic: '\(device.localizedName)' (escolhido='\(cfg.inputDeviceName ?? "")' "
+               + "saida=\(route.outputTransport) padraoEhBT=\(route.defaultInputIsBluetooth) "
+               + "fallback=\(deviceFallback))")
+
+        captureSession.beginConfiguration()
+        for existing in captureSession.inputs { captureSession.removeInput(existing) }
+        for existing in captureSession.outputs { captureSession.removeOutput(existing) }
+        do {
+            let deviceInput = try AVCaptureDeviceInput(device: device)
+            guard captureSession.canAddInput(deviceInput) else {
+                captureSession.commitConfiguration()
+                onError?("Microfone '\(device.localizedName)' indisponível.")
+                cleanupCapture()
+                return
+            }
+            captureSession.addInput(deviceInput)
+        } catch {
+            captureSession.commitConfiguration()
+            onError?("Falha ao abrir o microfone: \(error.localizedDescription)")
+            cleanupCapture()
+            return
+        }
+
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: captureQueue)
+        guard captureSession.canAddOutput(output) else {
+            captureSession.commitConfiguration()
+            onError?("Não foi possível ler o microfone.")
+            cleanupCapture()
+            return
+        }
+        captureSession.addOutput(output)
+        captureOutput = output
+        captureSession.commitConfiguration()
+
+        // NOTA: nao ha mais Voice Processing I/O (AEC) aqui. Ele so existe no
+        // inputNode do AVAudioEngine, que tivemos de abandonar porque nao troca de
+        // dispositivo (ver `captureSession`). Na pratica nao se perdeu nada: o AEC
+        // ja vinha DESLIGADO por padrao -- com o sidecar da wake word segurando o
+        // mic, o VPIO entregava 0 frames ou audio mudo. `NEO_AUDIO_AEC=on` agora
+        // so afeta o webview, que continua no getUserMedia.
+
         guard let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: 16000,
@@ -155,38 +571,152 @@ final class VoiceController {
             interleaved: true
         ) else {
             onError?("Formato de áudio inválido.")
+            cleanupCapture()
             return
         }
         outFormat = target
-        let conv = AVAudioConverter(from: inFormat, to: target)
-        // Reamostragem HW(48k)->16k com qualidade maxima (menos aliasing).
-        conv?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
-        converter = conv
-
-        input.installTap(onBus: 0, bufferSize: 1600, format: inFormat) { [weak self] buffer, _ in
-            self?.processCaptured(buffer)
-        }
+        // `converter`/`inFormat` ficam nil de proposito: sao criados no primeiro
+        // sample buffer, com o formato REAL do device (ver makeConverter).
+        converter = nil
+        inFormat = nil
+        diagInSR = 0
 
         do {
             framesReceived = 0
-            captureEngine.prepare()
-            try captureEngine.start()
+            framesSent = 0
+            diagPeakRms = 0
+            captureSession.startRunning()
             listening = true
             micMuted = false
             onListeningChanged?(true)
             // Diagnostic: if the tap never fires, the mic isn't actually feeding
             // us audio (almost always the TCC permission for this bare binary).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-                guard let self, self.listening else { return }
-                if self.framesReceived == 0 {
-                    logErr("[NeoNotch] mic tap delivered 0 frames after 1.6s — permission?")
-                    self.onError?("Sem áudio do microfone — confira Ajustes › Privacidade › Microfone.")
+            // Emitimos um `notch_diag` (o Rust loga no Neo Desktop.log) em dois
+            // instantes: 1.6s (saude inicial) e 5s (depois do usuario ja ter
+            // falado) — para distinguir 0-frames vs capta-mas-nao-envia.
+            for delay in [1.6, 5.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.listening else { return }
+                    emitEvent([
+                        "type": "notch_diag",
+                        "at": delay,
+                        "framesReceived": self.framesReceived,
+                        "framesSent": self.framesSent,
+                        "micMuted": self.micMuted,
+                        "converterNil": self.converter == nil,
+                        "taskNil": self.sttTask == nil,
+                        "aec": self.diagAec,
+                        "inSampleRate": self.diagInSR,
+                        "peakRms": self.diagPeakRms,
+                        "device": self.diagDevice,
+                    ])
                 }
             }
-        } catch {
-            onError?("Falha ao iniciar captura: \(error.localizedDescription)")
-            cleanupCapture()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                guard let self, self.listening else { return }
+                guard self.framesReceived == 0 else { return }
+                if !self.deviceFallback {
+                    // O device escolhido abriu mas nao entrega audio (fone BT em
+                    // A2DP nao tem mic, device ocupado, ...). Ultima tentativa no
+                    // PADRAO DO SISTEMA -- ter audio vale mais que ter o device
+                    // preferido. Isto e o que faltava antes: o retry so mexia no
+                    // AEC (ja desligado), entao a falha era permanente.
+                    logErr("[NeoNotch] 0 frames em '\(self.diagDevice)' — tentando o padrao do sistema")
+                    self.deviceFallback = true
+                    self.cleanupCapture()
+                    self.beginCapture()
+                } else {
+                    logErr("[NeoNotch] 0 frames tambem no padrao do sistema")
+                    self.onError?("Sem áudio do microfone — nenhuma entrada está capturando.")
+                }
+            }
         }
+    }
+
+    /// Microfone a abrir nesta captura. A escolha do usuario ganha; se ela sumiu
+    /// (ou ja falhou uma vez, `deviceFallback`), cai na heuristica antiga e por
+    /// fim no padrao do sistema.
+    private func pickCaptureDevice(route: AudioRoute) -> AVCaptureDevice? {
+        let available = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+
+        if !deviceFallback, let wanted = cfg.inputDeviceName, !wanted.isEmpty {
+            if let match = available.first(where: { $0.localizedName == wanted }) {
+                return match
+            }
+            logErr("[NeoNotch] microfone escolhido '\(wanted)' nao esta disponivel — usando outro")
+        }
+
+        // Sem escolha (ou escolha ausente): so evitamos o caso nocivo -- mic de
+        // fone Bluetooth, que derruba o aparelho de A2DP p/ HFP.
+        if !deviceFallback, route.defaultInputIsBluetooth,
+           let builtin = available.first(where: { $0.localizedName == route.builtinInputName }) {
+            return builtin
+        }
+
+        return AVCaptureDevice.default(for: .audio) ?? available.first
+    }
+
+    /// Conversor p/ 16 kHz int16 criado com o formato REAL do primeiro buffer.
+    private func makeConverter(from format: AVAudioFormat) {
+        guard let target = outFormat else { return }
+        inFormat = format
+        diagInSR = format.sampleRate
+        let conv = AVAudioConverter(from: format, to: target)
+        // Reamostragem HW(48k)->16k com qualidade maxima (menos aliasing).
+        conv?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+        converter = conv
+        logErr("[NeoNotch] captura ativa: \(format.sampleRate) Hz, \(format.channelCount) ch")
+    }
+
+    /// Converte o CMSampleBuffer da AVCaptureSession no AVAudioPCMBuffer que o
+    /// resto do pipeline (VU, conversor 16k, envio ao WS) ja consumia do
+    /// AVAudioEngine -- assim so a FONTE mudou, o processamento continua igual.
+    fileprivate func handle(sampleBuffer: CMSampleBuffer) {
+        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+        else { return }
+
+        // O formato real so e conhecido agora; o conversor nasce aqui.
+        if converter == nil || inFormat?.sampleRate != asbd.pointee.mSampleRate {
+            guard let fmt = AVAudioFormat(streamDescription: asbd) else { return }
+            makeConverter(from: fmt)
+        }
+        guard let fmt = inFormat else { return }
+
+        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frames > 0,
+              let pcm = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames)
+        else { return }
+        pcm.frameLength = frames
+
+        // Copia as amostras para dentro do AVAudioPCMBuffer.
+        var blockBuffer: CMBlockBuffer?
+        var abl = AudioBufferList()
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &abl,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr else { return }
+        _ = blockBuffer // mantido vivo enquanto copiamos
+
+        let src = UnsafeMutableAudioBufferListPointer(&abl)
+        let dst = UnsafeMutableAudioBufferListPointer(pcm.mutableAudioBufferList)
+        for i in 0..<min(src.count, dst.count) {
+            guard let from = src[i].mData, let to = dst[i].mData else { continue }
+            memcpy(to, from, Int(min(src[i].mDataByteSize, dst[i].mDataByteSize)))
+        }
+
+        processCaptured(pcm)
     }
 
     private func processCaptured(_ buffer: AVAudioPCMBuffer) {
@@ -199,6 +729,7 @@ final class VoiceController {
             let p = ch[0]
             for i in 0..<n { sum += p[i] * p[i] }
             let rms = sqrtf(sum / Float(n))
+            if rms > diagPeakRms { diagPeakRms = rms }
             let level = CGFloat(min(1, powf(min(1, rms * 11), 0.6)))
             DispatchQueue.main.async { [weak self] in
                 self?.onLevel?(level)
@@ -227,6 +758,7 @@ final class VoiceController {
         let byteCount = Int(outBuffer.frameLength) * 2
         let data = Data(bytes: ch[0], count: byteCount)
         task.send(.data(data)) { _ in }
+        framesSent += 1
     }
 
     private func receiveSTT() {
@@ -241,8 +773,10 @@ final class VoiceController {
                 @unknown default: break
                 }
                 self.receiveSTT()
-            case .failure:
-                break // socket closed
+            case .failure(let error):
+                // Antes: `break` silencioso -> "capta mas nao transcreve" sem
+                // pista nenhuma. Agora logamos o motivo (recusa/queda do WS).
+                logErr("[NeoNotch] STT WS caiu: \(error.localizedDescription)")
             }
         }
     }
@@ -252,13 +786,16 @@ final class VoiceController {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = root["type"] as? String else { return }
         let text = (root["text"] as? String) ?? ""
+        let raw = root["raw_text"] as? String
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if type == "partial" {
                 self.onPartial?(text)
             } else if type == "final" {
+                // Final VAZIO e proposital: o neo-voice descartou o enunciado (eco
+                // do wake word). Nao abre turno — o guard de vazio ja cobre.
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { self.onFinal?(trimmed) }
+                if !trimmed.isEmpty { self.onFinal?(trimmed, raw) }
             }
         }
     }
@@ -270,13 +807,17 @@ final class VoiceController {
     }
 
     private func cleanupCapture() {
-        if captureEngine.isRunning {
-            captureEngine.inputNode.removeTap(onBus: 0)
-            captureEngine.stop()
-        }
+        if captureSession.isRunning { captureSession.stopRunning() }
+        captureOutput?.setSampleBufferDelegate(nil, queue: nil)
+        captureOutput = nil
+        captureSession.beginConfiguration()
+        for input in captureSession.inputs { captureSession.removeInput(input) }
+        for output in captureSession.outputs { captureSession.removeOutput(output) }
+        captureSession.commitConfiguration()
         sttTask?.cancel(with: .goingAway, reason: nil)
         sttTask = nil
         converter = nil
+        inFormat = nil
     }
 
     // ------------------------------------------------------------------ TTS
@@ -292,6 +833,9 @@ final class VoiceController {
         speaking = true
         ttsDone = false
         pendingBuffers = 0
+        diagTtsChunks = 0
+        diagPlayStarted = false
+        diagTtsErr = ""
         onSpeakingChanged?(true)
 
         let task = session.webSocketTask(with: url)
@@ -320,7 +864,15 @@ final class VoiceController {
                 }
                 self.receiveTTS()
             case .failure:
-                DispatchQueue.main.async { [weak self] in self?.finishSpeaking() }
+                // O servidor FECHA o /ws/tts logo apos o `done` -> isso cai aqui.
+                // NAO parar o player agora: os buffers ja agendados ainda estao
+                // tocando. Marca fim de stream e deixa drenar (o callback
+                // .dataPlayedBack chama maybeFinishSpeaking quando o ultimo acaba).
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.ttsDone = true
+                    self.maybeFinishSpeaking()
+                }
             }
         }
     }
@@ -365,8 +917,10 @@ final class VoiceController {
             playEngine.prepare()
             try playEngine.start()
             player.play()
+            diagPlayStarted = true
         } catch {
-            // best-effort
+            diagTtsErr = error.localizedDescription
+            logErr("[NeoNotch] TTS playEngine.start() FALHOU: \(error.localizedDescription)")
         }
     }
 
@@ -387,6 +941,7 @@ final class VoiceController {
                 for i in 0..<count { dst[i] = Float(src[i]) / 32768.0 }
             }
             self.pendingBuffers += 1
+            self.diagTtsChunks += 1
             self.player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -404,10 +959,24 @@ final class VoiceController {
     private func finishSpeaking() {
         guard speaking else { return }
         speaking = false
+        emitEvent([
+            "type": "notch_tts_diag",
+            "chunks": diagTtsChunks,
+            "playStarted": diagPlayStarted,
+            "engineRunning": playEngine.isRunning,
+            "playerPlaying": player.isPlaying,
+            "err": diagTtsErr,
+            "outTransport": AudioRoute.currentOutputTransport(),
+        ])
         ttsTask?.cancel(with: .goingAway, reason: nil)
         ttsTask = nil
         if player.isPlaying { player.stop() }
         if playEngine.isRunning { playEngine.stop() }
+        // Zera o formato: paramos o engine acima, entao a proxima fala precisa
+        // passar pelo caminho completo do setupPlayer (reconecta + start + play).
+        // Sem isso, o setupPlayer faz early-return por "formato ja existe" e os
+        // buffers da 2a fala vao para um engine parado = silencio (Bug B).
+        playerFormat = nil
         onSpeakingChanged?(false)
         resumeMic()
     }
@@ -423,6 +992,18 @@ final class VoiceController {
     func dispose() {
         cancelSpeak()
         stopListening()
+    }
+}
+
+// Recebe o audio da AVCaptureSession (fila `captureQueue`) e entrega ao mesmo
+// pipeline de sempre. Ver VoiceController.handle(sampleBuffer:).
+extension VoiceController: AVCaptureAudioDataOutputSampleBufferDelegate {
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        handle(sampleBuffer: sampleBuffer)
     }
 }
 
@@ -467,6 +1048,8 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     private let horizontalPadding: CGFloat = 24
 
     private var pulsePhase: CGFloat = 0
+    /// 0...1 sweep position of the CRT scanline (expanded state only).
+    private var scanPhase: CGFloat = 0
     private var pulseTimer: Timer?
 
     // Hit-test rects (refreshed every draw, expanded state only)
@@ -478,14 +1061,14 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         wantsLayer = true
 
         let placeholderAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 14, weight: .regular),
+            .font: CP.mono(13, .regular),
             .foregroundColor: NSColor.white.withAlphaComponent(0.38)
         ]
         promptField.placeholderAttributedString = NSAttributedString(
             string: "Pergunte ou peça algo ao Neo...",
             attributes: placeholderAttrs
         )
-        promptField.font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        promptField.font = CP.mono(13, .regular)
         promptField.focusRingType = .none
         promptField.isBordered = false
         promptField.drawsBackground = false
@@ -555,6 +1138,8 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.pulsePhase += 0.12
+            self.scanPhase += 0.0037   // ~9s per sweep, matching gdScan
+            if self.scanPhase > 1 { self.scanPhase -= 1 }
             if self.islandState == .expanded { self.needsDisplay = true }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -568,9 +1153,9 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     // -------------------------------------------------------------- drawing
     override func draw(_ dirtyRect: NSRect) {
-        // Subtle dark tint over the glass blur so text stays readable on bright
-        // desktops. Rounding is handled by the container layer's mask.
-        NSColor.black.withAlphaComponent(0.30).setFill()
+        // Near-black red-tinted glass over the blur, matching --app-bg in the
+        // web theme. Rounding is handled by the container layer's mask.
+        CP.glassTint.setFill()
         bounds.fill()
 
         switch islandState {
@@ -578,27 +1163,36 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         case .peek: drawPeek()
         case .expanded: drawExpanded()
         }
+
+        cpDrawTopHairline(in: bounds)
     }
 
     private func drawIdle() {
-        // Slim glowing bar — a tiny presence indicator inside the pill.
-        let bar = NSBezierPath(roundedRect: bounds.insetBy(dx: 14, dy: 11), xRadius: 6, yRadius: 6)
-        NSColor.white.withAlphaComponent(0.12).setFill()
+        // Slim HUD strip — a tiny presence indicator inside the bar.
+        let bar = NSBezierPath(roundedRect: bounds.insetBy(dx: 14, dy: 11), xRadius: CP.cardRadius, yRadius: CP.cardRadius)
+        CP.surface1.setFill()
         bar.fill()
         drawGlowDot(center: NSPoint(x: bounds.midX, y: bounds.midY), radius: 2.4)
     }
 
     private func drawPeek() {
         drawBotIcon(in: NSRect(x: 22, y: 9, width: 28, height: 28))
-        drawText("Neo", in: NSRect(x: 60, y: 12, width: 90, height: 22), size: 16, weight: .semibold, color: .white, alignment: .left)
+        cpDrawLabel("Neo", in: NSRect(x: 60, y: 10, width: 90, height: 22), size: 15, weight: .bold, color: .white, tracking: 0.08)
         let dotX = bounds.width - 92
         drawStatusDot(center: NSPoint(x: dotX, y: 23), active: isListening || isSpeaking)
         let label = isSpeaking ? "falando" : (isListening ? "ouvindo" : "online")
-        drawText(label, in: NSRect(x: dotX + 12, y: 12, width: 64, height: 22), size: 14, weight: .medium, color: NSColor.white.withAlphaComponent(0.72), alignment: .left)
+        cpDrawLabel(label, in: NSRect(x: dotX + 12, y: 11, width: 64, height: 22), size: 11, weight: .bold, color: CP.red, tracking: 0.08)
     }
 
     private func drawExpanded() {
         notifHitRects.removeAll()
+
+        // Ambient HUD grid + CRT scanline, matching the main window's glassdark
+        // shell (.app::after / .app::before) — the expanded island is the only
+        // surface big enough to read it.
+        cpDrawGrid(in: bounds)
+        cpDrawScanline(in: bounds, phase: scanPhase)
+
         drawHeaderCard()
         drawPromptCard()
 
@@ -608,52 +1202,46 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
         switch activity {
         case .listening:
-            drawVoiceStage(in: stage, title: "Ouvindo…", body: caption.isEmpty ? "Pode falar — estou te ouvindo." : caption, accent: NSColor(calibratedRed: 0.36, green: 0.78, blue: 0.42, alpha: 1.0))
+            drawVoiceStage(in: stage, title: "Ouvindo…", body: caption.isEmpty ? "Pode falar — estou te ouvindo." : caption)
         case .thinking:
-            drawVoiceStage(in: stage, title: "Pensando…", body: caption, accent: NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 1.0))
+            drawVoiceStage(in: stage, title: "Pensando…", body: caption)
         case .answering:
-            drawVoiceStage(in: stage, title: isSpeaking ? "Neo está falando" : "Neo respondeu", body: caption, accent: NSColor(calibratedRed: 0.36, green: 0.46, blue: 1.0, alpha: 1.0))
+            drawVoiceStage(in: stage, title: isSpeaking ? "Neo está falando" : "Neo respondeu", body: caption)
         case .none:
             drawNotifications(in: stage)
         }
 
         if let err = errorText {
-            drawText("⚠ \(err)", in: NSRect(x: horizontalPadding, y: bounds.height - 60, width: bounds.width - horizontalPadding * 2, height: 18), size: 11, weight: .semibold, color: NSColor.systemRed.withAlphaComponent(0.9), alignment: .left)
+            cpDrawLabel("⚠ \(err)", in: NSRect(x: horizontalPadding, y: bounds.height - 60, width: bounds.width - horizontalPadding * 2, height: 18), size: 11, weight: .bold, color: CP.red, tracking: 0)
         }
 
         drawText("⌘ Espaço · abrir Neo", in: NSRect(x: 24, y: bounds.height - 30, width: 160, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.42), alignment: .left)
         drawKeycap("fn", in: NSRect(x: bounds.width - 78, y: bounds.height - 32, width: 25, height: 20))
-        drawText("ditar", in: NSRect(x: bounds.width - 48, y: bounds.height - 28, width: 32, height: 14), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.48), alignment: .left)
+        cpDrawLabel("ditar", in: NSRect(x: bounds.width - 48, y: bounds.height - 28, width: 32, height: 14), size: 10, weight: .bold, color: NSColor.white.withAlphaComponent(0.48), tracking: 0.05)
     }
 
     private func drawHeaderCard() {
         let card = NSRect(x: horizontalPadding, y: 44, width: bounds.width - horizontalPadding * 2, height: 72)
-        fillRoundedCard(card, radius: 20, alpha: 0.22)
+        fillRoundedCard(card)
         let avatarRect = NSRect(x: card.minX + 18, y: card.minY + 18, width: 34, height: 34)
         drawBotIcon(in: avatarRect)
 
-        // Mic button
+        // Mic button — solid neon red primary action (btn-send recipe).
         let micSize: CGFloat = 46
         let mic = NSRect(x: card.maxX - micSize - 16, y: card.minY + (card.height - micSize) / 2, width: micSize, height: micSize)
         micHitRect = mic
-        let micPath = NSBezierPath(ovalIn: mic)
-        if isListening {
-            NSColor(calibratedRed: 0.92, green: 0.30, blue: 0.38, alpha: 1.0).setFill()
-        } else if isSpeaking {
-            NSColor(calibratedRed: 0.36, green: 0.46, blue: 1.0, alpha: 1.0).setFill()
-        } else {
-            NSColor(calibratedRed: 0.37, green: 0.30, blue: 0.94, alpha: 1.0).setFill()
-        }
+        let micPath = NSBezierPath(roundedRect: mic, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
+        (isListening ? CP.redBright : CP.red).setFill()
         micPath.fill()
         if isListening {
             // pulsing ring
             let r = 4 + sin(pulsePhase) * 2
-            NSColor(calibratedRed: 0.92, green: 0.30, blue: 0.38, alpha: 0.35).setStroke()
-            let ring = NSBezierPath(ovalIn: mic.insetBy(dx: -r, dy: -r))
+            CP.red.withAlphaComponent(0.4).setStroke()
+            let ring = NSBezierPath(roundedRect: mic.insetBy(dx: -r, dy: -r), xRadius: CP.cardRadius + r, yRadius: CP.cardRadius + r)
             ring.lineWidth = 2
             ring.stroke()
         }
-        drawMicGlyph(in: mic, scale: 0.34)
+        drawMicGlyph(in: mic, scale: 0.34, color: CP.redInk)
 
         let textX = avatarRect.maxX + 22
         let textMaxWidth = max(120, mic.minX - textX - 14)
@@ -675,7 +1263,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     private func drawPromptCard() {
         let card = NSRect(x: horizontalPadding, y: 136, width: bounds.width - horizontalPadding * 2, height: 46)
-        fillRoundedCard(card, radius: 14, alpha: 0.32)
+        fillRoundedCard(card)
         let searchRect = NSRect(x: card.minX + 16, y: card.minY + 14, width: 18, height: 18)
         drawSearchGlyph(in: searchRect)
 
@@ -688,12 +1276,12 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawNotifications(in stage: NSRect) {
-        drawText("NOTIFICAÇÕES", in: NSRect(x: stage.minX + 6, y: stage.minY, width: 250, height: 18), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.56), alignment: .left)
-        drawText("\(notifications.count)", in: NSRect(x: stage.maxX - 64, y: stage.minY, width: 58, height: 18), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.64), alignment: .right)
+        cpDrawLabel("Notificações", in: NSRect(x: stage.minX + 6, y: stage.minY, width: 250, height: 18), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.56), tracking: 0.08)
+        cpDrawLabel("\(notifications.count)", in: NSRect(x: stage.maxX - 64, y: stage.minY, width: 58, height: 18), size: 11, weight: .bold, color: CP.red, alignment: .right, tracking: 0.04)
 
         if notifications.isEmpty {
             let empty = NSRect(x: stage.minX, y: stage.minY + 30, width: stage.width, height: 64)
-            fillRoundedCard(empty, radius: 14, alpha: 0.22)
+            fillRoundedCard(empty)
             drawText("Tudo limpo por aqui ✨", in: empty.offsetBy(dx: 0, dy: 24), size: 13, weight: .medium, color: NSColor.white.withAlphaComponent(0.5), alignment: .center)
             return
         }
@@ -711,7 +1299,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawNotificationCard(_ card: NSRect, n: NotchNotification) {
-        fillRoundedCard(card, radius: 13, alpha: 0.30)
+        fillRoundedCard(card)
         let iconRect = NSRect(x: card.minX + 14, y: card.minY + 11, width: 30, height: 30)
         drawAppIcon(n.kind, in: iconRect)
 
@@ -720,18 +1308,18 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         let textWidth = max(110, card.maxX - textX - rightMetaWidth - 12)
         drawText(n.title, in: NSRect(x: textX, y: card.minY + 10, width: textWidth, height: 17), size: 13, weight: .semibold, color: .white, alignment: .left)
         drawText(n.subtitle, in: NSRect(x: textX, y: card.minY + 27, width: textWidth, height: 16), size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.62), alignment: .left)
-        drawText(relativeTime(n.createdAt), in: NSRect(x: card.maxX - rightMetaWidth, y: card.minY + 12, width: rightMetaWidth - 10, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.55), alignment: .right)
+        cpDrawLabel(relativeTime(n.createdAt), in: NSRect(x: card.maxX - rightMetaWidth, y: card.minY + 12, width: rightMetaWidth - 10, height: 16), size: 10, weight: .semibold, color: NSColor.white.withAlphaComponent(0.55), alignment: .right, tracking: 0.03)
     }
 
-    private func drawVoiceStage(in stage: NSRect, title: String, body: String, accent: NSColor) {
+    private func drawVoiceStage(in stage: NSRect, title: String, body: String) {
         let card = NSRect(x: stage.minX, y: stage.minY, width: stage.width, height: min(stage.height, 220))
-        fillRoundedCard(card, radius: 16, alpha: 0.26)
+        fillRoundedCard(card)
 
-        // animated accent dot
+        // animated accent dot — a single neon red across all activity states.
         let dotAlpha = activity == .answering && !isSpeaking ? 1.0 : (0.55 + 0.45 * (0.5 + 0.5 * sin(pulsePhase)))
-        accent.withAlphaComponent(dotAlpha).setFill()
+        CP.red.withAlphaComponent(dotAlpha).setFill()
         NSBezierPath(ovalIn: NSRect(x: card.minX + 18, y: card.minY + 20, width: 10, height: 10)).fill()
-        drawText(title, in: NSRect(x: card.minX + 36, y: card.minY + 15, width: card.width - 52, height: 20), size: 13, weight: .bold, color: NSColor.white.withAlphaComponent(0.85), alignment: .left)
+        cpDrawLabel(title, in: NSRect(x: card.minX + 36, y: card.minY + 15, width: card.width - 52, height: 20), size: 12, weight: .bold, color: NSColor.white.withAlphaComponent(0.85), tracking: 0.06)
 
         let bodyRect = NSRect(x: card.minX + 18, y: card.minY + 44, width: card.width - 36, height: card.height - 58)
         if body.isEmpty && activity == .thinking {
@@ -782,11 +1370,13 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         return "\(Int(delta / 86400))d"
     }
 
-    private func fillRoundedCard(_ rect: NSRect, radius: CGFloat, alpha: CGFloat) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-        NSColor(calibratedWhite: 1.0, alpha: alpha * 0.18).setFill()
+    /// Angular frosted card, matching the web theme's flat surface recipe
+    /// (surface-1 fill + surface-border hairline, radius 4).
+    private func fillRoundedCard(_ rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
+        CP.surface1.setFill()
         path.fill()
-        NSColor.white.withAlphaComponent(0.10).setStroke()
+        CP.surfaceBorder.setStroke()
         path.lineWidth = 1
         path.stroke()
     }
@@ -806,8 +1396,8 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     private func drawThinkingDots(at origin: NSPoint) {
         for i in 0..<3 {
             let phase = pulsePhase - CGFloat(i) * 0.5
-            let a = 0.3 + 0.5 * (0.5 + 0.5 * sin(phase))
-            NSColor.white.withAlphaComponent(a).setFill()
+            let a = 0.35 + 0.55 * (0.5 + 0.5 * sin(phase))
+            CP.red.withAlphaComponent(a).setFill()
             NSBezierPath(ovalIn: NSRect(x: origin.x + CGFloat(i) * 14, y: origin.y, width: 7, height: 7)).fill()
         }
     }
@@ -823,48 +1413,54 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
             let v = levelHistory[i]
             let h = max(2.5, v * height)
             let rect = NSRect(x: x + CGFloat(i) * (barW + gap), y: y + (height - h) / 2, width: barW, height: h)
-            NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 0.55 + 0.45 * v).setFill()
-            NSBezierPath(roundedRect: rect, xRadius: barW / 2, yRadius: barW / 2).fill()
+            CP.red.withAlphaComponent(0.55 + 0.45 * v).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
 
+    /// Squared HUD avatar — red rim + red glyph, matching `.header-avatar`.
     private func drawBotIcon(in rect: NSRect) {
-        NSColor(calibratedRed: 0.39, green: 0.31, blue: 0.80, alpha: 0.22).setFill()
+        CP.red.withAlphaComponent(0.15).setFill()
         NSBezierPath(ovalIn: rect.insetBy(dx: -9, dy: -9)).fill()
 
         let antenna = NSBezierPath()
         antenna.move(to: NSPoint(x: rect.midX, y: rect.minY - 11))
         antenna.line(to: NSPoint(x: rect.midX, y: rect.minY))
-        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 1.0).setStroke()
+        CP.red.setStroke()
         antenna.lineWidth = 2
         antenna.stroke()
-        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 1.0).setFill()
+        CP.red.setFill()
         NSBezierPath(ovalIn: NSRect(x: rect.midX - 3.5, y: rect.minY - 15, width: 7, height: 7)).fill()
 
-        let outer = NSBezierPath(roundedRect: rect, xRadius: 13, yRadius: 13)
-        NSColor(calibratedWhite: 0.16, alpha: 1.0).setFill()
+        let outer = NSBezierPath(roundedRect: rect, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
+        CP.accentBg.setFill()
         outer.fill()
-        NSColor.white.withAlphaComponent(0.12).setStroke()
+        CP.accentBorder.setStroke()
         outer.lineWidth = 1
         outer.stroke()
 
-        let face = NSBezierPath(roundedRect: rect.insetBy(dx: 8, dy: 12), xRadius: 6, yRadius: 6)
-        NSColor(calibratedWhite: 0.08, alpha: 1.0).setFill()
+        let face = NSBezierPath(roundedRect: rect.insetBy(dx: 8, dy: 12), xRadius: 2, yRadius: 2)
+        NSColor(calibratedWhite: 0.05, alpha: 1.0).setFill()
         face.fill()
 
         drawGlowDot(center: NSPoint(x: rect.midX - 7, y: rect.midY + 2), radius: 3)
         drawGlowDot(center: NSPoint(x: rect.midX + 7, y: rect.midY + 2), radius: 3)
     }
 
+    /// Squared app icon — chat = solid red fill, spark = outline (differentiate
+    /// by fill vs. outline, staying inside the mono-red palette).
     private func drawAppIcon(_ kind: String, in rect: NSRect) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9)
+        let path = NSBezierPath(roundedRect: rect, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
         if kind == "chat" {
-            NSColor(calibratedRed: 0.12, green: 0.78, blue: 0.34, alpha: 1.0).setFill()
+            CP.red.setFill()
             path.fill()
             drawChatGlyph(in: rect)
         } else {
-            NSColor(calibratedRed: 0.36, green: 0.28, blue: 0.94, alpha: 1.0).setFill()
+            CP.surface1.setFill()
             path.fill()
+            CP.accentBorder.setStroke()
+            path.lineWidth = 1
+            path.stroke()
             drawSparkGlyph(in: rect)
         }
     }
@@ -880,25 +1476,25 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         path.line(to: NSPoint(x: rect.minX + 8, y: rect.midY))
         path.line(to: NSPoint(x: rect.midX - 4, y: rect.midY - 2))
         path.close()
-        NSColor.white.setFill()
+        CP.red.setFill()
         path.fill()
     }
 
     private func drawChatGlyph(in rect: NSRect) {
-        let bubble = NSBezierPath(ovalIn: rect.insetBy(dx: 8, dy: 8))
-        NSColor.white.setFill()
+        let bubble = NSBezierPath(roundedRect: rect.insetBy(dx: 8, dy: 8), xRadius: 2, yRadius: 2)
+        CP.redInk.setFill()
         bubble.fill()
-        NSColor(calibratedRed: 0.12, green: 0.78, blue: 0.34, alpha: 1.0).setFill()
+        CP.red.setFill()
         NSBezierPath(ovalIn: NSRect(x: rect.midX - 6, y: rect.midY - 2, width: 2.5, height: 2.5)).fill()
         NSBezierPath(ovalIn: NSRect(x: rect.midX, y: rect.midY + 1, width: 2.5, height: 2.5)).fill()
     }
 
-    private func drawMicGlyph(in rect: NSRect, scale: CGFloat = 1.0) {
+    private func drawMicGlyph(in rect: NSRect, scale: CGFloat = 1.0, color: NSColor = .white) {
         let scaledWidth = rect.width * scale
         let scaledHeight = rect.height * scale
         let r = NSRect(x: rect.midX - scaledWidth / 2, y: rect.midY - scaledHeight / 2, width: scaledWidth, height: scaledHeight)
         let s = min(scaledWidth, scaledHeight) / 20
-        NSColor.white.setStroke()
+        color.setStroke()
         let capsule = NSBezierPath(roundedRect: NSRect(x: r.midX - 3.4 * s, y: r.midY - 8.9 * s, width: 6.8 * s, height: 13 * s), xRadius: 3.4 * s, yRadius: 3.4 * s)
         capsule.lineWidth = 1.4 * s
         capsule.stroke()
@@ -928,24 +1524,27 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawKeyIcon(_ text: String, in rect: NSRect) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        NSColor.white.withAlphaComponent(0.12).setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+        CP.surface1.setFill()
         path.fill()
+        CP.surfaceBorder.setStroke()
+        path.lineWidth = 1
+        path.stroke()
         drawText(text, in: rect.offsetBy(dx: 0, dy: 5), size: 14, weight: .bold, color: .white, alignment: .center)
     }
 
     private func drawKeycap(_ text: String, in rect: NSRect) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
-        NSColor.white.withAlphaComponent(0.11).setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+        CP.surface1.setFill()
         path.fill()
-        NSColor.white.withAlphaComponent(0.14).setStroke()
+        CP.surfaceBorder.setStroke()
         path.lineWidth = 1
         path.stroke()
-        drawText(text, in: rect.offsetBy(dx: 0, dy: 4), size: 12, weight: .bold, color: NSColor.white.withAlphaComponent(0.80), alignment: .center)
+        cpDrawLabel(text, in: rect.offsetBy(dx: 0, dy: 4), size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.80), alignment: .center, tracking: 0.04)
     }
 
     private func drawDottedLine(x: CGFloat, y: CGFloat, dots: Int) {
-        NSColor(calibratedRed: 0.53, green: 0.43, blue: 0.86, alpha: 0.72).setFill()
+        CP.red.withAlphaComponent(0.6).setFill()
         for index in 0..<dots {
             let dotX = x + CGFloat(index) * 6
             NSBezierPath(ovalIn: NSRect(x: dotX, y: y, width: 2.5, height: 2.5)).fill()
@@ -953,16 +1552,19 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawGlowDot(center: NSPoint, radius: CGFloat) {
-        NSColor(calibratedRed: 0.61, green: 0.50, blue: 1.0, alpha: 0.34).setFill()
+        CP.red.withAlphaComponent(0.34).setFill()
         NSBezierPath(ovalIn: NSRect(x: center.x - radius - 5, y: center.y - radius - 5, width: radius * 2 + 10, height: radius * 2 + 10)).fill()
-        NSColor(calibratedRed: 0.72, green: 0.62, blue: 1.0, alpha: 1.0).setFill()
+        CP.red.setFill()
         NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
     }
 
+    /// Solid red status LED with a soft glow, matching `.header-status.connected`.
     private func drawStatusDot(center: NSPoint, active: Bool) {
         let radius: CGFloat = 4
         let rect = NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
-        (active ? NSColor.systemGreen : NSColor.systemGreen).setFill()
+        CP.red.withAlphaComponent(0.35).setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: -3, dy: -3)).fill()
+        CP.red.setFill()
         NSBezierPath(ovalIn: rect).fill()
     }
 
@@ -989,8 +1591,10 @@ final class NotchController {
     private let voice = VoiceController()
 
     /// Emits a prompt for the full agent (set by AppDelegate so it can tag the
-    /// turn's origin — notch vs. Live chip).
-    var onPrompt: ((String) -> Void)?
+    /// turn's origin — notch vs. Live chip): (texto, veio-do-microfone, cru do ASR).
+    /// A ilha tem AS DUAS entradas (campo de texto e mic), e so a de voz ganha a
+    /// tolerancia a erro de transcricao no neo-core.
+    var onPrompt: ((String, Bool, String?) -> Void)?
 
     private var state: IslandState = .idle
     private var hoverTimer: Timer?
@@ -1000,12 +1604,19 @@ final class NotchController {
 
     private var lastTurnWasVoice = false
 
+    /// Ilha recolhida porque tem alguem em tela cheia (ver FullscreenProbe).
+    private var hiddenForFullscreen = false
+    private var lastFullscreenPoll: TimeInterval = 0
+
     private let idleSize = NSSize(width: 138, height: 30)
     private let peekSize = NSSize(width: 460, height: 46)
     private let expandedSize = NSSize(width: 560, height: 538)
     private let movementTolerance: CGFloat = 8
     private let peekIntentDelay: TimeInterval = 0.14
     private let expandIntentDelay: TimeInterval = 0.72
+    /// Varrer a lista de janelas custa caro pros 40 Hz do `tick`, e entrar/sair
+    /// de tela cheia nao e algo que precise de resposta em milissegundos.
+    private let fullscreenPollInterval: TimeInterval = 0.4
 
     init(screen: NSScreen) {
         let startFrame = Self.frame(for: idleSize, on: screen)
@@ -1019,9 +1630,9 @@ final class NotchController {
         container = NSView(frame: NSRect(origin: .zero, size: idleSize))
         container.wantsLayer = true
         container.layer?.masksToBounds = true
-        container.layer?.cornerRadius = idleSize.height / 2
+        container.layer?.cornerRadius = CP.cardRadius
         container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        container.layer?.borderColor = CP.hairline.cgColor
 
         blur = NSVisualEffectView(frame: container.bounds)
         blur.autoresizingMask = [.width, .height]
@@ -1058,7 +1669,7 @@ final class NotchController {
             self.islandView.errorText = nil
             self.islandView.caption = ""
             self.islandView.activity = .thinking
-            self.onPrompt?(text)
+            self.onPrompt?(text, false, nil)
         }
         islandView.onMicTapped = { [weak self] in
             self?.voice.toggleListening()
@@ -1077,12 +1688,12 @@ final class NotchController {
             guard let self else { return }
             if self.islandView.activity == .listening { self.islandView.caption = text }
         }
-        voice.onFinal = { [weak self] text in
+        voice.onFinal = { [weak self] text, raw in
             guard let self else { return }
             self.lastTurnWasVoice = true
             self.islandView.caption = ""
             self.islandView.activity = .thinking
-            self.onPrompt?(text)
+            self.onPrompt?(text, true, raw)
         }
         voice.onListeningChanged = { [weak self] on in
             guard let self else { return }
@@ -1096,6 +1707,9 @@ final class NotchController {
         }
         voice.onSpeakingChanged = { [weak self] on in
             self?.islandView.isSpeaking = on
+            // Anti-echo gate: while Neo speaks, the wake sidecar hears this
+            // TTS on the mic — Rust drops wake events for the duration.
+            emitEvent(["type": "tts_state", "source": "notch", "speaking": on])
         }
         voice.onLevel = { [weak self] level in
             self?.islandView.micLevel = level
@@ -1103,6 +1717,23 @@ final class NotchController {
         voice.onError = { [weak self] msg in
             self?.islandView.errorText = msg
         }
+    }
+
+    /// Voice-triggered interrupt ("pare") for the ISLAND surface (prompt/mic
+    /// turns): stop the spoken answer and/or cancel the in-flight turn.
+    /// Returns false when there was nothing to stop.
+    func interruptTurn() -> Bool {
+        var acted = false
+        if voice.speaking {
+            voice.cancelSpeak()
+            acted = true
+        }
+        if islandView.activity == .thinking {
+            emitEvent(["type": "live_abort"]) // cancels the in-flight agent turn
+            islandView.activity = .none
+            acted = true
+        }
+        return acted
     }
 
     // ----------------------------------------------------------------- IPC
@@ -1143,13 +1774,22 @@ final class NotchController {
         guard let screen = activeScreen() else { return }
         let pointer = NSEvent.mouseLocation
         let now = CACurrentMediaTime()
-        let interactiveFrame = panel.frame.insetBy(dx: state == .idle ? 8 : 14, dy: state == .idle ? 8 : 12)
-        let isOverIsland = interactiveFrame.contains(pointer)
-        let isOverNotch = notchZone(on: screen).contains(pointer)
 
         // Keep the island open while a voice/agent turn is alive even if the
         // pointer drifts away.
         let busy = voice.listening || voice.speaking || islandView.activity == .thinking
+
+        if now - lastFullscreenPoll >= fullscreenPollInterval {
+            lastFullscreenPoll = now
+            updateFullscreenHiding(on: screen, busy: busy)
+        }
+        // Recolhida: nada de hover/expandir. O turno em voo continua vivo (o
+        // audio nao para), so a apresentacao e que sai da frente.
+        if hiddenForFullscreen { return }
+
+        let interactiveFrame = panel.frame.insetBy(dx: state == .idle ? 8 : 14, dy: state == .idle ? 8 : 12)
+        let isOverIsland = interactiveFrame.contains(pointer)
+        let isOverNotch = notchZone(on: screen).contains(pointer)
 
         if isOverIsland || isOverNotch {
             updateIntent(pointer: pointer, now: now, on: screen)
@@ -1181,6 +1821,33 @@ final class NotchController {
         }
     }
 
+    /// Some/volta conforme alguem entra ou sai de tela cheia NA TELA DA ILHA
+    /// (`activeScreen` segue o ponteiro: video em tela cheia no monitor de fora
+    /// nao esconde a ilha no monitor onde voce esta).
+    private func updateFullscreenHiding(on screen: NSScreen, busy: Bool) {
+        // `busy` segura o recolhimento: se o usuario mandou um prompt e so
+        // depois foi pra tela cheia, engolir a ilha sumiria com a resposta.
+        // Assim que o turno assenta, o proximo poll recolhe.
+        let shouldHide = FullscreenProbe.isCovering(screen) && !busy
+        guard shouldHide != hiddenForFullscreen else { return }
+        hiddenForFullscreen = shouldHide
+
+        if shouldHide {
+            resetIntent()
+            // Volta pra pilula ANTES de sair de cena: reaparecer expandida, com
+            // o texto de um turno velho, nao faz sentido.
+            apply(.idle, on: screen, animated: false)
+            islandView.stopPulse()
+            panel.orderOut(nil)
+        } else {
+            // Reposiciona antes de mostrar: enquanto recolhida o `tick` sai
+            // cedo, entao o painel ficou parado na tela de onde ela sumiu.
+            apply(.idle, on: screen, animated: false)
+            islandView.startPulse()
+            panel.orderFrontRegardless()
+        }
+    }
+
     private func resetIntent() {
         hoverBeganAt = nil
         stableBeganAt = nil
@@ -1207,17 +1874,14 @@ final class NotchController {
         }
 
         let size: NSSize
-        let radius: CGFloat
+        let radius: CGFloat = CP.cardRadius   // angular HUD corners in every state
         switch next {
         case .idle:
             size = idleSize
-            radius = idleSize.height / 2     // true capsule (fixes the "knife")
         case .peek:
             size = peekSize
-            radius = peekSize.height / 2     // true capsule
         case .expanded:
             size = expandedSize
-            radius = 28
         }
 
         container.layer?.cornerRadius = radius
@@ -1288,6 +1952,9 @@ final class LiveChipView: NSView {
     private var levelHistory = [CGFloat](repeating: 0, count: 22)
     private var pulsePhase: CGFloat = 0
     private var progressPhase: CGFloat = 0
+    /// 0...1 sweep position of the CRT scanline (speaking card only — the
+    /// only state tall enough to read it).
+    private var scanPhase: CGFloat = 0
     private var timer: Timer?
     private var closeHitRect: NSRect = .zero
     private var abortHitRect: NSRect = .zero
@@ -1301,6 +1968,8 @@ final class LiveChipView: NSView {
             self.pulsePhase += 0.13
             self.progressPhase += 0.018
             if self.progressPhase > 1 { self.progressPhase -= 1 }
+            self.scanPhase += 0.0037
+            if self.scanPhase > 1 { self.scanPhase -= 1 }
             self.needsDisplay = true
         }
         RunLoop.main.add(t, forMode: .common)
@@ -1313,8 +1982,8 @@ final class LiveChipView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // Light tint over the blur — keep it glassy (the desktop shows through).
-        NSColor.black.withAlphaComponent(0.18).setFill()
+        // Near-black red-tinted glass over the blur, matching --app-bg.
+        CP.glassTint.setFill()
         bounds.fill()
         abortHitRect = .zero
         closeHitRect = .zero
@@ -1324,6 +1993,7 @@ final class LiveChipView: NSView {
         case "speaking": drawSpeaking()
         default: break
         }
+        cpDrawTopHairline(in: bounds)
     }
 
     // listening pill
@@ -1346,12 +2016,12 @@ final class LiveChipView: NSView {
         _ = drawControls(centerY: 19, rightEdge: bounds.maxX - 15, showAbort: true)
 
         let textX = avatar.maxX + 12
-        drawText("Deixa comigo", in: NSRect(x: textX, y: bounds.minY + 13, width: 200, height: 18), size: 13, weight: .semibold, color: .white, alignment: .left)
+        cpDrawLabel("Deixa comigo", in: NSRect(x: textX, y: bounds.minY + 14, width: 200, height: 18), size: 12, weight: .bold, color: .white, tracking: 0.05)
         drawThinkingDots(at: NSPoint(x: textX + 104, y: bounds.minY + 21))
 
-        // indeterminate progress bar
+        // indeterminate progress bar, matching `.progress-bar`'s red gradient.
         let track = NSRect(x: textX, y: bounds.maxY - 20, width: bounds.maxX - 18 - textX, height: 3)
-        NSColor.white.withAlphaComponent(0.10).setFill()
+        CP.surface1.setFill()
         NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
         let segW = track.width * 0.32
         let travel = track.width + segW
@@ -1360,21 +2030,26 @@ final class LiveChipView: NSView {
         let clampedMax = min(track.maxX, x + segW)
         if clampedMax > clampedX {
             let seg = NSRect(x: clampedX, y: track.minY, width: clampedMax - clampedX, height: 3)
-            NSColor(calibratedRed: 0.45, green: 0.58, blue: 1.0, alpha: 0.95).setFill()
+            CP.red.setFill()
             NSBezierPath(roundedRect: seg, xRadius: 1.5, yRadius: 1.5).fill()
         }
     }
 
     // speaking / response card
     private func drawSpeaking() {
+        // Ambient HUD grid + scanline — this is the tallest, most card-like
+        // state, the same threshold used by the expanded island.
+        cpDrawGrid(in: bounds)
+        cpDrawScanline(in: bounds, phase: scanPhase)
+
         let avatar = NSRect(x: 15, y: 13, width: 26, height: 26)
         drawNeoFace(in: avatar, glow: false)
-        drawText("Neo", in: NSRect(x: avatar.maxX + 9, y: 17, width: 48, height: 18), size: 13, weight: .bold, color: .white, alignment: .left)
+        cpDrawLabel("Neo", in: NSRect(x: avatar.maxX + 9, y: 15, width: 48, height: 18), size: 12, weight: .bold, color: .white, tracking: 0.08)
         drawMiniBars(x: avatar.maxX + 44, y: 20, active: true)
 
         let leftmost = drawControls(centerY: 24, rightEdge: bounds.maxX - 15, showAbort: true)
         // "⌥ falar" hint, left of the controls
-        drawText("⌥ falar", in: NSRect(x: leftmost - 66, y: 17, width: 56, height: 16), size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.5), alignment: .right)
+        cpDrawLabel("⌥ falar", in: NSRect(x: leftmost - 66, y: 17, width: 56, height: 16), size: 10, weight: .bold, color: NSColor.white.withAlphaComponent(0.5), alignment: .right, tracking: 0.04)
 
         let body = NSRect(x: 18, y: 48, width: bounds.width - 36, height: bounds.height - 58)
         let p = NSMutableParagraphStyle()
@@ -1402,41 +2077,44 @@ final class LiveChipView: NSView {
     // ------------------------------------------------------------- helpers
     /// Draws the abort (stop) + close controls at the right edge. Returns the
     /// x of the leftmost control so callers can lay out content beside them.
+    /// Squared, matching `.window-control` / `.window-control-close`.
     @discardableResult
     private func drawControls(centerY: CGFloat, rightEdge: CGFloat, showAbort: Bool) -> CGFloat {
         let closeR: CGFloat = 7
         let close = NSRect(x: rightEdge - closeR * 2, y: centerY - closeR, width: closeR * 2, height: closeR * 2)
         closeHitRect = close
-        NSColor(calibratedRed: 0.92, green: 0.32, blue: 0.34, alpha: 0.95).setFill()
-        NSBezierPath(ovalIn: close).fill()
+        CP.red.setFill()
+        NSBezierPath(roundedRect: close, xRadius: 2, yRadius: 2).fill()
 
         guard showAbort else { return close.minX }
 
         let aR: CGFloat = 9
         let abort = NSRect(x: close.minX - 12 - aR * 2, y: centerY - aR, width: aR * 2, height: aR * 2)
         abortHitRect = abort
-        NSColor.white.withAlphaComponent(0.14).setFill()
-        NSBezierPath(ovalIn: abort).fill()
-        NSColor.white.withAlphaComponent(0.18).setStroke()
-        let ring = NSBezierPath(ovalIn: abort)
-        ring.lineWidth = 1
-        ring.stroke()
+        CP.surface1.setFill()
+        let abortPath = NSBezierPath(roundedRect: abort, xRadius: 3, yRadius: 3)
+        abortPath.fill()
+        CP.surfaceBorder.setStroke()
+        abortPath.lineWidth = 1
+        abortPath.stroke()
         // stop square
         let sq = abort.insetBy(dx: aR * 0.62, dy: aR * 0.62)
         NSColor.white.withAlphaComponent(0.85).setFill()
-        NSBezierPath(roundedRect: sq, xRadius: 1.5, yRadius: 1.5).fill()
+        NSBezierPath(roundedRect: sq, xRadius: 1, yRadius: 1).fill()
         return abort.minX
     }
 
+    /// Squared HUD face — red rim + red glowing "eyes", matching the notch
+    /// island's bot icon / `.message.assistant .message-avatar`.
     private func drawNeoFace(in rect: NSRect, glow: Bool) {
         if glow {
-            NSColor(calibratedRed: 0.42, green: 0.55, blue: 0.98, alpha: 0.22).setFill()
+            CP.red.withAlphaComponent(0.20).setFill()
             NSBezierPath(ovalIn: rect.insetBy(dx: -7, dy: -7)).fill()
         }
-        NSColor(calibratedRed: 0.30, green: 0.41, blue: 0.92, alpha: 1.0).setFill()
-        NSBezierPath(ovalIn: rect).fill()
-        NSColor(calibratedRed: 0.55, green: 0.66, blue: 1.0, alpha: 0.5).setStroke()
-        let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+        CP.accentBg.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: CP.cardRadius, yRadius: CP.cardRadius).fill()
+        CP.accentBorder.setStroke()
+        let ring = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: CP.cardRadius, yRadius: CP.cardRadius)
         ring.lineWidth = 1
         ring.stroke()
 
@@ -1444,7 +2122,7 @@ final class LiveChipView: NSView {
         let eyeY = rect.midY - eyeR
         let dx = rect.width * 0.17
         for ex in [rect.midX - dx, rect.midX + dx] {
-            NSColor.white.withAlphaComponent(0.95).setFill()
+            CP.red.setFill()
             NSBezierPath(ovalIn: NSRect(x: ex - eyeR, y: eyeY, width: eyeR * 2, height: eyeR * 2)).fill()
         }
     }
@@ -1458,8 +2136,8 @@ final class LiveChipView: NSView {
             let v = levelHistory[i]
             let h = max(3, v * height)
             let rect = NSRect(x: x + CGFloat(i) * (barW + gap), y: y + (height - h) / 2, width: barW, height: h)
-            NSColor(calibratedRed: 0.50, green: 0.62, blue: 1.0, alpha: 0.55 + 0.45 * v).setFill()
-            NSBezierPath(roundedRect: rect, xRadius: barW / 2, yRadius: barW / 2).fill()
+            CP.red.withAlphaComponent(0.55 + 0.45 * v).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
 
@@ -1468,16 +2146,16 @@ final class LiveChipView: NSView {
             let phase = pulsePhase - CGFloat(i) * 0.6
             let h = active ? 4 + (0.5 + 0.5 * sin(phase)) * 9 : 5
             let rect = NSRect(x: x + CGFloat(i) * 5, y: y + (12 - h) / 2, width: 3, height: h)
-            NSColor(calibratedRed: 0.50, green: 0.62, blue: 1.0, alpha: 0.9).setFill()
-            NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
+            CP.red.withAlphaComponent(0.9).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
 
     private func drawThinkingDots(at origin: NSPoint) {
         for i in 0..<3 {
             let phase = pulsePhase - CGFloat(i) * 0.5
-            let a = 0.3 + 0.5 * (0.5 + 0.5 * sin(phase))
-            NSColor.white.withAlphaComponent(a).setFill()
+            let a = 0.35 + 0.55 * (0.5 + 0.5 * sin(phase))
+            CP.red.withAlphaComponent(a).setFill()
             NSBezierPath(ovalIn: NSRect(x: origin.x + CGFloat(i) * 13, y: origin.y, width: 7, height: 7)).fill()
         }
     }
@@ -1515,9 +2193,9 @@ final class LiveChipController {
         container = NSView(frame: panel.contentView?.bounds ?? .zero)
         container.wantsLayer = true
         container.layer?.masksToBounds = true
-        container.layer?.cornerRadius = 32
+        container.layer?.cornerRadius = CP.cardRadius
         container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        container.layer?.borderColor = CP.hairline.cgColor
 
         blur = NSVisualEffectView(frame: container.bounds)
         blur.autoresizingMask = [.width, .height]
@@ -1594,7 +2272,7 @@ final class LiveChipController {
     private func resize(for state: String, spoken: String) {
         guard let screen = NSScreen.main else { return }
         let size = Self.size(for: state, spoken: spoken)
-        let radius: CGFloat = state == "listening" ? size.height / 2 : 20
+        let radius: CGFloat = CP.cardRadius   // angular HUD corners in every state
         container.layer?.cornerRadius = radius
         blur.layer?.cornerRadius = radius
 
@@ -1643,7 +2321,8 @@ final class LiveChipController {
 final class LiveSession {
     private let chip: LiveChipController
     private let voice = VoiceController()
-    var onPrompt: ((String) -> Void)?
+    /// (texto, transcricao crua) — a sessao Live SEMPRE vem do microfone.
+    var onPrompt: ((String, String?) -> Void)?
 
     private var active = false
     /// The answer card lingers after TTS ends; it only collapses back to
@@ -1652,13 +2331,34 @@ final class LiveSession {
     /// True between sending a prompt and the agent answering — used by the
     /// "pare" interrupt to know there's an in-flight turn worth cancelling.
     private var thinking = false
+    /// Auto-encerramento por inatividade: se acionar o Modo Live e NAO falar
+    /// nada, o chip se fecha sozinho depois de `idleTimeout`. So corre no estado
+    /// de escuta ocioso; e pausado enquanto o Neo pensa/fala. Ver armIdleTimer.
+    private var idleTimer: DispatchWorkItem?
+    /// Vem do VoiceConfig (Rust, NEO_NOTCH_IDLE_TIMEOUT_S). O default aqui so
+    /// vale ate o primeiro `config` chegar pelo IPC. 0 = nunca fecha sozinho.
+    private var idleTimeout: TimeInterval = 15
+    /// Teto de seguranca p/ os estados OCUPADOS (pensando/falando), onde o timer
+    /// de ociosidade nao corre. Sem ele, um turno que trava — engine de TTS que
+    /// para de mandar audio no meio, agente que nunca responde — deixava o chip
+    /// aberto e o mic pausado P/ SEMPRE, porque `onSpeakingChanged(false)` nunca
+    /// chegava para rearmar o timer. Generoso de proposito: uma resposta longa de
+    /// verdade passa de 2 minutos de fala (ja medimos 166s), entao isto e um
+    /// backstop contra travamento, nao um limite de duracao de resposta.
+    private let stuckTimeout: TimeInterval = 300
 
     init(chip: LiveChipController) {
         self.chip = chip
         wire()
     }
 
-    func applyVoiceConfig(_ cfg: VoiceConfig) { voice.cfg = cfg }
+    func applyVoiceConfig(_ cfg: VoiceConfig) {
+        voice.cfg = cfg
+        idleTimeout = cfg.idleTimeoutS
+        // config pode chegar com uma sessao ja aberta: re-arma no novo prazo em
+        // vez de esperar o proximo evento (senao a sessao atual fica no antigo).
+        if active && idleTimer != nil { armIdleTimer() }
+    }
     var isActive: Bool { active }
 
     func start() {
@@ -1668,6 +2368,7 @@ final class LiveSession {
         thinking = false
         chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
         voice.toggleListening()
+        armIdleTimer()
     }
 
     func stop() {
@@ -1675,8 +2376,41 @@ final class LiveSession {
         active = false
         showingAnswer = false
         thinking = false
+        cancelIdleTimer()
         voice.dispose()
         chip.hideChip()
+    }
+
+    /// (Re)arma o fecha-sozinho: dispara em `idleTimeout` se nada o rearmar.
+    /// Chamado ao entrar/permanecer em escuta ociosa (start, cada parcial, fim
+    /// da fala do Neo). A saida e a MESMA do X do chip (emit live_close + stop).
+    private func armIdleTimer() {
+        guard idleTimeout > 0 else { cancelIdleTimer(); return } // 0 = desligado
+        armClose(after: idleTimeout, reason: "inatividade (%.0fs sem fala)")
+    }
+
+    /// Enquanto o Neo pensa ou fala nao e "sem ouvir nada", entao o timer de
+    /// ociosidade nao vale — mas alguma coisa tem de correr, senao um turno
+    /// travado prende a sessao para sempre. Ver `stuckTimeout`.
+    private func armStuckTimer() {
+        armClose(after: stuckTimeout, reason: "turno travado (%.0fs no mesmo estado)")
+    }
+
+    private func armClose(after seconds: TimeInterval, reason: String) {
+        cancelIdleTimer()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.active else { return }
+            NSLog("[NeoNotch] Live fechado por " + reason, seconds)
+            emitEvent(["type": "live_close"])
+            self.stop()
+        }
+        idleTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func cancelIdleTimer() {
+        idleTimer?.cancel()
+        idleTimer = nil
     }
 
     /// Abort just the current turn (stop speaking/agent) and keep listening.
@@ -1686,20 +2420,26 @@ final class LiveSession {
         showingAnswer = false
         thinking = false
         chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
+        armIdleTimer() // voltou a escutar ocioso -> conta o tempo de novo
         emitEvent(["type": "live_abort"])
     }
 
     /// Voice-triggered interrupt ("pare"): only act when there's something to
-    /// stop (Neo is speaking or still thinking), otherwise leave listening as-is.
-    func interrupt() {
-        guard active, voice.speaking || thinking else { return }
+    /// stop (Neo is speaking or still thinking), otherwise leave listening
+    /// as-is. Returns false when it didn't act (so the caller can offer the
+    /// interrupt to the island surface instead).
+    @discardableResult
+    func interrupt() -> Bool {
+        guard active, voice.speaking || thinking else { return false }
         abort()
+        return true
     }
 
     func agentComplete(text: String, voice voiceOverride: [String: Any]?) {
         guard active else { return }
         showingAnswer = true
         thinking = false
+        armStuckTimer() // vai falar: ociosidade nao vale, mas o teto de travamento sim
         chip.update(active: true, state: "speaking", partial: "", spoken: text, level: 0)
         let v = voiceOverride?["voice"] as? String
         let lang = voiceOverride?["language"] as? String
@@ -1711,6 +2451,7 @@ final class LiveSession {
         guard active else { return }
         showingAnswer = true
         thinking = false
+        armIdleTimer() // erro mostrado, sem fala a caminho -> fecha se ficar ocioso
         chip.update(active: true, state: "speaking", partial: "", spoken: "⚠ " + message, level: 0)
     }
 
@@ -1731,17 +2472,26 @@ final class LiveSession {
             guard let self, self.active else { return }
             // User is speaking again → dismiss the lingering answer.
             self.showingAnswer = false
+            // So rearma ESCUTANDO: um parcial atrasado (audio ja em transito no
+            // neo-voice) chegando durante a fala trocaria o teto de travamento
+            // pelo prazo curto de ociosidade e cortaria uma resposta longa.
+            if !self.thinking && !self.voice.speaking { self.armIdleTimer() }
             self.chip.update(active: true, state: "listening", partial: text, spoken: "", level: 0)
         }
-        voice.onFinal = { [weak self] text in
+        voice.onFinal = { [weak self] text, raw in
             guard let self, self.active else { return }
             self.showingAnswer = false
             self.thinking = true
+            self.armStuckTimer() // vai pensar: idem — agente mudo nao prende a sessao
             self.chip.update(active: true, state: "thinking", partial: "", spoken: "", level: 0)
-            self.onPrompt?(text)
+            self.onPrompt?(text, raw)
         }
-        voice.onSpeakingChanged = { _ in
-            // Intentionally no-op: when playback ends we KEEP the answer card.
+        voice.onSpeakingChanged = { [weak self] on in
+            // The answer card is KEPT when playback ends (no UI change here);
+            // we only feed the wake-word anti-echo gate.
+            emitEvent(["type": "tts_state", "source": "live", "speaking": on])
+            // Falando -> so o teto de travamento; parou -> volta a contar ociosidade.
+            if on { self?.armStuckTimer() } else { self?.armIdleTimer() }
         }
         voice.onLevel = { [weak self] level in
             guard let self, self.active, !self.showingAnswer else { return }
@@ -1771,12 +2521,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = NotchController(screen: screen)
         self.controller = controller
         controller.start()
-        controller.onPrompt = { [weak self] text in self?.submitPrompt(text, fromLive: false) }
+        controller.onPrompt = { [weak self] text, fromVoice, raw in
+            self?.submitPrompt(text, fromLive: false, fromVoice: fromVoice, asrRaw: raw)
+        }
 
         let chip = LiveChipController()
         liveChip = chip
         let session = LiveSession(chip: chip)
-        session.onPrompt = { [weak self] text in self?.submitPrompt(text, fromLive: true) }
+        session.onPrompt = { [weak self] text, raw in
+            // sessao Live: sempre microfone
+            self?.submitPrompt(text, fromLive: true, fromVoice: true, asrRaw: raw)
+        }
         liveSession = session
 
         emitEvent(["type": "ready"])
@@ -1785,9 +2540,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func submitPrompt(_ text: String, fromLive: Bool) {
+    private func submitPrompt(_ text: String, fromLive: Bool, fromVoice: Bool,
+                              asrRaw: String? = nil) {
         pendingFromLive = fromLive
-        emitEvent(["type": "prompt", "text": text])
+        // `source` marca a ENTRADA como transcricao de audio: o notch tambem tem
+        // campo de texto, e so o turno que saiu do microfone ganha a tolerancia a
+        // erro de ASR no neo-core (voice-input-normalization-plan.md §3).
+        var event: [String: Any] = ["type": "prompt", "text": text]
+        if fromVoice {
+            event["source"] = "voice"
+            if let raw = asrRaw, !raw.isEmpty { event["raw_text"] = raw }
+        }
+        emitEvent(event)
     }
 
     private func readLoop() {
@@ -1812,6 +2576,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 cfg.voice = v["voice"] as? String
                 if let b = v["backend"] as? String, !b.isEmpty { cfg.backend = b }
                 cfg.language = v["language"] as? String
+                if let t = v["idleTimeoutS"] as? Double { cfg.idleTimeoutS = max(0, t) }
+                cfg.inputDeviceName = (v["inputDeviceName"] as? String)
+                    .flatMap { $0.isEmpty ? nil : $0 }
                 controller.applyConfig(cfg)
                 liveSession?.applyVoiceConfig(cfg)
             }
@@ -1839,7 +2606,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "live_stop":
             liveSession?.stop()
         case "live_interrupt":
-            liveSession?.interrupt()
+            // "pare": the Live chip has priority; when it has nothing to stop,
+            // the island surface (typed/mic prompt being spoken or thought)
+            // takes the interrupt instead.
+            if liveSession?.interrupt() != true {
+                _ = controller.interruptTurn()
+            }
         default:
             break
         }

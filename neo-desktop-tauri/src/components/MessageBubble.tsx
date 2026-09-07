@@ -2,9 +2,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github-dark.css';
-import { useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import type { Message, PlanStep } from '../types';
 import PlanTracker from './PlanTracker';
+import InlineImages from './InlineImages';
+import CodeBlock, { CopyButton } from './CodeBlock';
+import { extractInlineImages } from '../lib/inlineImages';
 import './MessageBubble.css';
 
 interface MessageBubbleProps {
@@ -13,8 +16,62 @@ interface MessageBubbleProps {
   onMissionResponse?: (missionId: string, approved: boolean, editedText?: string) => void;
 }
 
+function humanFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function MessageBubble({ message, onPermissionResponse, onMissionResponse }: MessageBubbleProps) {
   const [responding, setResponding] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  // Imagens que a resposta pediu via `[[IMAGE:…]]`: o marcador sai do texto e
+  // vira imagem de verdade abaixo dele (bytes lidos do disco pelo Rust, nunca
+  // pelo prompt — ver lib/inlineImages.ts). Como o marcador fica salvo no
+  // conteúdo da mensagem, reabrir uma sessão antiga redesenha as imagens.
+  const { text: displayText, images: inlineImages } = useMemo(
+    () => extractInlineImages(message.content || ''),
+    [message.content]
+  );
+
+  // Lido no clique (o comando pode chegar depois, junto do evento de permissão).
+  const getCommandText = useCallback(() => message.command?.cmd ?? '', [message.command?.cmd]);
+
+  const handleDownload = async (fileId: string, fileName: string) => {
+    setDownloadingId(fileId);
+    try {
+      await window.electronAPI?.downloadGeneratedFile(fileId, fileName);
+    } catch (err) {
+      // "cancelled" = usuário fechou o diálogo "Salvar como" sem escolher — não é erro.
+      if (err !== 'cancelled') {
+        console.error('[MessageBubble] download falhou:', err);
+      }
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
+  const renderFiles = () => {
+    if (!message.files || message.files.length === 0) return null;
+    return (
+      <div className="message-file-list">
+        {message.files.map((f) => (
+          <button
+            key={f.id}
+            type="button"
+            className="message-file-download"
+            title={`Baixar ${f.name}`}
+            disabled={downloadingId === f.id}
+            onClick={() => handleDownload(f.id, f.name)}
+          >
+            {downloadingId === f.id ? '⏳' : '⬇'} {f.name}
+            <span className="message-file-download-size">{humanFileSize(f.sizeBytes)}</span>
+          </button>
+        ))}
+      </div>
+    );
+  };
 
   const getStatusLabel = (status: string) => {
     switch (status) {
@@ -80,12 +137,15 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
     );
   }
 
-  // Renderizar plan tracker (real-time updates from neo-core)
+  // Renderizar plan tracker (real-time updates from neo-core).
+  // Sem a classe `plan-content`: ela é o cartão do plano ESTÁTICO (fundo, borda e
+  // 16px de padding próprios, mais o que cada tema aplica em cima). O PlanTracker
+  // já é o cartão — aninhar um no outro deixava moldura dentro de moldura.
   if (message.messageType === 'plan_update' && message.plan) {
     return (
       <div className="message assistant plan-message">
         <div className="message-avatar">📋</div>
-        <div className="message-content plan-content">
+        <div className="message-content plan-tracker-content">
           <PlanTracker plan={message.plan} />
         </div>
       </div>
@@ -308,11 +368,26 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
+              components={{
+                table: ({ children }) => (
+                  <div className="table-scroll-wrapper">
+                    <table>{children}</table>
+                  </div>
+                ),
+                // Todo bloco ``` do chat ganha botão de copiar (ver CodeBlock).
+                pre: ({ children, className }) => (
+                  <CodeBlock className={className}>{children}</CodeBlock>
+                ),
+              }}
             >
-              {message.content}
+              {displayText}
             </ReactMarkdown>
           </div>
-          
+
+          <InlineImages images={inlineImages} />
+
+          {renderFiles()}
+
           {message.command && (
             <div className="command-box">
               <div className="command-header">
@@ -320,6 +395,7 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
                 <div className="command-status">
                   <span className={`status-dot ${message.command.status}`}></span>
                   <span>{getStatusLabel(message.command.status)}</span>
+                  <CopyButton getText={getCommandText} />
                 </div>
               </div>
               

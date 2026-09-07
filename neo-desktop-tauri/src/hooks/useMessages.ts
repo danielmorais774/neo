@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import type { Message } from '../types';
+import { newMessageId } from '../lib/messageId';
 
 export const useMessages = () => {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -7,7 +8,7 @@ export const useMessages = () => {
   const addMessage = useCallback((msg: Omit<Message, 'id' | 'timestamp'>) => {
     const newMsg: Message = {
       ...msg,
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: newMessageId(),
       timestamp: new Date()
     };
     setMessages(prev => [...prev, newMsg]);

@@ -66,7 +66,7 @@ pub struct DesktopMessage {
     /// UUID do usuário autenticado no desktop
     #[prost(string, tag = "6")]
     pub user_id: ::prost::alloc::string::String,
-    #[prost(oneof = "desktop_message::Content", tags = "2, 3, 4")]
+    #[prost(oneof = "desktop_message::Content", tags = "2, 3, 4, 5")]
     pub content: ::core::option::Option<desktop_message::Content>,
 }
 /// Nested message and enum types in `DesktopMessage`.
@@ -79,6 +79,8 @@ pub mod desktop_message {
         ToolResult(super::ToolResult),
         #[prost(message, tag = "4")]
         CommandApproval(super::CommandApproval),
+        #[prost(message, tag = "5")]
+        KeepAlive(super::KeepAlive),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -110,6 +112,11 @@ pub struct CommandApproval {
     pub command_id: ::prost::alloc::string::String,
     #[prost(bool, tag = "2")]
     pub approved: bool,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct KeepAlive {
+    #[prost(int64, tag = "1")]
+    pub timestamp: i64,
 }
 /// Mensagens do Core para o Desktop
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -177,17 +184,58 @@ pub struct AgentResponse {
     pub is_final: bool,
     #[prost(int32, tag = "3")]
     pub total_iterations: i32,
+    /// default TTS voice/engine to render this reply (Pattern A)
     #[prost(message, optional, tag = "4")]
     pub voice: ::core::option::Option<VoiceSettings>,
+    /// Multi-voice reply: ordered speech segments, each optionally with its own
+    /// voice (voice imitation). When present, the renderer speaks each segment in
+    /// order; a segment with an empty `voice` uses the reply-level `voice` above.
+    /// `message` still carries the full concatenated text (display + back-compat).
+    #[prost(message, repeated, tag = "5")]
+    pub segments: ::prost::alloc::vec::Vec<SpeechSegment>,
+    /// Arquivos que o Neo gerou/catalogou nesta resposta (ex: um .zip criado via
+    /// a tool file_save) — mesmo campo que o REST/NDJSON (`files`) já expõe pro
+    /// neo-panel. Baixável via GET /api/v1/files/{id}/download no neo-core
+    /// (endpoint aberto, agnóstico de cliente). Vazio quando nenhum file_save
+    /// rodou neste turno.
+    #[prost(message, repeated, tag = "6")]
+    pub files: ::prost::alloc::vec::Vec<FileRef>,
 }
+/// Referência a um arquivo gerado/catalogado (file_save), pronto pra download
+/// via GET /api/v1/files/{id}/download no neo-core.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FileRef {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub size_bytes: i64,
+}
+/// One chunk of a multi-voice reply. `text` is spoken with `voice` if set,
+/// otherwise with the AgentResponse-level default voice.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpeechSegment {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// optional per-segment voice override
+    #[prost(message, optional, tag = "2")]
+    pub voice: ::core::option::Option<VoiceSettings>,
+}
+/// Active TTS voice the renderer (desktop) should use to speak the reply. Resolved
+/// by neo-core from the persisted user preference (service="neo-voice").
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct VoiceSettings {
+    /// qwen | coqui | dia
     #[prost(string, tag = "1")]
     pub engine: ::prost::alloc::string::String,
+    /// speaker id / clone id sent to the engine
     #[prost(string, tag = "2")]
     pub voice: ::prost::alloc::string::String,
+    /// optional language hint
     #[prost(string, tag = "3")]
     pub language: ::prost::alloc::string::String,
+    /// friendly name (ex: "Jarvis")
     #[prost(string, tag = "4")]
     pub label: ::prost::alloc::string::String,
 }

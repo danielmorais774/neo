@@ -11,6 +11,13 @@ export class CommandService {
   }
 
   static respondToPermission(requestId: string, approved: boolean): void {
-    window.electronAPI?.respondToPermission(requestId, approved);
+    const api = window.electronAPI;
+    if (!api?.respondToPermission) {
+      // Sem ponte não há como aprovar: grita em vez de virar no-op silencioso — o
+      // sintoma seria o mesmo botão travado em "Aguardando...".
+      console.error('[CommandService] electronAPI.respondToPermission indisponível', { requestId, approved });
+      return;
+    }
+    api.respondToPermission(requestId, approved);
   }
 }

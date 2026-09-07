@@ -1,0 +1,361 @@
+/* ============================================================
+   Modo Live — HUD "Cyberpunk 2077" (tema glassdark)
+   Base: "Neo Assistant Cyberpunk Live.dc.html" (Claude Design).
+   Reaproveita os tokens do bloco [data-theme='glassdark'] do themes.css
+   (--gd-red, --gd-red-ink, --gd-mono, …). Só renderiza no tema Cyberpunk.
+   ============================================================ */
+.cyber-live {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px 32px 0;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(180, 10, 20, 0.16) 0%, transparent 48%),
+    rgba(8, 6, 8, 0.86);
+  backdrop-filter: blur(30px) saturate(140%);
+  -webkit-backdrop-filter: blur(30px) saturate(140%);
+  animation: cyberLiveIn 0.28s ease;
+}
+
+@keyframes cyberLiveIn {
+  from { opacity: 0; transform: scale(0.99); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* linha vermelha no topo do overlay, igual ao chrome do tema */
+.cyber-live::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 30, 45, 0.7), transparent);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* ---- ambiência: grid vermelho + scanline CRT ---- */
+.cyber-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 20, 40, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 20, 40, 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+.cyber-scan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 140px;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(255, 20, 40, 0.05), transparent);
+  animation: cyberScan 9s linear infinite;
+}
+
+@keyframes cyberScan {
+  0% { transform: translateY(-160px); }
+  100% { transform: translateY(760px); }
+}
+
+/* ---- rótulo MODO LIVE ---- */
+.cyber-live-label {
+  flex-shrink: 0;
+  z-index: 1;
+  font-size: 12px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.3em;
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+}
+
+/* ---- área central do estágio ---- */
+.cyber-live-stage {
+  flex: 1;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  width: 100%;
+  max-width: 520px;
+  min-height: 0;
+}
+
+.cyber-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+.cyber-col-say {
+  gap: 16px;
+  width: 100%;
+}
+
+/* ---- núcleo (wrap) ---- */
+.cyber-core-wrap {
+  position: relative;
+  width: 190px;
+  height: 190px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.cyber-core-sm {
+  width: 120px;
+  height: 120px;
+}
+
+/* brackets de mira (só ouvindo) */
+.cyber-bracket {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+}
+.cyber-bracket.tl { top: 0; left: 0; border-top: 2px solid var(--gd-red); border-left: 2px solid var(--gd-red); }
+.cyber-bracket.tr { top: 0; right: 0; border-top: 2px solid var(--gd-red); border-right: 2px solid var(--gd-red); }
+.cyber-bracket.bl { bottom: 0; left: 0; border-bottom: 2px solid var(--gd-red); border-left: 2px solid var(--gd-red); }
+.cyber-bracket.br { bottom: 0; right: 0; border-bottom: 2px solid var(--gd-red); border-right: 2px solid var(--gd-red); }
+
+/* anéis */
+.cyber-ring {
+  position: absolute;
+  border-radius: 50%;
+}
+/* ouvindo */
+.cyber-l-ring1 { inset: 14px; border: 1px dashed rgba(255, 45, 61, 0.5); animation: cyberSpinCw 12s linear infinite; }
+.cyber-l-ring2 { inset: 28px; border: 1px solid rgba(255, 45, 61, 0.3); animation: cyberSpinCcw 8s linear infinite; }
+/* pensando */
+.cyber-t-ring1 { inset: 6px; border: 1px dashed rgba(255, 45, 61, 0.35); animation: cyberSpinCw 3s linear infinite; }
+.cyber-t-ring2 { inset: 22px; border: 2px dotted rgba(255, 45, 61, 0.5); animation: cyberSpinCcw 2.2s linear infinite; }
+.cyber-t-ring3 {
+  inset: 38px;
+  border: 3px solid transparent;
+  border-top-color: var(--gd-red);
+  animation: cyberSpinCw 1s linear infinite;
+}
+/* falando */
+.cyber-s-ring { inset: 8px; border: 1px solid rgba(255, 45, 61, 0.3); }
+
+/* núcleo em losango (ouvindo / falando) */
+.cyber-diamond {
+  width: 70px;
+  height: 70px;
+  transform: rotate(45deg);
+  background: linear-gradient(135deg, #ff5a4a 0%, var(--gd-red) 55%, #6b0d14 100%);
+  box-shadow:
+    0 0 50px rgba(255, 20, 40, 0.6),
+    0 0 100px rgba(255, 20, 40, 0.3),
+    inset 0 0 24px rgba(0, 0, 0, 0.35);
+  animation: cyberCorePulse 2.2s ease-in-out infinite;
+}
+.cyber-diamond-sm {
+  width: 52px;
+  height: 52px;
+  box-shadow: 0 0 40px rgba(255, 20, 40, 0.55);
+  animation-duration: 1.4s;
+}
+
+@keyframes cyberCorePulse {
+  0%, 100% { transform: rotate(45deg) scale(1); opacity: 1; }
+  50% { transform: rotate(45deg) scale(1.12); opacity: 0.75; }
+}
+
+/* núcleo redondo (pensando) */
+.cyber-orb {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #ff5a4a 0%, var(--gd-red) 55%, #6b0d14 100%);
+  box-shadow: 0 0 40px rgba(255, 20, 40, 0.5);
+  animation: cyberThinkPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cyberThinkPulse {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50% { transform: scale(0.85); opacity: 0.6; }
+}
+
+@keyframes cyberSpinCw { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes cyberSpinCcw { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
+
+/* ---- equalizador (ouvindo) ---- */
+.cyber-eq {
+  display: flex;
+  align-items: flex-end;
+  gap: 5px;
+  height: 44px;
+  transform-origin: bottom;
+  transition: transform 0.09s ease-out;
+}
+.cyber-eq span {
+  width: 4px;
+  background: var(--gd-red);
+  border-radius: 1px;
+}
+.cyber-eq span:nth-child(1) { animation: cyberBar1 1.1s ease-in-out infinite; }
+.cyber-eq span:nth-child(2) { animation: cyberBar2 0.9s ease-in-out infinite; }
+.cyber-eq span:nth-child(3) { animation: cyberBar3 1.3s ease-in-out infinite; }
+.cyber-eq span:nth-child(4) { animation: cyberBar4 1s ease-in-out infinite; }
+.cyber-eq span:nth-child(5) { animation: cyberBar5 1.2s ease-in-out infinite; }
+
+@keyframes cyberBar1 { 0%, 100% { height: 10px; } 50% { height: 38px; } }
+@keyframes cyberBar2 { 0%, 100% { height: 22px; } 50% { height: 52px; } }
+@keyframes cyberBar3 { 0%, 100% { height: 14px; } 50% { height: 60px; } }
+@keyframes cyberBar4 { 0%, 100% { height: 28px; } 50% { height: 46px; } }
+@keyframes cyberBar5 { 0%, 100% { height: 8px; } 50% { height: 34px; } }
+
+/* ---- textos de estado + terminal ---- */
+.cyber-state-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.cyber-state-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--gd-red);
+  letter-spacing: 0.15em;
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+}
+.cyber-state-line.flicker {
+  animation: cyberFlicker 4s linear infinite;
+}
+
+@keyframes cyberFlicker {
+  0%, 92%, 100% { opacity: 1; }
+  94% { opacity: 0.3; }
+  96% { opacity: 1; }
+  97% { opacity: 0.5; }
+}
+
+.cyber-dots {
+  display: flex;
+  gap: 3px;
+}
+.cyber-dots span:nth-child(1) { animation: cyberDotBlink1 1.2s linear infinite; }
+.cyber-dots span:nth-child(2) { animation: cyberDotBlink2 1.2s linear infinite; }
+.cyber-dots span:nth-child(3) { animation: cyberDotBlink3 1.2s linear infinite; }
+
+@keyframes cyberDotBlink1 { 0%, 20%, 100% { opacity: 0.2; } 10% { opacity: 1; } }
+@keyframes cyberDotBlink2 { 0%, 100% { opacity: 0.2; } 40% { opacity: 0.2; } 50% { opacity: 1; } 70% { opacity: 0.2; } }
+@keyframes cyberDotBlink3 { 0%, 70% { opacity: 0.2; } 80% { opacity: 1; } 100% { opacity: 0.2; } }
+
+.cyber-term {
+  max-width: 460px;
+  text-align: center;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.05em;
+  font-family: var(--gd-mono);
+  word-break: break-word;
+}
+
+/* ---- caixa de resposta (falando) ---- */
+.cyber-say {
+  width: 100%;
+  padding: 16px 20px;
+  border-radius: 4px;
+  background: rgba(255, 20, 40, 0.06);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 30, 45, 0.3);
+  box-shadow: 0 0 24px rgba(255, 20, 40, 0.1);
+  max-height: 34vh;
+  overflow-y: auto;
+}
+.cyber-say-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--gd-red);
+  letter-spacing: 0.2em;
+  font-family: var(--gd-mono);
+  margin-bottom: 8px;
+}
+.cyber-say-text {
+  font-size: 15px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.9);
+}
+.cyber-cursor {
+  color: var(--gd-red);
+  animation: cyberCursorBlink 1s step-start infinite;
+}
+
+@keyframes cyberCursorBlink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* ---- encerrar (octógono) ---- */
+.cyber-end {
+  flex-shrink: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 0 22px;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.cyber-end-btn {
+  width: 52px;
+  height: 52px;
+  clip-path: polygon(30% 0, 70% 0, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0 70%, 0 30%);
+  background: var(--gd-red);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 30px rgba(255, 20, 40, 0.6), 0 0 60px rgba(255, 20, 40, 0.3);
+  transition: transform 0.12s ease, filter 0.12s ease;
+}
+.cyber-end:hover .cyber-end-btn {
+  transform: scale(1.06);
+  filter: brightness(1.1);
+}
+.cyber-end:active .cyber-end-btn {
+  transform: scale(0.96);
+}
+.cyber-end-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.5);
+  letter-spacing: 0.2em;
+  font-family: var(--gd-mono);
+  text-transform: uppercase;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cyber-live,
+  .cyber-scan,
+  .cyber-diamond,
+  .cyber-diamond-sm,
+  .cyber-orb,
+  .cyber-ring,
+  .cyber-eq span,
+  .cyber-state-line.flicker,
+  .cyber-dots span,
+  .cyber-cursor {
+    animation: none;
+  }
+}

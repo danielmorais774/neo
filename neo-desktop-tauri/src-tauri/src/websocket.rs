@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,13 +27,14 @@ fn should_show_notification(app_handle: &AppHandle) -> bool {
     !(is_visible && !is_minimized && is_focused && active_tab == "chat")
 }
 
-/// WebSocket manager for device online/offline signaling and notifications
+/// WebSocket manager for device online/offline signaling, notifications and control
 pub struct DeviceWsManager {
     device_id: String,
     api_url: String,
     app_handle: AppHandle,
     online_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     notif_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    control_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
 }
 
@@ -48,6 +49,7 @@ impl DeviceWsManager {
             app_handle,
             online_task: Arc::new(RwLock::new(None)),
             notif_task: Arc::new(RwLock::new(None)),
+            control_task: Arc::new(RwLock::new(None)),
             shutdown_tx: Arc::new(RwLock::new(None)),
         }
     }
@@ -65,11 +67,19 @@ impl DeviceWsManager {
         let api_url = self.api_url.clone();
         let app_handle = self.app_handle.clone();
 
+        // Token de pareamento nos canais antigos (F5). Enquanto
+        // `neo_device_auth_required` estiver OFF no core, mandar o token é
+        // inofensivo; quando for ligada, é o que mantém estes canais de pé.
+        let token_qs = crate::device_token()
+            .map(|t| format!("&token={}", urlencoding::encode(&t)))
+            .unwrap_or_default();
+
         // Online status WebSocket
         let online_url = format!(
-            "{}/api/v1/ws/devices/online?device_id={}",
+            "{}/api/v1/ws/devices/online?device_id={}{}",
             api_url.replace("http", "ws"),
-            urlencoding::encode(&device_id)
+            urlencoding::encode(&device_id),
+            token_qs
         );
         info!("[DeviceWS] Online URL: {}", online_url);
 
@@ -80,9 +90,12 @@ impl DeviceWsManager {
 
         // Notifications WebSocket
         let notif_url = format!(
-            "{}/api/v1/ws/devices/notifications/{}",
+            "{}/api/v1/ws/devices/notifications/{}{}",
             api_url.replace("http", "ws"),
-            urlencoding::encode(&device_id)
+            urlencoding::encode(&device_id),
+            // O `&token=` do helper vira `?token=` aqui: esta URL não tem
+            // query string própria.
+            token_qs.replacen('&', "?", 1)
         );
         info!("[DeviceWS] Notifications URL: {}", notif_url);
 
@@ -91,7 +104,33 @@ impl DeviceWsManager {
         });
         *self.notif_task.write().await = Some(notif_task);
 
-        info!("[DeviceWS] Both WebSocket connections initiated");
+        // Canal de CONTROLE (volume, mídia, energia). Só sobe se este device
+        // estiver pareado — sem token o core recusa a conexão, e ficar tentando
+        // seria um loop de 4401 a cada 5s.
+        match crate::device_token() {
+            Some(token) => {
+                let control_url = format!(
+                    "{}/api/v1/ws/devices/control/{}?token={}",
+                    self.api_url.replace("http", "ws"),
+                    urlencoding::encode(&self.device_id),
+                    urlencoding::encode(&token)
+                );
+                let control_app = self.app_handle.clone();
+                let control_task = tokio::spawn(async move {
+                    Self::connect_control_ws(&control_url, control_app).await;
+                });
+                *self.control_task.write().await = Some(control_task);
+                info!("[DeviceWS] Control channel initiated");
+            }
+            None => {
+                warn!(
+                    "[DeviceWS] Sem token de pareamento — canal de controle NÃO subiu. \
+                     Gere um código no painel e pareie este dispositivo."
+                );
+            }
+        }
+
+        info!("[DeviceWS] WebSocket connections initiated");
     }
 
     /// Connect to online status WebSocket
@@ -177,6 +216,154 @@ impl DeviceWsManager {
         }
     }
 
+    /// Canal de controle: recebe comandos do core, executa e devolve o resultado.
+    ///
+    /// Envelope (docs/device-control-plan.md §3):
+    ///   core → device   {"id":"c-7f3a","action":"volume_set","args":{"level":30}}
+    ///   device → core   {"id":"c-7f3a","ok":true,"result":{"level":30,"muted":false}}
+    ///
+    /// O `result` carrega o estado REAL medido depois de agir — é o que permite
+    /// ao Neo reportar o volume que ficou, e não o que foi pedido.
+    async fn connect_control_ws(url: &str, app_handle: AppHandle) {
+        loop {
+            match connect_async(url).await {
+                Ok((ws_stream, _)) => {
+                    info!("[DeviceWS] Control connection established");
+                    let (mut write, mut read) = ws_stream.split();
+
+                    while let Some(msg) = read.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let reply = Self::handle_control_command(&app_handle, &text).await;
+                                if let Some(reply) = reply {
+                                    if let Err(e) = write.send(Message::Text(reply.into())).await {
+                                        warn!("[DeviceWS] Control send failed: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(Message::Close(frame)) => {
+                                // 4401 = "não pareado". Reconectar em loop só
+                                // geraria um 4401 a cada 5s para sempre — o
+                                // conserto é parear, não insistir.
+                                if frame.as_ref().map(|f| u16::from(f.code)) == Some(4401) {
+                                    error!(
+                                        "[DeviceWS] Controle recusado: dispositivo não pareado. \
+                                         Gere um código no painel e pareie."
+                                    );
+                                    return;
+                                }
+                                warn!("[DeviceWS] Control connection closed by server");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("[DeviceWS] Control read error: {}", e);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[DeviceWS] Failed to connect control WS: {}", e);
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Executa um comando e monta a resposta. `None` = não responder (ações de
+    /// energia: a máquina cai, e o core confirma pela desconexão).
+    async fn handle_control_command(app_handle: &AppHandle, text: &str) -> Option<String> {
+        use crate::services::device_control;
+
+        let command: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[DeviceWS] Control command inválido: {}", e);
+                return None;
+            }
+        };
+
+        let id = command.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let action = command.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let args = command.get("args").cloned().unwrap_or(serde_json::Value::Null);
+
+        info!("[DeviceWS] Control command: {} (id={})", action, id);
+
+        // Energia pede confirmação NESTA máquina — quem está na frente dela é
+        // quem decide. Recusar mantém o canal aberto, e o core lê "continua
+        // conectado" como cancelamento (§4).
+        if matches!(action.as_str(), "suspend" | "shutdown" | "restart") {
+            if !Self::confirm_power_action(app_handle, &action).await {
+                info!("[DeviceWS] Ação de energia '{}' recusada pelo usuário", action);
+                return None;
+            }
+            let act = action.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || device_control::power(&act)).await;
+            return None;
+        }
+
+        // Navegador local: assíncrono (socket do open-browser-use + CDP) e fora
+        // do spawn_blocking. Ver services/browser_local.rs e
+        // neo-core/docs/browser-local-plan.md §3.2.
+        if action.starts_with("browser.") {
+            let reply = match crate::services::browser_local::execute(&action, &args).await {
+                Ok(result) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+                Err(e) => {
+                    warn!("[DeviceWS] {} falhou: {}", action, e);
+                    serde_json::json!({ "id": id, "ok": false, "error": e })
+                }
+            };
+            return Some(reply.to_string());
+        }
+
+        let act = action.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            device_control::execute(&act, &args)
+        })
+        .await;
+
+        let reply = match outcome {
+            Ok(Ok(result)) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+            Ok(Err(e)) => serde_json::json!({ "id": id, "ok": false, "error": e }),
+            Err(e) => serde_json::json!({
+                "id": id,
+                "ok": false,
+                "error": format!("falha ao executar: {}", e)
+            }),
+        };
+        Some(reply.to_string())
+    }
+
+    /// Diálogo nativo de confirmação para desligar/suspender/reiniciar.
+    async fn confirm_power_action(app_handle: &AppHandle, action: &str) -> bool {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+        let (title, body) = match action {
+            "suspend" => ("Suspender este computador?", "O Neo pediu para suspender esta máquina."),
+            "restart" => ("Reiniciar este computador?", "O Neo pediu para reiniciar esta máquina."),
+            _ => ("Desligar este computador?", "O Neo pediu para desligar esta máquina."),
+        };
+
+        let app = app_handle.clone();
+        // blocking_show trava se rodar na thread principal — mesmo padrão do
+        // seletor de arquivos em commands/mod.rs.
+        tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .message(body)
+                .title(title)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Confirmar".to_string(),
+                    "Cancelar".to_string(),
+                ))
+                .blocking_show()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Stop all WebSocket connections
     pub async fn disconnect(&self) {
         info!("[DeviceWS] Disconnecting all connections");
@@ -190,6 +377,10 @@ impl DeviceWsManager {
         }
 
         if let Some(task) = self.notif_task.write().await.take() {
+            task.abort();
+        }
+
+        if let Some(task) = self.control_task.write().await.take() {
             task.abort();
         }
 

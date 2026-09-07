@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import type { Message, AgentEvent, ExecutionPlan } from '../types';
+import { newMessageId } from '../lib/messageId';
 
 interface UseAgentEventsProps {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
@@ -30,7 +31,7 @@ export const useAgentEvents = ({
           setMessages(prev => {
             const filtered = prev.filter(m => m.messageType !== 'thinking');
             return [...filtered, {
-              id: Date.now().toString(),
+              id: newMessageId(),
               role: 'assistant',
               content: event.data.content,
               messageType: 'thinking',
@@ -47,18 +48,19 @@ export const useAgentEvents = ({
           setMessages(prev => {
             const filtered = prev.filter(m => m.messageType !== 'thinking');
             return [...filtered, {
-              id: Date.now().toString(),
+              id: newMessageId(),
               role: 'assistant',
               content: event.data.content,
               messageType: 'text',
-              timestamp: new Date()
+              timestamp: new Date(),
+              files: event.data.files,
             }];
           });
           break;
 
         case 'plan':
           setMessages(prev => [...prev, {
-            id: Date.now().toString(),
+            id: newMessageId(),
             role: 'assistant',
             content: `Plano: ${event.data.goal}`,
             messageType: 'plan',
@@ -142,7 +144,7 @@ export const useAgentEvents = ({
             }
 
             return [...prev, {
-              id: Date.now().toString(),
+              id: newMessageId(),
               role: 'assistant' as const,
               content: `Plano: ${update.goal}`,
               messageType: 'plan_update' as const,
@@ -155,7 +157,7 @@ export const useAgentEvents = ({
 
         case 'step_start':
           setMessages(prev => [...prev, {
-            id: Date.now().toString(),
+            id: newMessageId(),
             role: 'assistant',
             content: event.data.title,
             messageType: 'step',
@@ -193,7 +195,7 @@ export const useAgentEvents = ({
 
         case 'command_request':
           setMessages(prev => [...prev, {
-            id: Date.now().toString(),
+            id: newMessageId(),
             role: 'assistant',
             content: `Comando: ${event.data.explanation}`,
             messageType: 'command',
@@ -216,7 +218,7 @@ export const useAgentEvents = ({
             };
             if (event.data.stopped) {
               return [...filtered, {
-                id: Date.now().toString(),
+                id: newMessageId(),
                 role: 'assistant',
                 content: '⏹ Execução interrompida pelo usuário',
                 messageType: 'text',
@@ -247,12 +249,13 @@ export const useAgentEvents = ({
               } : undefined;
               const msgType = missionMatch ? 'mission' : (event.data.success ? 'result' : 'error');
               return [...filtered, {
-                id: Date.now().toString(),
+                id: newMessageId(),
                 role: 'assistant',
                 content: cleanContent || rawContent,
                 messageType: msgType,
                 timestamp: new Date(),
                 details,
+                files: event.data.files,
                 ...(parsedMission ? { mission: parsedMission } : {}),
               }];
             }
@@ -265,7 +268,7 @@ export const useAgentEvents = ({
           setMessages(prev => {
             const filtered = prev.filter(m => m.messageType !== 'thinking');
             return [...filtered, {
-              id: Date.now().toString(),
+              id: newMessageId(),
               role: 'assistant',
               content: `❌ Erro: ${event.data.message}`,
               messageType: 'error',

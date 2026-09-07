@@ -4,6 +4,7 @@ import { APP_THEMES, THEME_LABELS } from '../themes/themeTypes';
 import VoiceEnginesPanel from './VoiceEnginesPanel';
 import AudioDevicesPanel from './AudioDevicesPanel';
 import WakeWordPanel from './WakeWordPanel';
+import WakeTestPanel from './WakeTestPanel';
 import { useWakeEnabled } from '../hooks';
 import './SettingsModal.css';
 
@@ -113,6 +114,14 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
               </span>
             </button>
             <WakeWordPanel />
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <span>Teste de Wake</span>
+              <small>Veja o score de cada fala p/ afinar o limiar e o gatilho</small>
+            </div>
+            <WakeTestPanel />
           </div>
         </div>
       </section>

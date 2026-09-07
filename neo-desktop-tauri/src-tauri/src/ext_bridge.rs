@@ -21,8 +21,17 @@ use tokio_tungstenite::tungstenite::Message;
 /// Loopback port the browser extension connects to.
 pub const EXT_BRIDGE_PORT: u16 = 17872;
 
-/// An open music tab reported by the extension. Serialized into `media_context`;
-/// `find_music_tab` in neo-core only keys off `site`, the rest is informational.
+/// An open music tab reported by the extension. Serialized into `media_context`.
+///
+/// Só os campos que ALGUÉM aqui precisa entender ficam nomeados; todo o resto do
+/// que a extensão reporta (estado do player, duração, som na guia, música ou
+/// vídeo, tipo de página…) viaja em `extra` e chega ao neo-core intacto. Esta
+/// ponte não lê nenhum deles: ela recebe JSON e reemite JSON.
+///
+/// O `flatten` é deliberado. Com campos tipados, todo sinal novo aprendido pela
+/// extensão exigiria mexer no Rust — e mexer no Rust aqui custa reiniciar o
+/// `tauri dev` do usuário (não há build de release neste projeto). Assim a
+/// extensão evolui sozinha: o que ela mandar, o cérebro recebe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MusicTab {
     pub site: String, // "youtube" | "spotify"
@@ -32,8 +41,13 @@ pub struct MusicTab {
     pub url: String,
     #[serde(default)]
     pub title: String,
+    /// "a aba está tocando". A extensão refina com o estado real do player
+    /// (`paused`) e usa o som da guia só como piso — vídeo tocando no mudo não
+    /// é audível e mesmo assim está tocando.
     #[serde(default)]
     pub playing: bool,
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 struct CmdResult {
@@ -85,11 +99,15 @@ impl ExtBridge {
     /// Send a play command to the extension and await its result (~8s timeout).
     /// Returns Err with a human-readable reason when nothing is connected, the
     /// send fails, or the extension reports failure / times out.
+    /// `tab_id` is the tab the core picked when it decided to reuse (from the
+    /// snapshot this bridge reported). It is a pin, not an order: the extension
+    /// falls back to its own lookup when that tab is gone. `None` = no pin.
     pub async fn send_command(
         &self,
         action: &str,
         target: &str,
         video_id: &str,
+        tab_id: Option<i64>,
     ) -> Result<(), String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (resp_tx, resp_rx) = oneshot::channel::<CmdResult>();
@@ -112,6 +130,7 @@ impl ExtBridge {
             "action": action,
             "target": target,
             "videoId": video_id,
+            "tabId": tab_id,
         })
         .to_string();
 
@@ -265,4 +284,63 @@ async fn handle_conn(stream: TcpStream, bridge: ExtBridge) -> Result<(), String>
     writer.abort();
     info!("[ExtBridge] extension disconnected");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // O relay tem que ser TRANSPARENTE: o que a extensão aprender a reportar
+    // precisa chegar ao neo-core sem passar por aqui. Antes os campos eram
+    // tipados um a um e tudo que não estivesse na struct era descartado em
+    // silêncio — o sintoma seria a nota do cérebro sem duração, sem play/pause
+    // e sem "música ou vídeo", sem erro nenhum apontando para cá.
+    #[test]
+    fn campos_novos_da_extensao_atravessam_a_ponte() {
+        let json = r#"{
+            "site": "youtube",
+            "tabId": 42,
+            "url": "https://www.youtube.com/watch?v=abc",
+            "title": "Clipe",
+            "playing": true,
+            "audible": true,
+            "muted": false,
+            "kind": "watch",
+            "hasMedia": true,
+            "paused": false,
+            "currentTime": 72.4,
+            "duration": 245.0,
+            "contentType": "music",
+            "track": "No Matter What",
+            "artist": "Papa Roach",
+            "adShowing": false
+        }"#;
+        let tab: MusicTab = serde_json::from_str(json).expect("parse");
+        assert_eq!(tab.site, "youtube");
+        assert_eq!(tab.tab_id, 42);
+        assert!(tab.playing);
+
+        let de_volta = serde_json::to_value(&tab).expect("serialize");
+        // Nomes preservados como a extensão escreveu (camelCase), porque é
+        // assim que o neo-core lê.
+        assert_eq!(de_volta["contentType"], "music");
+        assert_eq!(de_volta["hasMedia"], true);
+        assert_eq!(de_volta["paused"], false);
+        assert_eq!(de_volta["duration"], 245.0);
+        assert_eq!(de_volta["track"], "No Matter What");
+        assert_eq!(de_volta["adShowing"], false);
+        assert_eq!(de_volta["tabId"], 42);
+    }
+
+    // Extensão velha (só os cinco campos originais) não pode quebrar a ponte —
+    // o usuário atualiza o app e a extensão em momentos diferentes.
+    #[test]
+    fn snapshot_no_formato_antigo_continua_valendo() {
+        let json = r#"{"site":"spotify","tabId":7,"url":"u","title":"T","playing":false}"#;
+        let tab: MusicTab = serde_json::from_str(json).expect("parse");
+        assert_eq!(tab.site, "spotify");
+        assert!(tab.extra.is_empty());
+        let de_volta = serde_json::to_value(&tab).expect("serialize");
+        assert_eq!(de_volta["tabId"], 7);
+    }
 }

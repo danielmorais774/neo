@@ -3,10 +3,15 @@ export class AgentService {
     message: string,
     model: string = 'gpt-4o',
     mode: string = 'agent',
-    provider?: string
+    provider?: string,
+    // Ids do File Store anexados a este turno (o Neo lê por fatias; o conteúdo
+    // não passa pelo chat).
+    attachments?: string[],
+    // Turno vindo do microfone (STT): o core tolera erro de transcrição.
+    voice?: { source: 'voice'; raw?: string; engine?: string }
   ): Promise<void> {
     try {
-      await window.electronAPI?.executeWithLoop(message, model, mode, provider);
+      await window.electronAPI?.executeWithLoop(message, model, mode, provider, attachments, voice);
     } catch (error: any) {
       console.error('Erro ao executar agente:', error);
       throw new Error(error.message || 'Falha ao processar mensagem');

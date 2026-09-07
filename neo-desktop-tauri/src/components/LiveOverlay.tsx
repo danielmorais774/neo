@@ -1,4 +1,6 @@
 import './LiveOverlay.css';
+import { useTheme } from '../themes/useTheme';
+import LiveOverlayCyberpunk from './LiveOverlayCyberpunk';
 import type { LiveState } from '../hooks/useLiveMode';
 
 interface LiveOverlayProps {
@@ -28,6 +30,22 @@ export default function LiveOverlay({
   micLevel,
   onClose,
 }: LiveOverlayProps) {
+  const { theme } = useTheme();
+
+  // No tema Cyberpunk o Modo Live vira um HUD dedicado (vermelho neon, grid,
+  // scanline, núcleo em losango). Os demais temas usam o orbe padrão abaixo.
+  if (theme === 'glassdark') {
+    return (
+      <LiveOverlayCyberpunk
+        liveState={liveState}
+        partialText={partialText}
+        spokenText={spokenText}
+        micLevel={micLevel}
+        onClose={onClose}
+      />
+    );
+  }
+
   // o orbe "respira" com o nível do microfone enquanto ouve
   const scale = liveState === 'listening' ? 1 + Math.min(0.45, micLevel * 0.6) : 1;
 

@@ -16,12 +16,14 @@
 
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
@@ -30,6 +32,93 @@ use tokio::sync::watch;
 pub struct WakeDetected {
     pub model: String,
     pub score: f64,
+}
+
+// ---- Gate anti-eco (wake suprimido enquanto o Neo fala) ------------------
+//
+// O mic do sidecar e sempre-ligado e ouve o proprio TTS do Neo pelo alto-
+// falante -- e o Neo fala "Neo" o tempo todo, entao as frases de wake casavam
+// com a fala dele e o chip Live aparecia "do nada". As fontes de TTS (chip
+// Live nativo, notch, webview) reportam speaking on/off e o evento `wake` e
+// descartado enquanto alguma estiver ativa, mais uma cauda de 1.5s (a janela
+// do detector ainda contem o fim do TTS logo apos ele parar).
+//
+// O `interrupt` ("pare") NUNCA passa por aqui: e exatamente durante a fala do
+// Neo que ele precisa funcionar (barge-in).
+
+struct TtsGate {
+    /// Fontes de TTS atualmente falando ("live" | "notch" | "webview").
+    speaking: HashSet<String>,
+    /// Fim da cauda de supressao apos a ultima fonte silenciar.
+    tail_until: Option<Instant>,
+}
+
+static TTS_GATE: OnceLock<Mutex<TtsGate>> = OnceLock::new();
+
+fn tts_gate() -> &'static Mutex<TtsGate> {
+    TTS_GATE.get_or_init(|| {
+        Mutex::new(TtsGate {
+            speaking: HashSet::new(),
+            tail_until: None,
+        })
+    })
+}
+
+/// Canal de estado agregado de TTS empurrado ao sidecar de wake (uma linha
+/// `{"tts": bool}` por mudanca). O sidecar entao roda so o grupo de detectores
+/// relevante -- stop enquanto o Neo fala, wake quando ocioso -- cortando ~metade
+/// das inferencias sem perder deteccao. So o Sender vive no estatico; cada sidecar
+/// novo faz `.subscribe()` e o `watch` retem o ultimo valor para ele.
+static TTS_STATE_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
+
+fn tts_state_tx() -> &'static watch::Sender<bool> {
+    TTS_STATE_TX.get_or_init(|| watch::channel(false).0)
+}
+
+/// Reporta o estado do TTS de uma fonte ("live", "notch", "webview").
+pub fn set_tts_speaking(source: &str, speaking: bool) {
+    let now_speaking = {
+        let Ok(mut gate) = tts_gate().lock() else {
+            return;
+        };
+        if speaking {
+            gate.speaking.insert(source.to_string());
+            gate.tail_until = None;
+        } else {
+            gate.speaking.remove(source);
+            if gate.speaking.is_empty() {
+                gate.tail_until = Some(Instant::now() + Duration::from_millis(1500));
+            }
+        }
+        !gate.speaking.is_empty()
+    };
+    // Empurra o estado agregado ao sidecar (dedup/retencao pelo watch). Sem
+    // receivers (sidecar parado) o valor fica retido para o proximo sidecar.
+    tts_state_tx().send_replace(now_speaking);
+}
+
+/// `true` enquanto algum TTS fala (ou acabou de falar): descarta o `wake`.
+fn wake_suppressed() -> bool {
+    let Ok(gate) = tts_gate().lock() else {
+        return false;
+    };
+    if !gate.speaking.is_empty() {
+        return true;
+    }
+    gate.tail_until.map(|t| Instant::now() < t).unwrap_or(false)
+}
+
+/// Modo teste (tela "Teste de Wake"): o detector segue rodando e emitindo score,
+/// mas o disparo NAO aciona o Live -- vira o evento `wake-test-fire` (só a tela
+/// ouve). Igual "testar microfone" do Discord: você se ouve, mas não vai ao ar.
+static WAKE_TEST_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_wake_test_mode(on: bool) {
+    WAKE_TEST_MODE.store(on, Ordering::Relaxed);
+}
+
+fn wake_test_mode() -> bool {
+    WAKE_TEST_MODE.load(Ordering::Relaxed)
 }
 
 /// Estado/config do detector, exposto aos comandos `wake_status`/`wake_start`.
@@ -51,6 +140,9 @@ struct WakeConfig {
     /// Pasta com os `<slug>_ref.json` das frases cadastradas (few-shot).
     refs_dir: String,
     threshold: f64,
+    /// Limiar proprio das frases "stop" ("pare"): recall > precisao, porque um
+    /// falso positivo de stop so age quando o Neo esta falando/pensando.
+    stop_threshold: f64,
     cooldown_ms: u64,
     /// Cooldown proprio (curto) dos slugs de interrupcao ("pare"). Separado do
     /// wake p/ um "Ei Neo" recente nao bloquear o "pare".
@@ -69,16 +161,25 @@ impl WakeConfig {
         let script = std::env::var("NEO_WAKE_SCRIPT")
             .ok()
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "../sidecar/wake/neo_wake.py".to_string());
+            .unwrap_or_else(|| "../sidecar/wake/neo_wake_oww.py".to_string());
         let refs_dir = std::env::var("NEO_WAKE_REFS_DIR")
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| refs_dir().to_string_lossy().into_owned());
-        // Few-shot (ArcLoss cosine): 0.7 e um ponto de partida razoavel.
+        // openWakeWord (ei_neo.onnx v3, treinado na 5070 Ti): na voz real do
+        // usuario dispara em ~0.6-0.98 e os confusores ("ne o", "-aneo") sobem
+        // ate ~0.9. 0.6 + a regra de N frames consecutivos do sidecar foi o
+        // ponto testado no wrapper start-wake-oww.sh. Para voltar ao few-shot
+        // antigo (ArcLoss cosine, limiar ~0.64), aponte NEO_WAKE_SCRIPT p/
+        // neo_wake.py e NEO_WAKE_THRESHOLD=0.64.
         let threshold = std::env::var("NEO_WAKE_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.7);
+            .unwrap_or(0.6);
+        let stop_threshold = std::env::var("NEO_WAKE_STOP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.64);
         let cooldown_ms = std::env::var("NEO_WAKE_COOLDOWN_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -93,6 +194,7 @@ impl WakeConfig {
             script,
             refs_dir,
             threshold,
+            stop_threshold,
             cooldown_ms,
             stop_cooldown_ms,
         }
@@ -137,6 +239,31 @@ struct ManifestEntry {
     label: String,
     #[serde(default = "default_role")]
     role: String,
+}
+
+/// Piso de nivel de uma amostra de cadastro. Calibrado com as amostras reais
+/// (2026-07-20): boas ficam em pico 0.385-0.641 / rms 0.040-0.044; a mais fraca
+/// que ainda funcionou, em 0.153 / 0.014; as ruins, em 0.037 / 0.003. Os limiares
+/// ficam ENTRE a que funcionou e as ruins. Espelha `analyzeLevel` do frontend.
+const MIN_SAMPLE_PEAK: f32 = 0.08;
+const MIN_SAMPLE_RMS: f32 = 0.006;
+
+/// (pico, rms) de um PCM int16, ambos normalizados em 0..1.
+fn pcm_level(pcm: &[i16]) -> (f32, f32) {
+    if pcm.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut peak = 0f32;
+    let mut sum_sq = 0f64;
+    for &s in pcm {
+        let n = s as f32 / 32768.0;
+        let a = n.abs();
+        if a > peak {
+            peak = a;
+        }
+        sum_sq += (n as f64) * (n as f64);
+    }
+    (peak, (sum_sq / pcm.len() as f64).sqrt() as f32)
 }
 
 fn base_dir() -> PathBuf {
@@ -254,6 +381,30 @@ fn write_wav_16k_mono(path: &Path, samples: &[i16]) -> std::io::Result<()> {
     std::fs::write(path, buf)
 }
 
+/// Le um WAV 16k mono int16 escrito por `write_wav_16k_mono` (cabecalho fixo de
+/// 44 bytes -- nao e um parser geral de WAV, so o par do writer acima).
+fn read_wav_16k_mono(path: &Path) -> std::io::Result<Vec<i16>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() <= 44 {
+        return Ok(Vec::new());
+    }
+    Ok(bytes[44..]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// Nivel de UMA amostra ja gravada, para a auditoria do cadastro.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleAudit {
+    pub file: String,
+    pub peak: f32,
+    pub rms: f32,
+    /// `false` = esta contaminando a referencia; regravar.
+    pub ok: bool,
+}
+
 struct WakeState {
     running: bool,
     /// Incrementado a cada start/stop; identifica a sessao ativa.
@@ -368,6 +519,39 @@ impl WakeManager {
         read_manifest().iter().map(phrase_status).collect()
     }
 
+    /// Audita o nivel das amostras JA gravadas de uma frase. A validacao no
+    /// `add_sample` so protege o futuro; isto revela o passivo -- amostras mudas
+    /// gravadas antes da trava existir, que seguem contaminando a referencia.
+    pub fn audit_samples(&self, slug: &str) -> Vec<SampleAudit> {
+        let dir = samples_dir().join(slug);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect();
+        files.sort();
+
+        files
+            .iter()
+            .map(|path| {
+                let pcm = read_wav_16k_mono(path).unwrap_or_default();
+                let (peak, rms) = pcm_level(&pcm);
+                SampleAudit {
+                    file: path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    peak,
+                    rms,
+                    ok: peak >= MIN_SAMPLE_PEAK && rms >= MIN_SAMPLE_RMS,
+                }
+            })
+            .collect()
+    }
+
     /// Salva uma amostra (PCM mono 16kHz int16, vinda do frontend) de uma frase.
     /// Cria a entrada no manifest na primeira amostra. `role` define se a frase
     /// acende o Live (`"wake"`) ou interrompe (`"stop"`). Retorna o estado da frase.
@@ -378,6 +562,19 @@ impl WakeManager {
         }
         if pcm.is_empty() {
             return Err("amostra de audio vazia".into());
+        }
+        // Trava de nivel (o frontend ja avisa antes, com mensagem melhor; isto e o
+        // porteiro). Amostra muda nao e "uma amostra a menos": ela CONTAMINA a
+        // referencia da frase, que e calculada em cima do conjunto. O cadastro
+        // aceitava qualquer coisa e acumulou uma gravacao em silencio puro
+        // (pico 0.001) + tres quase mudas (pico 0.037) -- ver medicao 2026-07-20.
+        let (peak, rms) = pcm_level(&pcm);
+        if peak < MIN_SAMPLE_PEAK || rms < MIN_SAMPLE_RMS {
+            return Err(format!(
+                "audio baixo demais para servir de referencia (pico {:.3}, rms {:.4}); \
+                 fale mais perto do microfone e regrave",
+                peak, rms
+            ));
         }
         let role = match role.trim() {
             "stop" => "stop".to_string(),
@@ -532,6 +729,29 @@ async fn supervise(app: AppHandle, cfg: WakeConfig, mut rx: watch::Receiver<bool
             });
         }
 
+        // Empurra o estado de TTS ao sidecar (stdin): escreve o valor atual na hora
+        // e a cada mudanca, para ele rodar so o grupo de detectores relevante.
+        if let Some(mut stdin) = child.stdin.take() {
+            let mut rx = tts_state_tx().subscribe();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let speaking = *rx.borrow_and_update();
+                    let line = if speaking {
+                        "{\"tts\": true}\n"
+                    } else {
+                        "{\"tts\": false}\n"
+                    };
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
+                        break; // sidecar saiu
+                    }
+                    let _ = stdin.flush().await;
+                    if rx.changed().await.is_err() {
+                        break; // sender global nunca dropa; guard defensivo
+                    }
+                }
+            });
+        }
+
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
@@ -582,17 +802,44 @@ async fn supervise(app: AppHandle, cfg: WakeConfig, mut rx: watch::Receiver<bool
     }
 }
 
+/// Microfone do sidecar. Ele segura o mic 24/7 (`sd.InputStream` num loop), e
+/// abrir o mic de um fone Bluetooth derruba o dispositivo de A2DP p/ HFP/SCO --
+/// ou seja, o fone tocaria musica em qualidade de telefone o tempo todo so
+/// porque o Neo esta esperando "Ei Neo". Quando o mic padrao e Bluetooth,
+/// fixamos o sidecar no mic INTERNO (o PortAudio casa o dispositivo por nome, o
+/// mesmo que o CoreAudio reporta). `NEO_WAKE_INPUT_DEVICE` explicito ganha.
+fn wake_input_device() -> Option<String> {
+    if let Ok(explicit) = std::env::var("NEO_WAKE_INPUT_DEVICE") {
+        let explicit = explicit.trim().to_string();
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+    }
+    let route = crate::services::audio_route::resolve();
+    let name = route.preferred_input_name()?.to_string();
+    info!(
+        "[Wake] mic padrao e Bluetooth; fixando o sidecar em \"{}\" p/ manter o fone em A2DP",
+        name
+    );
+    Some(name)
+}
+
 fn spawn_sidecar(cfg: &WakeConfig) -> std::io::Result<Child> {
     let mut cmd = Command::new(&cfg.python);
+    if let Some(device) = wake_input_device() {
+        cmd.env("NEO_WAKE_INPUT_DEVICE", device);
+    }
     cmd.arg(&cfg.script)
         .env("NEO_WAKE_REFS_DIR", &cfg.refs_dir)
         .env("NEO_WAKE_THRESHOLD", cfg.threshold.to_string())
+        .env("NEO_WAKE_STOP_THRESHOLD", cfg.stop_threshold.to_string())
         .env("NEO_WAKE_COOLDOWN_MS", cfg.cooldown_ms.to_string())
         // Slugs de interrupcao ("pare"): o sidecar emite `interrupt` (nao `wake`)
         // quando casarem, e os scoreia com cooldown proprio + unsafe=True.
         .env("NEO_WAKE_STOP_SLUGS", stop_slugs().join(","))
         .env("NEO_WAKE_STOP_COOLDOWN_MS", cfg.stop_cooldown_ms.to_string())
         .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -616,10 +863,30 @@ fn handle_line(app: &AppHandle, line: &str) {
         Some("wake") => {
             let model = val.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let score = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if wake_test_mode() {
+                // Modo teste: mostra o disparo na tela, mas NAO aciona o Live.
+                info!("[Wake] disparo (TESTE, sem acionar): model={} score={:.3}", model, score);
+                let _ = app.emit("wake-test-fire", WakeDetected { model, score });
+                return;
+            }
+            if wake_suppressed() {
+                info!(
+                    "[Wake] disparo SUPRIMIDO (Neo falando): model={} score={:.3}",
+                    model, score
+                );
+                return;
+            }
             info!("[Wake] disparo: model={} score={:.3}", model, score);
             if let Err(e) = app.emit("wake-detected", WakeDetected { model, score }) {
                 warn!("[Wake] falha ao emitir wake-detected: {}", e);
             }
+        }
+        Some("score") => {
+            // Monitor da tela "Teste de Wake": score por frame tipo-wake (inclui
+            // near-misses). Frequente, entao NAO loga -- so repassa ao frontend.
+            let model = val.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let score = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let _ = app.emit("wake-score", WakeDetected { model, score });
         }
         Some("interrupt") => {
             let model = val.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -650,4 +917,92 @@ fn emit_status(app: &AppHandle, kind: &str, message: &str) {
         "wake-status",
         serde_json::json!({ "kind": kind, "message": message }),
     );
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// Gera PCM senoidal com o pico pedido (proxy simples de "tem sinal").
+    fn tone(peak: f32, n: usize) -> Vec<i16> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * peak * 32767.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn level_matches_measured_values() {
+        let (peak, rms) = pcm_level(&tone(0.5, 16000));
+        assert!((peak - 0.5).abs() < 0.01, "pico medido {peak}");
+        // RMS de uma senoide = pico/sqrt(2)
+        assert!((rms - 0.5 / 2f32.sqrt()).abs() < 0.01, "rms medido {rms}");
+        assert_eq!(pcm_level(&[]), (0.0, 0.0));
+    }
+
+    /// Os limiares tem de SEPARAR as amostras reais medidas em 2026-07-20:
+    /// as ruins (pico 0.037 e 0.001) reprovam, a fraca-que-funcionou (0.153) passa.
+    #[test]
+    fn thresholds_separate_real_samples() {
+        let bad_silent = pcm_level(&tone(0.001, 16000));
+        let bad_quiet = pcm_level(&tone(0.037, 16000));
+        let weak_ok = pcm_level(&tone(0.153, 16000));
+        let good = pcm_level(&tone(0.55, 16000));
+
+        let passes = |(p, r): (f32, f32)| p >= MIN_SAMPLE_PEAK && r >= MIN_SAMPLE_RMS;
+
+        assert!(!passes(bad_silent), "amostra MUDA deveria reprovar");
+        assert!(!passes(bad_quiet), "amostra quase muda deveria reprovar");
+        assert!(passes(weak_ok), "a fraca que funcionou deveria passar");
+        assert!(passes(good), "amostra boa deveria passar");
+    }
+
+    #[test]
+    fn add_sample_rejects_silent_audio() {
+        let svc = WakeManager::default();
+        let res = svc.add_sample("teste nivel".into(), tone(0.001, 16000), "wake".into());
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("amostra muda foi ACEITA — a trava nao funcionou"),
+        };
+        assert!(err.contains("baixo demais"), "erro inesperado: {err}");
+    }
+}
+
+#[cfg(test)]
+mod audit_real_samples {
+    use super::*;
+
+    /// Roda a auditoria contra o cadastro REAL do usuario e imprime o veredito.
+    /// Nao afirma nada sobre o conteudo (a maquina de outra pessoa nao tem esses
+    /// arquivos) -- serve p/ enxergar o passivo com o mesmo codigo que a UI usa.
+    #[test]
+    fn report_existing_enrollment() {
+        let svc = WakeManager::default();
+        let mut total = 0;
+        let mut bad = 0;
+        for entry in read_manifest() {
+            let audits = svc.audit_samples(&entry.slug);
+            if audits.is_empty() {
+                continue;
+            }
+            println!("\n{} ({})", entry.label, entry.slug);
+            for a in &audits {
+                total += 1;
+                if !a.ok {
+                    bad += 1;
+                }
+                println!(
+                    "  {} {}  pico={:.3} rms={:.4}",
+                    if a.ok { "OK  " } else { "RUIM" },
+                    a.file,
+                    a.peak,
+                    a.rms
+                );
+            }
+        }
+        println!("\n=> {bad} de {total} amostras precisam ser regravadas");
+    }
 }

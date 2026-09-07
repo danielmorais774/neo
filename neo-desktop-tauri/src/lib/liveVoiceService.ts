@@ -11,11 +11,19 @@
 // Código de captura/resampler e de playback portado de
 // neo-voice/service/web/index.html (classe PCMCapture, makeResampler, ttsPlayChunk).
 
-import type { VoiceConfig, VoiceOverride } from './tauriApi';
-import { OutputRouter, micConstraints } from './audioDevices';
+import type { VoiceConfig, VoiceOverride, SpeechSegmentOverride } from './tauriApi';
+import { OutputRouter, getMicStream } from './audioDevices';
 
 const TARGET_SR = 16000;
 const CHUNK = 1600; // 100ms @ 16kHz — frames PCM int16 enviados ao neo-voice
+
+// Watchdog do TTS (ver speakInner). O gatilho é SILÊNCIO AUDÍVEL, não tempo de
+// síntese: só conta quando o áudio já agendado acabou de tocar. Um trecho que
+// demora 15s p/ sintetizar não dispara nada enquanto houver áudio na frente —
+// o que dispara é o servidor parar de mandar com o playhead na estaca zero.
+const TTS_FIRST_AUDIO_TIMEOUT_MS = 60_000; // nada tocou desde o pedido
+const TTS_STALL_MS = 15_000; // fala começou e secou no meio
+const TTS_WATCHDOG_TICK_MS = 1_000;
 
 const WORKLET_SRC = `
 class PCMCapture extends AudioWorkletProcessor {
@@ -23,9 +31,25 @@ class PCMCapture extends AudioWorkletProcessor {
 }
 registerProcessor('pcm-capture', PCMCapture);`;
 
+/** Correção que o neo-voice aplicou na transcrição (stt_text.py). */
+export interface SttFix {
+  from: string;
+  to: string;
+  rule: string;
+}
+
+/** Metadados do final do STT — viram `input_source`/`asr_raw` no metadata do turno. */
+export interface SttFinalMeta {
+  /** texto ANTES da correção do nome ("Neil que hora são") */
+  raw?: string;
+  /** de onde veio a transcrição: parakeet-gpu / parakeet-cpu / openrouter */
+  engine?: string;
+  fixes?: SttFix[];
+}
+
 export interface LiveVoiceCallbacks {
   onPartial?: (text: string) => void;
-  onFinal?: (text: string) => void;
+  onFinal?: (text: string, meta?: SttFinalMeta) => void;
   onLevel?: (level: number) => void; // VU do mic, 0..1
   onError?: (message: string) => void;
   onSttOpen?: () => void;
@@ -35,6 +59,12 @@ export interface LiveVoiceCallbacks {
 interface SttServerMsg {
   type?: string;
   text?: string;
+  /** transcrição crua, antes do corretor do neo-voice (stt_text.py) */
+  raw_text?: string;
+  fixes?: SttFix[];
+  asr_engine?: string;
+  /** final vazio + dropped = eco do wake word, não é turno */
+  dropped?: string;
 }
 
 interface TtsServerMsg {
@@ -110,6 +140,9 @@ export class LiveVoiceSession {
   // (há a ida-e-volta do WebSocket de TTS no meio), então não há glitch.
   private ttsSink: AudioNode | null = null;
   private ttsRouter: OutputRouter | null = null;
+  // Bumped by cancelSpeak()/dispose() so an in-flight speakSegments() loop stops
+  // before starting the next segment (each segment is its own speak()).
+  private segRun = 0;
 
   constructor(cfg: VoiceConfig, cb: LiveVoiceCallbacks) {
     this.cfg = cfg;
@@ -122,19 +155,12 @@ export class LiveVoiceSession {
       throw new Error('Navegador sem getUserMedia (permissão de microfone indisponível).');
     }
 
-    // 1) microfone
+    // 1) microfone (device + AEC seguem a rota de áudio atual — ver audioDevices)
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: micConstraints({
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        }),
-      });
+      this.stream = await getMicStream();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      throw new Error('Permissão de microfone negada: ' + msg, { cause: e });
+      throw new Error('Não foi possível abrir o microfone: ' + msg, { cause: e });
     }
     if (this.disposed) {
       this.stopListening();
@@ -157,7 +183,15 @@ export class LiveVoiceSession {
         return;
       }
       if (m.type === 'partial') this.cb.onPartial?.(m.text || '');
-      else if (m.type === 'final') this.cb.onFinal?.((m.text || '').trim());
+      else if (m.type === 'final') {
+        // final vazio (eco do wake word descartado no neo-voice) cai no guard de
+        // texto vazio do useLiveMode — nenhum turno é aberto.
+        this.cb.onFinal?.((m.text || '').trim(), {
+          raw: m.raw_text,
+          engine: m.asr_engine,
+          fixes: m.fixes,
+        });
+      }
       // 'response' é ignorado de propósito: o turno é orquestrado pelo desktop
       // via gRPC (rode o neo-voice SEM NEO_CORE_URL p/ não duplicar).
     };
@@ -316,7 +350,13 @@ export class LiveVoiceSession {
     const s = ctx.createBufferSource();
     s.buffer = buf;
     s.connect(this.ttsSink ?? ctx.destination);
-    const t = Math.max(ctx.currentTime + 0.03, this.ttsPlayhead);
+    // Folga adaptativa: com áudio ainda agendado à frente (primed), 30ms bastam
+    // p/ emendar sem clique; no 1º buffer — e na retomada após um underrun — o
+    // colchão sobe p/ 150ms, senão o WebKit descarta o começo (agendar colado no
+    // "agora" logo depois do resume() era o que comia o início da fala).
+    const now = ctx.currentTime;
+    const primed = this.ttsPlayhead > now;
+    const t = Math.max(now + (primed ? 0.03 : 0.15), this.ttsPlayhead);
     s.start(t);
     this.ttsPlayhead = t + buf.duration;
     this.activeSources.push(s);
@@ -332,36 +372,106 @@ export class LiveVoiceSession {
    * `override` (voz resolvida pelo neo-core, Pattern A) tem prioridade sobre a
    * VoiceConfig estática para esta fala: define voz/engine/idioma do TTS.
    */
-  speak(text: string, override?: VoiceOverride | null): Promise<void> {
+  async speak(text: string, override?: VoiceOverride | null): Promise<void> {
     const clean = (text || '').trim();
-    if (!clean) return Promise.resolve();
+    if (!clean) return;
 
     // neo-core manda `engine`; o neo-voice espera `backend`. Cai pra cfg quando ausente.
     const backend = override?.engine || this.cfg.backend;
     const voice = override?.voice ?? this.cfg.voice ?? undefined;
     const language = override?.language ?? this.cfg.language ?? undefined;
 
+    // resume() AGUARDADO antes de qualquer agendamento: agendar num contexto
+    // ainda suspenso descartava o começo do 1º áudio no WebKit.
+    const ctx = this.ttsEnsureCtx();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        /* segue mesmo assim: melhor tentar tocar do que travar a fala */
+      }
+    }
+
+    // Gate anti-eco: enquanto este TTS toca, a voz do Neo não pode acordar o
+    // wake word do sidecar ("Ei Neo" sai da boca do próprio Neo o tempo todo).
+    window.electronAPI?.wakeTtsState?.(true).catch(() => {});
+    try {
+      return await this.speakInner(clean, backend, voice, language, ctx);
+    } finally {
+      window.electronAPI?.wakeTtsState?.(false).catch(() => {});
+    }
+  }
+
+  private speakInner(
+    clean: string,
+    backend: string | undefined,
+    voice: string | undefined,
+    language: string | undefined,
+    ctx: AudioContext,
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const ctx = this.ttsEnsureCtx();
-      if (ctx.state === 'suspended') ctx.resume();
       this.ttsPlayhead = ctx.currentTime;
 
       let settled = false;
       let doneSignaled = false;
       let sr = 24000;
       let headerSr: number | null = null;
+      let lastChunkAt = Date.now();
+      let gotAudio = false;
+      let watchdog: ReturnType<typeof setInterval> | null = null;
 
+      const stopWatchdog = () => {
+        if (watchdog !== null) {
+          clearInterval(watchdog);
+          watchdog = null;
+        }
+      };
       const finish = () => {
         if (settled) return;
         settled = true;
+        stopWatchdog();
         this.ttsFinish = null;
         resolve();
       };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        stopWatchdog();
+        this.ttsFinish = null;
+        try {
+          ws.close();
+        } catch {
+          /* noop */
+        }
+        reject(err);
+      };
       this.ttsFinish = finish;
       const scheduleDrain = () => {
+        stopWatchdog(); // 'done' recebido: o resto é só o playhead escoar
         const remainingMs = Math.max(0, (this.ttsPlayhead - ctx.currentTime) * 1000) + 80;
         setTimeout(finish, remainingMs);
       };
+
+      // Watchdog: sem ele, um engine que para de responder no meio da resposta
+      // deixava esta Promise pendurada P/ SEMPRE — e como o Modo Live só volta a
+      // ouvir quando ela resolve, o mic ficava mudo e o gate anti-eco travava a
+      // wake word: o usuário perdia até o "pare". Ver o incidente de 2026-07-20
+      // (coqui 500 no 7º trecho, 18 re-tentativas, 4min de silêncio).
+      watchdog = setInterval(() => {
+        if (settled || doneSignaled) return;
+        // ainda há áudio agendado tocando: não é silêncio, não é stall
+        if (this.ttsPlayhead > ctx.currentTime) return;
+        const quietMs = Date.now() - lastChunkAt;
+        const limit = gotAudio ? TTS_STALL_MS : TTS_FIRST_AUDIO_TIMEOUT_MS;
+        if (quietMs < limit) return;
+        fail(
+          new Error(
+            gotAudio
+              ? `TTS travou no meio da fala (${Math.round(quietMs / 1000)}s sem áudio).`
+              : `TTS não respondeu (${Math.round(quietMs / 1000)}s sem áudio).`,
+          ),
+        );
+      }, TTS_WATCHDOG_TICK_MS);
 
       const ws = new WebSocket(`${this.cfg.wsBaseUrl.replace(/\/$/, '')}/ws/tts`);
       ws.binaryType = 'arraybuffer';
@@ -387,8 +497,10 @@ export class LiveVoiceSession {
             return;
           }
           if (m.type === 'start') sr = m.sr || 24000;
-          else if (m.type === 'chunk') headerSr = m.sr || headerSr;
-          else if (m.type === 'done') {
+          else if (m.type === 'chunk') {
+            headerSr = m.sr || headerSr;
+            lastChunkAt = Date.now();
+          } else if (m.type === 'done') {
             doneSignaled = true;
             scheduleDrain();
             try {
@@ -397,28 +509,17 @@ export class LiveVoiceSession {
               /* noop */
             }
           } else if (m.type === 'error') {
-            try {
-              ws.close();
-            } catch {
-              /* noop */
-            }
-            if (!settled) {
-              settled = true;
-              this.ttsFinish = null;
-              reject(new Error(m.error || 'Falha no TTS'));
-            }
+            fail(new Error(m.error || 'Falha no TTS'));
           }
         } else {
           const int16 = new Int16Array(ev.data as ArrayBuffer);
+          lastChunkAt = Date.now();
+          gotAudio = true;
           this.ttsPlayChunk(int16, headerSr || sr);
         }
       };
       ws.onerror = () => {
-        if (!settled && !doneSignaled) {
-          settled = true;
-          this.ttsFinish = null;
-          reject(new Error('Erro de WebSocket no TTS.'));
-        }
+        if (!doneSignaled) fail(new Error('Erro de WebSocket no TTS.'));
       };
       ws.onclose = () => {
         if (doneSignaled && !settled) scheduleDrain();
@@ -426,8 +527,29 @@ export class LiveVoiceSession {
     });
   }
 
+  /**
+   * Fala uma sequência de segmentos (imitação de vozes), um após o outro,
+   * trocando a voz por segmento. `seg.voice` tem prioridade; sem ele, usa
+   * `defaultVoice` (a voz padrão do turno, Pattern A). Resolve quando o último
+   * segmento termina; um cancelSpeak()/dispose() no meio interrompe a sequência.
+   */
+  async speakSegments(
+    segments: SpeechSegmentOverride[],
+    defaultVoice?: VoiceOverride | null,
+  ): Promise<void> {
+    const myRun = ++this.segRun;
+    for (const seg of segments) {
+      if (this.disposed || myRun !== this.segRun) return; // cancelado/substituído
+      const text = (seg.text || '').trim();
+      if (!text) continue;
+      await this.speak(text, seg.voice ?? defaultVoice ?? null);
+    }
+  }
+
   /** Interrompe a fala atual (fecha WS e para os buffers em reprodução). */
   cancelSpeak(): void {
+    this.segRun++; // aborta qualquer speakSegments() em andamento
+
     // resolve a Promise de speak() pendente para não deixá-la pendurada
     const finish = this.ttsFinish;
     this.ttsFinish = null;

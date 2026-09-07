@@ -55,6 +55,16 @@ export interface MessageDetails {
   [key: string]: any;
 }
 
+// Arquivo que o Neo gerou/catalogou nesta resposta (ex: um .zip via a tool
+// file_save) — mesma forma {id, name, sizeBytes} que o neo-panel usa
+// (AttachmentRef). Baixado via o comando Tauri download_generated_file, que
+// chama GET /api/v1/files/{id}/download no neo-core e salva com diálogo nativo.
+export interface GeneratedFile {
+  id: string;
+  name: string;
+  sizeBytes: number;
+}
+
 export type MessageType = 'text' | 'thinking' | 'plan' | 'plan_update' | 'step' | 'command' | 'mission' | 'result' | 'error' | 'iteration';
 
 export interface Message {
@@ -70,4 +80,5 @@ export interface Message {
   command?: CommandInfo;
   mission?: MissionInfo;
   details?: MessageDetails;
+  files?: GeneratedFile[];
 }

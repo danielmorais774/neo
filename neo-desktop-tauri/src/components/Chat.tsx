@@ -1,6 +1,8 @@
-import { useCallback, useState, useRef, useEffect } from 'react';
+import { useCallback, useState, useRef, useEffect, useLayoutEffect } from 'react';
 import type { Message } from '../types';
 import type { LiveState } from '../hooks/useLiveMode';
+import type { ModelType, ProviderType } from '../lib/models';
+import { MODELS_BY_PROVIDER, PROVIDER_OPTIONS, modelsFor } from '../lib/models';
 import MessageBubble from './MessageBubble';
 import GlassSelect from './GlassSelect';
 import './Chat.css';
@@ -11,7 +13,9 @@ interface ChatProps {
   isExecuting: boolean;
   currentIteration?: number;
   maxIterations?: number;
-  onSendMessage: (message: string) => void;
+  // `attachmentIds` são ids do File Store (neo-core) já enviados; o conteúdo do
+  // arquivo não passa por aqui.
+  onSendMessage: (message: string, attachmentIds?: string[]) => void;
   onClearHistory: () => void;
   onNewChat: () => void;
   onStop: () => void;
@@ -34,6 +38,22 @@ interface ChatProps {
   onToggleLive?: () => void;
 }
 
+// Um arquivo escolhido no picker, do clique até virar id no File Store.
+interface AttachmentChip {
+  key: string;
+  name: string;
+  sizeBytes: number;
+  status: 'uploading' | 'ready' | 'error';
+  id?: string;
+  error?: string;
+}
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 const LIVE_LABELS: Record<LiveState, string> = {
   idle: '',
   listening: 'Ouvindo…',
@@ -42,61 +62,6 @@ const LIVE_LABELS: Record<LiveState, string> = {
 };
 
 type ChatMode = 'agent' | 'plan' | 'ask';
-type ProviderType = 'openai' | 'groq' | 'grok' | 'deepseek' | 'anthropic' | 'gemini' | 'ollama';
-type ModelType = string;
-
-const PROVIDER_OPTIONS: { value: ProviderType; label: string; description: string }[] = [
-  { value: 'openai',    label: 'OpenAI',       description: 'GPT-4o, GPT-4.1...' },
-  { value: 'groq',      label: 'Groq',         description: 'Llama-3.3, ultra-rápido' },
-  { value: 'grok',      label: 'Grok (xAI)',   description: 'Grok-3-mini, Grok-2...' },
-  { value: 'deepseek',  label: 'DeepSeek',     description: 'V4 Flash, V4 Pro...' },
-  { value: 'anthropic', label: 'Anthropic',    description: 'Claude 3...' },
-  { value: 'gemini',    label: 'Gemini',       description: 'Gemini 2.5 Pro...' },
-  { value: 'ollama',    label: 'Ollama',       description: 'Local (Gemma4...)' },
-];
-
-const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: string; description: string }[]> = {
-  openai: [
-    { value: 'gpt-4.1',       label: 'GPT-4.1',        description: 'Mais capaz' },
-    { value: 'gpt-4.1-mini',  label: 'GPT-4.1 Mini',   description: 'Rápido' },
-    { value: 'gpt-4.1-nano',  label: 'GPT-4.1 Nano',   description: 'Mais rápido' },
-    { value: 'gpt-4o',        label: 'GPT-4o',          description: 'Equilíbrio' },
-    { value: 'gpt-4o-mini',   label: 'GPT-4o-mini',     description: 'Econômico' },
-  ],
-  groq: [
-    { value: 'llama-3.3-70b-versatile', label: 'Llama-3.3 70B',     description: 'Padrão (free)' },
-    { value: 'llama-3.1-8b-instant',    label: 'Llama-3.1 8B Fast', description: 'Ultra-rápido (free)' },
-    { value: 'llama3-70b-8192',         label: 'Llama3 70B 8k',     description: 'Contexto longo (free)' },
-    { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B',      description: '32k tokens (free)' },
-    { value: 'gemma2-9b-it',            label: 'Gemma2 9B',         description: 'Google (free)' },
-  ],
-  grok: [
-    { value: 'grok-3-mini-fast', label: 'Grok-3 Mini Fast', description: 'Mais rápido (free)' },
-    { value: 'grok-3-mini',      label: 'Grok-3 Mini',      description: 'Rápido (free)' },
-    { value: 'grok-2-1212',      label: 'Grok-2',           description: 'Completo (free)' },
-    { value: 'grok-3',           label: 'Grok-3',           description: 'Mais capaz (pago)' },
-  ],
-  deepseek: [
-    { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', description: 'Mais rápido' },
-    { value: 'deepseek-v4-pro',   label: 'DeepSeek V4 Pro',   description: 'Mais capaz' },
-    { value: 'deepseek-chat',     label: 'DeepSeek Chat',     description: 'Uso geral' },
-    { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner', description: 'Raciocínio lento' },
-  ],
-  anthropic: [
-    { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', description: 'Mais capaz' },
-    { value: 'claude-3-haiku-20240307',    label: 'Claude 3 Haiku',   description: 'Rápido' },
-  ],
-  gemini: [
-    { value: 'gemini-2.5-pro-preview-03-25', label: 'Gemini 2.5 Pro',     description: 'Avançado' },
-    { value: 'gemini-2.0-flash',             label: 'Gemini 2.0 Flash',   description: 'Rápido' },
-    { value: 'gemini-2.0-flash-lite',        label: 'Gemini Flash Lite',  description: 'Leve' },
-  ],
-  ollama: [
-    { value: 'gemma4:e2b', label: 'Gemma4 2B (Local)', description: 'Ultra-leve' },
-    { value: 'gemma4:12b', label: 'Gemma4 12B (Local)', description: 'Local' },
-    { value: 'phi4',       label: 'Phi-4 (Local)',      description: 'Local' },
-  ],
-};
 
 function Chat({ 
   messages, 
@@ -125,8 +90,20 @@ function Chat({
   onToggleLive,
 }: ChatProps) {
   const [input, setInput] = useState(initialInput || '');
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Se o usuário está grudado no fim da lista. Enquanto true, seguimos o fluxo
+  // (auto-scroll). Se ele rolar pra cima pra ler, vira false e paramos de
+  // arrastá-lo de volta.
+  const isPinnedToBottomRef = useRef(true);
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isPinnedToBottomRef.current = distanceFromBottom < 80;
+  }, []);
 
   const resizeInput = useCallback(() => {
     const el = inputRef.current;
@@ -136,10 +113,21 @@ function Chat({
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   }, []);
 
-  useEffect(() => {
-    // Always scroll to the end when messages change
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  // Auto-scroll pro fim ANTES do paint (useLayoutEffect) e de forma INSTANTÂNEA.
+  // O conteúdo muda de altura a cada evento do agente (bolhas de "thinking" que
+  // entram/saem, e no `complete` todas as thinking somem e o balão de resposta
+  // entra). Se o scroll rodasse depois do paint (useEffect) e com `smooth`, o
+  // navegador pintava primeiro o frame com o conteúdo já mexido e o scroll no
+  // lugar antigo e só então o smooth corria atrás — parecia a janela "encolhendo
+  // e se reajustando". Aqui conteúdo e scroll caem no mesmo frame. Só pinamos se
+  // o usuário já está no fim (senão ele não conseguiria rolar pra cima e ler).
+  useLayoutEffect(() => {
+    if (!isPinnedToBottomRef.current) return;
+    const el = messagesContainerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, isLoading, isExecuting]);
 
+  useEffect(() => {
     // If the latest message is from the assistant, return focus to the input
     const last = messages[messages.length - 1];
     if (last && last.role === 'assistant' && !isLoading && !isExecuting) {
@@ -158,7 +146,13 @@ function Chat({
     resizeInput();
   }, [resizeInput]);
 
-  useEffect(() => {
+  // Must run BEFORE paint (useLayoutEffect, not useEffect): when a message is
+  // sent, `input` clears in the same render that swaps welcome->messages and
+  // mounts the agent-progress bar. If the textarea shrink lagged a frame
+  // behind (as a regular effect / rAF), the browser painted the tall empty
+  // box first, then visibly snapped it (and the message list height with it)
+  // one frame later — looked like the window "readjusting" itself.
+  useLayoutEffect(() => {
     resizeInput();
   }, [input, resizeInput]);
 
@@ -194,12 +188,59 @@ function Chat({
     return () => window.removeEventListener('neo-new-chat', handler);
   }, [onNewChat]);
 
+  // Anexo: picker nativo → upload pro File Store (cada arquivo sobe sozinho, o
+  // chip mostra o progresso). O envio da mensagem carrega só os ids.
+  const isUploading = attachments.some((a) => a.status === 'uploading');
+
+  const handlePickAttachments = useCallback(async () => {
+    let paths: string[] = [];
+    try {
+      paths = (await window.electronAPI?.pickAttachmentFiles()) ?? [];
+    } catch (err: any) {
+      console.error('[Chat] picker falhou:', err);
+      return;
+    }
+    for (const path of paths) {
+      const key = `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const name = path.split('/').pop() || path;
+      setAttachments((prev) => [...prev, { key, name, sizeBytes: 0, status: 'uploading' }]);
+      window.electronAPI
+        ?.uploadAttachment(path)
+        .then((meta) =>
+          setAttachments((prev) =>
+            prev.map((a) =>
+              a.key === key
+                ? { ...a, status: 'ready', id: meta.id, name: meta.name, sizeBytes: meta.size_bytes }
+                : a
+            )
+          )
+        )
+        .catch((err: any) =>
+          setAttachments((prev) =>
+            prev.map((a) =>
+              a.key === key
+                ? { ...a, status: 'error', error: String(err?.message ?? err) }
+                : a
+            )
+          )
+        );
+    }
+  }, []);
+
+  const removeAttachment = useCallback((key: string) => {
+    // Só tira da mensagem — o arquivo fica no catálogo como temp e o GC limpa.
+    setAttachments((prev) => prev.filter((a) => a.key !== key));
+  }, []);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (input.trim() && !isLoading && !isExecuting) {
-      onSendMessage(input.trim());
+    if (input.trim() && !isLoading && !isExecuting && !isUploading) {
+      const ids = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id!);
+      onSendMessage(input.trim(), ids.length ? ids : undefined);
       setInput('');
-      requestAnimationFrame(resizeInput);
+      setAttachments([]);
+      // Textarea shrink is handled by the useLayoutEffect on [input] below,
+      // synchronously before the next paint — no need to schedule it here.
       // keep focus in the textarea so user can continue typing
       inputRef.current?.focus();
     }
@@ -212,30 +253,9 @@ function Chat({
     }
   };
 
-  const progressPercent = maxIterations > 0 ? (currentIteration / maxIterations) * 100 : 0;
-
   return (
     <div className={`chat-container ${windowMode}`}>
-      {/* Barra de progresso do agente */}
-      {isExecuting && (
-        <div className="agent-progress">
-          <span className="executing-badge">⚡ Executando</span>
-          <div className="progress-bar-container">
-            <div
-              className="progress-bar"
-              style={{ width: `${progressPercent}%` }}
-            />
-          </div>
-          <span className="progress-text">
-            Iteração {currentIteration}/{maxIterations}
-          </span>
-          <button className="btn-stop" onClick={onStop}>
-            ⏹ Parar
-          </button>
-        </div>
-      )}
-
-      <div className="messages-container">
+      <div className="messages-container" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
         {messages.length === 0 ? (
           <div className="welcome-message">
             <div className="welcome-icon">🤖</div>
@@ -287,7 +307,6 @@ function Chat({
                 </div>
               </div>
             )}
-            <div ref={messagesEndRef} />
           </>
         )}
       </div>
@@ -313,8 +332,40 @@ function Chat({
             <span className="live-label">🎙️ {liveError}</span>
           </div>
         )}
+        {attachments.length > 0 && (
+          <div className="attachment-chips">
+            {attachments.map((a) => (
+              <span
+                key={a.key}
+                className={`attachment-chip attachment-${a.status}`}
+                title={a.status === 'error' ? a.error : a.name}
+              >
+                {a.status === 'uploading' && <span className="attachment-spinner" />}
+                <span className="attachment-name">{a.name}</span>
+                {a.status === 'ready' && (
+                  <span className="attachment-size">{humanSize(a.sizeBytes)}</span>
+                )}
+                {a.status === 'error' && <span className="attachment-size">falhou</span>}
+                <button
+                  type="button"
+                  className="attachment-remove"
+                  onClick={() => removeAttachment(a.key)}
+                  title="Remover anexo"
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         <div className="input-wrapper">
-          <button type="button" className="btn-attachment" title="Anexar arquivo">
+          <button
+            type="button"
+            className="btn-attachment"
+            title="Anexar arquivo"
+            onClick={handlePickAttachments}
+            disabled={isLoading || isExecuting}
+          >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
@@ -347,7 +398,14 @@ function Chat({
               ⏹
             </button>
           ) : (
-            <button type="submit" className="btn-send" disabled={!input.trim() || isLoading}>
+            <button
+              type="submit"
+              className="btn-send"
+              // Enquanto um anexo sobe, enviar mandaria a mensagem SEM o
+              // manifesto do arquivo — o Neo responderia às cegas.
+              disabled={!input.trim() || isLoading || isUploading}
+              title={isUploading ? 'Aguarde o anexo terminar de subir…' : undefined}
+            >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z" />
               </svg>
@@ -387,7 +445,7 @@ function Chat({
             disabled={isExecuting}
             width={160}
             onChange={(model) => onModelChange(model)}
-            options={MODELS_BY_PROVIDER[selectedProvider as ProviderType] ?? MODELS_BY_PROVIDER.openai}
+            options={modelsFor(selectedProvider)}
           />
         </div>
       </form>

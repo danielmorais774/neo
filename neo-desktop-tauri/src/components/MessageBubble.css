@@ -40,7 +40,8 @@
 }
 
 .message.assistant {
-  align-self: flex-start;
+  align-self: stretch;
+  max-width: 100%;
 }
 
 /* ========================================
@@ -84,6 +85,7 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  flex: 1;
 }
 
 .message.user .message-body {
@@ -100,12 +102,16 @@
 
 .message-content {
   min-width: 0;
+  width: 100%;
 }
 
 .message-text {
   padding: 10px 14px;
   border-radius: 18px;
   word-wrap: break-word;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   line-height: 1.5;
   font-size: 14px;
 }
@@ -527,6 +533,11 @@
   font-size: 12px;
 }
 
+/* botão de copiar do card de comando: fica no cabeçalho, longe do texto */
+.command-status .code-copy-button {
+  margin-left: 4px;
+}
+
 .status-dot {
   width: 6px;
   height: 6px;
@@ -705,18 +716,49 @@
   color: rgba(148, 163, 184, 0.9);
 }
 
+.table-scroll-wrapper {
+  overflow-x: auto;
+  margin: 10px -14px;
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table-scroll-wrapper::-webkit-scrollbar {
+  height: 6px;
+}
+
+.table-scroll-wrapper::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 3px;
+}
+
+.table-scroll-wrapper::-webkit-scrollbar-thumb {
+  background: rgba(59, 130, 246, 0.3);
+  border-radius: 3px;
+}
+
+.table-scroll-wrapper::-webkit-scrollbar-thumb:hover {
+  background: rgba(59, 130, 246, 0.5);
+}
+
 .message-text table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 10px 0;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 13px;
+  width: auto;
+  border-left: 1px solid rgba(59, 130, 246, 0.15);
+  border-top: 1px solid rgba(59, 130, 246, 0.15);
 }
 
 .message-text th,
 .message-text td {
   padding: 6px 10px;
-  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-right: 1px solid rgba(59, 130, 246, 0.15);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.15);
   text-align: left;
+  white-space: nowrap;
 }
 
 .message-text th {
@@ -757,7 +799,13 @@
 
 .message.user .message-text th,
 .message.user .message-text td {
-  border-color: rgba(255, 255, 255, 0.2);
+  border-right-color: rgba(255, 255, 255, 0.2);
+  border-bottom-color: rgba(255, 255, 255, 0.2);
+}
+
+.message.user .message-text table {
+  border-left-color: rgba(255, 255, 255, 0.2);
+  border-top-color: rgba(255, 255, 255, 0.2);
 }
 
 .message.user .message-text th {
@@ -889,3 +937,45 @@
   transition: background 0.15s;
 }
 .btn-edit-inline:hover { background: rgba(148,163,184,0.14); }
+
+/* Arquivos gerados/catalogados pelo Neo (file_save) — botão de download nativo
+   (diálogo "Salvar como"), mesma linguagem visual do command-box. */
+.message-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.message-file-download {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(15, 20, 35, 0.7);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--text-primary, #e2e8f0);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.message-file-download:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.message-file-download:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.message-file-download-size {
+  margin-left: auto;
+  color: var(--text-secondary, #94a3b8);
+  font-size: 11px;
+  font-weight: 400;
+}
