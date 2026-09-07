@@ -2,6 +2,11 @@ import { useEffect, useState } from 'react'
 
 interface DeviceInfo {
   device_id: string;
+  user_id?: string;
+  name?: string;
+  display_name?: string | null;
+  controllable?: boolean;
+  capabilities?: Record<string, boolean>;
   device_type: string;
   model: string;
   hardware_id: string;
@@ -551,6 +556,186 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
   );
 }
 
+/**
+ * Gerador de código de pareamento.
+ *
+ * É daqui que sai a autoridade de dizer "este aparelho é do usuário X": o
+ * painel tem credencial, o desktop não tem nenhuma (o user_id dele vem de uma
+ * env var com fallback hardcoded). O código dura 5 minutos, vale uma vez só, e
+ * gerar outro invalida o anterior.
+ */
+function PairingCodeCard({ devices }: { devices: DeviceInfo[] }) {
+  // Em qual conta o aparelho vai cair. O default é o dono da maioria dos
+  // devices já registrados — com mais de um usuário no banco, inferir sozinho
+  // no servidor seria chutar, e parear na conta errada é silencioso.
+  const suggestedUserId = (() => {
+    const tally = new Map<string, number>();
+    for (const d of devices) {
+      if (d.user_id) tally.set(d.user_id, (tally.get(d.user_id) ?? 0) + 1);
+    }
+    let best = '';
+    let bestCount = 0;
+    for (const [id, count] of tally) {
+      if (count > bestCount) {
+        best = id;
+        bestCount = count;
+      }
+    }
+    return best;
+  })();
+
+  const [userId, setUserId] = useState(suggestedUserId);
+  const [code, setCode] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt] = useState<number>(0);
+  const [remaining, setRemaining] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // A lista chega depois do primeiro render; só adota a sugestão enquanto o
+  // campo não foi mexido (vazio).
+  useEffect(() => {
+    setUserId((current) => current || suggestedUserId);
+  }, [suggestedUserId]);
+
+  useEffect(() => {
+    if (!expiresAt) return;
+    const tick = () => setRemaining(Math.max(0, Math.round((expiresAt - Date.now()) / 1000)));
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, [expiresAt]);
+
+  const generate = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const query = userId.trim() ? `?user_id=${encodeURIComponent(userId.trim())}` : '';
+      const response = await fetch(
+        `http://127.0.0.1:8000/api/v1/devices/pairing-code${query}`,
+        { method: 'POST' },
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        setError(body?.detail || 'Falha ao gerar código');
+        return;
+      }
+      const data = await response.json();
+      setCode(data.code);
+      setExpiresAt(Date.now() + data.expires_in_s * 1000);
+    } catch {
+      setError('neo-core offline');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const expired = code !== null && remaining <= 0;
+
+  return (
+    <div style={{
+      padding: 16, marginBottom: 6,
+      background: 'rgba(124, 58, 237, 0.06)',
+      border: '1px solid rgba(124, 58, 237, 0.2)',
+      borderRadius: 12,
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 4 }}>
+        Parear um dispositivo
+      </div>
+      <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12 }}>
+        Gere o código e digite-o no aparelho (aba Dispositivos do neo-desktop).
+        Sem pareamento o Neo não controla volume, mídia nem energia daquele aparelho.
+      </div>
+      <input
+        value={userId}
+        onChange={(e) => setUserId(e.target.value)}
+        placeholder="user_id (UUID da conta)"
+        style={{
+          width: 340, marginBottom: 12, padding: '6px 10px',
+          fontSize: 12, fontFamily: 'monospace',
+          background: '#0f1220', color: '#cbd5e1',
+          border: '1px solid #334155', borderRadius: 6, outline: 'none',
+        }}
+      />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <button
+          onClick={generate}
+          disabled={busy}
+          style={{
+            background: '#1e2235', color: '#e2e8f0',
+            border: '1px solid #334155', borderRadius: 8,
+            padding: '8px 18px', cursor: busy ? 'default' : 'pointer',
+            opacity: busy ? 0.6 : 1,
+          }}
+        >
+          {busy ? 'Gerando…' : code ? 'Gerar outro' : 'Gerar código'}
+        </button>
+        {code && (
+          <>
+            <span style={{
+              fontSize: 24, fontWeight: 700, letterSpacing: 6,
+              fontVariantNumeric: 'tabular-nums',
+              color: expired ? '#64748b' : '#a78bfa',
+              textDecoration: expired ? 'line-through' : 'none',
+            }}>
+              {code}
+            </span>
+            <span style={{ fontSize: 12, color: expired ? '#f87171' : '#64748b' }}>
+              {expired ? 'expirado' : `expira em ${remaining}s`}
+            </span>
+          </>
+        )}
+      </div>
+      {error && <div style={{ marginTop: 10, fontSize: 12, color: '#f87171' }}>❌ {error}</div>}
+    </div>
+  );
+}
+
+/** Remover com confirmação em dois toques — o clique só apaga na segunda vez. */
+function RemoveDeviceButton({ device, onRemoved }: { device: DeviceInfo; onRemoved: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const btn = (label: string, danger: boolean, onClick: () => void) => (
+    <button
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      disabled={busy}
+      style={{
+        fontSize: 11, padding: '3px 10px', borderRadius: 6, cursor: 'pointer',
+        color: danger ? '#fca5a5' : '#94a3b8',
+        background: danger ? 'rgba(248, 113, 113, 0.12)' : 'transparent',
+        border: `1px solid ${danger ? 'rgba(248, 113, 113, 0.4)' : '#334155'}`,
+        opacity: busy ? 0.5 : 1,
+      }}
+    >
+      {label}
+    </button>
+  );
+
+  const remove = async () => {
+    setBusy(true);
+    try {
+      const r = await fetch(
+        `http://127.0.0.1:8000/api/v1/devices/${encodeURIComponent(device.device_id)}`,
+        { method: 'DELETE' },
+      );
+      if (r.ok) onRemoved();
+    } finally {
+      setBusy(false);
+      setConfirming(false);
+    }
+  };
+
+  if (!confirming) return btn('Remover', false, () => setConfirming(true));
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} onClick={(e) => e.stopPropagation()}>
+      <span style={{ fontSize: 11, color: '#fca5a5' }}>Remover e desparear?</span>
+      {btn('Confirmar', true, remove)}
+      {btn('Cancelar', false, () => setConfirming(false))}
+    </div>
+  );
+}
+
 export default function ConnectedDevicesPanel() {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -618,6 +803,7 @@ export default function ConnectedDevicesPanel() {
     <>
       {selectedDevice && <DeviceModal device={selectedDevice} onClose={() => setSelectedDevice(null)} />}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 24, overflow: 'auto', flex: 1 }}>
+        <PairingCodeCard devices={devices} />
         <div style={{ fontSize: 13, color: '#475569', marginBottom: 8 }}>
           {devices.length} dispositivo{devices.length !== 1 ? 's' : ''} conectado{devices.length !== 1 ? 's' : ''}
         </div>
@@ -647,11 +833,16 @@ export default function ConnectedDevicesPanel() {
             }}>
               <DeviceIcon type={device.device_type} />
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0, flex: 1 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>
-                  {device.device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop'}
+                  {device.name || (device.device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop')}
                 </span>
+                {device.controllable && (
+                  <span style={{ fontSize: 10, padding: '2px 6px', background: 'rgba(59, 130, 246, 0.15)', border: '1px solid rgba(59, 130, 246, 0.35)', borderRadius: 8, color: '#93c5fd' }}>
+                    controlável
+                  </span>
+                )}
                 {device.is_current_device && (
                   <span style={{ fontSize: 10, padding: '2px 6px', background: 'rgba(34, 197, 94, 0.15)', border: '1px solid rgba(34, 197, 94, 0.3)', borderRadius: 8, color: '#4ade80' }}>
                     este
@@ -682,6 +873,9 @@ export default function ConnectedDevicesPanel() {
               </div>
               <div style={{ fontSize: 10, color: '#334155', marginTop: 4 }}>
                 {device.is_online ? 'Online via WebSocket' : 'Offline'}
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <RemoveDeviceButton device={device} onRemoved={fetchDevices} />
               </div>
             </div>
           </div>

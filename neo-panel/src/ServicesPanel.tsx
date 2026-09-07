@@ -50,9 +50,35 @@ interface Credential {
   label: string;
   kind: string;
   description: string | null;
+  /** Campos não-secretos do tipo (usuário, endereço, imap_host…). */
+  fields: Record<string, string | number>;
+  /** Resumo pronto dos campos, montado pelo backend ("usuário: daniel"). */
+  fields_summary: string;
   hint: string | null;
   ref: string;
   last_used_at: string | null;
+}
+
+// A spec dos tipos vem do backend (GET /credential-kinds) — o formulário é
+// RENDERIZADO a partir dela. Antes o form era fixo (só "Segredo") e o tipo não
+// mudava nada na tela: não havia onde digitar o usuário de um login.
+interface CredentialFieldSpec {
+  name: string;
+  label: string;
+  required: boolean;
+  placeholder: string;
+  type: 'text' | 'number';
+  help: string;
+}
+
+interface CredentialKindSpec {
+  kind: string;
+  label: string;
+  secret_label: string;
+  secret_placeholder: string;
+  secret_help: string;
+  fields: CredentialFieldSpec[];
+  description_hint: string;
 }
 
 interface AuditEntry {
@@ -658,10 +684,26 @@ function VaultTab({
   setError: (s: string | null) => void;
   setNotice: (s: string | null) => void;
 }) {
+  const [specs, setSpecs] = useState<CredentialKindSpec[]>([]);
   const [label, setLabel] = useState('');
   const [secret, setSecret] = useState('');
-  const [kind, setKind] = useState('token');
+  const [kind, setKind] = useState('password');
   const [description, setDescription] = useState('');
+  // Campos por tipo, guardados por NOME: trocar o tipo preserva o que ainda faz
+  // sentido (o `username` de um password continua válido num basic).
+  const [fields, setFields] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+
+  // A spec dos tipos é do backend — o formulário se monta a partir dela.
+  useEffect(() => {
+    api<{ kinds: CredentialKindSpec[] }>(`${API}/credential-kinds`)
+      .then((d) => setSpecs(d.kinds))
+      .catch(() => setSpecs([]));
+  }, []);
+
+  const spec = specs.find((k) => k.kind === kind) ?? null;
+  const missing = (spec?.fields ?? []).filter((f) => f.required && !(fields[f.name] ?? '').trim());
+  const canSave = Boolean(label.trim() && secret && !missing.length && !busy);
 
   if (unavailable) {
     return (
@@ -675,18 +717,28 @@ function VaultTab({
 
   const create = async () => {
     setError(null);
+    setBusy(true);
     try {
       await api(`${API}/credentials`, {
         method: 'POST',
-        body: JSON.stringify({ label, secret, kind, description: description || null }),
+        body: JSON.stringify({
+          label: label.trim(),
+          secret,
+          kind,
+          description: description.trim() || null,
+          fields,
+        }),
       });
-      setNotice(`Credencial '${label}' guardada (cifrada).`);
+      setNotice(`Credencial '${label}' guardada (só o segredo é cifrado).`);
       setLabel('');
       setSecret('');
       setDescription('');
+      setFields({});
       await reload();
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -705,42 +757,93 @@ function VaultTab({
       <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 18 }}>
         <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Guardar credencial</div>
         <div style={{ color: COLORS.muted, fontSize: 12, marginBottom: 14 }}>
-          O valor é cifrado com a NEO_CRED_KEY (que vive só na env da VPS) e{' '}
-          <strong style={{ color: COLORS.text }}>nunca mais é exibido</strong> — nem aqui, nem para
-          o Neo. Para trocar, cadastre de novo por cima.
+          Só o <strong style={{ color: COLORS.text }}>segredo</strong> é cifrado (NEO_CRED_KEY, que
+          vive na env da VPS) e <strong style={{ color: COLORS.text }}>nunca mais é exibido</strong> —
+          nem aqui, nem para o Neo. Os demais campos ficam em claro de propósito: é como o Neo sabe
+          qual credencial usar sem tocar no segredo.
         </div>
+
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          <div>
-            <label style={labelStyle}>Rótulo</label>
-            <input style={inputStyle} value={label} placeholder="github-personal" onChange={(e) => setLabel(e.target.value)} />
-          </div>
           <div>
             <label style={labelStyle}>Tipo</label>
             <select style={inputStyle} value={kind} onChange={(e) => setKind(e.target.value)}>
-              {['token', 'api_key', 'password', 'basic', 'cookie', 'cert', 'other'].map((k) => (
-                <option key={k} value={k}>{k}</option>
+              {(specs.length ? specs : [{ kind, label: kind } as CredentialKindSpec]).map((k) => (
+                <option key={k.kind} value={k.kind}>{k.label}</option>
               ))}
             </select>
           </div>
+          <div>
+            <label style={labelStyle}>Rótulo</label>
+            <input
+              style={inputStyle}
+              value={label}
+              placeholder={kind === 'email' ? 'email-do-neo' : 'github-pessoal'}
+              onChange={(e) => setLabel(e.target.value)}
+            />
+          </div>
         </div>
+
+        {/* Campos do TIPO escolhido — é isto que faz "usuário e senha" existir. */}
+        {(spec?.fields ?? []).length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
+            {spec!.fields.map((f) => (
+              <div key={f.name}>
+                <label style={labelStyle}>
+                  {f.label}
+                  {f.required && <span style={{ color: COLORS.danger }}> *</span>}
+                </label>
+                <input
+                  style={inputStyle}
+                  type={f.type === 'number' ? 'number' : 'text'}
+                  value={fields[f.name] ?? ''}
+                  placeholder={f.placeholder}
+                  onChange={(e) => setFields({ ...fields, [f.name]: e.target.value })}
+                />
+                {f.help && (
+                  <div style={{ color: COLORS.muted, fontSize: 11, marginTop: 4 }}>{f.help}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
         <div style={{ marginTop: 12 }}>
-          <label style={labelStyle}>Segredo</label>
+          <label style={labelStyle}>{spec?.secret_label ?? 'Segredo'}</label>
           <input
             style={{ ...inputStyle, fontFamily: 'ui-monospace, monospace' }}
             type="password"
             value={secret}
-            placeholder="ghp_…"
+            placeholder={spec?.secret_placeholder ?? ''}
             onChange={(e) => setSecret(e.target.value)}
           />
+          {spec?.secret_help && (
+            <div style={{ color: COLORS.muted, fontSize: 11, marginTop: 4 }}>{spec.secret_help}</div>
+          )}
         </div>
+
         <div style={{ marginTop: 12 }}>
-          <label style={labelStyle}>Descrição (opcional)</label>
-          <input style={inputStyle} value={description} onChange={(e) => setDescription(e.target.value)} />
+          <label style={labelStyle}>Descrição — o Neo lê isto para escolher</label>
+          <input
+            style={inputStyle}
+            value={description}
+            placeholder={spec?.description_hint || 'Para que serve e quando usar'}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+          <div style={{ color: COLORS.muted, fontSize: 11, marginTop: 4 }}>
+            Quando o Neo precisa de uma credencial, ele vê rótulo, tipo, campos e esta descrição —
+            nunca o segredo. Escreva o que separa esta das outras.
+          </div>
         </div>
-        <div style={{ marginTop: 14 }}>
-          <Button variant="primary" onClick={create} disabled={!label || !secret}>
-            Guardar
+
+        <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Button variant="primary" onClick={create} disabled={!canSave}>
+            {busy ? 'Guardando…' : 'Guardar'}
           </Button>
+          {missing.length > 0 && (
+            <span style={{ color: COLORS.muted, fontSize: 12 }}>
+              Falta preencher: {missing.map((f) => f.label).join(', ')}
+            </span>
+          )}
         </div>
       </div>
 
@@ -749,14 +852,22 @@ function VaultTab({
       ) : (
         <div style={{ display: 'grid', gap: 8 }}>
           {credentials.map((c) => (
-            <div key={c.id} style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
-              <strong style={{ fontSize: 13 }}>{c.label}</strong>
-              <Badge>{c.kind}</Badge>
-              {c.hint && <code style={{ color: COLORS.muted, fontSize: 12 }}>…{c.hint}</code>}
-              <span style={{ color: COLORS.muted, fontSize: 12 }}>{c.description}</span>
-              <div style={{ flex: 1 }} />
-              <code style={{ color: COLORS.accentSoft, fontSize: 11 }}>{c.ref}</code>
-              <Button variant="danger" onClick={() => remove(c)}>Apagar</Button>
+            <div key={c.id} style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 12, display: 'grid', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <strong style={{ fontSize: 13 }}>{c.label}</strong>
+                <Badge>{specs.find((k) => k.kind === c.kind)?.label ?? c.kind}</Badge>
+                {c.hint && <code style={{ color: COLORS.muted, fontSize: 12 }}>…{c.hint}</code>}
+                <div style={{ flex: 1 }} />
+                <code style={{ color: COLORS.accentSoft, fontSize: 11 }}>{c.ref}</code>
+                <Button variant="danger" onClick={() => remove(c)}>Apagar</Button>
+              </div>
+              {(c.fields_summary || c.description) && (
+                <div style={{ color: COLORS.muted, fontSize: 12 }}>
+                  {c.fields_summary}
+                  {c.fields_summary && c.description ? ' — ' : ''}
+                  {c.description}
+                </div>
+              )}
             </div>
           ))}
         </div>

@@ -56,6 +56,23 @@ function appraiserDegraded(health?: AffectHealth): boolean {
 // ── Constantes visuais ─────────────────────────────────────────────────────────
 const AXES: Axis[] = ['ira', 'alegria', 'tristeza', 'medo', 'confianca'];
 
+// Gatilhos simuláveis pelo painel. É o controle mais útil dos três: postura e a
+// linha "Sobre a discussão em andamento" dependem de um evento recente no
+// `recent`, não do valor dos eixos — nenhum arrasto de slider liga isso.
+const SIMULABLE_TRIGGERS = ['insult', 'wrong_name', 'obtuse', 'threat_coercion', 'contested', 'apology'];
+
+type BirraAct = {
+  id: string; entity_id: string | null; mecanica: string; fala: string;
+  requested: Record<string, unknown>; performed: Record<string, unknown> | null;
+  revert_at: string | null;
+};
+type BirraPayload = {
+  enabled: boolean;
+  active: boolean;
+  episode: { armed_at: string; act_count: number; physical_acts: number } | null;
+  pending: BirraAct[];
+};
+
 const AXIS_META: Record<Axis, { label: string; color: string; emoji: string }> = {
   ira:       { label: 'Ira',       color: '#f87171', emoji: '😠' },
   alegria:   { label: 'Alegria',   color: '#fbbf24', emoji: '😄' },
@@ -168,6 +185,13 @@ export default function AffectPanel() {
   const [resetting, setResetting] = useState(false);
   const [flash, setFlash] = useState('');
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ajuste manual (docs/modo-birra-plan.md §15): o polling PAUSA enquanto edita,
+  // senão o valor volta sozinho embaixo do dedo.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<Record<string, number>>({});
+  const [draftGrudge, setDraftGrudge] = useState(0);
+  const [applying, setApplying] = useState(false);
+  const [birra, setBirra] = useState<BirraPayload | null>(null);
 
   useEffect(() => {
     fetch(`${KG_API}/users`)
@@ -184,19 +208,114 @@ export default function AffectPanel() {
     try {
       const res = await fetch(`${AFFECT_API}?user_id=${encodeURIComponent(userId)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setData(await res.json());
+      const payload: AffectPayload = await res.json();
+      setData(payload);
       setError('');
+      return payload;
     } catch (e) {
       setError(e instanceof Error ? e.message : 'erro ao carregar');
     }
+    return null;
   }, [userId]);
 
+  const loadBirra = useCallback(async () => {
+    if (!userId) return;
+    try {
+      const res = await fetch(`${AFFECT_API}/birra?user_id=${encodeURIComponent(userId)}`);
+      if (res.ok) setBirra(await res.json());
+    } catch { /* card some, o resto do painel segue */ }
+  }, [userId]);
+
+  // Dois efeitos separados de propósito. Juntos, entrar em modo de ajuste (que
+  // muda `editing`) re-disparava o reset de troca de usuário: `setData(null)`
+  // pintava "carregando…" e `setEditing(false)` desligava o modo no mesmo tique.
+  // Reset pertence à troca de USUÁRIO; o polling é que olha `editing`.
   useEffect(() => {
     setData(null);
+    setBirra(null);
+    setEditing(false);
     load();
-    const iv = setInterval(load, POLL_MS);
+    loadBirra();
+  }, [load, loadBirra]);
+
+  useEffect(() => {
+    // Pausa o polling durante a edição — senão o valor volta sozinho embaixo do dedo.
+    if (editing) return;
+    const iv = setInterval(() => { load(); loadBirra(); }, POLL_MS);
     return () => clearInterval(iv);
-  }, [load]);
+  }, [load, loadBirra, editing]);
+
+  const startEdit = () => {
+    if (!data) return;
+    setDraft({ ...data.stats_live });
+    setDraftGrudge(data.grudge?.count ?? 0);
+    setEditing(true);
+  };
+
+  const cancelEdit = () => { setEditing(false); load(); };
+
+  const postSet = async (body: Record<string, unknown>, msg: string) => {
+    setApplying(true);
+    try {
+      const res = await fetch(`${AFFECT_API}/set?user_id=${encodeURIComponent(userId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setFlash(msg);
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+      flashTimer.current = setTimeout(() => setFlash(''), 4000);
+      const fresh = await load();
+      await loadBirra();
+      return fresh;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'erro ao gravar');
+    } finally {
+      setApplying(false);
+    }
+    return null;
+  };
+
+  const applyEdit = async () => {
+    await postSet(
+      { stats: draft, grudge_count: draftGrudge, reason: 'ajuste manual pelo painel' },
+      'Estado ajustado manualmente.',
+    );
+    setEditing(false);
+  };
+
+  const simulateTrigger = async (trigger: string) => {
+    const fresh = await postSet(
+      { trigger, reason: `gatilho '${trigger}' simulado pelo painel` },
+      `Gatilho '${trigger}' registrado.`,
+    );
+    // Sem isto os sliders ficariam no valor antigo depois do gatilho mexer no
+    // estado — e o painel pareceria não ter feito nada.
+    if (fresh) {
+      setDraft({ ...fresh.stats_live });
+      setDraftGrudge(fresh.grudge?.count ?? 0);
+    }
+  };
+
+  const endBirra = async () => {
+    if (!userId) return;
+    if (!window.confirm('Encerrar a birra e desfazer os atos pendentes?')) return;
+    try {
+      const res = await fetch(`${AFFECT_API}/birra/end?user_id=${encodeURIComponent(userId)}`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const out = await res.json();
+      setFlash(`Birra encerrada — ${out.reverted ?? 0} ato(s) desfeito(s).`);
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+      flashTimer.current = setTimeout(() => setFlash(''), 4000);
+      await loadBirra();
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'erro ao encerrar');
+    }
+  };
 
   const doReset = async () => {
     if (!userId || resetting) return;
@@ -342,18 +461,162 @@ export default function AffectPanel() {
             </div>
           )}
 
-          {/* Barras */}
+          {/* Barras — modo leitura ou modo ajuste */}
           <div style={{ ...card, marginBottom: 16 }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14,
+            }}>
+              <span style={{
+                color: '#64748b', fontSize: 11, textTransform: 'uppercase', letterSpacing: 1,
+              }}>
+                {editing ? 'Ajuste manual — polling pausado' : 'Estado'}
+              </span>
+              <button
+                onClick={() => (editing ? cancelEdit() : startEdit())}
+                style={{
+                  marginLeft: 'auto', background: editing ? '#2d3350' : '#1e2235',
+                  color: '#e2e8f0', border: '1px solid #2d3350', borderRadius: 8,
+                  padding: '4px 12px', fontSize: 12, cursor: 'pointer',
+                }}
+              >
+                {editing ? 'Cancelar' : '✎ Ajustar'}
+              </button>
+              {editing && (
+                <button
+                  onClick={applyEdit}
+                  disabled={applying}
+                  style={{
+                    background: '#34d399', color: '#0b0e16', border: 'none', borderRadius: 8,
+                    padding: '4px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                  }}
+                >
+                  {applying ? 'aplicando…' : 'Aplicar'}
+                </button>
+              )}
+            </div>
+
             {AXES.map(axis => (
-              <StatBar
-                key={axis}
-                axis={axis}
-                live={data.stats_live[axis] ?? 0}
-                raw={data.stats_raw[axis] ?? 0}
-                baseline={data.baselines[axis] ?? 0}
-              />
+              editing ? (
+                <div key={axis} style={{ marginBottom: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontSize: 14 }}>{AXIS_META[axis].emoji}</span>
+                    <span style={{ color: '#e2e8f0', fontSize: 13, fontWeight: 600, width: 80 }}>
+                      {AXIS_META[axis].label}
+                    </span>
+                    <span style={{
+                      color: AXIS_META[axis].color, fontSize: 14, fontWeight: 700,
+                      fontVariantNumeric: 'tabular-nums',
+                    }}>
+                      {Math.round(draft[axis] ?? 0)}
+                    </span>
+                    {Math.round(draft[axis] ?? 0) !== Math.round(data.stats_live[axis] ?? 0) && (
+                      <span style={{ color: '#fbbf24', fontSize: 11 }}>
+                        ← era {Math.round(data.stats_live[axis] ?? 0)}
+                      </span>
+                    )}
+                    <span style={{ marginLeft: 'auto', color: '#475569', fontSize: 10 }}>
+                      repouso {(data.baselines[axis] ?? 0).toFixed(0)}
+                    </span>
+                  </div>
+                  <input
+                    type="range" min={0} max={100} step={1}
+                    value={draft[axis] ?? 0}
+                    onChange={e => setDraft(d => ({ ...d, [axis]: Number(e.target.value) }))}
+                    style={{ width: '100%', accentColor: AXIS_META[axis].color }}
+                  />
+                </div>
+              ) : (
+                <StatBar
+                  key={axis}
+                  axis={axis}
+                  live={data.stats_live[axis] ?? 0}
+                  raw={data.stats_raw[axis] ?? 0}
+                  baseline={data.baselines[axis] ?? 0}
+                />
+              )
             ))}
+
+            {editing && (
+              <div style={{ borderTop: '1px solid #1e2235', marginTop: 8, paddingTop: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                  <span style={{ color: '#e2e8f0', fontSize: 13, fontWeight: 600 }}>
+                    Ofensas na janela (24h)
+                  </span>
+                  <input
+                    type="number" min={0} max={20}
+                    value={draftGrudge}
+                    onChange={e => setDraftGrudge(Math.max(0, Number(e.target.value)))}
+                    style={{
+                      background: '#1e2235', color: '#e2e8f0', border: '1px solid #2d3350',
+                      borderRadius: 6, padding: '4px 8px', width: 64, fontSize: 13,
+                    }}
+                  />
+                  <span style={{ color: '#64748b', fontSize: 11 }}>
+                    a birra exige ira ≥ 60 <b>e</b> ≥ 2 ofensas — só o slider de ira não arma
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ color: '#64748b', fontSize: 12 }}>Simular gatilho:</span>
+                  {SIMULABLE_TRIGGERS.map(t => (
+                    <button
+                      key={t}
+                      onClick={() => simulateTrigger(t)}
+                      style={{
+                        background: '#1e2235', color: TRIGGER_COLORS[t] ?? '#94a3b8',
+                        border: '1px solid #2d3350', borderRadius: 8, padding: '3px 10px',
+                        fontSize: 12, cursor: 'pointer',
+                      }}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ color: '#475569', fontSize: 11, marginTop: 8 }}>
+                  O gatilho é o único controle que liga a <b>postura</b> — ela depende de um
+                  evento recente, não do valor dos eixos.
+                </div>
+              </div>
+            )}
           </div>
+
+          {/* Card de birra */}
+          {birra && (birra.active || birra.pending.length > 0) && (
+            <div style={{
+              ...card, marginBottom: 16, borderColor: '#f87171',
+              background: 'rgba(248,113,113,0.06)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                <span style={{ fontSize: 20 }}>😤</span>
+                <span style={{ fontSize: 15, fontWeight: 700, color: '#f87171' }}>
+                  Modo Birra {birra.active ? 'ATIVO' : '— atos pendentes'}
+                </span>
+                <button
+                  onClick={endBirra}
+                  style={{
+                    marginLeft: 'auto', background: '#f87171', color: '#0b0e16', border: 'none',
+                    borderRadius: 8, padding: '4px 14px', fontSize: 12, fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Encerrar e desfazer
+                </button>
+              </div>
+              {birra.episode && (
+                <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 8 }}>
+                  desde {fmtTime(birra.episode.armed_at)} · {birra.episode.act_count} ato(s),
+                  {' '}{birra.episode.physical_acts} físico(s)
+                </div>
+              )}
+              {birra.pending.map(a => (
+                <div key={a.id} style={{ fontSize: 12, color: '#e2e8f0', padding: '3px 0' }}>
+                  <b>{a.entity_id}</b> — {a.mecanica} ({a.fala})
+                  {a.revert_at && (
+                    <span style={{ color: '#fbbf24' }}> · desfaz em {fmtTime(a.revert_at)}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Timeline */}
           <div style={{ ...card, marginBottom: 16 }}>

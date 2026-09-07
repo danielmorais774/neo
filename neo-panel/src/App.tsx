@@ -11,8 +11,10 @@ import AffectPanel from './AffectPanel';
 import SettingsPanel from './SettingsPanel';
 import SkillsPanel from './SkillsPanel';
 import ServicesPanel from './ServicesPanel';
+import WakeTrainingPanel from './WakeTrainingPanel';
 import FilesPanel from './FilesPanel';
 import SpotifyPanel from './SpotifyPanel';
+import SirenePanel from './SirenePanel';
 import LettaPanel from './LettaPanel';
 import Sidebar from './Sidebar';
 import { ToastContainer, useToast } from './ToastNotification';
@@ -34,6 +36,7 @@ function App() {
             <Route path="/pesquisas" element={<ResearchPanel />} />
             <Route path="/servicos" element={<ServicesPanel />} />
             <Route path="/arquivos" element={<FilesPanel />} />
+            <Route path="/sirene" element={<SirenePanel />} />
 
             <Route path="/memoria" element={<MemoriaScreen />} />
             <Route path="/emocoes" element={<AffectPanel />} />
@@ -44,6 +47,8 @@ function App() {
             <Route path="/sessoes" element={<DebugPanel />} />
             <Route path="/logs" element={<LogsScreen />} />
 
+            <Route path="/wake" element={<WakeTrainingPanel />} />
+
             <Route path="/config" element={<SettingsPanel />} />
 
             {/*
@@ -53,7 +58,7 @@ function App() {
             */}
             <Route path="/whatsapp" element={<Navigate to="/comunicacao?tab=conversas" replace />} />
             <Route path="/missions" element={<Navigate to="/comunicacao?tab=missoes" replace />} />
-            <Route path="/whatsapp-status" element={<Navigate to="/config?tab=conexoes" replace />} />
+            <Route path="/whatsapp-status" element={<Navigate to="/config?tab=comunicacoes" replace />} />
             <Route path="/devices" element={<Navigate to="/config?tab=dispositivos" replace />} />
             <Route path="/settings" element={<Navigate to="/config" replace />} />
             <Route path="/debug" element={<Navigate to="/sessoes" replace />} />

@@ -1,0 +1,563 @@
+/*
+ * Estilos exclusivos da tela Sirene. Só entra aqui o que a linguagem visual do
+ * neo-ui.css não cobre: leds de estado, chips de dia da semana e o cartão de
+ * slot. Tudo o mais (card, field, input, toggle, botões) é reaproveitado.
+ */
+
+.sirene-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sirene-connect {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+}
+
+/* ── Estado ao vivo ────────────────────────────────────────── */
+
+.sirene-state-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 22px;
+}
+
+.sirene-siren {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sirene-siren-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(167, 139, 250, 0.75);
+}
+
+.sirene-siren-value {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--neo-text-dim);
+}
+
+.sirene-siren.tone-hot .sirene-siren-value {
+  color: var(--neo-rose);
+  text-shadow: 0 0 22px rgba(244, 63, 94, 0.5);
+  animation: neoPulseGlow 0.9s ease-in-out infinite;
+}
+
+.sirene-siren.tone-warm .sirene-siren-value {
+  color: #f59e0b;
+}
+
+.sirene-armed {
+  padding: 8px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--neo-text-faint);
+}
+
+.sirene-armed.is-armed {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+}
+
+.sirene-state-pills {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sirene-leds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.sirene-led {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 15px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 13px;
+  color: var(--neo-text-faint);
+}
+
+.sirene-led-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+  flex-shrink: 0;
+}
+
+.sirene-led.is-on {
+  color: var(--neo-text);
+}
+
+.sirene-led.is-on.tone-violet {
+  border-color: rgba(139, 92, 246, 0.45);
+  background: rgba(139, 92, 246, 0.1);
+}
+.sirene-led.is-on.tone-violet .sirene-led-dot {
+  background: var(--neo-violet-light);
+  box-shadow: 0 0 10px rgba(167, 139, 250, 0.9);
+}
+
+.sirene-led.is-on.tone-rose {
+  border-color: rgba(251, 113, 133, 0.45);
+  background: rgba(244, 63, 94, 0.1);
+}
+.sirene-led.is-on.tone-rose .sirene-led-dot {
+  background: var(--neo-rose);
+  box-shadow: 0 0 10px rgba(251, 113, 133, 0.9);
+}
+
+.sirene-led.is-on.tone-green {
+  border-color: rgba(52, 211, 153, 0.45);
+  background: rgba(16, 185, 129, 0.1);
+}
+.sirene-led.is-on.tone-green .sirene-led-dot {
+  background: var(--neo-green);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.9);
+}
+
+/* ── Silêncio escalonado ───────────────────────────────────── */
+
+/* Âmbar, e não vermelho: "muda" é um estado escolhido pelo firmware, não uma
+   falha — mas convive com ARMADO em verde, então precisa contradizer à vista. */
+.sirene-mute-badge {
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  white-space: nowrap;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.12);
+  color: #fcd34d;
+}
+
+.sirene-cool-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.sirene-cool-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sirene-cool-stat.is-hot {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.07);
+}
+
+.sirene-cool-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--neo-text-faint);
+}
+
+.sirene-cool-value {
+  font-size: 21px;
+  font-weight: 700;
+  color: var(--neo-text-dim);
+}
+
+.sirene-cool-stat.is-hot .sirene-cool-value {
+  color: #fcd34d;
+}
+
+.sirene-ladder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sirene-ladder-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 15px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 13px;
+  color: var(--neo-text-faint);
+}
+
+.sirene-ladder-row.is-next {
+  border-color: rgba(139, 92, 246, 0.45);
+  background: rgba(139, 92, 246, 0.1);
+}
+
+.sirene-ladder-when {
+  min-width: 190px;
+  color: var(--neo-text-dim);
+}
+
+.sirene-ladder-ms {
+  font-weight: 700;
+  color: var(--neo-text);
+}
+
+.sirene-ladder-tag {
+  margin-left: auto;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  font-size: 11px;
+  color: var(--neo-violet-pale);
+  white-space: nowrap;
+}
+
+/* ── Comando manual ────────────────────────────────────────── */
+
+.sirene-override {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.sirene-override-label {
+  font-size: 13px;
+  color: var(--neo-text-faint);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Verde é o repouso saudável (automático); as variantes são a exceção. */
+.sirene-override-badge {
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  white-space: nowrap;
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+}
+
+.sirene-override-badge.is-on {
+  border-color: rgba(251, 113, 133, 0.5);
+  background: rgba(244, 63, 94, 0.12);
+  color: #fca5a5;
+}
+
+.sirene-override-badge.is-off {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.12);
+  color: #fcd34d;
+}
+
+.sirene-override-badge.is-unknown {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--neo-text-faint);
+}
+
+.sirene-cmd {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sirene-confirm {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(251, 113, 133, 0.35);
+  background: rgba(244, 63, 94, 0.07);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--neo-text);
+}
+
+/* ── Histórico de disparos ─────────────────────────────────── */
+
+.sirene-events-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.sirene-events {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* 200 eventos cabem no buffer do firmware; a lista rola em vez de esticar o card. */
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.sirene-event {
+  display: grid;
+  grid-template-columns: minmax(150px, auto) minmax(70px, auto) 1fr;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 11px 15px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sirene-event-when {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sirene-event-time {
+  font-size: 13px;
+  color: var(--neo-text-dim);
+}
+
+.sirene-event-ago {
+  font-size: 11.5px;
+  color: var(--neo-text-faint);
+}
+
+.sirene-event-dur {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--neo-rose);
+}
+
+.sirene-event-tags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sirene-event-flag {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: var(--neo-text-faint);
+  white-space: nowrap;
+}
+
+.sirene-event-flag.is-motion {
+  border-color: rgba(139, 92, 246, 0.35);
+  color: var(--neo-violet-pale);
+}
+
+@media (max-width: 640px) {
+  .sirene-event {
+    grid-template-columns: 1fr auto;
+  }
+  .sirene-event-tags {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+}
+
+/* ── Detecção ──────────────────────────────────────────────── */
+
+.sirene-path {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.sirene-path-tag {
+  padding: 4px 11px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.12);
+  color: var(--neo-violet-pale);
+}
+
+.sirene-path-tag.is-burst {
+  border-color: rgba(251, 113, 133, 0.4);
+  background: rgba(244, 63, 94, 0.1);
+  color: #fca5a5;
+}
+
+.sirene-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0 18px;
+}
+
+/* ── Agenda / slots ────────────────────────────────────────── */
+
+.sirene-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 10px;
+}
+
+.sirene-slot {
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 16px 18px;
+}
+
+.sirene-slot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.sirene-slot-n {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(167, 139, 250, 0.75);
+}
+
+.sirene-slot-del {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--neo-text-faint);
+  cursor: pointer;
+}
+.sirene-slot-del:hover {
+  color: var(--neo-rose);
+}
+
+.sirene-days {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.sirene-day {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(20, 20, 31, 0.8);
+  color: var(--neo-text-faint);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.sirene-day:hover {
+  border-color: rgba(139, 92, 246, 0.4);
+  color: var(--neo-text-dim);
+}
+.sirene-day.is-on {
+  border-color: rgba(139, 92, 246, 0.6);
+  background: rgba(139, 92, 246, 0.18);
+  color: #e9e6ff;
+  box-shadow: 0 0 12px rgba(139, 92, 246, 0.22);
+}
+
+.sirene-day-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--neo-hairline);
+  margin: 0 6px;
+}
+
+.sirene-preset {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: none;
+  color: var(--neo-text-muted);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sirene-preset:hover {
+  border-color: rgba(139, 92, 246, 0.4);
+  color: var(--neo-text-dim);
+}
+.sirene-preset.is-on {
+  border-color: rgba(139, 92, 246, 0.5);
+  color: var(--neo-violet-pale);
+}
+
+.sirene-times {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+/* type=time desenha o relógio nativo — em tema escuro ele nasce preto no preto. */
+.sirene-times input[type='time']::-webkit-calendar-picker-indicator {
+  filter: invert(0.8);
+  cursor: pointer;
+}
+
+/* ── Referência ────────────────────────────────────────────── */
+
+.sirene-ref {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13.5px;
+  line-height: 1.9;
+  color: var(--neo-text-muted);
+}
+.sirene-ref strong {
+  color: var(--neo-text-dim);
+}
+
+/* Escopado na tela: o CSS do painel é um bundle global, um `.neo-content code`
+   solto repintaria code de todas as outras telas. */
+.sirene-screen code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(139, 92, 246, 0.12);
+  font-size: 0.9em;
+  color: var(--neo-violet-pale);
+}

@@ -70,7 +70,7 @@ export const PROVIDER_OPTIONS: { value: ProviderType; label: string }[] = [
   { value: 'anthropic', label: 'Anthropic — Claude 3...' },
   { value: 'gemini', label: 'Gemini — Gemini 2.5 Pro...' },
   { value: 'ollama', label: 'Ollama — Local (Gemma4...)' },
-  { value: 'openrouter', label: 'OpenRouter — Grok 4.5, Grok 4.20...' },
+  { value: 'openrouter', label: 'OpenRouter — Grok 4.5, DeepSeek V4 Flash...' },
 ];
 
 export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: string }[]> = {
@@ -118,6 +118,10 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: st
     { value: 'x-ai/grok-4.5', label: 'Grok 4.5 — mais capaz (raciocínio)' },
     { value: 'x-ai/grok-4.20', label: 'Grok 4.20 — equilíbrio, 2M contexto' },
     { value: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite — econômico' },
+    // O sufixo `@baidu` fixa o provedor de infra do gateway (o neo-core o
+    // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
+    // provedor, com outro preço e outro teto de saída.
+    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu) — 1M contexto, barato' },
   ],
 };
 

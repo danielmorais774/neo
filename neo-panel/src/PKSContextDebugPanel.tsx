@@ -74,10 +74,27 @@ interface CandidateTrace {
   skip_reason: string;
 }
 
+interface RecoveredMemory {
+  content: string;
+  source: string;
+  score: number;
+}
+
+interface DecisionInfo {
+  intent: string;
+  needs_memory: boolean;
+  knowledge_keywords: string[];
+}
+
 interface PromptPreviewResult {
   system_prompt: string;
   trace: CandidateTrace[];
   prompt_tokens_est: number;
+  decision: DecisionInfo;
+  contexts_found: Neighborhood[];
+  context_text: string;
+  recovered: RecoveredMemory[];
+  keywords: string[];
 }
 
 interface EntityRecord {
@@ -291,15 +308,18 @@ export default function PKSContextDebugPanel() {
     const body = JSON.stringify({ user_id: userId.trim(), user_input: userInput.trim() });
     const headers = { 'Content-Type': 'application/json' };
     try {
-      const [resCtx, resPreview] = await Promise.all([
-        fetch(`${API}/retrieve`, { method: 'POST', headers, body }),
-        fetch(`${API}/prompt-preview`, { method: 'POST', headers, body }),
-      ]);
-      if (!resCtx.ok) throw new Error(`retrieve ${resCtx.status}: ${await resCtx.text()}`);
+      // Uma chamada só: o /prompt-preview agora reproduz o turno real inteiro
+      // (classify → recover_context → register → build_prompt), read-only, e
+      // devolve entidades, memória semântica e a decisão junto com o prompt.
+      const resPreview = await fetch(`${API}/prompt-preview`, { method: 'POST', headers, body });
       if (!resPreview.ok) throw new Error(`preview ${resPreview.status}: ${await resPreview.text()}`);
-      const [ctxData, previewData] = await Promise.all([resCtx.json(), resPreview.json()]);
-      setResult(ctxData);
+      const previewData: PromptPreviewResult = await resPreview.json();
       setPreview(previewData);
+      setResult({
+        contexts_found: previewData.contexts_found,
+        context_text: previewData.context_text,
+        metadata: { keywords: previewData.keywords },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Erro desconhecido');
     } finally {
@@ -320,6 +340,8 @@ export default function PKSContextDebugPanel() {
 
   const keywords = (result?.metadata?.keywords as string[] | undefined) ?? [];
   const entityCount = result?.contexts_found.length ?? 0;
+  const decision = preview?.decision;
+  const recovered = preview?.recovered ?? [];
 
   return (
     <div style={{
@@ -347,7 +369,7 @@ export default function PKSContextDebugPanel() {
             🔍 PKS Context Debug
           </div>
           <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-            Visualiza o contexto recuperado do PKS e o texto injetado no prompt final
+            Reproduz o turno real (classify → memória → registro → prompt), sem gravar nem chamar o LLM
           </div>
         </div>
         {result && (
@@ -363,6 +385,7 @@ export default function PKSContextDebugPanel() {
             gap: 14,
           }}>
             <span><span style={{ color: '#a78bfa', fontWeight: 600 }}>{entityCount}</span> entidade{entityCount !== 1 ? 's' : ''}</span>
+            <span><span style={{ color: '#22d3ee', fontWeight: 600 }}>{recovered.length}</span> memória{recovered.length !== 1 ? 's' : ''}</span>
             <span><span style={{ color: '#a78bfa', fontWeight: 600 }}>{keywords.length}</span> keyword{keywords.length !== 1 ? 's' : ''}</span>
             {preview && (
               <span><span style={{ color: '#34d399', fontWeight: 600 }}>~{preview.prompt_tokens_est}</span> tokens estimados</span>
@@ -476,6 +499,42 @@ export default function PKSContextDebugPanel() {
 
           {result && (
             <>
+              {/* Decision bar — real routing decision that drove retrieval */}
+              {decision && (
+                <div style={{
+                  background: '#13161f',
+                  border: '1px solid #1e2235',
+                  borderRadius: 8,
+                  padding: '12px 16px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                }}>
+                  <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600, flexShrink: 0 }}>
+                    DECISÃO DE ROTEAMENTO
+                  </span>
+                  <span style={{
+                    background: '#1e3a5f44', color: '#60a5fa', fontSize: 12, fontWeight: 700,
+                    padding: '3px 10px', borderRadius: 6, letterSpacing: '0.03em',
+                    textTransform: 'uppercase' as const,
+                  }}>{decision.intent}</span>
+                  <span style={{
+                    background: decision.needs_memory ? '#065f4622' : '#1e2235',
+                    color: decision.needs_memory ? '#34d399' : '#64748b',
+                    fontSize: 12, fontWeight: 600, padding: '3px 10px', borderRadius: 999,
+                    border: `1px solid ${decision.needs_memory ? '#065f46' : '#2d3148'}`,
+                  }}>
+                    needs_memory: {decision.needs_memory ? 'true' : 'false'}
+                  </span>
+                  {!decision.needs_memory && (
+                    <span style={{ color: '#475569', fontSize: 11, fontStyle: 'italic' }}>
+                      memória semântica pulada neste turno
+                    </span>
+                  )}
+                </div>
+              )}
+
               {/* Keywords bar */}
               <div style={{
                 background: '#13161f',
@@ -530,6 +589,55 @@ export default function PKSContextDebugPanel() {
                   ))
                 )}
               </div>
+
+              {/* Retrieved layer — hybrid cross-session semantic memory */}
+              {decision?.needs_memory && (
+                <div>
+                  <div style={{ ...sectionLabel, marginBottom: 12 }}>
+                    Memória Semântica Recuperada — camada RETRIEVED ({recovered.length})
+                  </div>
+                  {recovered.length === 0 ? (
+                    <div style={{
+                      background: '#13161f', border: '1px solid #1e2235', borderRadius: 8,
+                      padding: 20, color: '#475569', fontSize: 13, fontStyle: 'italic',
+                      textAlign: 'center',
+                    }}>
+                      Nenhuma memória de sessão anterior recuperada.
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {recovered.map((r, i) => (
+                        <div key={i} style={{
+                          background: '#13161f',
+                          border: '1px solid #1e2235',
+                          borderLeft: '3px solid #22d3ee',
+                          borderRadius: 8,
+                          padding: '10px 14px',
+                          display: 'flex',
+                          alignItems: 'flex-start',
+                          gap: 10,
+                          fontSize: 13,
+                        }}>
+                          <span style={{
+                            background: '#22d3ee22', color: '#22d3ee', fontSize: 10, fontWeight: 700,
+                            padding: '2px 7px', borderRadius: 4, letterSpacing: '0.04em',
+                            textTransform: 'uppercase' as const, flexShrink: 0,
+                          }}>{r.source}</span>
+                          <span style={{ color: '#cbd5e1', flex: 1, wordBreak: 'break-word' as const }}>
+                            {r.content}
+                          </span>
+                          <span style={{
+                            color: r.score >= 0.25 ? '#34d399' : '#f87171',
+                            fontSize: 12, fontWeight: 600, flexShrink: 0,
+                          }} title="score final da busca híbrida (limiar de inclusão ≈ 0.25)">
+                            {r.score.toFixed(3)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Context text */}
               <div>

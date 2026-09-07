@@ -9,7 +9,8 @@ import type { ReactNode } from 'react';
 export type IconName =
   | 'key' | 'chat' | 'bug' | 'logs' | 'vision' | 'frame' | 'graph'
   | 'mission' | 'search' | 'device' | 'robot' | 'brain' | 'emotion'
-  | 'skill' | 'music' | 'gear' | 'refresh' | 'warn' | 'file';
+  | 'skill' | 'music' | 'gear' | 'refresh' | 'warn' | 'file' | 'mic'
+  | 'siren';
 
 const PATHS: Record<IconName, ReactNode> = {
   key: (
@@ -127,6 +128,20 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M7 3h7l4 4v14H7z" strokeLinejoin="round" />
       <path d="M14 3v4h4" strokeLinejoin="round" />
       <path strokeLinecap="round" d="M9.5 13h5M9.5 16.5h5" />
+    </>
+  ),
+  mic: (
+    <>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path strokeLinecap="round" d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6" />
+    </>
+  ),
+  // Giroflex: cúpula + base + raios de luz saindo.
+  siren: (
+    <>
+      <path d="M7 16a5 5 0 0 1 10 0z" strokeLinejoin="round" />
+      <rect x="5" y="16" width="14" height="3.5" rx="1" strokeLinejoin="round" />
+      <path strokeLinecap="round" d="M12 4v2.5M5.5 6.5 7.2 8.2M18.5 6.5 16.8 8.2" />
     </>
   ),
 };
