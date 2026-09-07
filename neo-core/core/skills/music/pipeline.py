@@ -35,6 +35,10 @@ from core.skills.music.service import (
     detect_service,
     find_music_tab,
     parse_media_context,
+    pick_reuse_tab,
+    neo_played_ids,
+    remember_played,
+    NEO_PLAYED_KEY,
     pick_active_device,
 )
 from modules import music_config
@@ -100,7 +104,38 @@ class MusicPipeline(SkillPipeline):
 
         if service == "spotify":
             return await self._play_spotify(query, user_id, spotify_connected)
-        return await self._play_youtube(query, media_context, youtube_available)
+        return await self._play_youtube(
+            query, media_context, youtube_available, session_id=session_id
+        )
+
+    async def _session_metadata(self, session_id: UUID | None) -> dict[str, Any]:
+        """`session_metadata` da conversa; {} em qualquer problema.
+
+        Nunca derruba o play: sem isto, um banco fora do ar transformaria "toca
+        uma música" em erro por causa de uma otimização de aba.
+        """
+        if session_id is None or self.db is None:
+            return {}
+        try:
+            sess = await self.db.get_conversation_session(session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Music] não li a sessão %s: %s", session_id, e)
+            return {}
+        return getattr(sess, "extra_metadata", None) or {}
+
+    async def _remember_played(
+        self, session_id: UUID | None, *ids: str | None
+    ) -> None:
+        """Guarda o que o Neo acabou de tocar nesta conversa."""
+        if session_id is None or self.db is None:
+            return
+        try:
+            atual = await self._session_metadata(session_id)
+            await self.db.merge_session_metadata(
+                session_id, {NEO_PLAYED_KEY: remember_played(atual, *ids)}
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Music] não gravei o que toquei: %s", e)
 
     def _control(self, action: str, media_context: dict[str, Any]) -> SkillResult:
         """Pause/resume/next/... on the open YouTube tab via the extension bridge.
@@ -109,7 +144,12 @@ class MusicPipeline(SkillPipeline):
         connected and a YouTube tab open). Spotify-side control would need the
         Connect API and is out of scope for v1.
         """
-        if not find_music_tab(media_context, "youtube"):
+        # `require_media`: aba sem player (a home do YouTube) não pausa nem pula.
+        # Ela contava como alvo e o comando ia parar numa página sem `<video>` —
+        # a extensão respondia "não achei o player na aba" DEPOIS de o Neo já ter
+        # dito que pausou.
+        tab = find_music_tab(media_context, "youtube", require_media=True)
+        if not tab:
             return SkillResult(
                 ok=False,
                 message="Não tem nada tocando no navegador pra eu controlar.",
@@ -127,7 +167,11 @@ class MusicPipeline(SkillPipeline):
             extra={"actuation": {
                 "channel": "browser",
                 "tool": "media_command",
-                "args": {"action": action, "target": "youtube"},
+                "args": {
+                    "action": action,
+                    "target": "youtube",
+                    "tabId": tab.get("tabId"),
+                },
                 "summary": summary,
             }},
         )
@@ -177,7 +221,11 @@ class MusicPipeline(SkillPipeline):
         )
 
     async def _play_youtube(
-        self, query: str, media_context: dict[str, Any], available: bool
+        self,
+        query: str,
+        media_context: dict[str, Any],
+        available: bool,
+        session_id: UUID | None = None,
     ) -> SkillResult:
         if not available:
             return SkillResult(
@@ -192,8 +240,27 @@ class MusicPipeline(SkillPipeline):
         if not video or not video.id:
             return SkillResult(ok=False, message=f'Não achei "{query}" no YouTube.')
 
-        # Reuse an already-open YouTube tab via the extension when available.
-        if find_music_tab(media_context, "youtube"):
+        # Reusar aba só onde há POSSE: a que o próprio Neo colocou música nesta
+        # conversa, ou uma sem nada carregado. Aba de vídeo do usuário — tocando
+        # OU parada — nunca é tomada; para essa, abre uma nova.
+        #
+        # O `tabId` vai junto de propósito: a decisão de reusar é tomada AQUI, sobre
+        # o snapshot do `media_context`, mas quem executa é a extensão — que antes
+        # refazia a escolha sozinha (`tabs.query` + PRIMEIRA aba do YouTube). Com
+        # mais de uma aba aberta, ou com o agente de navegador abrindo a dele no meio
+        # do turno, os dois lados escolhiam abas diferentes e o play caía na errada.
+        played = neo_played_ids(await self._session_metadata(session_id))
+        tab, motivo = pick_reuse_tab(media_context, played)
+        logger.info("[Music] reuso de aba: %s (%s)", "sim" if tab else "não", motivo)
+        # Marca ANTES de atuar: é assim que o próximo "agora toca Bon Jovi"
+        # reconhece esta aba como do Neo. Se a atuação falhar, o id sobra na
+        # lista sem efeito — ele só casa com uma aba que realmente abriu o vídeo.
+        # Guarda o id do vídeo E o do mix que o YouTube deriva dele (`RD<id>` —
+        # é o formato real: `v=c-g6X5nsbn8&list=RDc-g6X5nsbn8`). Sem o segundo, a
+        # aba deixaria de ser reconhecida como do Neo assim que o autoplay do mix
+        # virasse a faixa sozinho.
+        await self._remember_played(session_id, video.id, f"RD{video.id}")
+        if tab:
             return SkillResult(
                 ok=True,
                 message=f"Tocando {video.label} no YouTube 🎵",
@@ -205,6 +272,7 @@ class MusicPipeline(SkillPipeline):
                         "target": "youtube",
                         "videoId": video.id,
                         "reuseTab": True,
+                        "tabId": tab.get("tabId"),
                     },
                     "summary": f"{video.label} (YouTube)",
                 }},

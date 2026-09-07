@@ -56,7 +56,7 @@ class HybridMemorySearch:
         self,
         query: str,
         user_id: UUID | None = None,
-        service: str = "neo-desktop",
+        service: str | None = None,
         limit: int | None = None,
     ) -> list[MemorySearchResult]:
         """Busca híbrida completa.
@@ -64,7 +64,11 @@ class HybridMemorySearch:
         Args:
             query: Texto de busca.
             user_id: Filtrar por usuário.
-            service: Filtrar por serviço.
+            service: Filtrar por canal. ``None`` (default) = TODOS os canais do
+                usuário. O default era ``"neo-desktop"`` enquanto o app grava
+                as sessões como ``"neo-desktop-tauri"`` — a busca enxergava 53
+                de 3010 mensagens (1,8% do corpus) e o resto da memória entre
+                sessões era invisível. Ver docs/conversation-recall-plan.md §2a.
             limit: Número de resultados (default: settings.memory_search_limit).
 
         Returns:
@@ -257,7 +261,7 @@ class HybridMemorySearch:
         self,
         query: str,
         user_id: UUID | None,
-        service: str,
+        service: str | None,
         limit: int,
     ) -> list[MemorySearchResult]:
         """Busca apenas FTS quando embeddings não disponíveis."""

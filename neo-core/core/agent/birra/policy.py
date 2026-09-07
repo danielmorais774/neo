@@ -184,6 +184,22 @@ class BirraDecision:
         )
 
 
+def resume_or_start(
+    current: BirraEpisode | None, incoming: BirraEpisode
+) -> BirraEpisode:
+    """Qual episódio a persistência deve gravar: o que já estava, ou o novo.
+
+    Só um episódio VIVO é retomado — retomar um encerrado faz o novo nascer
+    morto, porque ``active`` é ``released_at is None``. E o episódio persistido
+    é o que o seletor de contexto lê para injetar a diretiva de birra: com um
+    cadáver nesse campo a birra decide certo em memória e nunca se anuncia,
+    além de perder contadores de teto e a histerese de desarme (que também
+    saem daí). Regra pura e aqui de propósito — foi a ausência dela, escondida
+    numa expressão dentro do serviço de banco, que passou sem teste.
+    """
+    return current if (current is not None and current.active) else incoming
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 

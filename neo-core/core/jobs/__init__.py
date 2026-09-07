@@ -13,6 +13,8 @@ from core.jobs.executor import JobToolExecutor
 from core.jobs.dispatcher import ProactiveDispatcher
 from core.jobs.runner_research import build_research_runner
 from core.jobs.runner_browser import build_browser_runner
+from core.jobs.runner_browser_local import build_browser_local_runner
+from core.jobs.runner_download_watch import build_download_watch_runner
 from core.jobs.tools import JOB_TOOLS, JOB_TOOL_NAMES
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "ProactiveDispatcher",
     "build_research_runner",
     "build_browser_runner",
+    "build_browser_local_runner",
+    "build_download_watch_runner",
     "JOB_TOOLS",
     "JOB_TOOL_NAMES",
 ]

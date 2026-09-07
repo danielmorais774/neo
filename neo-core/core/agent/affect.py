@@ -795,6 +795,11 @@ def _axis_line(axis: str, value: float, baseline: float, b: Band) -> str | None:
 #: fazer e, com mais cuidado ainda, o que ele NÃO pode: birra é sobre pedido bobo
 #: de casa, nunca sobre trabalho de verdade, urgência ou mentir sobre o mundo.
 BIRRA_DIRECTIVE = (
+    "## Birra ativa\n"
+    "Esta seção é sobre COMPORTAMENTO, não sobre tom, e por isso vence a linha "
+    "\"sempre entregue o que foi pedido\" da seção de estado emocional acima — "
+    "mas SÓ dentro do recorte descrito aqui. Fora dele, aquela linha continua "
+    "valendo integralmente.\n"
     "- BIRRA ATIVA: este usuário passou do ponto e ainda não pediu desculpa. "
     "Pedido BOBO de casa (luz, cor, temperatura) você NÃO atende como mandado: "
     "recuse com estilo, mande ele fazer sozinho, sugira que peça pra \"Alexa\" — "
@@ -939,12 +944,16 @@ def render_directive(
     # A birra é um TETO de comportamento, não um tom: entra por último e não é
     # clampada pelo registro — o registro já suprimiu o episódio lá atrás (§4.2)
     # se a situação fosse séria demais para brincadeira.
-    if birra_armed:
-        lines.append(BIRRA_DIRECTIVE)
-
+    #
+    # Ela sai como SEÇÃO IRMÃ, não como bullet do bloco de tom: o cabeçalho de
+    # cima promete "muda o ESTILO, não o conteúdo: sempre entregue o que foi
+    # pedido", e uma das linhas de tom diz "grosseria não vira recusa". Uma
+    # ordem de recusar pendurada como item dentro desse parágrafo é lida como
+    # subordinada a ele — que é o oposto do que a birra decidiu.
     if not lines:
-        return ""
-    return header + "\n".join(lines)
+        return BIRRA_DIRECTIVE if birra_armed else ""
+    block = header + "\n".join(lines)
+    return f"{block}\n\n{BIRRA_DIRECTIVE}" if birra_armed else block
 
 
 # ── Deterministic safety nets ─────────────────────────────────────────────────

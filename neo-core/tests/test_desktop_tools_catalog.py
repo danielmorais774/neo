@@ -11,10 +11,13 @@ de proibidas ao mesmo tempo em que a devolve pro DESKTOP_TOOLS.
 
 from modules.desktop.tools import DESKTOP_TOOLS
 
+# `write_file` saiu desta lista em 2026-08-30, seguindo a receita do docstring:
+# ganhou execução real ANTES de voltar ao catálogo — `write_text_file` em
+# commands/mod.rs, despachada em ai_agent.rs, devolvendo ToolResult com o mesmo
+# envelope saved/conflict do save_generated_file.
 _KNOWN_DEAD_TOOLS = {
     "list_directory",
     "read_file",
-    "write_file",
     "create_directory",
     "delete_path",
     "search_files",
@@ -37,4 +40,9 @@ def test_desktop_tools_catalog_only_has_working_tools():
     # request_user_file É executado de verdade (intercept em ai_agent.rs, reusando
     # pick_attachment_files + upload_path_to_store) — plano "arquivos sob iniciativa
     # do cérebro". Não é dead tool: tem handler, devolve ToolResult.
-    assert names == {"run_command", "save_generated_file", "request_user_file"}
+    assert names == {
+        "run_command",
+        "save_generated_file",
+        "request_user_file",
+        "write_file",
+    }

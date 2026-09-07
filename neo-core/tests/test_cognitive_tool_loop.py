@@ -31,9 +31,11 @@ class _ScriptedProvider:
     def __init__(self, responses):
         self._responses = list(responses)
         self.tool_flags = []
+        self.tool_payloads = []   # a lista EXATA que iria pro provider, por round
 
     async def complete(self, *, messages, tools=None, model=None, temperature=0.7, max_tokens=4096, **kwargs):
         self.tool_flags.append(tools is not None)
+        self.tool_payloads.append(list(tools or []))
         return self._responses.pop(0)
 
 
@@ -356,9 +358,132 @@ async def test_loop_tool_trace_records_errors():
     assert trace == [{"tool": "neo_bash", "ok": False, "error": "exit 1"}]
 
 
+# ── guarda de verdade-do-resultado (docs/self-continuation-plan.md §4) ──────
+@pytest.mark.asyncio
+async def test_loop_artifact_claim_guard_forces_verification_round():
+    """Reprodução da sessão bb22cc33: bash sai 0 sem produzir nada e o modelo
+    afirma que as imagens existem. A guarda tem que forçar uma rodada com tool
+    obrigatória em vez de aceitar a conclusão falsa."""
+    svc = _svc()
+    provider = _ScriptedProvider([
+        _Resp(tool_calls=[ToolCall(id="1", name="neo_bash", arguments={
+            "command": "python3 -c \"baixar('/workspace/ciclo-prova')\""})]),
+        _Resp(content="Baixei as 3 imagens para /workspace/ciclo-prova. As imagens são reais."),
+        _Resp(content="Na verdade não baixei nada: a pasta está vazia, o download falhou."),
+    ])
+    # exit_code 0 e stdout vazio — "rodou" sem materializar arquivo nenhum.
+    execu = _FakeExecutor({"ok": True, "exit_code": 0, "stdout": "", "stderr": ""})
+    trace: list = []
+    out = await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="baixa as imagens")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=execu, slog=None, trace=None,
+        tool_trace=trace,
+    )
+    assert out == "Na verdade não baixei nada: a pasta está vazia, o download falhou."
+    assert provider.tool_flags == [True, True, True]   # rodada extra foi forçada
+
+
+@pytest.mark.asyncio
+async def test_loop_artifact_claim_guard_retries_only_once():
+    """Modelo reafirma a mentira: aceita e segue, sem loop infinito."""
+    svc = _svc()
+    lie = "Baixei as imagens para /workspace/ciclo-prova."
+    provider = _ScriptedProvider([_Resp(content=lie), _Resp(content=lie)])
+    out = await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="baixa")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=_FakeExecutor({}), slog=None, trace=None,
+        # Trace com uma tool que FALHOU: o turno trabalhou e não produziu nada.
+        tool_trace=[{"tool": "neo_bash", "ok": False, "error": "exit 8"}],
+    )
+    assert out == lie
+    assert provider.tool_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_loop_artifact_claim_guard_ignores_turn_that_ran_no_tools():
+    """session-b407c213: "me mostra as imagens que baixou" não rodou tool nenhuma —
+    os downloads foram no turno ANTERIOR. O trace é do turno, não da conversa, então
+    a guarda não tem o que julgar aqui. Acusar empurrava o modelo a "verificar" o
+    sandbox com `run_command`, que roda na máquina do usuário."""
+    svc = _svc()
+    claim = "Aqui estão as imagens que baixei: /workspace/portifolio-naruto/images/naruto-capa.png"
+    provider = _ScriptedProvider([_Resp(content=claim)])
+    out = await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="me mostra as imagens")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=_FakeExecutor({}), slog=None, trace=None,
+        tool_trace=[],   # turno sem nenhuma tool
+    )
+    assert out == claim
+    assert provider.tool_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_loop_artifact_claim_guard_silent_without_a_trace():
+    """Sem tool_trace não há evidência — a guarda não pode acusar no escuro."""
+    svc = _svc()
+    claim = "Salvei o arquivo relatorio.csv na pasta."
+    provider = _ScriptedProvider([_Resp(content=claim)])
+    out = await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="salva")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=_FakeExecutor({}), slog=None, trace=None,
+    )
+    assert out == claim
+    assert provider.tool_flags == [True]
+
+
 # ── CognitiveReadExecutor scoping ───────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_read_executor_withholds_scoped_tools_without_user():
     ex = CognitiveReadExecutor(global_executor=None, db=None, pks_service=None, user_id=None)
     out = await ex.execute_tool_call(ToolCall(id="1", name="search_pks", arguments={"query": "x"}))
     assert out.error is not None  # cannot scope → error, never a wrong-user read
+
+
+# ── payload de tools: um nome, um schema ────────────────────────────────────
+@pytest.mark.asyncio
+async def test_loop_nunca_manda_nome_de_tool_repetido_ao_provider():
+    """Sessões c35e576f e 1e7c5943: DeepSeek recusava o turno com 400 "Tool names
+    must be unique." porque `browser_task` entrava duas vezes — uma pela skill
+    `compras` (que lista a tool no frontmatter) e outra pelas JOB_TOOLS do
+    workbench. Cada camada da montagem só deduplicava contra a anterior, então a
+    colisão entre camadas NÃO adjacentes passava batido. A OpenAI aceitava o mesmo
+    payload, o que fazia o bug parecer "problema do DeepSeek".
+
+    O loop é o último ponto antes do payload: a garantia mora aqui."""
+    svc = _svc()
+    provider = _ScriptedProvider([_Resp(content="ok")])
+    dup = [t for t in cognitive_tools_for(uuid4()) if t.name in {"web_search", "search_pks"}]
+    assert dup, "fixture precisa de pelo menos uma tool real para duplicar"
+    tools = list(cognitive_tools_for(uuid4())) + dup   # a colisão que quebrava o turno
+
+    await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="oi")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=tools, tool_executor=_FakeExecutor({}), slog=None, trace=None,
+    )
+
+    enviado = [t.name for t in provider.tool_payloads[0]]
+    assert len(enviado) == len(set(enviado)), f"nome repetido no payload: {enviado}"
+    # dedup não pode AMPUTAR o toolset — só colapsar as repetições
+    assert set(enviado) == {t.name for t in tools}
+
+
+@pytest.mark.asyncio
+async def test_dedup_mantem_a_primeira_ocorrencia_e_a_ordem():
+    """A 1a ocorrência é a da camada mais específica (read set antes das action
+    tools), e a ordem do payload é estável — trocar isso mudaria silenciosamente
+    qual schema o modelo vê."""
+    from modules.desktop.ai_service import _dedup_tools_by_name
+
+    class _T:
+        def __init__(self, name, tag):
+            self.name, self.tag = name, tag
+
+    a, b, c = _T("x", "primeira"), _T("y", "unica"), _T("x", "segunda")
+    out = _dedup_tools_by_name([a, b, c])
+    assert [t.name for t in out] == ["x", "y"]
+    assert out[0].tag == "primeira"

@@ -238,6 +238,32 @@ class AsyncPostgresClient:
                 extra_metadata=row["session_metadata"],
             )
 
+    async def merge_session_metadata(
+        self, session_id: UUID, patch: dict[str, Any]
+    ) -> None:
+        """Funde chaves em ``session_metadata`` sem tocar no resto da linha.
+
+        ``update_session`` reescreve a linha inteira (status, tópico, embedding):
+        usá-la para guardar um detalhe de skill faria o turno concorrente que
+        rotaciona o tópico perder a atualização. O ``||`` do jsonb resolve no
+        próprio banco — sem leitura prévia, sem corrida.
+        """
+        if not patch:
+            return
+        async with self.get_session() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE conversation_session
+                    SET session_metadata =
+                        COALESCE(session_metadata, '{}'::jsonb) || CAST(:patch AS jsonb)
+                    WHERE id = :session_id
+                    """
+                ),
+                {"patch": json.dumps(patch), "session_id": session_id},
+            )
+            await db.commit()
+
     async def update_session(self, session: ConversationSession) -> None:
         """Update a session (topic, status, etc.)."""
         async with self.get_session() as db:
@@ -355,11 +381,15 @@ class AsyncPostgresClient:
         self,
         embedding: list[float],
         user_id: UUID | None = None,
-        service: str = "neo-desktop",
+        service: str | None = "neo-desktop",
         limit: int = 5,
         min_similarity: float = 0.5,
     ) -> list[tuple[ConversationSession, float]]:
-        """Find sessions with similar topic embeddings using cosine distance."""
+        """Find sessions with similar topic embeddings using cosine distance.
+
+        ``service=None`` busca em TODOS os canais do usuário (desktop, painel,
+        WhatsApp). O escopo real de privacidade é o ``user_id``, não o app.
+        """
         async with self.get_session() as db:
             try:
                 from pgvector.sqlalchemy import Vector
@@ -368,22 +398,25 @@ class AsyncPostgresClient:
                 # Use pgvector cosine similarity operator
                 params = {
                     "embedding": str(embedding),
-                    "service": service,
                     "limit": limit,
                     "min_sim": min_similarity,
                 }
+                service_filter = ""
+                if service:
+                    service_filter = "AND service = :service"
+                    params["service"] = service
                 user_filter = ""
                 if user_id:
                     user_filter = "AND user_id = :user_id"
                     params["user_id"] = str(user_id)
 
                 query = text(f"""
-                    SELECT id, topic_summary, 
+                    SELECT id, topic_summary,
                            1 - (topic_embedding <=> CAST(:embedding AS vector)) as similarity
                     FROM conversation_session
                     WHERE status = 'closed'
                       AND topic_embedding IS NOT NULL
-                      AND service = :service
+                      {service_filter}
                       {user_filter}
                       AND 1 - (topic_embedding <=> CAST(:embedding AS vector)) > :min_sim
                     ORDER BY topic_embedding <=> CAST(:embedding AS vector)
@@ -437,19 +470,26 @@ class AsyncPostgresClient:
         self,
         embedding: list[float],
         user_id: UUID | None = None,
-        service: str = "neo-desktop",
+        service: str | None = "neo-desktop",
         limit: int = 20,
         min_similarity: float = 0.4,
     ) -> list[tuple[ConversationMessage, float]]:
-        """Busca mensagens individuais por similaridade de embedding."""
+        """Busca mensagens individuais por similaridade de embedding.
+
+        ``service=None`` busca em TODOS os canais do usuário — ver
+        ``find_similar_sessions``.
+        """
         async with self.get_session() as db:
             try:
                 params: dict[str, Any] = {
                     "embedding": str(embedding),
-                    "service": service,
                     "limit": limit,
                     "min_sim": min_similarity,
                 }
+                service_filter = ""
+                if service:
+                    service_filter = "AND cs.service = :service"
+                    params["service"] = service
                 user_filter = ""
                 if user_id:
                     user_filter = "AND cm.user_id = :user_id"
@@ -461,7 +501,7 @@ class AsyncPostgresClient:
                     FROM conversation_message cm
                     JOIN conversation_session cs ON cs.id = cm.session_id
                     WHERE cm.embedding IS NOT NULL
-                      AND cs.service = :service
+                      {service_filter}
                       {user_filter}
                       AND 1 - (cm.embedding <=> CAST(:embedding AS vector)) > :min_sim
                     ORDER BY cm.embedding <=> CAST(:embedding AS vector)
@@ -488,20 +528,24 @@ class AsyncPostgresClient:
         self,
         query_text: str,
         user_id: UUID | None = None,
-        service: str = "neo-desktop",
+        service: str | None = "neo-desktop",
         limit: int = 20,
     ) -> list[tuple[ConversationMessage, float]]:
         """Busca mensagens por Full-Text Search (FTS) no PostgreSQL.
 
         Usa tsquery com fallback de idioma: português → inglês.
+        ``service=None`` busca em TODOS os canais do usuário.
         """
         async with self.get_session() as db:
             try:
                 params: dict[str, Any] = {
                     "query": query_text,
-                    "service": service,
                     "limit": limit,
                 }
+                service_filter = ""
+                if service:
+                    service_filter = "AND cs.service = :service"
+                    params["service"] = service
                 user_filter = ""
                 if user_id:
                     user_filter = "AND cm.user_id = :user_id"
@@ -515,7 +559,7 @@ class AsyncPostgresClient:
                         JOIN conversation_session cs ON cs.id = cm.session_id,
                              plainto_tsquery('portuguese', :query) query
                         WHERE cm.content_tsv @@ query
-                          AND cs.service = :service
+                          {service_filter}
                           {user_filter}
 
                         UNION ALL
@@ -526,7 +570,7 @@ class AsyncPostgresClient:
                         JOIN conversation_session cs ON cs.id = cm.session_id,
                              plainto_tsquery('english', :query) query
                         WHERE cm.content_tsv @@ query
-                          AND cs.service = :service
+                          {service_filter}
                           {user_filter}
                     )
                     SELECT DISTINCT ON (id) id, rank
@@ -550,6 +594,27 @@ class AsyncPostgresClient:
     # ---------------------------------------------------------------
     # ConversationMessage CRUD
     # ---------------------------------------------------------------
+
+    async def set_message_embedding(
+        self,
+        message_id: UUID,
+        embedding: list[float],
+    ) -> None:
+        """Preenche o embedding de uma mensagem já salva.
+
+        Usado pelo preenchimento em background das respostas do assistant
+        (ver PersistentSessionManager._embed_saved_message) e pelo backfill
+        de scripts/backfill_assistant_embeddings.py.
+        """
+        async with self.get_session() as db:
+            await db.execute(
+                text(
+                    "UPDATE conversation_message SET embedding = CAST(:emb AS vector) "
+                    "WHERE id = :id"
+                ),
+                {"emb": str(embedding), "id": str(message_id)},
+            )
+            await db.commit()
 
     async def save_message(
         self,
@@ -777,6 +842,13 @@ class AsyncPostgresClient:
             stmt = select(User).where(User.username == username)
             result = await db.execute(stmt)
             return result.scalars().first()
+
+    async def list_user_ids(self) -> list[UUID]:
+        """IDs de todos os usuários. Usado pelo pareamento: com um único usuário
+        (o caso real hoje) o painel não precisa pedir UUID digitado à mão."""
+        async with self.get_session() as db:
+            result = await db.execute(select(User.id))
+            return [row[0] for row in result.all()]
 
     async def ensure_user_exists(self, user_id: UUID) -> None:
         """Create user record with given ID if it doesn't exist yet."""
@@ -1511,6 +1583,129 @@ class AsyncPostgresClient:
             if device:
                 device.ws_connection_id = None
                 device.is_online = False
+                db.add(device)
+                await db.commit()
+
+    # ── Pareamento de device (docs/device-control-plan.md §2) ───────────
+
+    async def pair_device(
+        self,
+        *,
+        user_id: UUID,
+        device_id: str,
+        pairing_token_hash: str,
+        device_type: str,
+        model: str,
+        hardware_id: str,
+        os_platform: str,
+        os_version: str,
+        client_version: str = "",
+        display_name: str | None = None,
+        capabilities: dict | None = None,
+    ) -> ConnectedDevice:
+        """Cria/atualiza o device e grava o vínculo de dono (hash do token).
+
+        Re-parear um device existente ROTACIONA o token (o antigo deixa de valer
+        na hora) e mantém o ``display_name`` já dado pelo usuário, a menos que um
+        novo venha explicitamente.
+        """
+        from datetime import datetime as _dt
+        import time as _time
+
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+
+            if device is None:
+                device = ConnectedDevice(
+                    user_id=user_id,
+                    device_id=device_id,
+                    device_type=device_type,
+                    model=model,
+                    hardware_id=hardware_id,
+                    os_platform=os_platform,
+                    os_version=os_version,
+                    client_version=client_version,
+                    last_heartbeat_unix=int(_time.time()),
+                    is_online=False,
+                )
+
+            device.user_id = user_id
+            device.device_type = device_type
+            device.model = model
+            device.hardware_id = hardware_id
+            device.os_platform = os_platform
+            device.os_version = os_version
+            device.client_version = client_version
+            device.pairing_token_hash = pairing_token_hash
+            device.paired_at = _dt.utcnow()
+            device.capabilities = capabilities
+            # Nome só é sobrescrito quando vem um novo — o pareamento não pode
+            # apagar o "PC da sala" que o usuário já batizou.
+            if display_name is not None:
+                device.display_name = display_name
+            elif not device.display_name:
+                device.display_name = None
+
+            db.add(device)
+            await db.commit()
+            await db.refresh(device)
+            return device
+
+    async def delete_device(self, device_id: str) -> bool:
+        """Apaga um device. Apagar a linha invalida o token junto (só existia o hash)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device is None:
+                return False
+            await db.delete(device)
+            await db.commit()
+            return True
+
+    async def get_device_by_token_hash(self, token_hash: str) -> ConnectedDevice | None:
+        """Resolve um device pelo hash do token — a fonte de verdade do dono.
+
+        É por aqui que o core descobre ``user_id`` e ``device_id`` sem confiar em
+        nada que o cliente afirme.
+        """
+        if not token_hash:
+            return None
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(
+                ConnectedDevice.pairing_token_hash == token_hash
+            )
+            result = await db.execute(stmt)
+            return result.scalars().first()
+
+    async def set_device_display_name(
+        self, device_id: str, display_name: str | None
+    ) -> ConnectedDevice | None:
+        """Renomeia um device. Devolve o registro atualizado (ou None)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device is None:
+                return None
+            device.display_name = display_name
+            db.add(device)
+            await db.commit()
+            await db.refresh(device)
+            return device
+
+    async def set_device_capabilities(
+        self, device_id: str, capabilities: dict | None
+    ) -> None:
+        """Atualiza o que o device declara saber fazer (informado na conexão)."""
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            result = await db.execute(stmt)
+            device = result.scalars().first()
+            if device:
+                device.capabilities = capabilities
                 db.add(device)
                 await db.commit()
 

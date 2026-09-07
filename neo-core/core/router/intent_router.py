@@ -320,8 +320,9 @@ Nunca invente um `file_id` nem um caminho que o usuário não mencionou.
 ## Paths
 - **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversa, conhecimento geral, saudação, jogo, tradução, dados pessoais (treino, dieta, suplemento, rotina — injetados automaticamente) — qualquer coisa respondível em texto — MAIS tudo que roda no sandbox (regra mestra acima). O cérebro também tem `web_search` e as tools `file_*` do catálogo. **Default na dúvida.**
 - **SERVER_TOOL**: dado externo em tempo real (clima via `get_weather`) OU ler/mudar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Para MUDAR use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: voz → `{{"setting":"tts.voice","value":"<nome>"}}`; engine/motor → `{{"setting":"tts.engine","value":"<qwen|coqui|dia>"}}`. "quais vozes você tem?" → `voice_list`; "o que dá pra configurar?" → `config_list`.
-- **CLIENT_TOOL**: só o que exige a máquina do usuário (regra mestra acima). Existem DUAS tools client-side e nenhuma outra — `read_file`, `list_directory`, `search_files`, `get_system_info` NÃO existem, nunca invente uma terceira:
+- **CLIENT_TOOL**: só o que exige a máquina do usuário (regra mestra acima). Existem TRÊS tools client-side e nenhuma outra — `read_file`, `list_directory`, `search_files`, `get_system_info` NÃO existem, nunca invente uma quarta:
   - `save_generated_file`: entrega no disco dele um arquivo que o cérebro já publicou (exige um `file_id` real do histórico).
+  - `write_file`: grava TEXTO que você já tem num arquivo do disco dele, em uma chamada — `tool_arguments={{"path": "<absoluto ou ~/...>", "content": "<o texto>"}}` (opcional `mode: "append"`). Prefira esta a um `run_command` com `cat <<EOF`/`echo >`: pelo shell, aspas/crase/`$` no conteúdo corrompem o arquivo calado. Só quando o conteúdo JÁ existe (o usuário ditou, ou está na conversa); se ainda é preciso GERAR o conteúdo, é DIRECT_RESPONSE.
   - `run_command`: todo o resto (ler/listar/escrever arquivo, espaço em disco, processos, instalar/abrir programa), via `raw_command` de shell. O comando só pode citar nome/caminho que o USUÁRIO disse nesta mensagem ou no histórico recente — NUNCA invente um nome plausível que ele não mencionou (pediram "meu relatório de finanças" sem dizer o nome → não existe `relatorio.csv` pra chutar; isso é DIRECT_RESPONSE ou plano de sondagem).
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário — pessoal ("avisa minha mãe que vou chegar tarde"), comercial (pizza, delivery, farmácia, mercado, encomenda) ou pra telefone/JID direto. Extraia sempre em `tool_arguments` os campos `text` (o texto) e `recipient` (JID, telefone OU apelido cru como "minha mãe", "pai", "Ana" — NÃO interprete o apelido, o pipeline resolve na agenda). `contact_source` ("whatsapp" = agenda do WhatsApp | "saved" = contatos salvos do Neo) só quando o usuário disser a fonte EXPLICITAMENTE; senão omita.
 - **HOME_ASSISTANT**: a casa inteligente do usuário — luz, tomada/interruptor, clima/termostato, persiana, cena, script, automação ("acende a luz da sala", "ativa o modo cinema", "qual a temperatura do termostato?"). É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*`, NÃO preencha `entity_id`/`tool_arguments` (a skill resolve o dispositivo sozinha) e nunca invente entity_id. NÃO confundir com `list_connected_devices`, que é dos dispositivos do PRÓPRIO Neo (desktop/celular).
@@ -351,7 +352,7 @@ REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=impe
 
 ## Key Rules
 - **Arquivo ANEXADO na conversa**: se o contexto tem a seção "ARQUIVOS ANEXADOS NESTA MENSAGEM" ou "ARQUIVOS DESTA CONVERSA", esses arquivos estão no catálogo do PRÓPRIO Neo (não no disco do usuário) — QUALQUER pergunta sobre eles ("o que tem nesse arquivo?", "de qual instituição é?", "resume", "quantas linhas tem") é **DIRECT_RESPONSE**: o cérebro lê sozinho com as tools `file_*`. NUNCA escolha `run_command` para eles e **NUNCA invente um caminho** (ex.: `/Users/.../Downloads/<nome>`) a partir do nome do arquivo. Só é CLIENT_TOOL quando o USUÁRIO cita explicitamente um caminho/pasta da máquina dele nesta mensagem.
-- **Mostrar/exibir IMAGEM** ("carrega essa imagem aqui no chat", "mostra a foto X", "quero ver o print"): quem exibe é o CÉREBRO — ele escreve `[[IMAGE:/caminho/da/imagem.ext]]` na resposta e o cliente desenha. Se o caminho JÁ apareceu nesta conversa (o usuário citou, ou saiu de um comando anterior) → **DIRECT_RESPONSE**. Só é CLIENT_TOOL quando ainda falta DESCOBRIR onde a imagem está (`ls`/`find`). NUNCA roteie para um comando que "converte a imagem" (`base64`, `xxd`, `cat` de .jpg/.png): isso não mostra nada e despeja um blob gigante na conversa.
+- **Mostrar/exibir IMAGEM** ("carrega essa imagem aqui no chat", "mostra a foto X", "quero ver o print"): quem exibe é o CÉREBRO — ele escreve `[[IMAGE:/caminho/da/imagem.ext]]` na resposta e o cliente desenha. Se o caminho JÁ apareceu nesta conversa (o usuário citou, ou saiu de um comando anterior) → **DIRECT_RESPONSE**. Só é CLIENT_TOOL quando ainda falta DESCOBRIR onde a imagem está (`ls`/`find`). NUNCA roteie para um comando que "converte a imagem" (`base64`, `xxd`, `cat` de .jpg/.png): isso não mostra nada e despeja um blob gigante na conversa. Exceção: print da tela do BROWSER do servidor ("mostra o que apareceu no browser", "tira um print daí") → **SERVER_TOOL** `browser_screenshot` — essa imagem ainda não existe, precisa ser tirada.
 - **Evento atual / notícia / esporte / cotação** ("qual o jogo hoje?", "quem ganhou X?", "cotação do dólar", "saiu a versão nova?") e questionamento de resposta anterior ("tem certeza?"): **DIRECT_RESPONSE** — o cérebro busca na web sozinho antes de responder. NÃO escolha tool aqui.
 - **Agir é o padrão; só o TEXTO do comando é a exceção**: quando o pedido depende da máquina do usuário, a resposta certa é RODAR (CLIENT_TOOL), não explicar como rodar — inclusive em follow-up curto logo depois de um comando ("e quais?", "lista os nomes", "então roda", "e agora?", "mostra tudo"), que é a MESMA tarefa com mais detalhe. A ÚNICA exceção é ele pedir explicitamente só o texto ("qual o comando pra...", "me diz o comando", "como eu faço pelo terminal?", "não roda, só me mostra") → **DIRECT_RESPONSE**.
 - **Continuidade e back-reference**: jogo/quiz/roleplay/tarefa criativa em andamento no histórico, ou referência ao que já foi feito ("está errado", "refaz", "melhora isso", "de onde veio isso?") → DIRECT_RESPONSE.
@@ -474,6 +475,7 @@ class IntentRouter:
         system_context: str | None = None,
         affect_hint: str | None = None,
         affect_force_brain: bool = False,
+        artifact_paths: dict[str, str] | None = None,
     ) -> RoutingDecision:
         """Classify user intent and return a routing decision.
 
@@ -489,6 +491,12 @@ class IntentRouter:
             affect_force_brain: Desvio determinístico para o núcleo cognitivo. O
                 hint sozinho é sugestão a um LLM; isto é a garantia. Quem calcula
                 é o AIService — o roteador não conhece PKS nem afeto.
+            artifact_paths: ``{nome-do-arquivo: caminho real}`` dos arquivos que o
+                Neo já pôs no disco do usuário (registro de artefatos do caderno
+                de trabalho). Serve a DUAS coisas, e nenhuma delas é prompt: o
+                nome conhecido passa a contar como fundamentado, e o caminho que
+                o classificador montou de cabeça é substituído pelo real. É o que
+                torna "vai direto no arquivo" determinístico em vez de torcida.
 
         Returns:
             RoutingDecision with intent, tool info, etc.
@@ -689,7 +697,10 @@ class IntentRouter:
 
             # Parse routing decision as before, then attach classifier metadata
             decision = self._parse_classification(
-                raw_text, user_message=user_message, conversation_history=conversation_history
+                raw_text,
+                user_message=user_message,
+                conversation_history=conversation_history,
+                artifact_paths=artifact_paths,
             )
             self._apply_memory_heuristics(decision, user_message)
             # Attach raw classifier response + the prompt/messages sent for later inspection
@@ -703,6 +714,7 @@ class IntentRouter:
                 ],
                 "raw_response": raw_text,
             }
+            decision = self._bias_local_browser(decision, user_message)
             return self._apply_affect_bias(decision, affect_force_brain)
 
         except Exception as e:
@@ -714,7 +726,42 @@ class IntentRouter:
                 {"role": m.role.value if hasattr(m.role, 'value') else str(m.role), "content": m.content[:4000]}
                 for m in messages
             ], "error": str(e)}
+            fallback = self._bias_local_browser(fallback, user_message)
             return self._apply_affect_bias(fallback, affect_force_brain)
+
+    def _resolve_artifact_paths(
+        self, command: str, artifact_paths: dict[str, str]
+    ) -> tuple[str, list[str]]:
+        """Troca caminho MONTADO por caminho REAL de artefato já registrado.
+
+        O classificador compõe ``<pasta do Contexto do Sistema> + <nome>`` e
+        acerta na maioria das vezes — mas é um palpite: o navegador do usuário
+        pode salvar em outra pasta, e o nome pode ter mudado ao completar o
+        download. Quando o nome está no registro de artefatos, o caminho real é
+        conhecido e não há motivo para adivinhar.
+
+        Devolve ``(comando, nomes resolvidos)``. Os nomes servem para o guard de
+        fundamentação: arquivo que EU mesmo pus lá está fundamentado por
+        construção, mesmo que o usuário nunca tenha escrito o nome.
+        """
+        if not command or not artifact_paths:
+            return command, []
+        resolved: list[str] = []
+        out = command
+        for match in _PATH_WITH_EXT_RE.finditer(command):
+            literal = match.group(0)
+            basename = literal.rsplit("/", 1)[-1]
+            real = artifact_paths.get(basename.lower())
+            if not real or real == literal:
+                continue
+            out = out.replace(literal, real)
+            resolved.append(basename)
+        if resolved:
+            logger.info(
+                "Router: caminho resolvido pelo registro de artefatos %r — %r → %r",
+                resolved, command, out,
+            )
+        return out, resolved
 
     def _ungrounded_path_literals(self, command: str, haystack: str) -> list[str]:
         """Caminhos com extensão citados em ``command`` que não aparecem (nem pelo
@@ -845,6 +892,7 @@ class IntentRouter:
         raw_text: str,
         user_message: str = "",
         conversation_history: list[dict[str, str]] | None = None,
+        artifact_paths: dict[str, str] | None = None,
     ) -> RoutingDecision:
         """Parse LLM JSON response into RoutingDecision."""
         text = raw_text.strip()
@@ -962,9 +1010,23 @@ class IntentRouter:
                 tool_arguments.get("command") if isinstance(tool_arguments, dict) else None
             )
             if cmd_to_check:
+                # Passo 1: caminho de artefato conhecido vira o caminho REAL.
+                cmd_to_check, resolved = self._resolve_artifact_paths(
+                    cmd_to_check, artifact_paths or {}
+                )
+                if resolved:
+                    if raw_command:
+                        raw_command = cmd_to_check
+                    elif isinstance(tool_arguments, dict):
+                        tool_arguments = {**tool_arguments, "command": cmd_to_check}
                 haystack = user_message + "\n" + "\n".join(
                     str(m.get("content", "")) for m in (conversation_history or [])[-8:]
                 )
+                # Passo 2: o registro é âncora de fundamentação. Arquivo que o
+                # próprio Neo baixou não precisa ter sido citado pelo usuário
+                # para ser um alvo legítimo — ele é evidência de disco, não chute.
+                if artifact_paths:
+                    haystack += "\n" + "\n".join(artifact_paths.values())
                 ungrounded = self._ungrounded_path_literals(cmd_to_check, haystack)
                 if ungrounded:
                     logger.warning(
@@ -1030,6 +1092,53 @@ class IntentRouter:
             "Roteado ao núcleo cognitivo: o estado emocional do Neo com este usuário "
             "muda qual é a resposta certa, e a skill não conhece esse estado "
             "(o cérebro decide e pode acionar a skill via handoff)."
+        )
+        return decision
+
+    def _bias_local_browser(
+        self, decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """Pediu o navegador DELE? Então quem atende é o cognitivo, e ponto.
+
+        A tool ``browser_local_task`` só existe no núcleo cognitivo. Quando o
+        roteador manda a mensagem para outro trilho, o portão do §5 nunca roda e
+        o pedido cai no navegador HEADLESS do servidor — o usuário fica olhando
+        uma tela onde nada acontece. Foi o que houve em 2026-08-28: o
+        classificador caiu (OpenRouter 403), o fallback por palavra-chave viu
+        "busca" em "deveria ter buscado na barra de busca" e devolveu
+        SERVER_TOOL; o turno virou um job no Chromium da VPS que terminou em
+        ``about:blank``.
+
+        Vale nos DOIS caminhos do classify pelo mesmo motivo do viés de afeto:
+        quando o provider cai, o fallback é justamente onde o erro acontece.
+        A âncora é o portão já medido contra o corpus real
+        (``scripts/eval_browser_gate.py``: 15 marcações em ~1700 mensagens, zero
+        falso positivo), então promover essas poucas ao cérebro é barato.
+        """
+        if decision.intent in (IntentType.COGNITIVE, IntentType.DIRECT_RESPONSE):
+            return decision
+        from shared.config import get_settings
+
+        if not getattr(get_settings(), "browser_local_enabled", False):
+            return decision
+        from core.browser_local.gate import local_browser_requested
+
+        if not local_browser_requested(user_message):
+            return decision
+
+        logger.info(
+            "Intent: %s → COGNITIVE (pediu o navegador dele; conf=%.2f)",
+            decision.intent.value, decision.confidence,
+        )
+        decision.intent = IntentType.COGNITIVE
+        decision.skill_name = None
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.needs_memory = True
+        decision.explanation = (
+            "Roteado ao núcleo cognitivo: o pedido é para o navegador do próprio "
+            "usuário, e a tool que abre a tela dele (browser_local_task) só existe lá."
         )
         return decision
 

@@ -90,15 +90,81 @@ def _manager(db: _FakeDB) -> PersistentSessionManager:
     )
 
 
-@pytest.mark.asyncio
-async def test_expired_explicit_session_creates_new_backend_session():
-    old_id = uuid4()
-    old = ConversationSession(
-        id=old_id,
+def _idle_session(hours: float) -> ConversationSession:
+    return ConversationSession(
+        id=uuid4(),
         status="active",
         message_count=4,
-        last_activity_at=datetime.utcnow() - timedelta(hours=2),
+        last_activity_at=datetime.utcnow() - timedelta(hours=hours),
     )
+
+
+@pytest.mark.asyncio
+async def test_expired_live_session_creates_new_backend_session():
+    """No live, o relógio curto continua valendo: pausa longa encerra a conversa."""
+    old = _idle_session(hours=2)
+    old_id = old.id
+    db = _FakeDB(old)
+
+    session = await _manager(db).get_or_create_session(
+        session_id=old_id,
+        user_id=None,
+        service="neo-desktop",
+        mode="live",
+    )
+
+    assert session.id != old_id
+    assert old.status == "closed"
+    assert old.extra_metadata["close_reason"] == "inactivity"
+    assert session.extra_metadata["created_after_expired_session_id"] == str(old_id)
+
+
+@pytest.mark.asyncio
+async def test_chat_session_survives_a_gap_that_would_expire_live():
+    """A regressão que motivou o mode: 2h de pausa NÃO podem cortar um chat.
+
+    Era assim que "converte o preço da ponte que eu tinha pedido" chegava numa
+    sessão em branco — 3h27 depois da resposta que continha o preço.
+    """
+    old = _idle_session(hours=2)
+    old_id = old.id
+    db = _FakeDB(old)
+
+    session = await _manager(db).get_or_create_session(
+        session_id=old_id,
+        user_id=None,
+        service="neo-desktop",
+        mode="agent",
+    )
+
+    assert session.id == old_id
+    assert old.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_chat_session_still_expires_on_the_long_backstop():
+    """O backstop existe para `close_session` ainda gerar o resumo do tópico."""
+    old = _idle_session(hours=24)
+    old_id = old.id
+    db = _FakeDB(old)
+
+    session = await _manager(db).get_or_create_session(
+        session_id=old_id,
+        user_id=None,
+        service="neo-desktop",
+        mode="agent",
+    )
+
+    assert session.id != old_id
+    assert old.status == "closed"
+    assert session.extra_metadata["created_after_expired_session_id"] == str(old_id)
+
+
+@pytest.mark.asyncio
+async def test_turn_resumption_without_mode_is_treated_as_chat():
+    """tool_result/aprovação de comando não carregam mode e não podem expirar."""
+    old = _idle_session(hours=2)
+    old_id = old.id
     db = _FakeDB(old)
 
     session = await _manager(db).get_or_create_session(
@@ -107,10 +173,8 @@ async def test_expired_explicit_session_creates_new_backend_session():
         service="neo-desktop",
     )
 
-    assert session.id != old_id
-    assert old.status == "closed"
-    assert old.extra_metadata["close_reason"] == "inactivity"
-    assert session.extra_metadata["created_after_expired_session_id"] == str(old_id)
+    assert session.id == old_id
+    assert old.status == "active"
 
 
 @pytest.mark.asyncio

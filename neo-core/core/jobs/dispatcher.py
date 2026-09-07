@@ -18,6 +18,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from core.jobs.screenshots import image_markers
 from db.models.agent_job import AgentJob
 from shared import Message, MessageRole
 
@@ -57,7 +58,7 @@ class ProactiveDispatcher:
             await self._mark_notified(job)
             return
 
-        text = await self._compose(job)
+        text = self._append_images(job, await self._compose(job))
 
         # 1. Persiste na história da sessão de origem (se houver).
         if job.session_id is not None:
@@ -92,10 +93,23 @@ class ProactiveDispatcher:
             provider = self.llm.get_provider(None)
             spec = job.spec_json or {}
             detail = spec.get("command") or spec.get("goal") or job.title
+            # "Estado final: failed" sozinho é fraco demais: o modelo lê o resumo,
+            # acha uma frase otimista e escreve "deu tudo certo". A ordem em
+            # português, no imperativo, é o que segura.
+            aviso = (
+                ""
+                if job.status == "completed"
+                else (
+                    f"\nATENÇÃO: a tarefa NÃO foi concluída (estado {job.status}). "
+                    "É PROIBIDO dizer que deu certo, que baixou, que enviou ou que "
+                    "terminou. Diga o que falhou e onde parou.\n"
+                )
+            )
             user_ctx = (
                 f"Tarefa: {job.title}\n"
                 f"Detalhe: {detail}\n"
                 f"Estado final: {job.status}\n"
+                f"{aviso}"
                 f"Resultado/logs (pode estar truncado):\n{summary[:3500] or '(sem saída)'}"
             )
             messages = [
@@ -113,6 +127,26 @@ class ProactiveDispatcher:
         except Exception as e:  # noqa: BLE001
             logger.warning("[Dispatch] compose LLM failed for job %s: %s", job.id, e)
             return fallback
+
+    @staticmethod
+    def _append_images(job: AgentJob, text: str) -> str:
+        """Pendura os `[[IMAGE:file:…]]` do job DEPOIS de redigir o texto.
+
+        Fora do ``_compose`` de propósito: o marcador é sintaxe para o cliente, e
+        um LLM redigindo "no seu tom de sempre" reescreve, resume ou come um
+        token estranho no meio do texto. Passando por fora, a imagem chega
+        íntegra — e como o marcador fica no ``content`` salvo, reabrir a sessão
+        redesenha os prints (ver docs/file-store-plan.md + imagens inline).
+        """
+        markers = image_markers((job.extra_metadata or {}).get("images"))
+        if not markers:
+            return text
+        # Se o texto redigido já citou um marcador (o resumo mencionava), não
+        # duplica — o parser do cliente dedup por origem, mas o texto ficaria feio.
+        novos = [m for m in markers if m.split("|")[0] not in text]
+        if not novos:
+            return text
+        return (text.rstrip() + "\n\n" + "\n".join(novos)).strip()
 
     @staticmethod
     def _fallback_text(job: AgentJob, summary: str) -> str:

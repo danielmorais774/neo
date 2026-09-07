@@ -2,8 +2,8 @@
 
 **Data:** 2026-07-15
 **Status:** F1 EM PRODUÇÃO (2026-07-15, ver §10) — F2 parcial (handoff note e
-GET /sessions já saíram na F1); pendentes F2-resto (screenshots como artefatos,
-progresso em job_logs), F3 (credenciais) e F4 (hardening)
+GET /sessions saíram na F1; **prints da tela em 2026-08-24, ver §3.7**);
+pendentes progresso em `job_logs`, F3 (credenciais) e F4 (hardening)
 **Depende de:** sistema de jobs (docs/workbench-background-jobs-plan.md, F1–F3 em prod) e ProactiveDispatcher.
 
 A ideia: uma instância de Chromium rodando no backend (VPS), dirigida pela lib
@@ -219,9 +219,37 @@ Regra de ouro: **nenhum LLM vê segredo em claro**. Três camadas:
 
 ### 3.7 Artefatos e observabilidade
 
-- Screenshots por passo (ou GIF da task, a lib gera) salvos no volume;
-  expostos pelo padrão dos artefatos de research (endpoint autenticado do
-  neo-core), NUNCA públicos — screenshot de página logada é dado sensível.
+**Prints da tela (implementado em 2026-08-24).** O texto do subagente é a única
+coisa que o usuário via de uma task; quando dava erro, "não consegui" não
+explicava nada. Agora o print vira a evidência — e chega sozinho no chat:
+
+| Camada | Arquivo | Papel |
+|---|---|---|
+| captura | `docker/neo-browser-agent/app/shots.py` | print AO VIVO (CDP, JPEG q75) + os por passo que a lib guardou (PNG); orçamento de nº/tamanho |
+| política | `session_manager.run_task(screenshots=…)` | `auto` (default: só em erro/timeout/`success=False`) · `always` · `never` |
+| transporte | `POST /sessions/{sid}/tasks` → campo `screenshots` (base64) | o browser está em OUTRO container; o File Store é a única superfície comum |
+| ingestão | `core/jobs/screenshots.py` → `extra_metadata["images"]` | vira arquivo `origin="job"`, retenção temp (TTL de 7 dias do store) |
+| exibição | `ProactiveDispatcher._append_images` | `[[IMAGE:file:<id>\|legenda]]` colado DEPOIS do texto redigido |
+| sob demanda | `POST /sessions/{sid}/screenshot` + tool `browser_screenshot` | "me mostra o que tá aí agora", sem rodar task nova — funciona até com task em andamento |
+
+Três decisões que valem a pena lembrar:
+
+1. **O print do erro é tirado ANTES do `_kill_browser`.** Nos dois caminhos de
+   falha (timeout e crash) o Chromium é reciclado; depois disso não existe mais
+   tela para fotografar. Por isso `_capture_failure` roda primeiro.
+2. **Mais de um print, de propósito**: o ao vivo mostra ONDE parou, os do
+   histórico mostram COMO chegou lá (`browser_max_screenshots`, default 3).
+3. **O marcador entra por fora do LLM** que redige o aviso proativo. Dentro do
+   `result_summary` ele seria reescrito/comido pelo "escreve no seu tom"; por
+   fora, chega íntegro — e como fica salvo no `content` da mensagem, reabrir a
+   sessão redesenha os prints.
+
+Print é evidência EXTRA: base64 podre, File Store desligado ou quota estourada
+NUNCA derrubam a task (`ingest_shots` engole tudo e loga). O oposto — perder o
+resultado por causa de uma foto — seria trocar o certo pelo enfeite.
+
+- GIF da task (a lib gera) continua fora: um MP4/GIF por task é caro no volume
+  e o par "passos + tela final" já responde "o que aconteceu?".
 - Log do agente (ação por passo) vai para o log do job ⇒ `job_logs` já serve
   de olho em tempo real. Evitar o gap de observabilidade da skill HA (verdade
   só no app.log): o resultado do job guarda o histórico de ações.
@@ -298,8 +326,8 @@ Regra de ouro: **nenhum LLM vê segredo em claro**. Três camadas:
   A do §4 — dois prompts encadeados continuam na mesma aba; e restart do
   container preserva um login feito manualmente na sessão.
 - **F2 — continuidade rica:** handoff note, `GET /sessions` (estado + abas +
-  screenshot), TTL/eviction, fila por sessão, screenshots como artefatos no
-  padrão research, progresso em `job_logs`.
+  screenshot), TTL/eviction, fila por sessão, **prints da tela (§3.7, feito em
+  2026-08-24)**, progresso em `job_logs` (pendente).
 - **F3 — credenciais:** tabela cifrada + store + aba Credenciais no neo-panel
   + `use_credentials`→`sensitive_data` + `credential_guard` no PKS.
 - **F4 — hardening/extras:** `allowed_domains` por skill, TOTP/2FA, múltiplas
@@ -379,7 +407,16 @@ fila FIFO (2) por sessão.
 
 ### Limitações conhecidas (= backlog F2/F4)
 
-- Sem screenshots/GIF como artefatos e sem progresso em `job_logs` (F2-resto).
+- Sem progresso em `job_logs` durante a task (F2-resto) — hoje só o
+  `progress_note` genérico. Prints já saíram (§3.7); GIF segue fora.
+- **Marcador cru fora do desktop**: a tool `browser_screenshot` só entrega o
+  `[[IMAGE:file:…]]` a cliente que renderiza (`can_show_images`), mas o AVISO
+  PROATIVO de um job não sabe de qual cliente a task nasceu — num canal sem
+  render (WhatsApp, neo-panel) o marcador apareceria como texto. Mesmo gap já
+  conhecido das imagens inline; fechar quando incomodar (guardar o `client` no
+  `spec_json` da task e checar no dispatcher).
+- Print de página logada é dado sensível: fica no File Store com retenção
+  `temp` (TTL de 7 dias, GC do store) e sai pela rota autenticada de download.
 - `GET /sessions/{sid}` perde last_task/current_url no restart do container
   (estado warm é só RAM; o que persiste é o perfil).
 - Roteador ainda não foi auditado para frases de browser (gotcha

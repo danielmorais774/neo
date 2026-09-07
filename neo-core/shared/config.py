@@ -77,6 +77,24 @@ class Settings(BaseSettings):
         description="Phase 4: expand the classifier's declared pipeline_plan into "
         "a multi-step cascade. Set false to ignore pipeline_plan (single step).",
     )
+    pipeline_self_handoff_enabled: bool = Field(
+        default=True,
+        description="Self-continuation: let the cognitive core emit "
+        "[[HANDOFF:continuar]] to run ITSELF again with the next concrete order, "
+        "instead of ending the turn promising future work ('sigo tentando'). "
+        "Requires pipeline_handoff_enabled.",
+    )
+    pipeline_self_handoff_max_steps: int = Field(
+        default=8,
+        description="Total step budget for a turn that self-continues. Larger than "
+        "the plain handoff budget (a retry cycle burns steps fast) and it is the "
+        "hard stop that keeps the cycle finite.",
+    )
+    pipeline_self_handoff_max_depth: int = Field(
+        default=7,
+        description="Max chain depth for self-continuation steps. Must stay under "
+        "pipeline_self_handoff_max_steps or the step budget never binds.",
+    )
 
     # Intent routing — bias-to-brain (Workstream B, intent-routing-redesign.md)
     router_bias_to_brain_enabled: bool = Field(
@@ -238,6 +256,95 @@ class Settings(BaseSettings):
         default=40, ge=3, le=100,
         description="Teto default de passos do subagente browser-use por task.",
     )
+    browser_screenshots_default: str = Field(
+        default="auto",
+        description="Política default de prints da tela numa browser_task: 'auto' "
+        "(tira só quando dá erro/timeout — a evidência que o texto não dá), "
+        "'always' (tira também no fim de uma task bem-sucedida) ou 'never'. O "
+        "cérebro sobrescreve por chamada quando o usuário pede para ver.",
+    )
+    browser_max_screenshots: int = Field(
+        default=3, ge=1, le=6,
+        description="Quantos prints uma browser_task pode anexar (o do momento do "
+        "erro + os passos anteriores). Vira arquivo temp no File Store.",
+    )
+
+    # Mercado Livre — app oficial (docs/product-search-plan.md §2).
+    # Medido em 2026-08-19: é o ÚNICO caminho que abre o ML. Sem token a API dá
+    # 403, o HTML manda pra /gz/account-verification (inclusive de IP
+    # ── Navegador LOCAL (docs/browser-local-plan.md) ──
+    # O Neo dirigindo o navegador da máquina do usuário, na tela dele. Default
+    # OFF como todo caminho que atua para fora (mesmo critério do device_power):
+    # é o Chrome do usuário, com as sessões logadas dele.
+    browser_local_enabled: bool = Field(
+        default=False,
+        description="Liga a tool browser_local_task (navegador do usuário via "
+        "/ws/devices/control + extensão neo-browser-local). Requer jobs_enabled.",
+    )
+    browser_local_model: str = Field(
+        default="deepseek-v4-flash",
+        description="Modelo que decide o passo do navegador local. Saída curta e "
+        "estruturada (um JSON por passo) — não precisa do caro.",
+    )
+    browser_local_vision: bool = Field(
+        default=True,
+        description="Manda um print da tela JUNTO com o texto a cada passo do "
+        "navegador local. Sem isto o driver é cego: em 2026-08-28 ele clicou 25 "
+        "vezes no mesmo botão sem perceber que a tela não mudava.",
+    )
+    browser_local_vision_model: str = Field(
+        default="google/gemini-3.1-flash-lite",
+        description="Modelo COM VISÃO que decide o passo quando browser_local_vision "
+        "está ligado (substitui browser_local_model nesse caso). Precisa aceitar "
+        "image_url + max_tokens/temperature. Se a chamada falhar, o driver cai "
+        "sozinho para browser_local_model (texto) pelo resto da tarefa. "
+        "Este é só o PADRÃO: o valor de verdade vem do painel (Configurações → "
+        "Modelos → 'Navegador local — olho'), lido a cada job. Era gpt-4.1-mini "
+        "até 2026-08-31, quando a chave da OpenAI ficou sem crédito e dois jobs "
+        "inteiros rodaram cegos sem ninguém saber.",
+    )
+    browser_local_max_steps: int = Field(
+        default=25,
+        description="Teto de passos por tarefa no navegador local. Menor que o do "
+        "headless: cada passo é uma ida-e-volta até a máquina do usuário, e ele "
+        "está olhando.",
+    )
+    browser_local_job_timeout: int = Field(
+        default=600,
+        description="Timeout (s) de uma tarefa no navegador local.",
+    )
+    browser_local_blocked_domains: str = Field(
+        default="",
+        description="Domínios onde o Neo NUNCA entra no navegador local, separados "
+        "por vírgula (internet banking, painel do provedor). Sem exceção via LLM.",
+    )
+    browser_local_confirm_sensitive: bool = Field(
+        default=True,
+        description="Parar e perguntar antes de clicar em algo irreversível "
+        "(comprar/pagar/enviar/excluir) no navegador local.",
+    )
+    browser_local_trace_dir: str = Field(
+        default="logs/browser_local",
+        description="Onde fica o diário de bordo de cada tarefa do navegador local "
+        "(um diretório por job: trace.md + os JPEGs de cada passo). Vazio desliga. "
+        "Guarda as 20 tarefas mais recentes.",
+    )
+    browser_local_max_screenshots: int = Field(
+        default=3,
+        description="Quantos prints uma tarefa do navegador local pode anexar.",
+    )
+
+    # residencial) e o browser real toma reCAPTCHA em loop.
+    ml_app_id: str = Field(
+        default="",
+        description="AppID (client_id) do app em developers.mercadolivre.com.br. "
+        "Vai no .env da RAIZ (ML_APP_ID) — o container não lê o neo-core/.env.",
+    )
+    ml_client_secret: str = Field(
+        default="",
+        description="Client Secret do mesmo app (ML_CLIENT_SECRET). Só na env da "
+        "VPS — nunca no banco nem no spec_json de job.",
+    )
 
     # Skills Library — skills declarativas SKILL.md (docs/skills-library-plan.md)
     skills_library_enabled: bool = Field(
@@ -310,7 +417,22 @@ class Settings(BaseSettings):
 
     # Session lifecycle
     session_inactivity_minutes: int = Field(
-        default=30, ge=1, description="Minutes of inactivity before auto-closing a session"
+        default=30, ge=1,
+        description="Minutes of inactivity before auto-closing a LIVE (voice) session",
+    )
+    #: O chat não é uma ligação telefônica: um intervalo de 30min nele é normal
+    #: (você sai, volta e continua a MESMA conversa), enquanto no live ele quer
+    #: mesmo dizer que a conversa acabou. Medido no corpus de 536 sessões: das 28
+    #: nascidas do relógio, ~metade das de chat abria com uma continuação órfã
+    #: ("tenta de novo", "converte o preço da ponte que eu tinha pedido") contra
+    #: ZERO das de live — cujas aberturas são todas partidas do zero ("Alô, você
+    #: está me ouvindo?", "Testando o módulo de voz"). Daí o relógio curto valer
+    #: só para o live. Este backstop longo existe porque `close_session` é quem
+    #: gera `topic_summary`/`topic_embedding`: sem NENHUMA expiração eles nunca
+    #: seriam produzidos. Use 0 para nunca expirar por tempo fora do live.
+    session_inactivity_chat_minutes: int = Field(
+        default=720, ge=0,
+        description="Minutes of inactivity before auto-closing a non-live session (0 = never)",
     )
     session_topic_similarity_threshold: float = Field(
         default=0.45, ge=0.0, le=1.0,
@@ -348,6 +470,46 @@ class Settings(BaseSettings):
     context_relevance_threshold: float = Field(
         default=0.25, ge=0.0, le=1.0,
         description="Minimum relevance score for non-pinned candidates to enter the prompt",
+    )
+    context_budget_working_mem: int = Field(
+        default=700, ge=0,
+        description="Token budget for the working-memory index (docs/working-memory-plan.md)",
+    )
+
+    # ── Memória de trabalho — o caderno da tarefa (docs/working-memory-plan.md) ──
+    # Terceiro tipo de memória, entre a sessão (volátil) e o PKS (permanente): o
+    # Neo grava a CONCLUSÃO do trabalho que acabou de fazer (número apurado,
+    # formato do arquivo, decisão, caminho de artefato) para o turno seguinte não
+    # precisar reler nem reprocessar. Índice no prompt + corpo sob demanda.
+    working_memory_enabled: bool = Field(
+        default=False,
+        description="Liga o caderno de trabalho: tools wm_write/wm_read + índice no "
+        "system prompt + regra 12 no CORE. Off → prompt e toolset idênticos aos de antes.",
+    )
+    working_memory_autonote_enabled: bool = Field(
+        default=True,
+        description="Backstop determinístico (sem LLM): turno que rodou tool pesada e NÃO "
+        "chamou wm_write ganha um append automático com o tool_trace. Requer working_memory_enabled.",
+    )
+    working_memory_max_notes_in_index: int = Field(
+        default=8, ge=1,
+        description="Máximo de notas ativas listadas no índice injetado no prompt",
+    )
+    working_memory_note_max_bytes: int = Field(
+        default=32768, ge=1024,
+        description="Teto do corpo de uma nota; ao estourar, as entradas MAIS ANTIGAS caem",
+    )
+    working_memory_ttl_days: int = Field(
+        default=30, ge=1,
+        description="TTL de toque: nota sem escrita por esse tempo é arquivada pelo GC (pinned não expira)",
+    )
+    working_memory_read_tail_entries: int = Field(
+        default=4, ge=1,
+        description="Quantas entradas o wm_read devolve por padrão (full=true traz tudo)",
+    )
+    working_memory_gc_interval_s: int = Field(
+        default=21600, ge=60,
+        description="Intervalo do GC do caderno de trabalho (arquiva nota vencida)",
     )
 
     # ── Neo affect / emotional state (limbic model, per-user) ──────────
@@ -526,6 +688,14 @@ class Settings(BaseSettings):
         description="Chave Fernet do cofre de credenciais (NEO_CRED_KEY). Só na env "
         "da VPS — nunca no banco. Trocar a chave invalida os segredos já cifrados.",
     )
+    neo_email_send_enabled: bool = Field(
+        default=True,
+        description="Deixa o cérebro ENVIAR email pela caixa do próprio Neo (tool "
+        "`email_send`, SMTP com a mesma senha de app do IMAP). SEPARADA da leitura de "
+        "propósito: ler é reversível, um email enviado não volta. O `From` é sempre o "
+        "endereço do Neo — ele nunca escreve em nome do usuário. Off → a tool some do "
+        "registry e do toolset do cérebro; `email_inbox` continua funcionando.",
+    )
 
     # File Store (docs/file-store-plan.md §12) — entrada/catálogo de arquivos.
     neo_files_enabled: bool = Field(
@@ -580,6 +750,33 @@ class Settings(BaseSettings):
         "aí e me manda a saída' (sessão 69feab87). Off → o cérebro volta a só sugerir.",
     )
 
+    # ── Controle de devices (docs/device-control-plan.md) ──────────────
+    neo_device_control_enabled: bool = Field(
+        default=True,
+        description="Deixa o cérebro CONTROLAR dispositivos do usuário (tool "
+        "`device_control`: volume, mudo, play/pause, faixa, bloquear tela), inclusive "
+        "um dispositivo que NÃO é o desta conversa — 'abaixa o volume do PC da sala' "
+        "dito no celular. Roda pelo canal /ws/devices/control, que exige token de "
+        "pareamento. Off → o cérebro não vê a tool.",
+    )
+    neo_device_power_enabled: bool = Field(
+        default=False,
+        description="Habilita a tool `device_power` (suspend/shutdown/restart de um "
+        "dispositivo). SEPARADA de device_control de propósito: desligar a máquina "
+        "errada é irreversível de um jeito que abaixar o volume não é. O aparelho alvo "
+        "sempre pede confirmação na própria tela antes de executar. Default OFF — ligue "
+        "só depois de conferir que a :8000 não está aberta na internet.",
+    )
+    neo_device_auth_required: bool = Field(
+        default=False,
+        description="Exige token de pareamento também nos canais ANTIGOS "
+        "(/ws/devices/online e /ws/devices/notifications) e no gRPC. Default OFF porque "
+        "esses canais nasceram sem auth e virar a chave derruba o desktop em execução "
+        "no meio de um save (o core roda --reload). O canal de CONTROLE exige token "
+        "sempre, independente desta flag — ele é novo e não tem cliente antigo a "
+        "quebrar. Ligue depois que todo device estiver pareado.",
+    )
+
     # Panel auth (temporary without login flow)
     panel_jwt_secret: str = Field(
         default="l5L0mJ30C7v10OTI4eEOvxShOGwhGkPSEst7eicOiFGq8qG6TgL9u4CQUr6mByjV",
@@ -611,6 +808,31 @@ class Settings(BaseSettings):
     temporal_decay_days: int = Field(default=30, ge=1, description="Half-life for temporal decay")
     mmr_lambda: float = Field(default=0.7, ge=0.0, le=1.0, description="MMR diversity vs relevance")
     memory_search_limit: int = Field(default=20, ge=1, description="Results per memory search")
+
+    # ── Conversation Recall (docs/conversation-recall-plan.md) ────
+    conversation_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            "Tool `conversation_recall`: busca no arquivo de conversas passadas. "
+            "Read-only; a flag existe para desligar em incidente."
+        ),
+    )
+    conversation_recall_sessions_per_page: int = Field(
+        default=3, ge=1, le=10,
+        description="Conversas por página do recall (o resto vira 'foi antes ainda')",
+    )
+    conversation_recall_excerpts_per_session: int = Field(
+        default=4, ge=1, le=10,
+        description="Trechos mostrados por conversa recuperada",
+    )
+    assistant_embeddings_enabled: bool = Field(
+        default=True,
+        description=(
+            "Embeddar as respostas do Neo em background depois de salvá-las. "
+            "Sem isto, só as mensagens do usuário têm embedding e a busca "
+            "vetorial nunca acha o que o próprio Neo disse."
+        ),
+    )
 
     # ── Loop Detection ────────────────────────────────────────────
     loop_max_identical_calls: int = Field(

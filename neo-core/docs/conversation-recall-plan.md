@@ -1,6 +1,9 @@
 # Recall de Conversas — "a gente já falou sobre X?"
 
-**Status:** PLANO (nada implementado).
+**Status:** **TODAS as fases (F0–F6) EM PRODUÇÃO** (2026-08-02), validadas
+contra o corpus real (34 testes unitários + `scripts/eval_conversation_recall.py`).
+Migration `r1s2t3u4v5w6` aplicada; corpus 100% coberto (3094/3094 com `content_tsv`
+e com embedding). Ver §8.
 **Origem:** `session-860d0fb1-23a1-488e-9ff4-9d22a15279f2` (VPS, `neo-core:/app/logs/`), 2026-08-02.
 **Relacionado:** [`memory-semantic-v3-plan.md`](./memory-semantic-v3-plan.md) (memória episódica —
 complementar: lá é *destilar* conversa em fato; aqui é *achar a conversa crua*),
@@ -113,10 +116,15 @@ A pergunta de recall é feita de meta-palavras ("conversei", "contigo", "sobre")
 **um** termo de assunto. Buscar a frase toda com AND é o jeito garantido de não
 achar nada. É preciso **extrair os termos de assunto** e ligá-los com `|`.
 
-**Duas boas notícias medidas junto:**
-- o stemmer `portuguese` **já dobra o acento**: `'frança'` e `'franca'` viram o
-  mesmo lexema `'franc'`. Metade do "fuzzy" sai de graça (o usuário digitou
-  "a franca é capital de paris" numa das sessões — casaria).
+**Duas notas medidas junto:**
+- o stemmer `portuguese` dobra o acento **só às vezes** — e essa exceção quase
+  virou um bug de desenho. `'frança'` e `'franca'` caem no mesmo lexema
+  `'franc'` (por isso "a franca é capital de paris" casaria), mas `'avião'` vira
+  `'aviã'` e `'aviao'` vira `'avia'`, que **não casam**; `'você'` acentuado nem
+  sequer produz lexema (é stopword). Conclusão: o tsquery precisa emitir as
+  **duas variantes** de cada termo (`avião | aviao`) — foi o que `build_tsquery`
+  faz. Verificado: `to_tsvector('portuguese','...avião') @@ to_tsquery('portuguese','avião | aviao')`
+  e a versão sem acento dão `t` nas duas direções.
 - `word_similarity('franssa', '...é a frança') = 0.5` — pg_trgm (já instalado)
   cobre o erro de digitação que o stemmer não cobre. Cuidado: `similarity()`
   puro dá 0.25 nesse mesmo par (normaliza pelo tamanho da mensagem inteira) —
@@ -525,10 +533,87 @@ não pode vazar entre usuários.
 
 ---
 
-## 7. O que este plano NÃO resolve
+## 7. O que a implementação mudou em relação ao plano
+
+Quatro coisas só apareceram ao rodar contra o corpus real — todas corrigidas:
+
+**(a) Acento não dobra sozinho.** Ver §2d: o plano dizia que "metade do fuzzy
+sai de graça". Sai só para o caso do `ç`. `build_tsquery` passou a emitir termo
+acentuado **e** sem acento.
+
+**(b) Filler de conversa vazando como assunto.** "ta de boa, eu conversei algo
+contigo sobre a frança?" extraía `['frança', 'boa']` — e `boa` casa com meio
+banco. A stoplist ganhou o grupo de saudação/gíria/enchimento (`boa`, `beleza`,
+`valeu`, `mano`, `cara`…). Pego por teste unitário, não em produção.
+
+**(c) `= ANY(:array)` não funciona com asyncpg.** O driver recusa array passado
+como string (`invalid input for query argument $1`) e o `text()` não tipa uma
+lista Python sozinho. A carga de trechos virou `IN` com um bind por sessão —
+são no máximo 10.
+
+**(d) O trilho de typo mostrava o começo da conversa, não o trecho certo.**
+Buscando `franssa`, nenhuma mensagem contém a palavra literalmente, então a
+seleção de trechos caía no fallback "mostra o início" — e o bloco vinha cheio de
+"oi, tudo bem?". Agora existe `_fuzzy_hit_indices`, que espelha em Python o que
+o `word_similarity` fez no SQL (compara o termo com cada PALAVRA, não com a
+mensagem inteira). Depois do conserto, a mesma busca traz "a capital de Paris é
+a França?" e a correção do Neo.
+
+## 8. Estado e verificação
+
+Tudo implementado e no ar.
+
+**F0.1 — migration aplicada** (`alembic_version = r1s2t3u4v5w6`):
+
+| item | estado |
+|---|---|
+| `content_tsv` | 3094/3094 mensagens preenchidas |
+| trigger `trg_conversation_message_tsv` | ativo (verificado com INSERT + ROLLBACK: preenche e casa `frança\|franca` e `avião\|aviao`) |
+| `ix_conversation_message_content_tsv` (GIN) | criado e **usado** — Bitmap Index Scan, `Execution Time: 0.681ms` contra os ~120ms do seq scan |
+| `ix_conversation_message_content_trgm`, `ix_conv_msg_user_created` | criados |
+
+O código não depende disso: `ConversationRecallSearch._tsv_expr` detecta a
+coluna e cai para `to_tsvector` on-the-fly com um `warning` explícito se ela
+sumir. O caminho antes/depois foi exercitado nos dois estados.
+
+**F0.3 — embeddings** (`scripts/backfill_assistant_embeddings.py`): 1562
+respostas do Neo + 32 mensagens antigas do usuário preenchidas (21 msg/s no
+modelo local, sem custo de API). Coberturas agora: **3094/3094**. Daqui em
+diante o `PersistentSessionManager` embedda a resposta **em background, depois
+de salvá-la** — o turno não paga a CPU, e a task fica com referência forte em
+`_embedding_tasks` (sem isso o asyncio coleta a task no meio e o embedding some
+em silêncio).
+
+**Verificação (só leitura, roda em produção):**
+
+```bash
+docker exec -w /app neo-core python scripts/eval_conversation_recall.py
+docker exec -w /app neo-core python scripts/eval_conversation_recall.py --tool
+```
+
+Resultado no corpus real (2026-08-02, 3010+ mensagens):
+
+| caso | trilho | resultado |
+|---|---|---|
+| "ta de boa, eu conversei algo contigo sobre a frança?" | fts | 20 conversas, 74 mensagens |
+| "a gente falou de franssa?" (typo) | trgm | 29 conversas, 88 mensagens |
+| "você lembra o que você me falou sobre paris?" | fts | 27 conversas, 63 mensagens |
+| "a gente conversou sobre criptomoeda mongoliana?" | — | 0 — e o bloco AUTORIZA negar |
+| "você lembra?" (sem assunto) | — | `erro=sem_termo`, o bloco PROÍBE negar |
+
+Paginação verificada ponta a ponta: página 1 traz as 3 conversas mais recentes,
+`before` anda para trás sem repetir nenhuma, e a sessão `03bb9d5d` (a conversa
+real sobre a França, 12h antes da pergunta que falhou) aparece na página 2.
+
+## 9. O que este plano NÃO resolve
 
 - **Destilar** conversa em conhecimento (o que fica *sabido* em vez de
   *procurável*) — isso é o `memory-semantic-v3-plan.md`.
+- O disparo do embedding em background para mensagens NOVAS está coberto por
+  teste unitário, e a escrita no banco (`set_message_embedding`) foi exercida
+  1594 vezes pelo backfill em produção — mas o par completo só se prova de fato
+  na próxima conversa real. Checagem: `SELECT role, created_at, embedding IS NOT NULL
+  FROM conversation_message ORDER BY created_at DESC LIMIT 4;`
 - Resumo automático de sessão: só 58 das 503 sessões têm `topic_summary`. Com
   summary, a janela poderia mostrar "conversa sobre geografia e capitais" em vez
   de trechos. Melhoria óbvia, escopo separado.

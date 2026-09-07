@@ -25,7 +25,11 @@ from grpc import aio
 
 import neo_desktop_pb2
 import neo_desktop_pb2_grpc
-from modules.desktop.ai_service import AIService, AIServiceResponse
+from modules.desktop.ai_service import (
+    AIService,
+    AIServiceResponse,
+    is_pending_client_turn,
+)
 from shared import IntentType
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,48 @@ _connected_devices = ConnectedDevicesRegistry()
 _devices_ws_registry = DevicesWSRegistry()
 
 
+async def _grpc_device_authorized(context, device_id: str | None) -> bool:
+    """Autoriza uma chamada gRPC pelo token do device (F5).
+
+    O token viaja na **metadata da chamada** (`x-device-token`), nunca no corpo
+    da mensagem: o `metadata` do `user_input` alimenta o contexto do prompt
+    (`_build_current_device_context`), e credencial não pode passar perto disso.
+
+    Mesma assimetria dos canais WS: token errado recusa sempre; token ausente só
+    recusa com ``neo_device_auth_required`` ligada.
+    """
+    from shared.config import get_settings
+
+    required = getattr(get_settings(), "neo_device_auth_required", False)
+
+    token = None
+    for key, value in context.invocation_metadata() or ():
+        if key.lower() == "x-device-token":
+            token = value
+            break
+
+    if not token:
+        if required:
+            logger.warning("[auth] gRPC recusado: %s sem token", device_id)
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "device não pareado")
+            return False
+        return True
+
+    from api.routes import devices as devices_routes
+    from modules.devices.pairing import hash_device_token
+
+    db = devices_routes._db
+    if db is None:
+        return not required
+
+    device = await db.get_device_by_token_hash(hash_device_token(token))
+    if device is None or (device_id and device.device_id != device_id):
+        logger.warning("[auth] gRPC recusado: token inválido para %s", device_id)
+        await context.abort(grpc.StatusCode.UNAUTHENTICATED, "token de device inválido")
+        return False
+    return True
+
+
 class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
     """gRPC Servicer — thin controller that delegates to AIService."""
 
@@ -174,6 +220,12 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                             "user_id": desktop_msg.user_id or "",
                         }
                         if device_id:
+                            # F5: valida o token do device antes de registrar.
+                            # Aqui é onde o desktop se declara dono de um
+                            # device_id — sem a checagem, "sou de quem eu quiser"
+                            # continuaria valendo.
+                            if not await _grpc_device_authorized(context, device_id):
+                                return
                             _connected_devices.register(device_id, device_info)
                             # Sync to DB (async, non-blocking)
                             if self.ai_service and self.ai_service.db and uid_uuid:
@@ -303,10 +355,12 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         sobrescreveria o pending real com um dicionário sem `flow`, e o
         `plan_update` final — que vem depois do último passo — deixaria uma
         entrada órfã em `_pending` até o próximo turno da sessão.
+
+        Alias do predicado do ai_service: o pipeline usa o MESMO teste para não
+        fechar um turno estacionado no cliente, e as duas definições divergirem
+        significaria o pipeline encerrar o turno que este aqui está guardando.
         """
-        if resp.is_final or not resp.metadata:
-            return False
-        return bool(resp.metadata.get("flow"))
+        return is_pending_client_turn(resp)
 
     def _close_incomplete_tool_turn(self, pending: dict) -> None:
         """Persist a failure message when a client-tool turn ends without a result.
@@ -676,6 +730,9 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
             uid_uuid = UUID(user_id_str) if user_id_str else None
         except ValueError:
             uid_uuid = None
+
+        if not await _grpc_device_authorized(context, device_id):
+            return neo_desktop_pb2.RegisterDeviceResponse(ok=False)
 
         device_info = {
             "device_id": device_id,

@@ -71,3 +71,31 @@ def test_outward_action_requires_confirmation():
 def test_unknown_target_fails_safe_to_confirm():
     assert handoff_requires_confirmation(IntentType.CLIENT_TOOL) is True
     assert IntentType.HOME_ASSISTANT in HANDOFF_EXECUTION_POLICY
+
+
+# ── is_final × handoff (session-8147bc9c, 2026-08-02) ─────────────────────────
+# O desktop dá break no primeiro is_final e derruba o stream; o step do handoff,
+# já em voo, é cancelado ("ExecuteTask cancelled by client"). A regra antiga só
+# adiava o final para MUSIC, então TODO comando de casa por handoff morria 0 ms
+# depois de começar — e o cérebro ainda dizia "A luz do seu quarto foi desligada".
+
+def test_handoff_de_casa_tambem_adia_o_final():
+    from core.pipeline.policy import handoff_defers_final
+    from core.pipeline.types import Handoff
+
+    ha = Handoff(target_intent=IntentType.HOME_ASSISTANT, input_text="desligar a luz do quarto")
+    assert handoff_defers_final([ha]) is True
+
+
+def test_qualquer_handoff_adia_o_final_nao_so_o_client_actuating():
+    from core.pipeline.policy import handoff_defers_final
+    from core.pipeline.types import Handoff
+
+    for intent in (IntentType.MUSIC, IntentType.HOME_ASSISTANT, IntentType.WHATSAPP_MESSAGING):
+        assert handoff_defers_final([Handoff(target_intent=intent, input_text="x")]) is True
+
+
+def test_sem_handoff_a_resposta_do_cerebro_e_final():
+    from core.pipeline.policy import handoff_defers_final
+
+    assert handoff_defers_final([]) is False

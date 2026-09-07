@@ -43,6 +43,8 @@ class JobManager:
         dispatcher: "ProactiveDispatcher | None" = None,
         research_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
         browser_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
+        browser_local_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
+        download_watch_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
     ) -> None:
         self.db = db
         self.sandbox = sandbox
@@ -56,6 +58,10 @@ class JobManager:
         # Runner de jobs kind="browser" (subagente browser-use no container
         # neo-browser-agent — docs/browser-agent-plan.md), mesmo padrão.
         self._browser_runner = browser_runner
+        # Runner de jobs kind="browser_local" — o navegador do PRÓPRIO usuário,
+        # dirigido passo a passo pelo core (docs/browser-local-plan.md).
+        self._browser_local_runner = browser_local_runner
+        self._download_watch_runner = download_watch_runner
         self._sem = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._active: dict[str, asyncio.Task] = {}
@@ -162,6 +168,10 @@ class JobManager:
                     terminal = await self._research_runner(job)
                 elif job.kind == "browser" and self._browser_runner is not None:
                     terminal = await self._browser_runner(job)
+                elif job.kind == "browser_local" and self._browser_local_runner is not None:
+                    terminal = await self._browser_local_runner(job)
+                elif job.kind == "download_watch" and self._download_watch_runner is not None:
+                    terminal = await self._download_watch_runner(job)
                 else:
                     terminal = {
                         "status": "failed",

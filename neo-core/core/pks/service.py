@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from core.pks.audit import AuditLogger
 from core.pks.bootstrap import PKSBootstrap
 from core.pks.context_builder import ContextBuilder
 from core.pks.entity_resolver import EntityResolver
+from core.pks.ledger_guard import is_ledger_memory
 from core.pks.ontology import OntologyResolver, OntologyValidator
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
@@ -41,6 +43,8 @@ from core.pks.system_bootstrap import (
 from core.pks.writer import PKSWriter
 from db.async_client import AsyncPostgresClient
 from shared.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class PKSService:
@@ -396,17 +400,56 @@ class PKSService:
         return terms - cls._TRIGGER_STOPWORDS
 
     async def search_entities(self, *, user_id: UUID, query: str) -> list[dict[str, Any]]:
+        """Busca entidades E os campos delas — o conteúdo, não só o nome.
+
+        Medido em prod (session-5102534a): "uma musica que eu gosto" fez o cérebro
+        chamar ``search_pks`` três vezes, achar a entidade "Preferência musical de
+        Daniel" e receber ``entity_type=None, properties=None`` nas três — porque
+        os consumidores leem ``entity_type``/``properties``, chaves que o
+        ``EntityRecord`` (``type``/``metadata``) nunca teve, e porque os fatos moram
+        na ``pks_entity_field``, que ninguém carregava aqui. Resultado: a memória
+        existia (bands, style, disliked_genres) e o Neo respondia sem ela.
+
+        As chaves originais do ``EntityRecord`` continuam no dict; ``entity_type`` e
+        ``properties`` são os apelidos que os call sites já esperavam.
+        """
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
             rows = await self.repository.search_entities(session, workspace_id, query)
-            return [
+            if not rows:
+                return []
+            fields_by_entity = await self.repository.get_fields_for_entities(
+                session, [entity.id for entity, _, _ in rows]
+            )
+
+        results: list[dict[str, Any]] = []
+        for entity, score, matched_by in rows:
+            fields = fields_by_entity.get(entity.id, [])
+            # Dinheiro não sai daqui. Enquanto esta busca devolvia só o nome ela era
+            # inofensiva; passando a devolver valor, ela vira o mesmo canal de saldo
+            # fantasma que o ledger_guard fecha no learn e no contexto. Ver
+            # core/pks/ledger_guard.
+            if is_ledger_memory(entity.name, [f.key for f in fields]):
+                logger.info(
+                    "[PKS][search] entidade de extrato fora do resultado: %s", entity.name
+                )
+                continue
+            # O dict vai direto para o prompt do modelo: data tem que virar texto,
+            # senão o campo chega como `datetime.datetime(2026, 9, 5, ...)`.
+            properties = {
+                f.key: (f.value.isoformat() if isinstance(f.value, datetime) else f.value)
+                for f in fields
+            }
+            results.append(
                 {
                     **entity.model_dump(mode="json"),
+                    "entity_type": entity.type,
+                    "properties": properties,
                     "score": score,
                     "matched_by": matched_by,
                 }
-                for entity, score, matched_by in rows
-            ]
+            )
+        return results
 
     async def get_user_location(self, *, user_id: UUID) -> dict[str, Any] | None:
         """Resolve the user's home city from the PKS graph.
@@ -582,7 +625,11 @@ class PKSService:
                 current.release_reason = release_reason[:16]
                 state.birra = current
             elif episode is not None:
-                merged = BirraEpisode(**episode.model_dump()) if current is None else current
+                from core.agent.birra.policy import resume_or_start
+
+                merged = resume_or_start(
+                    current, BirraEpisode(**episode.model_dump())
+                )
                 merged.act_count += acts
                 merged.physical_acts += physical_acts
                 if physical_acts:

@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 #: toda classificação) estava pagando o raciocínio inteiro sem saber.
 _REASONING_DISABLED = {"reasoning": {"enabled": False}}
 
+#: Separador do "pin de provedor" nos IDs deste catálogo: ``vendor/modelo@slug``.
+#:
+#: O OpenRouter serve o MESMO modelo por vários provedores de infra, e eles não
+#: são intercambiáveis: mudam preço, quantização, contexto e até quais parâmetros
+#: aceitam (o ``deepseek/deepseek-v4-flash``, sondado em 2026-09-02, tem 17
+#: endpoints — de $0,0679 a $0,08386 por M de entrada, e só alguns aceitam
+#: ``tool_choice="required"``). O ID do modelo sozinho não expressa essa escolha.
+#:
+#: Ela também não cabia em nenhum campo existente: ``(provider, model)`` é o par
+#: que atravessa o ``user_preference`` no banco, o metadata do gRPC do desktop e
+#: os selects dos dois frontends. Em vez de abrir um terceiro campo em todas
+#: essas camadas, a escolha viaja dentro do próprio ID e é traduzida AQUI — no
+#: único lugar que fala com a API — para o campo ``provider`` do corpo.
+_PROVIDER_PIN_SEP = "@"
+
 
 class OpenRouterProvider(OpenAIProvider):
     """Provider para OpenRouter (acesso unificado a múltiplos vendors).
@@ -44,6 +59,7 @@ class OpenRouterProvider(OpenAIProvider):
       - google/gemini-2.0-flash       → bom custo-benefício
       - anthropic/claude-3.5-sonnet   → tarefas complexas
       - meta-llama/llama-3.3-70b-instruct → open-weights
+      - deepseek/deepseek-v4-flash@baidu → 1M de contexto, barato (pin de provedor)
 
     Os headers opcionais ``HTTP-Referer``/``X-Title`` identificam o app no
     leaderboard do OpenRouter (não são obrigatórios).
@@ -78,6 +94,77 @@ class OpenRouterProvider(OpenAIProvider):
         self.model = self.DEFAULT_MODEL
 
     @staticmethod
+    def _split_provider_pin(model: str, kwargs: dict[str, Any]) -> str:
+        """Separa ``vendor/modelo@slug`` e fixa o roteamento no slug pedido.
+
+        Devolve o ID limpo — o sufixo é convenção nossa e a API responderia 404
+        com ele — e escreve ``provider.order`` com ``allow_fallbacks=False``.
+        O ``allow_fallbacks`` importa: sem ele o slug vira mera *preferência* e o
+        gateway cai em outro provedor no primeiro erro, que é exatamente o que
+        quem escolheu um provedor específico (por preço ou quantização) não quer
+        — e falharia calado, cobrando outro preço.
+
+        Um ``extra_body["provider"]`` vindo do chamador vence, mesma regra do
+        ``_apply_reasoning_pref``: quem foi explícito manda.
+        """
+        bare, _, slug = model.rpartition(_PROVIDER_PIN_SEP)
+        if not bare or not slug:
+            return model
+        extra = dict(kwargs.get("extra_body") or {})
+        extra.setdefault("provider", {"order": [slug], "allow_fallbacks": False})
+        kwargs["extra_body"] = extra
+        logger.debug("[OpenRouter] %s fixado no provedor %r (sem fallback)", bare, slug)
+        return bare
+
+    @staticmethod
+    def _relax_provider_pin(kwargs: dict[str, Any], exc: Exception) -> bool:
+        """Provedor fixado LOTADO: mantém a preferência, libera a saída.
+
+        Devolve True quando afrouxou (e vale repetir a chamada). O pin vira
+        `order` SEM `allow_fallbacks=False`: o gateway continua tentando o
+        provedor escolhido PRIMEIRO e só sai dele quando ele não atende.
+
+        Vale só para "está ocupado" (429/502/503), nunca para erro de conteúdo
+        — 404 de compatibilidade de tool, por exemplo, tem tratamento próprio em
+        `_rejects_forced_tool_choice` e afrouxar ali esconderia a causa.
+
+        Existe porque um laço de passos é a carga que estoura RPM: medido em
+        2026-09-03 com `deepseek/deepseek-v4-flash@baidu`, o pool compartilhado
+        do Baidu devolveu `rpm_rate_limit_exceeded` e, com o fallback trancado,
+        as 3 tentativas de rate limit da OpenAIProvider esgotaram e a tarefa
+        inteira do navegador morreu no passo 1. Perder o provedor preferido é
+        ruim; perder a tarefa é pior — mesmo julgamento do downgrade de
+        `tool_choice` em `openai_provider`. O desvio vai para o log com o preço
+        em jogo: silêncio aqui é que seria inaceitável.
+        """
+        extra = kwargs.get("extra_body") or {}
+        pin = extra.get("provider") or {}
+        if not isinstance(pin, dict) or pin.get("allow_fallbacks") is not False:
+            return False  # sem pin trancado: nada a afrouxar (nem 2ª tentativa)
+        text = str(exc).lower()
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        busy = (
+            status in (429, 502, 503)
+            or "429" in text
+            or "rate_limit" in text
+            or "rate-limited" in text
+            or "temporarily" in text
+            or "overloaded" in text
+        )
+        if not busy:
+            return False
+        kwargs["extra_body"] = {
+            **extra,
+            "provider": {**pin, "allow_fallbacks": True},
+        }
+        logger.warning(
+            "[OpenRouter] provedor fixado %r está lotado — refazendo com fallback "
+            "liberado (outro provedor pode atender, com OUTRO preço): %s",
+            (pin.get("order") or ["?"])[0], str(exc)[:200],
+        )
+        return True
+
+    @staticmethod
     def _apply_reasoning_pref(kwargs: dict[str, Any]) -> None:
         """Traduz a intenção ``disable_thinking`` para o campo ``reasoning`` da API.
 
@@ -99,20 +186,30 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Completion via OpenRouter (usa mesma lógica da OpenAI)."""
+        model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
         self._apply_reasoning_pref(kwargs)
         try:
             return await super().complete(
                 messages=messages,
                 tools=tools,
-                model=model or self.DEFAULT_MODEL,
+                model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **kwargs,
             )
         except LLMProviderError as e:
+            if self._relax_provider_pin(kwargs, e):
+                return await super().complete(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
             raise LLMProviderError(
                 str(e.message).replace("OpenAI", "OpenRouter"),
-                details={"provider": "openrouter", "model": model or self.DEFAULT_MODEL},
+                details={"provider": "openrouter", "model": model},
             ) from e
 
     async def stream_complete(
@@ -125,20 +222,30 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Streaming via OpenRouter."""
+        model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
         self._apply_reasoning_pref(kwargs)
-        try:
-            async for chunk in super().stream_complete(
-                messages=messages,
-                tools=tools,
-                model=model or self.DEFAULT_MODEL,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **kwargs,
-            ):
-                yield chunk
-        except LLMProviderError as e:
-            yield StreamChunk(event=StreamEventType.ERROR, content=str(e))
-            raise LLMProviderError(
-                str(e.message).replace("OpenAI", "OpenRouter"),
-                details={"provider": "openrouter", "model": model or self.DEFAULT_MODEL},
-            ) from e
+        for tentativa in range(2):
+            emitiu = False
+            try:
+                async for chunk in super().stream_complete(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                ):
+                    emitiu = True
+                    yield chunk
+                return
+            except LLMProviderError as e:
+                # Refazer só vale se NADA saiu ainda: repetir depois de ter
+                # mandado texto duplicaria a resposta na tela do usuário, e um
+                # provedor lotado costuma recusar ANTES do primeiro chunk.
+                if tentativa == 0 and not emitiu and self._relax_provider_pin(kwargs, e):
+                    continue
+                yield StreamChunk(event=StreamEventType.ERROR, content=str(e))
+                raise LLMProviderError(
+                    str(e.message).replace("OpenAI", "OpenRouter"),
+                    details={"provider": "openrouter", "model": model},
+                ) from e

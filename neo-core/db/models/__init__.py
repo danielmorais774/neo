@@ -32,6 +32,7 @@ from .credential import Credential
 from .gateway import ServiceConnection, ServiceRequestLog
 from .stored_file import StoredFile
 from .birra_act import BirraAct
+from .working_note import WorkingNote
 
 __all__ = [
     "User",
@@ -65,4 +66,5 @@ __all__ = [
     "ServiceRequestLog",
     "StoredFile",
     "BirraAct",
+    "WorkingNote",
 ]

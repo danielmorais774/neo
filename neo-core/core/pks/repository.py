@@ -851,6 +851,34 @@ class PKSRepository:
         )
         return [_field_from_row(row) for row in result.mappings().all()]
 
+    async def get_fields_for_entities(
+        self, session: AsyncSession, entity_ids: list[UUID]
+    ) -> dict[UUID, list[FieldRecord]]:
+        """Fields of several entities in ONE query, grouped by entity id.
+
+        Batch twin of ``get_entity_fields``: ``search_entities`` returns up to
+        ``limit`` rows and needs every field of every hit, and doing that one
+        entity at a time is N+1 on the hot path of ``search_pks``.
+        """
+        if not entity_ids:
+            return {}
+        result = await session.execute(
+            text(
+                """
+                SELECT *
+                FROM pks_entity_field
+                WHERE entity_id = ANY(CAST(:ids AS uuid[])) AND deleted_at IS NULL
+                ORDER BY entity_id, key
+                """
+            ),
+            {"ids": entity_ids},
+        )
+        grouped: dict[UUID, list[FieldRecord]] = {}
+        for row in result.mappings().all():
+            field = _field_from_row(row)
+            grouped.setdefault(field.entity_id, []).append(field)
+        return grouped
+
     async def upsert_relation(self, session: AsyncSession, data: UpsertRelationInput) -> tuple[RelationRecord, dict[str, Any] | None]:
         before = await self.find_relation(session, data.from_entity_id, data.relation_type, data.to_entity_id, include_deleted=True)
         if before:

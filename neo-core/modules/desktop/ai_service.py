@@ -35,11 +35,12 @@ from core.cognitive import CognitiveReadExecutor, cognitive_tools_for
 from core.pipeline.handoff_parser import extract_handoffs
 from core.pipeline.speech_segments_parser import extract_speech_segments
 from core.pipeline.orchestrator import PipelineOrchestrator
-from core.pipeline.policy import handoff_requires_confirmation
+from core.pipeline.policy import handoff_defers_final, handoff_requires_confirmation
 from core.pipeline.types import Handoff, PipelineStep, StepOutcome
 from core.planning.plan_manager import ExecutionPlan, PlanManager, PlanStep
 from core.router.intent_router import IntentRouter
 from core.session.session_manager import PersistentSessionManager
+from core.text.asr_fixups import ASSISTANT_NAME, canonicalize_assistant_name
 from core.session.preference_extractor import PreferenceExtractor
 from core.tools.executor import ToolExecutor
 from core.tools.registry import ToolRegistry
@@ -48,6 +49,7 @@ from observability.logger import get_obs, MessageTrace
 from observability.session_file_logger import get_session_logger
 from core.memory import ConversationMemory
 from shared import (
+    ExecutionStatus,
     IntentType,
     MemorySearchResult,
     Message,
@@ -100,6 +102,39 @@ MAX_CLARIFICATION_ROUNDS = 2
 # emoção. O erro de verdade fica no log e no log .md da sessão.
 TURN_FAILED_REPLY = "Não consegui responder agora — deu erro do meu lado. Tenta de novo?"
 
+# Mesma frase para o caso em que o provider recusou por LIMITE/CRÉDITO da chave,
+# e não por defeito nosso. Vale a distinção porque "tenta de novo" é conselho
+# errado aqui: a 403 da OpenRouter ("Key limit exceeded (total limit)", chave sem
+# reset) se repete idêntica em toda tentativa, e a sessão 1e7c5943 gastou dois
+# turnos batendo nela sem o usuário ter como saber que o problema era crédito —
+# a informação só existia no log .md. Começa com o MESMO prefixo do
+# TURN_FAILED_REPLY de propósito: é assim que
+# core/agent/affect_updater._ERROR_RESPONSE_PREFIXES já a exclui do afeto, sem
+# precisar de mais uma entrada lá.
+TURN_FAILED_NO_CREDIT = (
+    "Não consegui responder agora — o provedor recusou por limite/crédito da "
+    "chave. Troca de modelo ou renova o crédito que eu sigo daqui."
+)
+
+# Assinaturas de "acabou o crédito / estourou a cota" nos provedores que usamos:
+# OpenRouter 403 "Key limit exceeded", OpenAI 429 "exceeded your current quota",
+# Anthropic "credit balance is too low", 402 pela frase "Payment Required" (o
+# número nu não entra: "402" aparece dentro de request_id e de contagem de token,
+# e classificar um bug nosso como falta de crédito manda o usuário caçar o
+# problema no lugar errado). Casado no TEXTO da exceção porque cada SDK embrulha
+# o corpo do erro de um jeito — não há um campo comum pra ler.
+_NO_CREDIT_SIGNS = re.compile(
+    r"(limit exceeded|exceeded your current quota|insufficient[_ ](?:quota|credit|balance)"
+    r"|credit balance is too low|payment required|billing|out of credits?"
+    r"|quota[_ ]exceeded)",
+    re.IGNORECASE,
+)
+
+
+def _is_no_credit_failure(exc: BaseException | str) -> bool:
+    """A falha foi limite/crédito da chave (ação do usuário) e não bug nosso?"""
+    return _NO_CREDIT_SIGNS.search(str(exc)) is not None
+
 # Injetado no prompt da resposta final quando o turno vem do modo Live (voz):
 # o texto será FALADO por TTS e mostrado como legenda, então pedimos texto corrido
 # sem markdown/emojis (que soam mal falados e poluem a legenda). Ativado por
@@ -126,13 +161,42 @@ _LIVE_STYLE_INSTRUCTION = (
 # caminho, ao contrário de `![](markdown)`).
 INLINE_IMAGE_MARKER_PREFIX = "[[IMAGE:"
 
+# Injetado quando o turno veio do microfone (metadata["input_source"] == "voice").
+# É o contrário do _LIVE_STYLE_INSTRUCTION: aquele fala da SAÍDA (será falada),
+# este fala da ENTRADA (foi transcrita, e o ASR erra). Medido no corpus de produção
+# (368 turnos de voz, 02/08/2026): o Parakeet NUNCA escreveu "Neo" — escreveu
+# Neil/New/Nil/Nir/knew. O neo-voice já corrige o que é catalogável antes de chegar
+# aqui (stt_text.py); esta instrução cobre o resto: palavra colada, pontuação
+# ausente, trecho em outro idioma, ruído.
+# O bullet do "dado exato" não é enfeite: entrada por voz é justamente onde um token
+# torto vira caminho de arquivo inventado (o bug do file_path fantasma).
+_VOICE_INPUT_INSTRUCTION = (
+    "## ENTRADA POR VOZ (transcrição automática)\n"
+    "Esta mensagem foi TRANSCRITA de áudio por um ASR, não digitada. Ela pode ter "
+    "erro de grafia, palavra colada, pontuação faltando, um trecho em outro idioma "
+    "ou uma palavra solta de ruído.\n"
+    "- Interprete por PROXIMIDADE FONÉTICA e pelo contexto. \"Neil\", \"Nil\", \"New\", "
+    "\"Niu\", \"Nir\", \"He knew\", \"A new\" são VOCÊ (Neo). Nome de pessoa, lugar ou "
+    "dispositivo também pode vir torto.\n"
+    "- NÃO responda \"não entendi\" por causa de um erro pequeno: responda ao que é "
+    "obviamente a intenção.\n"
+    "- NUNCA transforme um token estranho em caminho de arquivo, nome de arquivo, "
+    "entity_id, comando ou parâmetro literal. Se o dado exato importa (caminho, id, "
+    "valor, nome próprio novo), CONFIRME numa pergunta curta antes de agir.\n"
+    "- Se a mensagem inteira for incompreensível (uma ou duas palavras sem relação "
+    "com a conversa), peça para repetir numa frase curta — não invente assunto.\n"
+    "- Não comente nem corrija a transcrição em voz alta."
+)
+
 _INLINE_IMAGE_INSTRUCTION = (
     "## Mostrar imagem no chat\n"
     "O chat deste usuário RENDERIZA imagens. Para exibir uma, escreva numa linha só:\n"
     "`[[IMAGE:/caminho/absoluto/da/imagem.jpg]]` — pode ter espaços no caminho, "
     "sem aspas e sem escapes. Para um arquivo do SEU catálogo (File Store), use "
-    "`[[IMAGE:file:<file_id>]]`. Legenda opcional depois de `|`: "
-    "`[[IMAGE:/caminho/foto.png|a foto de ontem]]`.\n"
+    "`[[IMAGE:file:<file_id>]]`. Para uma imagem da internet (a foto de um "
+    "anúncio, por exemplo), use a URL http(s) direto: "
+    "`[[IMAGE:https://cdn.loja.com/foto.jpg]]` — o app baixa e desenha. Legenda "
+    "opcional depois de `|`: `[[IMAGE:/caminho/foto.png|a foto de ontem]]`.\n"
     "Regras:\n"
     "- Use SEMPRE que o usuário pedir para ver/mostrar/carregar/exibir uma imagem, "
     "ou quando uma imagem for a melhor resposta (um print, um gráfico que você gerou).\n"
@@ -141,6 +205,9 @@ _INLINE_IMAGE_INSTRUCTION = (
     "- O caminho tem que ser REAL: só use um que apareça nesta conversa (mensagem do "
     "usuário, saída de um comando, anexo). NUNCA invente ou adivinhe caminho/nome — se "
     "não souber, ache primeiro (ex.: `ls`/`find`) ou pergunte.\n"
+    "- A URL também tem que ser REAL: só use uma que VOCÊ viu num resultado de tool "
+    "(web_search/web_fetch/browser_task) nesta conversa. Montar URL de imagem por "
+    "dedução é o mesmo erro de inventar caminho — o usuário vê um cartão de erro.\n"
     "- Escreva o marcador junto de uma frase curta ('aqui está:'), não sozinho, e um "
     "marcador por imagem (várias linhas = várias imagens). O marcador não é falado nem "
     "lido em voz alta — é substituído pela imagem."
@@ -205,6 +272,87 @@ _VERIFICATION_STOPWORDS = frozenset({
 })
 
 
+# Perguntas sobre o ARQUIVO de conversas ("a gente já falou disso?", "você
+# lembra quando eu disse...") não podem ser respondidas de cabeça: o cognitivo
+# só tem no contexto as mensagens DESTA sessão, então negar é chutar. Foi
+# exatamente isso na session-860d0fb1 ("não tem nada sobre a França registrado",
+# com 61 mensagens sobre França no banco). Ver docs/conversation-recall-plan.md.
+_CONVERSATION_RECALL_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"\b(voce|vc|ce|tu)\s+(se\s+)?lembra\b",
+        r"\bse\s+lembra\s+(de|que|quando|do|da)\b",
+        r"\b(a\s+gente|nos|noix)\s+(ja\s+)?(conversou|conversamos|falou|falamos|discutiu|discutimos)\b",
+        r"\beu\s+(ja\s+)?(te\s+)?(falei|disse|contei|mostrei|comentei)\b",
+        r"\b(conversei|falei|comentei)\s+(algo|alguma\s+coisa|sobre)?\s*(contigo|com\s+voce|com\s+vc)\b",
+        r"\b(o\s+que|oque)\s+eu\s+(te\s+)?(falei|disse|contei|comentei)\b",
+        r"\bja\s+(te\s+)?(falei|disse|contei|comentei|mostrei)\b",
+        r"\b(quando|onde)\s+(foi\s+que\s+)?(eu|a\s+gente|nos)\s+(falou|falamos|conversou|conversamos|disse)\b",
+        r"\b(lembra|recorda)\s+(daquela|daquele|da|do|de)\s+(conversa|papo|assunto|vez)\b",
+        r"\bnossas?\s+conversas?\s+(anteriores|passadas|antigas)\b",
+        r"\bja\s+(conversamos|falamos|discutimos)\s+(sobre|disso|nisso)\b",
+    )
+]
+
+# Continuação de um recall já feito: "não foi isso, foi antes ainda". Frase curta
+# e vaga — sem o gatilho, o modelo pede desculpa e reformula em prosa em vez de
+# rebuscar mais para trás.
+_RECALL_CONTINUATION_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"\bnao\s+(foi|era)\s+(isso|essa|esse|essas|esses|dessa|nenhum)",
+        r"\bfoi\s+(antes|mais\s+antes|antes\s+ainda|antes\s+disso)\b",
+        r"\bantes\s+(disso|dessa|desse)\b",
+        r"\bmais\s+(antig[oa]|pra\s+tras|para\s+tras|atras|longe)\b",
+        r"\b(tem|teve|ha)\s+mais\s+(antig|coisa|conversa)",
+        r"\bprocura\s+mais\s+(pra\s+tras|para\s+tras|atras|antes)\b",
+        r"\bvai\s+mais\s+(pra\s+tras|para\s+tras|atras|longe)\b",
+        r"\boutra\s+(conversa|vez)\b",
+    )
+]
+
+_RECALL_NUDGE = (
+    "## Busca obrigatória no arquivo de conversas\n"
+    "O usuário está perguntando sobre uma conversa ANTERIOR. Você NÃO tem as "
+    "conversas antigas no contexto — só as mensagens desta sessão — então "
+    "responder de cabeça é chutar. ANTES de responder, chame "
+    "`conversation_recall` com o ASSUNTO (só o assunto: 'frança', 'treino de "
+    "perna' — nunca 'conversa' ou 'lembra'). Responda apenas com o que voltar: "
+    "se voltar vazio, aí sim pode dizer que não acharam nada; se voltar algo, "
+    "conte o que foi, situando no tempo. NUNCA diga 'não falamos disso' sem ter "
+    "chamado a tool nesta mesma resposta."
+)
+
+_RECALL_CONTINUATION_NUDGE = (
+    "## O usuário disse que não era aquela conversa\n"
+    "Ele quer uma conversa MAIS ANTIGA sobre o mesmo assunto. Chame "
+    "`conversation_recall` de novo com a MESMA query e o `before` indicado na "
+    "seção \"Arquivo de conversas\" — não repita a busca sem `before` (voltaria "
+    "o mesmo resultado) e não invente uma lembrança para agradar."
+)
+
+
+def _is_conversation_recall_request(text: str) -> bool:
+    """True quando o usuário pergunta sobre uma conversa passada."""
+    normalized = _normalize_for_match(text)
+    return any(p.search(normalized) for p in _CONVERSATION_RECALL_PATTERNS)
+
+
+def _is_recall_continuation(text: str) -> bool:
+    """True quando o usuário rejeita o recall anterior e quer ir mais para trás."""
+    normalized = _normalize_for_match(text)
+    return any(p.search(normalized) for p in _RECALL_CONTINUATION_PATTERNS)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Minúsculas, sem acento, espaços colapsados — para casar as regexes."""
+    normalized = "".join(
+        c for c in unicodedata.normalize("NFD", (text or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    return " ".join(normalized.split())
+
+
 def _is_memory_verification_request(text: str) -> bool:
     """True when the user is questioning whether something was really saved."""
     normalized = "".join(
@@ -234,6 +382,42 @@ _HANDOFF_INSTRUCTION_HEADER = (
 # normal de um fluxo ("so salva" / "variados" / "sim") sem grudar para sempre; cada
 # uso real de uma tool da skill renova o prazo.
 _SKILL_STICKY_TURNS = 5
+
+
+def _dedup_tools_by_name(tools: list[Any]) -> list[Any]:
+    """Uma tool por nome no payload — duplicata é 400 em provider que valida.
+
+    O toolset do turno é montado por camadas independentes (read set + tools da
+    skill autocarregada + action tools do workbench/jobs), e cada camada só sabia
+    deduplicar contra a anterior. Bastava uma skill `tool_backed` listar uma tool
+    que só existe numa camada POSTERIOR — `compras` lista `browser_task`, que vem
+    em JOB_TOOLS — para o mesmo nome entrar duas vezes e o DeepSeek recusar o
+    turno inteiro com 400 "Tool names must be unique." (sessões c35e576f e
+    1e7c5943). A OpenAI aceita o payload duplicado, então o bug só aparecia em
+    metade dos modelos: mais motivo para a garantia ficar aqui, no choke point,
+    e não em cada ponto de append.
+
+    Mantém a PRIMEIRA ocorrência (a camada mais específica entra antes) e a ordem.
+    """
+    seen: set[str] = set()
+    out: list[Any] = []
+    dropped: list[str] = []
+    for t in tools or []:
+        name = getattr(t, "name", None)
+        if name is None:
+            out.append(t)
+            continue
+        if name in seen:
+            dropped.append(str(name))
+            continue
+        seen.add(name)
+        out.append(t)
+    if dropped:
+        logger.warning(
+            "[Tools] nomes duplicados no toolset do turno, mantida a 1a ocorrencia: %s",
+            ", ".join(sorted(set(dropped))),
+        )
+    return out
 
 # A resposta AFIRMA ter executado algo (passado, não promessa). Usado para barrar a
 # mentira quando nenhuma tool da skill rodou no turno — o modelo dizia "registrei,
@@ -283,8 +467,88 @@ _PENDING_PROMISE = re.compile(
 # o bug: o workbench pede exatamente isso pra trabalho demorado.
 _LEGITIMATE_DEFERRAL_TOOLS = {
     "neo_bash_background", "job_status", "job_list", "job_logs", "job_cancel",
-    "deep_research", "browser_task",
+    "deep_research", "browser_task", "browser_local_task",
 }
+
+
+# ── Guarda anti-promessa de NAVEGADOR LOCAL ─────────────────────────────────
+# Medida na sessão d01cb5ab: pedido "abra o painel do simples nacional no meu
+# local", o modelo respondeu "Vou iniciar a tarefa... Abrindo o painel no seu
+# navegador agora" — com ZERO tool call. Cobrado ("nao aconteceu nada"), dobrou:
+# "a tarefa foi enfileirada, te aviso". Nada rodou nas duas vezes.
+#
+# Por que a anti-promessa genérica não pega: a lista de verbos dela é de ENTREGA
+# (zipar/baixar/mandar); "abrir/iniciar" não está lá. E "foi enfileirada" é
+# alegação no PASSADO, forma que nenhuma das duas guardas cobria.
+#
+# Desenho igual ao da anti-alegação-de-download: AFORDÂNCIA ∧ ÂNCORA, nenhuma
+# palavra decide sozinha. A âncora é o que torna isto seguro — tem que ser o
+# navegador DELE ("seu navegador", "navegador local", "na sua tela"), nunca o do
+# servidor. Medido contra 1738 respostas reais do assistente: 3 disparos, sendo
+# 2 as mensagens exatas do bug acima; o terceiro ("Abri o YouTube com os
+# resultados") é o fluxo de música, que ATUA de verdade e sai pela checagem de
+# tool usada. Ver tests/browser_local/test_promise_guard.py.
+_BROWSER_PROMISE_ANCHOR = re.compile(
+    r"\b(?:seu|teu)\s+(?:navegador|chrome|brave|edge|browser)\b"
+    r"|\bnavegador\s+local\b|\bna\s+sua\s+tela\b|\bacompanhar\s+na\s+tela\b"
+    r"|\bnavegador\s+(?:a[íi]|daqui)\b",
+    re.IGNORECASE,
+)
+
+# COMPROMISSO: o assistente se colocando como quem VAI fazer (ou já fez). A
+# primeira versão enumerava verbos (abrir/acessar/entrar/iniciar) e vazou na
+# sessão 91fae2d1 em "vou COLOCAR a live no seu navegador" e "vou FORÇAR a
+# abertura" — enumerar verbo de ação em português é jogo perdido. Como a âncora
+# é rara (11 em 1745 respostas reais), o compromisso pode ser largo: o que
+# segura o falso positivo é a âncora + a negação, não a lista.
+_COMMIT = re.compile(
+    r"\b(?:vou|vamos|irei|iremos)\b"                                   # 1ª pessoa, futuro
+    r"|\b(?:vai|v[ãa]o|est[áa]|est[ãa]o|estou|estiver|estarei|fica|ficar)\s+\w{3,}ndo\b"
+    r"|\b(?:vai|v[ãa]o|j[áa]\s+vai)\s+\w{3,}(?:ar|er|ir)\b"          # auxiliar + infinitivo
+    r"|(?:^|[.!?\n]\s*)\w{4,}ndo\b"                                   # gerúndio abrindo a frase
+    r"|\b(?:foi|est[áa])\s+(?:enfileirad\w+|em\s+andamento|rodando)"  # alegação de já ter feito
+    r"|\b(?:enfileirei|iniciei|abri|disparei|coloquei\s+na\s+fila)\b",
+    re.IGNORECASE,
+)
+
+# Negação REGENDO a frase da âncora: "não consigo acionar extensões direto do
+# seu navegador" é recusa honesta, não promessa vazia.
+_COMMIT_NEGATOR = re.compile(
+    r"\bn[ãa]o\b|\bnem\b|\bsem\b|\bimposs[íi]vel\b|\bfoge\s+do\s+meu\b|\bprecisa\s+de\b",
+    re.IGNORECASE,
+)
+
+# Handoff é ação DE VERDADE por outro trilho do pipeline (música, casa). O turno
+# não terminou numa promessa — ele delegou. Sem esta saída, "YouTube vai abrir
+# no seu navegador" (que vira [[HANDOFF:music]]) seria punido.
+_HANDOFF_ANY = re.compile(r"\[\[\s*HANDOFF\s*:", re.IGNORECASE)
+
+# Qualquer tool que de fato MEXE no navegador/máquina do usuário absolve a
+# promessa: se ela rodou, a frase é relato, não conversa fiada.
+_BROWSER_ACTING_TOOLS = frozenset(
+    {"browser_local_task", "browser_task", "run_command", "open_url", "launch_uri", "media_command"}
+)
+
+_SENTENCE_PIECES = re.compile(r"[^.!?\n]+[.!?\n]?")
+
+
+def _promises_browser_action(text: str) -> bool:
+    """A resposta diz que vai agir (ou que já agiu) no navegador DELE, por FRASE.
+
+    Escopo de frase, não de texto inteiro: "não consigo abrir no seu navegador,
+    mas vou pesquisar aqui" tem promessa E âncora, e mesmo assim não é o bug.
+    """
+    text = text or ""
+    if not text.strip() or _HANDOFF_ANY.search(text):
+        return False
+    for sentence in _SENTENCE_PIECES.findall(text):
+        if not _BROWSER_PROMISE_ANCHOR.search(sentence):
+            continue
+        if _COMMIT_NEGATOR.search(sentence):
+            continue
+        if _COMMIT.search(sentence):
+            return True
+    return False
 
 
 def _promises_pending_action(text: str) -> bool:
@@ -439,6 +703,149 @@ def _dispatch_would_hang(tool_name: str | None, arguments: dict[str, Any] | None
     return not command or bool(_PLACEHOLDER_COMMAND.match(command))
 
 
+# ── Guarda de verdade-do-resultado (docs/self-continuation-plan.md §4) ────────
+# Irmã da anti-alegação-de-download. Aquela cobre a ENTREGA ao usuário ("pode
+# baixar pelo botão" sem file_save); esta cobre o degrau anterior e mais básico:
+# "o arquivo EXISTE no meu sandbox". Medida na sessão bb22cc33, onde o passo final
+# do ciclo fechou com "três imagens baixadas… As imagens são reais" e /workspace
+# não tinha imagem nenhuma. Sem isto, "continuar até concluir" quer dizer
+# "continuar até o modelo DIZER que concluiu".
+#
+# Camada 1 — AFORDÂNCIA: verbo de criação no PASSADO (não promessa; futuro é do
+# _promises_pending_action) ancorado num substantivo de artefato. Os dois juntos,
+# porque "baixei" sozinho pega "baixei o tom" e "imagem" sozinho pega qualquer
+# frase sobre a imagem que o usuário mandou.
+_ARTIFACT_DONE_VERB = re.compile(
+    r"\b(?:baix(?:ei|amos|ou|ada|adas|ado|ados)"
+    r"|salv(?:ei|amos|ou|a|as|o|os)"
+    r"|ger(?:ei|amos|ou|ada|adas|ado|ados)"
+    r"|cri(?:ei|amos|ou|ada|adas|ado|ados)"
+    r"|escrev(?:i|emos|eu|ita|itas|ito|itos)"
+    r"|convert(?:i|emos|eu|ida|idas|ido|idos)"
+    r"|zip(?:ei|amos|ou|ada|ado)"
+    r"|montei|empacotei|coloquei|deixei)\b",
+    re.IGNORECASE,
+)
+_ARTIFACT_NOUN = re.compile(
+    r"\b(?:arquivos?|imagens?|imagem|fotos?|figuras?|[íi]cones?|zip|pastas?"
+    r"|diret[óo]rios?|scripts?|p[áa]ginas?|html|css|jpe?gs?|pngs?|svgs?|pdfs?)\b",
+    re.IGNORECASE,
+)
+# Afirmação de existência sem verbo de criação: "as imagens são reais",
+# "estão em /workspace/x". É exatamente como a mentira medida foi escrita.
+_ARTIFACT_EXISTS = re.compile(
+    r"\b(?:est[áã]o?|ficaram?|s[ãa]o)\s+(?:\w+\s+){0,3}?"
+    r"(?:em|na|no|dentro|reais?|reais|prontas?|prontos?|baixad[ao]s?)\b",
+    re.IGNORECASE,
+)
+
+# Caminhos e nomes de arquivo CITADOS na resposta — extraídos do texto CRU, não do
+# `_prose_only` (que apaga justamente path e filename). São eles que a gente cruza
+# contra o tool_trace: a pergunta é "algum tool que deu certo tocou esse caminho?".
+_CLAIMED_PATH = re.compile(r"(?:/workspace|/skills|/tmp|~)/[\w./-]+")
+_CLAIMED_FILENAME = re.compile(
+    r"\b[\w.-]+\.(?:html?|css|js|json|jpe?g|png|gif|svg|webp|zip|pdf|md|txt|csv|py|sh)\b",
+    re.IGNORECASE,
+)
+
+
+def _claimed_artifact_targets(text: str) -> set[str]:
+    """Caminhos/nomes de arquivo que a resposta afirma ter produzido."""
+    out = {m.group(0).rstrip(".,;:)") for m in _CLAIMED_PATH.finditer(text or "")}
+    out |= {m.group(0).lower() for m in _CLAIMED_FILENAME.finditer(text or "")}
+    # O basename do path também vale como alvo: o tool pode ter escrito com caminho
+    # relativo (`neo_list_files {'path': 'portifolio-naruto'}` no log real).
+    out |= {p.rsplit("/", 1)[-1].lower() for p in out if "/" in p}
+    return {t for t in out if t}
+
+
+def _claims_sandbox_artifact(text: str) -> bool:
+    """A resposta AFIRMA (passado, não promessa) ter criado artefato no sandbox?"""
+    for sent in _SENTENCE_SPLIT.finditer(_prose_only(text or "")):
+        sentence = sent.group(0)
+        if sentence.rstrip().endswith("?"):
+            continue
+        match = _ARTIFACT_DONE_VERB.search(sentence) or _ARTIFACT_EXISTS.search(sentence)
+        if not match or not _ARTIFACT_NOUN.search(sentence):
+            continue
+        if _FUTURE_INTENT.search(sentence[: match.start()]):
+            continue
+        # "não consegui baixar as imagens" é a resposta HONESTA — nunca punir.
+        if _claim_is_negated(sentence, match.start()):
+            continue
+        return True
+    return False
+
+
+_LISTING_FAILED = re.compile(r"'ok':\s*False|cannot access|No such file", re.IGNORECASE)
+
+# Um `file_id` com forma de UUID que não está no catálogo é id ALUCINADO — a trava
+# fecha nele. Só o que não tem forma de id é candidato a ser um nome de arquivo.
+_UUID_LIKE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _artifact_evidence_text(entry: dict[str, Any]) -> str | None:
+    """O que, nesta entrada do trace, PROVA que um arquivo passou a existir.
+
+    A distinção que faz a guarda funcionar: **comando não é evidência**. O turno
+    medido na bb22cc33 rodou um `neo_bash` com ``exit_code=0`` cujo script Python
+    engolia toda exceção (``except Exception: continue``) e baixava zero imagens —
+    stdout vazio. Como o caminho ``/workspace/ciclo-prova`` estava escrito DENTRO do
+    comando, cruzar contra o comando "confirmava" a mentira. Só conta o que o
+    sistema devolveu: stdout, listing, path escrito, arquivo catalogado.
+
+    ``None`` = esta entrada não prova nada (não é o mesmo que provar o contrário).
+    """
+    if not entry or not entry.get("ok"):
+        return None
+    tool = entry.get("tool")
+    if tool == "neo_write_file":
+        # A tool É a escrita: o path que ela reporta é resultado, não intenção.
+        return str(entry.get("path") or "")
+    if tool == "file_save":
+        return str(entry.get("name") or "")
+    if tool == "neo_bash":
+        if entry.get("exit_code") not in (0, None):
+            return None
+        # Saída vazia não prova nada — foi exatamente esse o caso do bug.
+        return str(entry.get("stdout_preview") or "") or None
+    summary = str(entry.get("summary") or entry.get("listing") or "")
+    if not summary or _LISTING_FAILED.search(summary):
+        # "ls: cannot access '/workspace/x'" CONTÉM o caminho e provaria o oposto
+        # do que diz, se entrasse como evidência.
+        return None
+    return summary
+
+
+def _trace_backs_artifact_claim(
+    tool_trace: list[dict[str, Any]] | None,
+    targets: set[str],
+    produced_files: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Algum tool que REALMENTE deu certo produziu o que a resposta alega?
+
+    Um arquivo já catalogado (``produced_files``, via ``file_save``) é prova
+    direta: existe artefato de verdade, com id e tamanho, do outro lado.
+    """
+    for f in produced_files or []:
+        name = str((f or {}).get("name") or "").lower()
+        if not targets or (name and name in targets):
+            return True
+    for entry in tool_trace or []:
+        evidence = _artifact_evidence_text(entry)
+        if evidence is None:
+            continue
+        if not targets:
+            # Sem caminho citado, a pergunta cai para "produziu algum arquivo?" —
+            # e só as tools que de fato materializam algo contam.
+            if entry.get("tool") in ("neo_write_file", "file_save", "neo_bash"):
+                return True
+            continue
+        if any(t in evidence.lower() for t in targets):
+            return True
+    return False
+
+
 def _claims_downloadable_delivery(text: str) -> bool:
     """A resposta AFIRMA que existe uma entrega baixável pronta?
 
@@ -477,6 +884,66 @@ def _claims_downloadable_delivery(text: str) -> bool:
 # derrubou "como tu tá? ta calmo"). Uma retentativa com o dobro do teto resolve.
 # Ver memória deepseek-empty-response-reasoning e ResearchAgent._complete.
 _EMPTY_RETRY_MAX_TOKENS_CEILING = 16384
+
+# O outro lado da mesma moeda do teto de tokens: em vez de content vazio, a API
+# devolve uma tool_call com o JSON dos argumentos CORTADO no meio (típico ao
+# escrever um HTML inteiro num `neo_write_file`). `get_tool_calls()` levanta
+# JSONDecodeError e, sem guarda, a exceção sobe do loop e mata o turno inteiro —
+# perdendo todo arquivo já escrito no sandbox. Quantos rounds extras a gente
+# concede pedindo escrita em pedaços antes de desistir.
+_MAX_TRUNCATED_TOOL_ROUNDS = 2
+
+
+# Tools cujo resultado custa caro para reproduzir — é o gatilho do backstop da
+# memória de trabalho (docs/working-memory-plan.md §7). Uma consulta de tempo ou
+# de dispositivo não entra: refazer é barato e a nota só viraria ruído.
+_WM_HEAVY_TOOLS = frozenset({
+    "neo_bash", "neo_write_file", "file_read", "file_stage", "file_save",
+    "deep_research", "web_fetch", "run_command", "browser_task",
+    "browser_local_task",
+})
+
+
+def is_pending_client_turn(resp: "AIServiceResponse") -> bool:
+    """True quando o turno fica ESPERANDO o desktop devolver um resultado.
+
+    Um ``tool_request``/``command_request`` sai NÃO-final de propósito: o turno
+    não acabou, ele está estacionado no cliente — que executa (ou pede aprovação
+    ao usuário) e devolve o resultado pela mesma stream. É o oposto de uma cadeia
+    que morreu sem resposta, e confundir os dois derruba justamente os turnos que
+    dependem de um clique humano.
+
+    Mesmo predicado de ``NeoDesktopServicer._is_pending_flow`` — que já é a
+    autoridade sobre o que entra em ``self._pending`` no gRPC. Está aqui, e lá é
+    um alias, para que os dois não possam divergir.
+    """
+    if resp.is_final or not resp.metadata:
+        return False
+    return bool(resp.metadata.get("flow"))
+
+
+def _autonote_entry(
+    tool_trace: list[dict[str, Any]], produced_files: list[dict[str, Any]] | None
+) -> str | None:
+    """Texto do append automático do turno, ou ``None`` quando não há o que anotar.
+
+    Separado do ``_bg_working_note`` porque é aqui que mora a decisão (e o bug
+    possível): o piso só entra se o turno fez trabalho CARO de refazer e o
+    modelo não anotou por conta própria.
+    """
+    # O modelo anotou sozinho: duplicar só viraria ruído no índice, que é o
+    # recurso mais caro da feature.
+    if any((e or {}).get("tool") == "wm_write" for e in tool_trace or []):
+        return None
+    heavy = [
+        e for e in (tool_trace or [])
+        if (e or {}).get("tool") in _WM_HEAVY_TOOLS and (e or {}).get("ok", True)
+    ]
+    if not heavy and not produced_files:
+        return None
+    from core.working_memory import render_auto_entry
+
+    return render_auto_entry(heavy, produced_files) or None
 
 
 def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[str, Any]:
@@ -531,11 +998,171 @@ _HANDOFF_SKILL_LINES_FALLBACK = (
 )
 
 
-def _build_handoff_instruction() -> str:
+# Self-continuation. The failure this fixes, measured in session-fd467d08: the
+# brain ended four turns in a row with "sigo tentando"/"vou resolver" and then did
+# nothing — a turn ends when the tool loop returns text, so a promise about the
+# future is just text. The block below gives it the only legal way to actually
+# keep working: say what it is going to do AND emit the order that does it.
+_SELF_HANDOFF_INSTRUCTION = (
+    "\n## Continuar trabalhando no mesmo turno (obrigatório)\n"
+    "Seu turno ACABA quando você devolve texto. Não existe \"depois eu faço\": se "
+    "você escrever que vai fazer algo e não emitir o bloco abaixo, NADA acontece — "
+    "o usuário fica esperando uma coisa que nunca vem, e é uma mentira.\n"
+    "Então, sempre que a sua resposta contiver uma promessa de trabalho "
+    "(\"vou procurar\", \"sigo tentando\", \"já te mando\", \"vou resolver\", \"deixa "
+    "comigo\"), ela é OBRIGADA a terminar com:\n"
+    "[[HANDOFF:continuar]]<a próxima ordem concreta, no imperativo>[[/HANDOFF]]\n\n"
+    "Como usar bem:\n"
+    "- A ordem tem que ser a PRÓXIMA AÇÃO REAL, específica e diferente do que já "
+    "falhou. Ruim: \"continuar o site\". Bom: \"baixar uma imagem do Naruto com "
+    "`curl -L -A 'Mozilla/5.0'` e salvar em /workspace/portifolio-naruto/images\".\n"
+    "- Repetir a mesma ordem não roda de novo (o ciclo detecta e para). Se uma "
+    "tentativa falhou, a próxima ordem tem que mudar a ABORDAGEM, não repetir.\n"
+    "- Você continua vendo o que já fez: cada continuação recebe uma nota com os "
+    "resultados reais dos passos anteriores. Leia antes de decidir o passo.\n"
+    "- Quando a tarefa terminar de verdade, NÃO emita o bloco: responda o "
+    "fechamento e entregue o resultado (arquivo via `file_save`, por exemplo). "
+    "Essa última mensagem é a que encerra o turno.\n"
+    "- Também não emita o bloco se você precisa de uma DECISÃO do usuário. "
+    "Perguntar e parar é legítimo; prometer e parar não é.\n"
+    "- O ciclo tem orçamento finito. Se estiver acabando, entregue o melhor "
+    "resultado que já tem em vez de gastar o último passo tentando de novo."
+)
+
+
+# Promise markers — the deterministic pre-filter in front of the (paid) promise
+# verifier. Deliberately generous: a false positive costs one cheap temperature-0
+# call that answers promised=false, while a false negative brings back the exact
+# bug this feature removes. Accent-insensitive, matched on the normalized reply.
+_PROMISE_MARKERS = (
+    "vou", "vamos", "sigo", "seguir tentando", "continuo", "ja te mando",
+    "ja mando", "ja volto", "ja trago", "ja resolvo", "ja te trago",
+    "deixa comigo", "pode deixar", "me da um minuto", "me de um minuto",
+    "em seguida eu", "agora eu vou", "proximo passo eu", "estou indo",
+    "tentar de novo", "tentar outra", "volto ja",
+)
+
+# Word boundaries are load-bearing, not cosmetic: as a plain substring "sigo"
+# matches inside "não conSIGO fazer isso" — a refusal read as a promise, which
+# would fire the cycle on exactly the turn that must stop.
+_PROMISE_RE = re.compile(
+    r"\b(?:%s)\b" % "|".join(re.escape(m) for m in _PROMISE_MARKERS)
+)
+
+# Announcements that only read as a promise when they CLOSE the reply. The list
+# above covers the explicit future ("vou baixar") and misses everything else —
+# both of these are verbatim endings measured on real runs of this feature, and
+# both ended the turn on a promise with the backstop never firing:
+#   "Script Jikan pronto. Rodando o download."                  (gerúndio)
+#   "Agora busco imagens dos outros personagens e baixo tudo."   (presente, 1ª p.)
+# Restricted to the last sentence because mid-reply the same words narrate what
+# already happened ("rodei o script, gerando o zip") — paying a verifier call for
+# that is waste, and the closing position is exactly where "what I do next" lives.
+_CLOSING_PROMISE_MARKERS = (
+    # gerúndio ("Rodando o download.")
+    "rodando", "baixando", "gerando", "criando", "montando", "buscando",
+    "procurando", "instalando", "processando", "compactando", "zipando",
+    "escrevendo", "testando", "ajustando", "corrigindo", "preparando",
+    "subindo", "finalizando", "tentando",
+    # presente do indicativo, 1ª pessoa ("Agora busco as imagens.")
+    "busco", "gero", "crio", "monto", "rodo", "testo", "ajusto", "corrijo",
+    "procuro", "preparo", "compacto", "instalo", "finalizo",
+)
+
+# Deliberately absent: "baixo" (colide com "preço baixo"), "fecho" (o substantivo)
+# e "subo"/"topo". São justamente as formas curtas que aparecem em frase comum
+# sem nenhuma intenção de continuar — o custo do falso positivo aqui não é uma
+# chamada barata, é o ciclo disparar num turno que devia terminar.
+_CLOSING_PROMISE_RE = re.compile(
+    r"\b(?:%s)\b" % "|".join(re.escape(m) for m in _CLOSING_PROMISE_MARKERS)
+)
+
+# Frase final = último trecho não vazio depois de . ! ? ou quebra de linha.
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _looks_like_promise(text: str | None) -> bool:
+    """Cheap gate: does this reply read like it announces work still to come?"""
+    if not text:
+        return False
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    flat = "".join(c for c in decomposed if not unicodedata.combining(c))
+    if _PROMISE_RE.search(flat):
+        return True
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(flat) if p.strip()]
+    return bool(parts and _CLOSING_PROMISE_RE.search(parts[-1]))
+
+
+# Prefix that tells the desktop a thinking bubble is a self-continuation step
+# actually EXECUTING, not the model musing. The Rust client strips it and flips the
+# bubble's label from "Pensando" to "Executando" (ai_agent.rs::core_message_to_event).
+# A marker rather than prose-sniffing on the client: the wording here changes freely.
+CYCLE_PROGRESS_MARKER = "[[CYCLE]]"
+
+# Closing lines for a self-continuation cycle that stopped on a guard instead of
+# finishing. Each names the real reason: a generic "algo deu errado" here would be
+# the same opacity the cycle exists to remove.
+_CYCLE_CLOSING_MESSAGE: dict[str, str] = {
+    "budget": (
+        "Bati no limite de passos deste turno e parei por aqui — o que já ficou "
+        "pronto está acima. Me fala se quer que eu continue de onde parei."
+    ),
+    "anti_loop": (
+        "Percebi que ia repetir a mesma tentativa que já falhou, então parei em vez "
+        "de rodar em círculo. Preciso de outra abordagem — ou de um empurrão seu."
+    ),
+    "max_depth": (
+        "A cadeia de continuações ficou funda demais e eu parei por segurança. "
+        "O que já ficou pronto está acima."
+    ),
+}
+
+
+def _format_work_note(
+    label: str,
+    reply: str | None,
+    tool_trace: list[dict[str, Any]] | None,
+    files: list[dict[str, Any]] | None,
+) -> str | None:
+    """Compact, factual record of one step, for the next continuation to read.
+
+    Deliberately built from the tool trace and not from ``reply``: the reply is
+    where the model states intentions ("vou baixar a imagem"), and feeding those
+    back would let a promise masquerade as a result on the next round. Tool lines
+    keep the failure verbatim-ish, because "falhou" without the reason is what made
+    the brain retry the same broken URL.
+    """
+    lines: list[str] = []
+    for entry in tool_trace or []:
+        if not entry:
+            continue
+        name = entry.get("tool", "?")
+        if entry.get("ok"):
+            detail = ", ".join(
+                f"{k}={v}"
+                for k, v in entry.items()
+                if k not in ("tool", "ok") and v not in (None, "")
+            )
+            lines.append(f"  - `{name}` OK{f' ({detail})' if detail else ''}")
+        else:
+            lines.append(f"  - `{name}` FALHOU: {str(entry.get('error') or '')[:200]}")
+    for f in files or []:
+        lines.append(f"  - entregue ao usuário: {f.get('name')} (file_id={f.get('file_id')})")
+    if not lines:
+        # No tools and no files: the step only talked. Say so explicitly — an empty
+        # note would read as "nothing is known", and the next step would restart.
+        said = (reply or "").strip().replace("\n", " ")[:160]
+        lines.append(f"  - nenhuma ação executada; só respondeu: {said!r}" if said else "  - nada foi executado")
+    return f"{label}:\n" + "\n".join(lines)
+
+
+def _build_handoff_instruction(*, allow_self: bool = False) -> str:
     """Instrução de handoff com a lista de skills vinda dos SkillManifest.
 
     Fonte única (F4 — docs/skills-library-plan.md): uma skill pipeline nova com
     ``handoff=True`` entra aqui automaticamente via ``handoff_line``.
+
+    ``allow_self`` acrescenta o contrato de autocontinuação (``[[HANDOFF:continuar]]``).
     """
     lines = ""
     try:
@@ -550,7 +1177,8 @@ def _build_handoff_instruction() -> str:
         logger.warning("[HANDOFF] manifest registry unavailable for instruction: %s", e)
     if not lines:
         lines = _HANDOFF_SKILL_LINES_FALLBACK
-    return _HANDOFF_INSTRUCTION_HEADER + lines + _HANDOFF_INSTRUCTION_RULES
+    base = _HANDOFF_INSTRUCTION_HEADER + lines + _HANDOFF_INSTRUCTION_RULES
+    return base + _SELF_HANDOFF_INSTRUCTION if allow_self else base
 
 # Workbench: the cognitive core has its OWN execution environment (a sandboxed
 # Linux with internet + a persistent /workspace). Injected on cognitive turns when
@@ -572,6 +1200,16 @@ _WORKBENCH_INSTRUCTION = (
     "linguagem natural; não cole saídas cruas enormes. Para trabalho demorado, "
     "prefira rodar em background (quando disponível) e avise que vai avisar ao "
     "terminar — não segure a conversa esperando.\n\n"
+    "**O que já está instalado aí** (não precisa instalar nem testar antes de "
+    "usar): `file` pra descobrir o tipo real; PDF com `pdftotext`/`pypdf` e "
+    "`pdfplumber` (tabela); PDF ESCANEADO e imagem por OCR com `pytesseract` "
+    "(`lang=\"por\"`) + `pdf2image`/`pymupdf`; Office com `python-docx`, "
+    "`python-pptx`, `openpyxl`, `xlrd`, `odfpy`; HTML com `html2text`/"
+    "`trafilatura`; dados com pandas, `duckdb` (SQL direto em CSV/Parquet) e "
+    "`pyarrow`; mídia com `ffmpeg`/`ffprobe`; `7z`/`unzip`. Faltou alguma lib? "
+    "`pip install --user <x>` funciona na hora — mas ela some no próximo restart "
+    "do sandbox, então não conte com ela depois. NUNCA responda que não consegue "
+    "ler um PDF/planilha/documento: você consegue, é só rodar.\n\n"
     "**NUNCA** tente `neo_bash cp`/`mv`/escrever um arquivo pra fora de "
     "/workspace (ex.: caminhos tipo `/Users/...`, `/home/...`, `~/Desktop`) — "
     "essa máquina não enxerga o disco do usuário de jeito nenhum, sempre falha "
@@ -592,10 +1230,20 @@ _FILE_ACTUATION_INSTRUCTION = (
     "## Arquivos: você pode PEGAR e ENTREGAR sozinho\n"
     "Você NÃO depende mais do usuário anexar nem de um turno separado pra mexer em "
     "arquivos dele:\n"
+    "- **SANDBOX PRIMEIRO.** Pra LER ou PROCESSAR um arquivo, suba ele pro seu "
+    "/workspace e trabalhe lá — não tente processar na máquina dele. O ambiente do "
+    "usuário quase sempre não tem a ferramenta (`pdftotext`, `mutool`, libs) e "
+    "descobrir isso por `command not found` queima turno atrás de turno. O seu "
+    "workspace tem. Só trate direto na máquina dele quando o arquivo for grande "
+    "demais pra subir (ordem de gigabytes) — aí sim vale tentar local.\n"
     "- **Precisa de um arquivo que só existe na máquina do usuário** (ele não anexou)? "
-    "Chame `request_user_file`. Padrão `mode=\"pick\"` (abre o seletor; ele escolhe — "
-    "seguro e sem chute). Use `mode=\"path\"` SÓ se ele citou um caminho literal nesta "
-    "conversa — NUNCA invente um caminho a partir do nome. Passe `stage=true` se você "
+    "Chame `request_user_file`. Use `mode=\"path\"` quando você SOUBER o caminho: ele "
+    "citou nesta conversa, OU o arquivo foi você mesmo que pôs lá (aparece no seu "
+    "registro de artefatos / na saída de um comando que você rodou). Nesse caso NÃO "
+    "abra o seletor — pedir ao usuário pra escolher um arquivo que você já localizou "
+    "é fazê-lo trabalhar à toa. `mode=\"pick\"` (abre o seletor) é pra quando você "
+    "REALMENTE não sabe qual é o arquivo. O que continua proibido é INVENTAR um "
+    "caminho a partir do nome. Passe `stage=true` se você "
     "vai RODAR/processar o arquivo (ele já vem materializado no /workspace pro neo_bash); "
     "`stage=false` se só vai LER (file_read). O arquivo chega ao seu catálogo e você "
     "continua a resposta lendo/processando — não peça de novo.\n"
@@ -638,12 +1286,51 @@ _MUSIC_HANDOFF_INSTRUCTION = (
     "tocou ou pulou SEM emitir o bloco; senão NADA acontece e você fica mentindo. "
     "Resolva pedidos vagos ('aquela que eu curto') usando o gosto do PKS e ponha algo "
     "concreto/buscável (ou a palavra exata da ação) dentro do bloco.\n"
+    "- Se NESTE MESMO turno você já mandou o navegador DO USUÁRIO abrir/tocar "
+    "(`browser_local_task`), isso JÁ É tocar: escreva a resposta e feche com "
+    "[[NO_MUSIC]]. Emitir o bloco também abriria uma SEGUNDA aba, com outra música "
+    "tocando junto com a primeira.\n"
     "- Responda curto e natural; a mecânica dos blocos fica invisível ao usuário."
 )
 
 # Client tools the music skill dispatches to the desktop (Etapa 2). process_tool_result
 # confirms these truthfully and skips the generic recovery flow.
 _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
+
+# A ÚNICA tool pela qual o núcleo cognitivo mexe no navegador que o usuário está
+# olhando. `browser_task` não entra: roda escondida no servidor e não abre aba
+# nenhuma na tela dele. Existe para a guarda de dupla atuação da música (sessão
+# a691f1e0): "abre uma aba no meu navegador com uma playlist de rock e coloca pra
+# tocar" casa AO MESMO TEMPO com a regra do navegador local (chame
+# `browser_local_task` no MESMO turno) e com o contrato de música (TOCAR sempre
+# exige [[HANDOFF:music]]). O modelo obedeceu aos dois e o turno atuou duas vezes:
+# o agente abriu uma aba nova com uma playlist e a skill de música sequestrou
+# OUTRA aba do YouTube com um vídeo diferente — duas playlists tocando juntas. O
+# contrato de música só sabia checar se FALTAVA handoff, nunca se o turno já tinha
+# atuado por outro canal.
+_USER_BROWSER_TOOL = "browser_local_task"
+
+
+def _drop_music_handoff_after_browser(
+    handoffs: list[Handoff], browser_actuated: bool
+) -> list[Handoff]:
+    """Descarta o handoff de música quando o turno JÁ atuou no navegador do usuário.
+
+    O navegador vence: é a atuação que o usuário pediu para VER acontecer, já está
+    rodando e não dá para cancelar do meio — enquanto o handoff ainda é só uma
+    intenção. ``browser_actuated`` tem que ser o fato consumado (tool efetiva,
+    pós-portão, ordem aceita), nunca "o modelo escolheu essa tool": suprimir em
+    cima de uma escolha que o portão rebaixou para o servidor, ou de uma chamada
+    que falhou, troca duas abas tocando por NENHUMA.
+    """
+    if not browser_actuated:
+        return handoffs
+    return [
+        h
+        for h in handoffs
+        if not (h.target_skill == "music" or h.target_intent == IntentType.MUSIC)
+    ]
+
 
 # Tools "client-actuating" que o NÚCLEO COGNITIVO aciona no meio do turno para
 # OBTER/ENTREGAR arquivos (plano "arquivos sob iniciativa do cérebro"): elas não
@@ -652,7 +1339,9 @@ _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
 # ``ClientActuationRequested``; ``_handle_direct_response`` quebra o turno e emite
 # um ``tool_request`` — o desktop executa e o resultado volta em
 # ``process_tool_result`` (mesmo round-trip de save_generated_file/execute_command).
-_CLIENT_ACTUATION_TOOLS = frozenset({"request_user_file", "save_generated_file"})
+_CLIENT_ACTUATION_TOOLS = frozenset(
+    {"request_user_file", "save_generated_file", "write_file"}
+)
 
 # Shell na máquina do usuário pela iniciativa do CÉREBRO (neo_brain_shell_enabled).
 # Fica num set próprio, e não dentro de _CLIENT_ACTUATION_TOOLS, porque o nome
@@ -929,6 +1618,7 @@ class AIService:
         job_manager: Any = None,
         skill_library: Any = None,
         file_store: Any = None,
+        credential_store: Any = None,
     ) -> None:
         self.llm = llm_router
         self.router = intent_router
@@ -949,6 +1639,11 @@ class AIService:
         # FileStore — catálogo de arquivos (docs/file-store-plan.md). None (flag
         # off) → metadata["attachments"] é ignorado e nenhum manifesto é injetado.
         self.file_store = file_store
+        # CredentialStore — cofre Fernet. Aqui serve a UMA coisa: saber que o Neo
+        # tem um email próprio e qual é o endereço (ver _neo_identity_block). O
+        # segredo continua sem passar por perto.
+        self.credential_store = credential_store
+        self._identity_cache: tuple[float, str] = (0.0, "")
         # Anexos por sessão (RAM): o arquivo anexado uma vez segue valendo nos
         # turnos seguintes da conversa — ver _remember_session_attachments.
         self._session_attachments: dict[str, list[str]] = {}
@@ -967,6 +1662,11 @@ class AIService:
         # Mesmo motivo do set acima: a resposta de um client tool
         # (process_tool_result → _format_tool_result) perde o metadata do turno.
         self._image_capable_sessions: set[str] = set()
+        # Sessões cujo último turno veio de VOZ (metadata["input_source"]=="voice").
+        # Independente do set Live acima: `mode` descreve a SAÍDA (falar sem
+        # markdown), `input_source` descreve a ENTRADA (texto transcrito por ASR,
+        # que erra nome/grafia). Ver docs/voice-input-normalization-plan.md.
+        self._voice_input_sessions: set[str] = set()
         # Registro da situação (docs/context-register-plan.md): gravidade sticky
         # por sessão (RAM, decai sozinha) + registro do último turno — este último
         # cobre as continuações (process_tool_result) que perdem o metadata.
@@ -989,6 +1689,54 @@ class AIService:
         self._bg_tasks: set[asyncio.Task] = set()
         self.planner = PlanManager(llm_router)
 
+    async def _neo_identity_block(self) -> str:
+        """Bloco "seus dados" do prompt — hoje, o email próprio do Neo.
+
+        Cache de 5 min: isto roda em TODO turno e o dado muda quando alguém mexe
+        no painel, não a cada mensagem. Falha em silêncio de propósito — cofre
+        fora do ar não pode custar o turno.
+        """
+        if self.credential_store is None:
+            return ""
+        now = time.monotonic()
+        cached_at, cached = self._identity_cache
+        if cached_at and now - cached_at < 300:
+            return cached
+        block = ""
+        try:
+            boxes = await self.credential_store.list_by_kind("email")
+            linhas = []
+            for box in boxes:
+                address = (box.fields or {}).get("address")
+                if not address:
+                    continue
+                desc = f" — {box.description}" if box.description else ""
+                linhas.append(f"- {address} (rótulo no cofre: '{box.label}'){desc}")
+            if linhas:
+                block = (
+                    "## Seu email\n"
+                    "Você TEM email próprio. Quando algo pedir 'um email' (cadastro, "
+                    "formulário, contato), use o SEU — nunca peça o do usuário nem invente "
+                    "um endereço:\n"
+                    + "\n".join(linhas)
+                    + "\nA senha está no cofre e você não a vê: quem preenche é a tool "
+                    "(browser_task com `credentials`). Para ler a caixa (código/link de "
+                    "confirmação que você mesmo provocou), use `email_inbox`."
+                    + (
+                        "\nVocê também ENVIA: `email_send` manda um email a partir dessa "
+                        "caixa, com você como remetente. Vale para 'manda um email pra "
+                        "fulano'. O email sai de verdade e não dá para cancelar — se não "
+                        "souber o endereço do destinatário, pergunte em vez de adivinhar."
+                        if getattr(self.settings, "neo_email_send_enabled", True)
+                        else ""
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[identity] cofre indisponível: %s", exc)
+            block = cached
+        self._identity_cache = (now, block)
+        return block
+
     @staticmethod
     def _client_renders_inline_images(metadata: dict[str, Any] | None) -> bool:
         """O cliente deste turno troca `[[IMAGE:…]]` pela imagem renderizada?
@@ -1003,6 +1751,20 @@ class AIService:
         if opt_in in {"1", "true", "yes"}:
             return True
         return str(metadata.get("client", "")).strip() == "neo-desktop-tauri"
+
+    @staticmethod
+    def _is_voice_input(metadata: dict[str, Any] | None) -> bool:
+        """O texto deste turno veio de um ASR (microfone), não do teclado?
+
+        Sinal explícito do cliente (``input_source="voice"``), NUNCA inferido de
+        ``mode="live"``: o Live descreve como a resposta sai (falada), não como a
+        pergunta entrou — existe voz que responde em texto e texto que responde
+        falando. Inferir daria tolerância a erro de ASR para o que o usuário
+        digitou de propósito.
+        """
+        if not metadata:
+            return False
+        return str(metadata.get("input_source", "")).strip().lower() == "voice"
 
     @staticmethod
     def _parse_attachment_ids(metadata: dict[str, Any] | None) -> list[str]:
@@ -1060,6 +1822,38 @@ class AIService:
                 continue
             lines.append(self.file_store.manifest_line(entry))
         return lines
+
+    async def _recent_artifacts(
+        self, user_id: UUID | None
+    ) -> tuple[str | None, dict[str, str]]:
+        """Bloco de artefatos para o ``system_context`` + mapa nome→caminho real.
+
+        Devolve as DUAS superfícies de uma leitura só, porque elas resolvem
+        problemas diferentes do mesmo turno: o bloco entra no prompt do
+        classificador (que é quem inventa caminho, e não enxerga o índice do
+        caderno — esse só chega ao cognitivo), e o mapa vai para a resolução
+        determinística do roteador, que reescreve o caminho em vez de confiar
+        que o modelo leu o bloco.
+
+        Silencioso quando a memória de trabalho está desligada, e nunca levanta:
+        um registro indisponível não pode custar o turno.
+        """
+        try:
+            from core.working_memory import artifacts as artifacts_mod
+
+            store = artifacts_mod.store_for(self.db)
+            if store is None:
+                return None, {}
+            items = await artifacts_mod.recent(store, user_id=user_id)
+            if not items:
+                return None, {}
+            return (
+                artifacts_mod.render_context_block(items) or None,
+                artifacts_mod.path_map(items),
+            )
+        except Exception as exc:  # noqa: BLE001 — contexto extra é best-effort
+            logger.warning("[Artefatos] contexto do turno indisponível: %s", exc)
+            return None, {}
 
     async def _build_attachments_manifest(
         self,
@@ -1350,6 +2144,16 @@ class AIService:
         except Exception:  # noqa: BLE001 — epílogo nunca derruba nada
             logger.warning("[BIRRA] epílogo falhou", exc_info=True)
 
+    def _birra_armed(self, session_id: UUID) -> bool:
+        """A birra deste turno está armada? Fonte única: a decisão do turno.
+
+        O seletor de contexto derivava isso do episódio persistido, que é um
+        efeito da decisão e não a decisão — as duas divergiram e a diretiva de
+        birra sumiu do prompt sem que nada mais mudasse de comportamento.
+        """
+        turn = self._session_birra.get(str(session_id))
+        return bool(turn is not None and getattr(turn.decision, "armed", False))
+
     def _birra_store(self) -> Any | None:
         from core.agent.birra.store import BirraStore
 
@@ -1586,6 +2390,21 @@ class AIService:
         Yields:
             AIServiceResponse with thinking, tool requests, or final response.
         """
+        # 0. Entrada por voz: backstop determinístico do nome ANTES de tudo — antes
+        # de salvar a mensagem, de embeddar e de classificar. O corretor completo
+        # mora no neo-voice (stt_text.py); isto cobre o cliente que não passou por
+        # ele (mobile, áudio de WhatsApp). O texto cru vai para o metadata, então
+        # nada se perde. Ver docs/voice-input-normalization-plan.md §4.2.
+        if self._is_voice_input(metadata):
+            fixed, variants = canonicalize_assistant_name(user_message)
+            if variants:
+                logger.info("[ASR] nome canonizado no core: %s → %s (%r)",
+                            variants, ASSISTANT_NAME, user_message)
+                metadata = {**(metadata or {})}
+                metadata.setdefault("asr_raw", user_message)
+                metadata["asr_core_fixes"] = ",".join(variants)
+                user_message = fixed
+
         # 1. Get or create session (with topic rotation check)
         t0_total = time.monotonic()
         logger.info(f"[HISTORY-DEBUG] Input session_id from desktop: {session_id}")
@@ -1594,6 +2413,8 @@ class AIService:
             session_id=session_id,
             user_id=user_id,
             service=service,
+            # Só o live expira pelo relógio curto; o chat ganha o backstop longo.
+            mode=(metadata or {}).get("mode"),
         )
         session_ms = round((time.monotonic() - t0_session) * 1000, 1)
         sid = session.id
@@ -1632,7 +2453,8 @@ class AIService:
                 logger.info(f"Topic change detected, rotating session {sid}")
                 await self.sessions.close_session(sid, reason="topic_change")
                 session = await self.sessions.get_or_create_session(
-                    session_id=None, user_id=user_id, service=service
+                    session_id=None, user_id=user_id, service=service,
+                    mode=(metadata or {}).get("mode"),
                 )
                 # Record a continuity link so the next (possibly elliptical)
                 # follow-up can still recover the rotated-away conversation,
@@ -1716,6 +2538,14 @@ class AIService:
             sys_context = "\n\n".join(part for part in (sys_context, _LIVE_STYLE_INSTRUCTION) if part)
         else:
             self._live_sessions.discard(str(sid))
+        # Entrada por VOZ: a instrução em si já veio dentro do _build_system_context
+        # (todo caminho que reconstrói o turno passa por lá). Aqui só marcamos a
+        # sessão, para os caminhos que perdem o metadata no round-trip — o mesmo
+        # motivo do set do Live acima.
+        if self._is_voice_input(metadata):
+            self._voice_input_sessions.add(str(sid))
+        else:
+            self._voice_input_sessions.discard(str(sid))
         # Imagens no chat: a instrução do marcador `[[IMAGE:…]]` só vai pro cliente
         # que sabe renderizá-lo (senão o usuário veria o marcador cru). Mesmo seam
         # do estilo Live acima — chega ao cognitivo E ao classificador (que recebe o
@@ -1727,6 +2557,13 @@ class AIService:
             )
         else:
             self._image_capable_sessions.discard(str(sid))
+        # Identidade: o email PRÓPRIO do Neo. Vai no prompt (e não atrás de uma
+        # tool) porque a pergunta que ele responde é "eu tenho um email?" — se
+        # dependesse de descobrir, o Neo pediria o email do usuário em vez de usar
+        # o dele. O ENDEREÇO é público; a senha fica no cofre.
+        identity = await self._neo_identity_block()
+        if identity:
+            sys_context = "\n\n".join(part for part in (sys_context, identity) if part)
         # Anexos (docs/file-store-plan.md §5): só o MANIFESTO entra no prompt; o
         # modelo lê por fatia/materializa com as tools file_*. Mesmo seam do estilo
         # Live acima — chega ao cognitivo via system_context E ao classificador
@@ -1740,6 +2577,12 @@ class AIService:
         mission_context = await self._build_recent_missions_context(sid, user_id)
         if mission_context:
             sys_context = "\n\n".join(part for part in (sys_context, mission_context) if part)
+        # Artefatos (arquivos que o Neo já pôs no disco dele). Mesma costura do
+        # manifesto de anexos, e pela mesma razão: o `sys_context` é o ÚNICO
+        # canal que o classificador também lê, e é ele quem monta o comando.
+        artifacts_block, artifact_paths = await self._recent_artifacts(user_id)
+        if artifacts_block:
+            sys_context = "\n\n".join(part for part in (sys_context, artifacts_block) if part)
 
         if continuity.get("action") == "inject" and continuity.get("history"):
             continuity_history = continuity["history"]
@@ -1905,6 +2748,7 @@ class AIService:
                 system_context=sys_context,
                 affect_hint=turn_affect.hint,
                 affect_force_brain=turn_affect.force_brain,
+                artifact_paths=artifact_paths,
             )
         intent_ms = (time.monotonic() - t0) * 1000
         logger.info(f"[TIMING] session={session_ms}ms embed+hist={embed_ms}ms intent={intent_ms:.0f}ms")
@@ -2154,7 +2998,16 @@ class AIService:
         """
 
         handoff_enabled = self.settings.pipeline_handoff_enabled
+        self_max_steps = self.settings.pipeline_self_handoff_max_steps
         pipeline_step_index = 0
+        last_notice: tuple[str, str] | None = None
+
+        def _notice(kind: str, message: str) -> None:
+            """Orchestrator early-exit → session log, so a dropped step is auditable."""
+            nonlocal last_notice
+            last_notice = (kind, message)
+            if slog:
+                slog.log_event(f"Pipeline — ciclo interrompido ({kind})", message)
 
         async def _step_runner(
             step: PipelineStep,
@@ -2195,6 +3048,26 @@ class AIService:
                         "Handoff — gating de segurança",
                         f"Ação externa para `{intent.value}` exige confirmação humana "
                         "(passa pelo fluxo de missão/confirmação da skill).",
+                    )
+                if step.is_self_continuation:
+                    # The continuation must see what the earlier steps really did,
+                    # otherwise it retries the attempt that just failed.
+                    if step.context_note:
+                        step_metadata["pipeline_work_note"] = step.context_note
+                    # Live progress: a non-final response with no persist_reply
+                    # becomes an AgentThinking bubble on the desktop, so the user
+                    # watches the cycle advance instead of staring at 100 s of
+                    # silence. It replaces the previous bubble and is cleared on
+                    # complete — exactly the semantics of "running right now".
+                    yield (
+                        AIServiceResponse(
+                            intent=IntentType.DIRECT_RESPONSE,
+                            session_id=sid,
+                            message=f"{CYCLE_PROGRESS_MARKER}Continuando ({step_idx}/{self_max_steps}): {msg}",
+                            is_final=False,
+                            iterations=step_idx,
+                        ),
+                        None,
                     )
 
             if intent == IntentType.DIRECT_RESPONSE:
@@ -2240,13 +3113,18 @@ class AIService:
                 return
 
             last_final: str | None = None
+            last_text: str | None = None
             handoffs: list[Handoff] = []
+            work: dict[str, Any] | None = None
             async for resp in gen:
                 control = (resp.metadata or {}).get("__pipeline_handoffs__")
                 if control:
                     # Internal control item — capture, never forward to the client.
                     handoffs = control
+                    work = (resp.metadata or {}).get("__pipeline_work__")
                     continue
+                if resp.message:
+                    last_text = resp.message
                 if resp.is_final:
                     last_final = resp.message
                 yield resp, None
@@ -2258,13 +3136,76 @@ class AIService:
                     origin=step.origin,
                     input_text=msg,
                     final_text=last_final,
-                    handoffs=[h.target_skill or h.target_intent.value for h in handoffs],
+                    handoffs=[
+                        "continuar" if h.is_self else (h.target_skill or h.target_intent.value)
+                        for h in handoffs
+                    ],
                 )
-            yield None, StepOutcome(ok=True, final_text=last_final, handoffs=handoffs)
+            # Only build a note when a continuation will actually read it; a skill
+            # handoff runs isolated and a terminal step has no successor.
+            note = None
+            if any(h.is_self for h in handoffs):
+                note = _format_work_note(
+                    f"Passo {step_idx} — {msg}",
+                    (work or {}).get("reply") or last_text,
+                    (work or {}).get("tool_trace"),
+                    (work or {}).get("files"),
+                )
+            yield None, StepOutcome(
+                ok=True, final_text=last_final, handoffs=handoffs, work_note=note
+            )
 
-        orchestrator = PipelineOrchestrator(_step_runner)
+        orchestrator = PipelineOrchestrator(
+            _step_runner,
+            self_max_steps=self_max_steps,
+            self_max_depth=self.settings.pipeline_self_handoff_max_depth,
+            on_notice=_notice,
+        )
+        saw_final = False
+        pending_client = False
         async for resp in orchestrator.run(self._seed_steps(decision, user_message)):
+            saw_final = saw_final or resp.is_final
+            pending_client = pending_client or is_pending_client_turn(resp)
             yield resp
+
+        # Invariant: the stream MUST end on an is_final. A response carrying a
+        # handoff is deliberately non-final (handoff_defers_final), so any chain
+        # that stops before running that handoff — anti-loop, depth, budget, a
+        # failed dependent step — would leave the turn without a terminator. The
+        # desktop only emits `complete` when it sees is_final (ai_agent.rs), so the
+        # chat would spin forever. Close it here instead.
+        #
+        # The closer is its OWN short message, never a repeat of the last reply:
+        # that reply already reached the chat as a persistent bubble, and echoing it
+        # into `complete` would show the same text twice.
+        #
+        # EXCEÇÃO (sessões 081cd1c3 e 15b6b825): um turno que emitiu
+        # tool_request/command_request está ESPERANDO o desktop, não morreu. O
+        # terminador aqui era lido pelo Rust como fim de turno (`break` +
+        # `drop(tx)`, ai_agent.rs), fechando a metade de envio da stream — ou
+        # seja, matando o canal pelo qual o resultado ia voltar. O usuário via o
+        # botão "Aprovar e Executar", clicava, e nada acontecia: o turno já tinha
+        # sido encerrado milissegundos depois de pedir a permissão. Quem cuida da
+        # queda de verdade é o `finally` do gRPC (`_close_incomplete_tool_turn`),
+        # que é event-driven e não precisa de terminador para agir.
+        if not saw_final and not pending_client:
+            logger.warning("[PIPELINE] chain ended without a final response — closing the turn")
+            if slog:
+                slog.log_event(
+                    "Pipeline — fechamento forçado",
+                    f"A cadeia terminou sem resposta final ({last_notice[0] if last_notice else 'motivo desconhecido'}). "
+                    "Emitindo terminador para o cliente não ficar preso.",
+                )
+            yield AIServiceResponse(
+                intent=decision.intent,
+                session_id=sid,
+                message=_CYCLE_CLOSING_MESSAGE.get(
+                    last_notice[0] if last_notice else "",
+                    "Parei este turno aqui. Me diz se quer que eu siga de onde parei.",
+                ),
+                is_final=True,
+                iterations=pipeline_step_index,
+            )
 
     async def _resolve_speech_segments(
         self, parsed: list[Any]
@@ -2331,22 +3272,26 @@ class AIService:
         """
         if slog:
             slog.log_event("Erro LLM", f"```\n{exc}\n```")
+        # Crédito/limite da chave é a única classe de falha em que o usuário tem o
+        # que fazer — e em que "tenta de novo" seria mentira. O texto do erro NÃO
+        # entra na frase (invariante do docstring); só escolhe qual frase usar.
+        reply = TURN_FAILED_NO_CREDIT if _is_no_credit_failure(exc) else TURN_FAILED_REPLY
         try:
             await self.sessions.add_message(
                 session_id=session_id,
                 role="assistant",
-                content=TURN_FAILED_REPLY,
+                content=reply,
                 generate_embedding=False,
                 user_id=user_id,
             )
         except Exception:  # noqa: BLE001 — o turno já falhou; não falhar de novo aqui
             logger.warning("[fail-turn] não consegui salvar o fecho do turno", exc_info=True)
         if slog:
-            slog.log_final_response(TURN_FAILED_REPLY, "COGNITIVE", iterations=1)
+            slog.log_final_response(reply, "COGNITIVE", iterations=1)
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
-            message=TURN_FAILED_REPLY,
+            message=reply,
             is_final=True,
             iterations=1,
         )
@@ -2475,6 +3420,43 @@ class AIService:
                     slog=slog,
                 )
 
+        # Recall de conversas: pergunta sobre o passado não pode ser respondida de
+        # cabeça (o cognitivo só vê ESTA sessão). Quando o gatilho determinístico
+        # casa, a tool vira obrigatória no primeiro round — o mesmo mecanismo que
+        # fez a skill `financas` finalmente ativar. Ver
+        # docs/conversation-recall-plan.md §4/F5.
+        recall_note: str | None = None
+        recall_forced = False
+        if (
+            user_id
+            and getattr(self.settings, "conversation_recall_enabled", True)
+            and self.settings.cognitive_tools_enabled
+            and not is_neo_training
+        ):
+            _cursor = await self._recall_cursor(session_id)
+            if _is_recall_continuation(user_message) and _cursor:
+                recall_note = (
+                    f"{_RECALL_CONTINUATION_NUDGE}\n\n"
+                    f"Busca anterior: query=\"{_cursor.get('query')}\", "
+                    f"before=\"{_cursor.get('next_before')}\"."
+                )
+                recall_forced = True
+                if slog:
+                    slog.log_event(
+                        "Recall — continuação",
+                        f"'{user_message[:60]}' rejeitou a janela anterior → "
+                        f"nova busca com before={_cursor.get('next_before')}",
+                    )
+            elif _is_conversation_recall_request(user_message):
+                recall_note = _RECALL_NUDGE
+                recall_forced = True
+                if slog:
+                    slog.log_event(
+                        "Recall — gatilho",
+                        "pergunta sobre conversa anterior → `conversation_recall` obrigatória",
+                    )
+            await self._touch_recall_cursor(session_id, keep=recall_forced)
+
         if slog:
             slog.log_context_recovery(recovered_context or [])
         if trace:
@@ -2505,6 +3487,9 @@ class AIService:
                 pks_system_prewrite=pks_system_prewrite,
                 mission_context=None,
                 register=register,
+                birra_armed=self._birra_armed(session_id),
+                # Caderno de trabalho: a nota tocada NESTA sessão sobe no índice.
+                session_id=session_id,
             )
             pks_ms = round((time.monotonic() - t0_ctx) * 1000, 1)
             if slog:
@@ -2553,7 +3538,36 @@ class AIService:
             if decision.skill_hint == "music":
                 messages.append(Message(role=MessageRole.SYSTEM, content=_MUSIC_HANDOFF_INSTRUCTION))
             else:
-                messages.append(Message(role=MessageRole.SYSTEM, content=_build_handoff_instruction()))
+                messages.append(
+                    Message(
+                        role=MessageRole.SYSTEM,
+                        content=_build_handoff_instruction(
+                            allow_self=self.settings.pipeline_self_handoff_enabled
+                        ),
+                    )
+                )
+
+        # Self-continuation: what the earlier steps of THIS turn already did. Built
+        # from execution facts by the step runner, so the continuation plans against
+        # results instead of retrying blind — the failure mode that made the brain
+        # re-download the same broken URL.
+        _work_note = (metadata or {}).get("pipeline_work_note")
+        if _work_note:
+            messages.append(
+                Message(
+                    role=MessageRole.SYSTEM,
+                    content=(
+                        "## O que você já fez neste turno\n"
+                        "Você está CONTINUANDO um trabalho seu (não é uma mensagem nova "
+                        "do usuário). Estes são os resultados reais dos passos "
+                        "anteriores — não repita o que já deu certo, e não repita do "
+                        "mesmo jeito o que falhou:\n\n"
+                        f"{_work_note}"
+                    ),
+                )
+            )
+            if slog:
+                slog.log_event("Continuação — nota de trabalho", _work_note)
 
         # Workbench: tell the brain it has its own sandbox to write/run code when no
         # specific tool fits. Training turns get no tools, so skip the note there too.
@@ -2636,6 +3650,10 @@ class AIService:
         if verification_note:
             messages.append(Message(role=MessageRole.SYSTEM, content=verification_note))
 
+        # Pergunta sobre conversa passada → obriga a busca no arquivo.
+        if recall_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=recall_note))
+
         # ── Device identity: deterministic registration (no LLM transcription) ──
         # When the user explicitly asks to remember THIS device, persist its real
         # identity (device_id/hardware_id/OS from connection metadata) ourselves —
@@ -2703,6 +3721,11 @@ class AIService:
         # Stream response
         produced_files: list[dict[str, Any]] = []
         tool_trace: list[dict[str, Any]] = []
+        # Tools que MEXERAM no navegador do usuário neste turno (nome efetivo,
+        # pós-portão, e só quando a ordem foi aceita). Nasce aqui, fora do ramo
+        # `use_tools`, porque quem consome é o pós-processamento do handoff lá
+        # embaixo — ver `_drop_music_handoff_after_browser`.
+        browser_actuation: list[str] = []
         try:
             _req_model = (metadata or {}).get("model")
             _req_provider = (metadata or {}).get("provider")
@@ -2725,6 +3748,15 @@ class AIService:
                     db=self.db,
                     pks_service=self.pks,
                     user_id=user_id,
+                    # `conversation_recall` precisa da sessão ATUAL para se
+                    # excluir do resultado (senão a própria pergunta casa com a
+                    # busca) e para guardar o cursor do "foi antes ainda".
+                    session_id=session_id,
+                    embeddings=getattr(self.sessions, "embeddings", None),
+                    # Identidade REAL da conexão: é o que permite "abaixa o
+                    # volume", sem citar aparelho, significar ESTE aparelho
+                    # (docs/device-control-plan.md §5).
+                    current_device_id=(metadata or {}).get("device_id"),
                 )
                 # The cognitive core's toolset = read tools + (when enabled) its own
                 # agent tools: the workbench sandbox (neo_*, dispatched through the
@@ -2734,8 +3766,11 @@ class AIService:
                 cognitive_tools = list(cognitive_tools_for(user_id))
                 # Tools da skill autocarregada (match de keyword) entram já no
                 # round 1 — o gating por skill_read continua valendo para as outras.
-                _have = {t.name for t in cognitive_tools}
-                cognitive_tools += [t for t in _autoloaded_tools if t.name not in _have]
+                # Não filtramos duplicata aqui: as camadas se sobrepõem em ordens
+                # que este ponto não enxerga (a skill pode listar uma tool que só
+                # chega depois, em `_agent_action_tools()`). Quem garante um nome
+                # só é o `_dedup_tools_by_name` no fim da montagem.
+                cognitive_tools += _autoloaded_tools
                 if _autoloaded_tools:
                     # Com a skill ativa, o search_pks é só uma tentação: o modelo ia
                     # procurar o lançamento na memória semântica (onde ele nunca
@@ -2745,9 +3780,18 @@ class AIService:
                 cog_executor: Any = read_executor
                 if self.settings.workbench_enabled:
                     cognitive_tools += self._agent_action_tools()
-                    cog_executor = self._build_cognitive_executor(
-                        read_executor, user_id=user_id, session_id=session_id
+                    cog_executor = self._with_job_tools(
+                        read_executor,
+                        user_id=user_id,
+                        session_id=session_id,
+                        can_show_images=self._client_renders_inline_images(metadata),
+                        user_message=user_message,
+                        metadata=metadata,
                     )
+                # Fim da montagem: read set + skill + action tools já empilhados.
+                # É aqui que o toolset vira "um nome, um schema" — antes disso as
+                # camadas não têm como se enxergar.
+                cognitive_tools = _dedup_tools_by_name(cognitive_tools)
                 _skill_tool_names = {t.name for t in _autoloaded_tools}
                 _used_tools: set[str] = set()
                 full_response = await self._run_cognitive_tool_loop(
@@ -2760,11 +3804,12 @@ class AIService:
                     tool_executor=cog_executor,
                     slog=slog,
                     trace=trace,
-                    force_tool_first=bool(_autoloaded_tools),
+                    force_tool_first=bool(_autoloaded_tools) or recall_forced,
                     skill_tool_names=_skill_tool_names,
                     used_tools=_used_tools,
                     produced_files=produced_files,
                     tool_trace=tool_trace,
+                    browser_actuation=browser_actuation,
                 )
                 llm_ms = (time.monotonic() - t0) * 1000
                 # Usou a skill de verdade → o assunto está vivo: renova o prazo dela
@@ -2868,6 +3913,7 @@ class AIService:
                     slog=slog, trace=trace, force_tool_first=True,
                     skill_tool_names=_skill_tool_names, used_tools=_used_tools,
                     produced_files=produced_files, tool_trace=tool_trace,
+                    browser_actuation=browser_actuation,
                 )
                 if not full_response:
                     full_response = "Desculpe, não consegui gerar uma resposta."
@@ -2957,8 +4003,11 @@ class AIService:
         # only acted on when this turn is allowed to chain. ``full_response`` is now
         # the clean user-facing text — saved, yielded, and fed to the PKS planner.
         pipeline_handoffs: list[Handoff] = []
+        _allow_self = self.settings.pipeline_self_handoff_enabled
         if enable_handoff:
-            full_response, pipeline_handoffs = extract_handoffs(full_response)
+            full_response, pipeline_handoffs = extract_handoffs(
+                full_response, allow_self=_allow_self
+            )
             if pipeline_handoffs and not full_response.strip():
                 # Model emitted only the directive — give a short acknowledgement.
                 full_response = "Ok, já cuido disso."
@@ -2966,13 +4015,13 @@ class AIService:
                 slog.log_event(
                     "Pipeline Handoff",
                     "\n".join(
-                        f"- → {h.target_skill or h.target_intent.value}: {h.input_text}"
+                        f"- → {'continuar (eu mesmo)' if h.is_self else (h.target_skill or h.target_intent.value)}: {h.input_text}"
                         for h in pipeline_handoffs
                     ),
                 )
         else:
             # Defensive: strip a stray block even when handoffs are disabled.
-            full_response, _ = extract_handoffs(full_response)
+            full_response, _ = extract_handoffs(full_response, allow_self=False)
 
         # Music reliability (neo-music-feature): a music turn must resolve to either a
         # [[HANDOFF:music]] (already extracted above) or an explicit [[NO_MUSIC]]. Strip
@@ -2981,11 +4030,37 @@ class AIService:
         if decision.skill_hint == "music" and enable_handoff:
             had_no_music = "[[NO_MUSIC]]" in full_response or "[[NO MUSIC]]" in full_response
             full_response = full_response.replace("[[NO_MUSIC]]", "").replace("[[NO MUSIC]]", "").strip()
+            # Dupla atuação: se o PRÓPRIO turno já mandou o navegador do usuário
+            # abrir/tocar, o handoff de música é a SEGUNDA aba. O navegador vence —
+            # é o que o usuário pediu pra ver acontecer, já está rodando e não dá
+            # pra cancelar do meio. Isto também desarma o verificador logo abaixo:
+            # sem a trava ele SINTETIZARIA o handoff que o modelo (certo) não emitiu.
+            _browser_played = bool(browser_actuation)
+            _kept = _drop_music_handoff_after_browser(pipeline_handoffs, _browser_played)
+            if len(_kept) != len(pipeline_handoffs):
+                logger.info(
+                    "[Music] handoff descartado — o turno já atuou no navegador "
+                    "do usuário (%s)", ", ".join(browser_actuation),
+                )
+                if slog:
+                    slog.log_event(
+                        "Música — handoff descartado (dupla atuação)",
+                        "O turno já mandou o navegador do usuário abrir/tocar "
+                        f"({', '.join(browser_actuation)}); o [[HANDOFF:music]] abriria "
+                        "uma SEGUNDA aba tocando outra coisa. A atuação pelo "
+                        "navegador vence.",
+                    )
+                pipeline_handoffs = _kept
             already_music = any(
                 h.target_skill == "music" or h.target_intent == IntentType.MUSIC
                 for h in pipeline_handoffs
             )
-            if not already_music and not had_no_music and self.settings.music_handoff_verifier_enabled:
+            if (
+                not already_music
+                and not had_no_music
+                and not _browser_played
+                and self.settings.music_handoff_verifier_enabled
+            ):
                 synth = await self._verify_music_decision(user_message, full_response)
                 if synth is not None:
                     pipeline_handoffs.append(synth)
@@ -2993,6 +4068,46 @@ class AIService:
                         slog.log_event("Music Handoff (verifier)", f"→ music: {synth.input_text}")
             if not full_response.strip():
                 full_response = "Ok 🎵"
+
+        # Self-continuation backstop. The prompt contract is not enough on its own:
+        # on the first E2E run the instruction was in the payload verbatim and the
+        # model still closed on "vou baixar…" with no block. Same shape as the music
+        # verifier — cheap, temperature 0, and gated behind a phrase pre-filter so an
+        # ordinary turn pays nothing. A promise the model refuses to back with an
+        # order becomes the order.
+        if (
+            enable_handoff
+            and _allow_self
+            and decision.skill_hint != "music"
+            and not any(h.is_self for h in pipeline_handoffs)
+        ):
+            # O verificador PRECISA saber o que este turno já despachou. Medido em
+            # prod (session-5102534a): a resposta foi "Vou pegar uma pedrada do teu
+            # mix." + [[HANDOFF:music]]tocar Slipknot - Duality — a ação estava
+            # despachada, e o verificador, que só via o texto (o bloco já foi
+            # extraído acima), leu "vou pegar" como promessa pendente e sintetizou
+            # "baixar a música do mix". O turno virou um download que ninguém pediu.
+            # Não dá para simplesmente pular quando há handoff: "vou tocar X E te
+            # mando a letra" tem promessa de verdade sobrando. Então informa.
+            dispatched = [
+                f"{h.target_skill or h.target_intent.value}: {h.input_text}"
+                for h in pipeline_handoffs
+                if not h.is_self
+            ]
+            synth = await self._verify_promise_continuation(
+                user_message,
+                full_response,
+                (metadata or {}).get("pipeline_work_note"),
+                dispatched,
+            )
+            if synth is not None:
+                pipeline_handoffs.append(synth)
+                if slog:
+                    slog.log_event(
+                        "Continuação (verificador de promessa)",
+                        f"A resposta prometeu trabalho sem emitir o bloco — "
+                        f"sintetizado: {synth.input_text}",
+                    )
 
         # Voice imitation: pull any [[VOICE:name]]…[[/VOICE]] spans out of the reply
         # into ordered speech segments so the renderer switches TTS voice per span.
@@ -3035,22 +4150,16 @@ class AIService:
             slog.log_message_saved("assistant", full_response, str(session_id))
             slog.log_final_response(full_response, "COGNITIVE", iterations=1)
 
-        # A handoff to a CLIENT-actuating skill (music: media_command/open_url/launch_uri)
-        # needs a DESKTOP round-trip AFTER this reply. If we mark this reply is_final, the
-        # desktop closes the gRPC stream and the play never reaches it ("cancelled by
-        # client"). So keep the stream open for such handoffs — the skill step's tool +
-        # its result deliver the real final. Server-side handoffs (home_assistant/
-        # whatsapp) act on neo-core, so their reply stays final. See neo-music-feature.
-        _client_handoff = any(
-            h.target_intent == IntentType.MUSIC for h in pipeline_handoffs
-        )
+        # Todo handler de step encerra com um is_final próprio, então adiar o
+        # final aqui não deixa o turno sem terminador. Ver a política.
+        _deferred_final = handoff_defers_final(pipeline_handoffs)
 
         # Yield final response FIRST — background tasks must never block the user-facing round-trip.
-        # On a music handoff this reply isn't the stream's final (the play follows), but it IS a
-        # real user-facing message — tag it persist_reply so the desktop renders it as its own chat
-        # bubble (not a transient "thinking"), then shows "🎵 …" as a second message.
+        # Num handoff esta resposta não é o final do stream (o step da skill vem depois), mas É uma
+        # mensagem real do usuário — marca persist_reply para o desktop renderizar como bolha
+        # própria (não como "pensando" transitório) e mostrar a confirmação da skill como a segunda.
         _resp_metadata: dict[str, Any] = {}
-        if _client_handoff:
+        if _deferred_final:
             _resp_metadata["persist_reply"] = True
         if produced_files:
             _resp_metadata["files"] = produced_files
@@ -3058,7 +4167,7 @@ class AIService:
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
             message=full_response,
-            is_final=not _client_handoff,
+            is_final=not _deferred_final,
             iterations=1,
             metadata=_resp_metadata or None,
             segments=speech_segments,
@@ -3195,22 +4304,73 @@ class AIService:
             except Exception as e:
                 logger.warning(f"[PKS] Post-response write failed: {e}", exc_info=True)
 
+        async def _bg_working_note() -> None:
+            """Piso da memória de trabalho (docs/working-memory-plan.md §7).
+
+            O caminho bom é o modelo chamar `wm_write` com a conclusão redigida.
+            Este é o piso para quando ele não chama: turno que rodou tool PESADA
+            (leu arquivo, rodou script, pesquisou) e não anotou nada ganha um
+            append determinístico com o que foi executado. Sem LLM, sem custo —
+            a lição de `force_tool_first` e do backstop do `pks_remember` é que
+            instrução de prompt sozinha falha em ~metade dos turnos a 0.9 de
+            temperatura, e aqui o preço da falha é refazer o trabalho inteiro.
+            """
+            if not (
+                self.settings.working_memory_enabled
+                and getattr(self.settings, "working_memory_autonote_enabled", True)
+                and user_id
+            ):
+                return
+            entry = _autonote_entry(tool_trace, produced_files)
+            if not entry:
+                return
+            try:
+                from core.working_memory import WorkingMemoryStore
+
+                store = WorkingMemoryStore(
+                    db=self.db,
+                    max_note_bytes=self.settings.working_memory_note_max_bytes,
+                    ttl_days=self.settings.working_memory_ttl_days,
+                    max_index_notes=self.settings.working_memory_max_notes_in_index,
+                )
+                note = await store.append_auto(
+                    user_id=user_id, session_id=session_id, entry=entry
+                )
+                if note and slog:
+                    slog.log_event(
+                        "Memória de Trabalho (automática)",
+                        f"[[{note.slug}]] entrada {note.entry_count}\n{entry}",
+                    )
+            except Exception as e:  # noqa: BLE001 — caderno nunca derruba o turno
+                logger.warning("[WorkingMemory] append automático falhou: %s", e)
+
         # Affect is NOT scheduled here: process_user_input's epilogue is the
         # single choke point (covers this path plus skills/HA/tools/WhatsApp
         # outbound), with dedup by source_message_id in the AffectUpdater.
         self._spawn_bg(_bg_prefs(), name="bg-prefs")
         self._spawn_bg(_bg_pks(), name="bg-pks")
+        self._spawn_bg(_bg_working_note(), name="bg-working-note")
 
         # Internal control item: hand the parsed handoffs back to the orchestrator.
         # ``message=None`` + the private metadata key make it non-user-facing; the
         # step runner consumes it and never forwards it to the client.
+        # ``__pipeline_work__`` carries the raw material for the continuation's work
+        # note (what this step really did); the step runner formats it, since only
+        # it knows the step's position in the chain.
         if pipeline_handoffs:
             yield AIServiceResponse(
                 intent=IntentType.DIRECT_RESPONSE,
                 session_id=session_id,
                 message=None,
                 is_final=False,
-                metadata={"__pipeline_handoffs__": pipeline_handoffs},
+                metadata={
+                    "__pipeline_handoffs__": pipeline_handoffs,
+                    "__pipeline_work__": {
+                        "reply": full_response,
+                        "tool_trace": tool_trace,
+                        "files": produced_files,
+                    },
+                },
             )
 
     def _agent_action_tools(self) -> list[Any]:
@@ -3242,6 +4402,11 @@ class AIService:
                     # Mesmo critério para browser_task (container neo-browser-agent).
                     if not self.settings.browser_agent_enabled:
                         job_tools = [t for t in job_tools if t.name != "browser_task"]
+                    # E para o navegador LOCAL (extensão na máquina do usuário):
+                    # oferecer a tool com a flag desligada seria pura tentação —
+                    # o portão rebaixaria toda chamada para o servidor.
+                    if not getattr(self.settings, "browser_local_enabled", False):
+                        job_tools = [t for t in job_tools if t.name != "browser_local_task"]
                     tools += job_tools
             except Exception:  # noqa: BLE001
                 pass
@@ -3300,29 +4465,110 @@ class AIService:
         except Exception as e:  # noqa: BLE001
             logger.warning("[SkillLibrary] persistência da skill ativa falhou: %s", e)
 
-    def _build_cognitive_executor(
-        self, read_executor: Any, *, user_id: UUID | None, session_id: UUID | None
-    ) -> Any:
-        """Composite executor: job tools → JobToolExecutor; everything else → reads.
+    async def _recall_cursor(self, session_id: UUID | None) -> dict[str, Any] | None:
+        """Onde a última busca no arquivo de conversas parou, nesta sessão.
 
-        The read executor already delegates unknown names (like ``neo_bash``) to the
+        É o que faz "não foi isso, foi antes ainda" continuar de onde parou em
+        vez de repetir a mesma janela. Guardado pelo
+        ``ConversationRecallExecutor``; expira em alguns turnos, como a skill
+        ativa. Só vale se ainda houver página anterior para buscar.
+        """
+        if session_id is None:
+            return None
+        try:
+            sess = await self.db.get_conversation_session(session_id)
+        except Exception as e:  # noqa: BLE001 — cursor nunca derruba o turno
+            logger.warning("[Recall] leitura do cursor falhou: %s", e)
+            return None
+        if sess is None:
+            return None
+        cursor = (sess.extra_metadata or {}).get("recall") or {}
+        if int(cursor.get("turns_left") or 0) <= 0:
+            return None
+        if not cursor.get("next_before"):
+            return None
+        return dict(cursor)
+
+    async def _touch_recall_cursor(self, session_id: UUID | None, *, keep: bool) -> None:
+        """Gasta um turno do cursor (ou renova quando o recall segue em jogo).
+
+        Sem o consumo, um "obrigado" três turnos depois ainda seria lido como
+        continuação de busca.
+        """
+        if session_id is None:
+            return
+        try:
+            sess = await self.db.get_conversation_session(session_id)
+            if sess is None:
+                return
+            meta = dict(sess.extra_metadata or {})
+            current = dict(meta.get("recall") or {})
+            if not current:
+                return
+            if keep:
+                from modules.conversation_recall import CURSOR_TTL_TURNS
+
+                current["turns_left"] = CURSOR_TTL_TURNS
+                meta["recall"] = current
+            else:
+                turns_left = int(current.get("turns_left") or 0) - 1
+                if turns_left > 0:
+                    meta["recall"] = {**current, "turns_left": turns_left}
+                else:
+                    meta.pop("recall", None)
+            sess.extra_metadata = meta
+            await self.db.update_session(sess)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Recall] persistência do cursor falhou: %s", e)
+
+    def _with_job_tools(
+        self,
+        base_executor: Any,
+        *,
+        user_id: UUID | None,
+        session_id: UUID | None,
+        can_show_images: bool = False,
+        user_message: str = "",
+        metadata: dict | None = None,
+    ) -> Any:
+        """Composite executor: job tools → JobToolExecutor; everything else → base.
+
+        The base executor already delegates unknown names (like ``neo_bash``) to the
         global tool executor, so the workbench tools work through it. Only the
         background-job tools need the turn's user/session context, so they are routed
         to a fresh per-request :class:`JobToolExecutor`.
+
+        Vale para os DOIS caminhos que executam tool. As job tools estão no registry
+        GLOBAL como ``module="jobs"``/``server-side``, então o router as lista no
+        catálogo de SERVER_TOOL e pode escolher ``browser_task`` — mas o executor
+        global nunca ganha um module executor "jobs" (o JobToolExecutor é por
+        request, precisa do user/session do turno). Sem este seam no SERVER_TOOL a
+        chamada morria em "Executor para módulo server-side 'jobs' não registrado" e
+        o turno respondia "Todas as ferramentas falharam".
         """
         if self.job_manager is None:
-            return read_executor
+            return base_executor
         try:
             from core.jobs import JOB_TOOL_NAMES, JobToolExecutor
         except Exception:  # noqa: BLE001
-            return read_executor
+            return base_executor
         job_executor = JobToolExecutor(
             db=self.db,
             job_manager=self.job_manager,
             user_id=user_id,
             session_id=session_id,
+            # browser_screenshot guarda o print no catálogo e devolve o marcador.
+            # `can_show_images` decide o que a tool MANDA o cérebro fazer com ele:
+            # num cliente que não renderiza, o marcador viraria texto cru na tela.
+            file_store=self.file_store,
+            can_show_images=can_show_images,
+            # O portão do navegador local decide pela FRASE do turno, não pelo
+            # que o modelo achou dela (docs/browser-local-plan.md §5.2); e o
+            # device_id diz em QUAL máquina abrir a aba.
+            user_message=user_message,
+            device_id=(metadata or {}).get("device_id"),
         )
-        return _CognitiveAgentExecutor(read_executor, job_executor, JOB_TOOL_NAMES)
+        return _CognitiveAgentExecutor(base_executor, job_executor, JOB_TOOL_NAMES)
 
     async def _run_cognitive_tool_loop(
         self,
@@ -3341,6 +4587,7 @@ class AIService:
         used_tools: set[str] | None = None,
         produced_files: list[dict[str, Any]] | None = None,
         tool_trace: list[dict[str, Any]] | None = None,
+        browser_actuation: list[str] | None = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -3364,6 +4611,12 @@ class AIService:
         é como o chamador entrega um anexo clicável na mensagem final sem o modelo
         precisar (e sem poder) inventar uma URL.
 
+        ``browser_actuation`` (in/out): recebe o nome da tool a cada vez que o turno
+        MEXEU DE FATO no navegador do usuário. Só isso serve como "o turno já atuou
+        na tela dele": ``used_tools`` guarda o nome que o MODELO escolheu, e o portão
+        (``jobs.executor._gate_browser``) reescreve local ⇄ servidor por baixo; o
+        ``tool_trace`` guarda o nome pré-portão e o resultado já stringificado.
+
         ``tool_trace`` (in/out): se passado, recebe um resumo compacto (via
         ``_summarize_tool_call``) de CADA tool call bem-sucedida deste turno — não
         só ``file_save``. É salvo em ``extra_metadata`` da mensagem e reinjetado no
@@ -3377,14 +4630,20 @@ class AIService:
         # Cópia mutável: skill_read pode DESTRAVAR tools de uma skill tool_backed
         # (tool gating — docs/skills-library-plan.md), estendendo o toolset dos
         # rounds seguintes sem pagar o schema delas antes da leitura.
-        tools = list(tools or [])
+        # O dedup fica AQUI, e não só em quem monta a lista: este é o último ponto
+        # antes do payload ir pro provider, então nenhum chamador futuro consegue
+        # reintroduzir a duplicata que derrubava o turno no DeepSeek.
+        tools = _dedup_tools_by_name(tools)
         skill_library = getattr(self, "skill_library", None)
         skill_tool_names = set(skill_tool_names or set())
         used: set[str] = used_tools if used_tools is not None else set()
         force_next = False
         lie_retried = False
         promise_retried = False
+        browser_promise_retried = False
         download_claim_retried = False
+        artifact_claim_retried = False
+        truncated_rounds = 0
 
         for round_idx in range(max_rounds + 1):
             round_tools = tools if (tools and round_idx < max_rounds) else None
@@ -3405,7 +4664,49 @@ class AIService:
             )
             llm_ms = (time.monotonic() - t0) * 1000
             content = resp.get_content() or ""
-            tool_calls = resp.get_tool_calls() if round_tools else []
+            try:
+                tool_calls = resp.get_tool_calls() if round_tools else []
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                # Truncated tool-call arguments. The provider hands us the raw JSON
+                # string and it was cut mid-value by max_tokens — writing a whole HTML
+                # file through `neo_write_file` is exactly the shape that blows the
+                # budget. Unhandled, this killed the ENTIRE turn from inside the loop
+                # ("Não consegui responder agora — deu erro do meu lado"), losing every
+                # file already written. Recoverable: tell the model what happened and
+                # let it split the write. Capped so a model that keeps truncating ends
+                # the round instead of looping.
+                truncated_rounds += 1
+                logger.warning(
+                    "[Cognitive] tool-call arguments truncated (round %d/%d): %s",
+                    truncated_rounds, _MAX_TRUNCATED_TOOL_ROUNDS, e,
+                )
+                if slog:
+                    slog.log_event(
+                        "Tool call truncada",
+                        f"Os argumentos vieram cortados pelo limite de tokens ({e}). "
+                        f"Round extra pedindo escrita em pedaços "
+                        f"({truncated_rounds}/{_MAX_TRUNCATED_TOOL_ROUNDS}).",
+                    )
+                if truncated_rounds > _MAX_TRUNCATED_TOOL_ROUNDS:
+                    final_text = (
+                        "Tentei escrever um arquivo grande demais numa tacada só e a "
+                        "chamada foi cortada. Me peça de novo que eu escrevo em partes."
+                    )
+                    break
+                messages.append(
+                    Message(
+                        role=MessageRole.USER,
+                        content=(
+                            "Sua última chamada de tool foi CORTADA no meio (os "
+                            "argumentos passaram do limite de tokens), então ela não "
+                            "rodou. Refaça em pedaços menores: escreva um arquivo por "
+                            "chamada e, se um arquivo for grande, quebre em várias "
+                            "escritas (crie e depois anexe com `neo_bash`). Não repita "
+                            "a chamada gigante."
+                        ),
+                    )
+                )
+                continue
 
             # Resposta vazia + zero tool_calls = orçamento consumido no raciocínio
             # (finish_reason=length), não "nada a dizer". Retenta UMA vez com o
@@ -3438,7 +4739,20 @@ class AIService:
                 )
                 llm_ms = (time.monotonic() - t0) * 1000
                 content = resp.get_content() or ""
-                tool_calls = resp.get_tool_calls() if round_tools else []
+                try:
+                    tool_calls = resp.get_tool_calls() if round_tools else []
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    # Same truncation, now on the doubled-budget retry. Nothing left
+                    # to escalate to, so treat it as "no tool call this round" and let
+                    # the loop continue instead of taking the whole turn down.
+                    logger.warning("[Cognitive] truncated tool-call on empty-retry: %s", e)
+                    if slog:
+                        slog.log_event(
+                            "Tool call truncada (no retry)",
+                            f"Argumentos cortados também na retentativa ({e}) — "
+                            "seguindo sem tool neste round.",
+                        )
+                    tool_calls = []
 
             if trace:
                 payload = []
@@ -3531,12 +4845,55 @@ class AIService:
                     )
                     continue
 
+                # Guarda anti-promessa de NAVEGADOR: ele disse que vai abrir (ou
+                # que já enfileirou) algo no navegador DO USUÁRIO sem ter chamado
+                # tool nenhuma que mexa no navegador. É a falha da sessão
+                # d01cb5ab, e a mais cara de todas aqui: o usuário fica OLHANDO
+                # a tela esperando algo que nunca vai acontecer.
+                if (
+                    round_tools
+                    and not browser_promise_retried
+                    and not (used & _BROWSER_ACTING_TOOLS)
+                    and _promises_browser_action(content)
+                ):
+                    browser_promise_retried = True
+                    force_next = True
+                    if slog:
+                        slog.log_event(
+                            "Anti-promessa (navegador)",
+                            "A resposta prometeu agir no navegador do usuário sem chamar "
+                            f"tool — round extra com tool obrigatória.\n\n> {content[:200]}",
+                        )
+                    logger.warning(
+                        "[Cognitive] prometeu ação no navegador do usuário sem tool — forçando"
+                    )
+                    messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE: você disse que ia abrir/abriu algo no navegador DO "
+                                "USUÁRIO, mas não chamou tool nenhuma — nada aconteceu na "
+                                "tela dele. Chame AGORA `browser_local_task` com a tarefa "
+                                "descrita (é ela que dirige o navegador local). Se a tarefa "
+                                "não for de navegador local, corrija a resposta dizendo o "
+                                "que você REALMENTE fez — nunca descreva uma ação que não "
+                                "executou."
+                            ),
+                        )
+                    )
+                    continue
+
                 # Guarda anti-alegação-de-download: ele disse "está pronto, pode
                 # baixar pelo botão" sem NUNCA ter chamado file_save neste turno
                 # (sessão 95ccd52d: só neo_write_file rodou). Diferente da
                 # anti-promessa (futuro — "vou fazer"), aqui é afirmação de que
                 # JÁ dá pra baixar — sem file_save isso é sempre falso, não
                 # existe nada catalogado pro usuário clicar.
+                #
+                # A guarda IRMÃ é a de baixo (_claims_sandbox_artifact): esta aqui
+                # cobre a alegação de ENTREGA ao usuário; aquela cobre o degrau
+                # anterior, "o arquivo existe no sandbox".
                 if (
                     round_tools
                     and not download_claim_retried
@@ -3566,6 +4923,69 @@ class AIService:
                     )
                     continue
 
+                # Guarda de verdade-do-resultado (docs/self-continuation-plan.md §4).
+                # A resposta afirma que criou/baixou artefato no sandbox, e NENHUM
+                # tool bem-sucedido deste turno tocou o que ela cita. Diferente das
+                # duas de cima: não é promessa (futuro) nem entrega ao usuário
+                # (file_save) — é afirmação de que o arquivo EXISTE. Determinístico
+                # de propósito: roda no fim de todo passo do ciclo e não pode custar
+                # uma chamada de LLM.
+                if (
+                    round_tools
+                    and not artifact_claim_retried
+                    # Sem rastro não há evidência NENHUMA, e acusar sem evidência
+                    # forçaria uma rodada extra em todo turno de um chamador que
+                    # simplesmente não pediu trace. Ausência de rastro ≠ prova de
+                    # ausência — a guarda só fala quando pode olhar.
+                    and tool_trace is not None
+                    # …e o trace é do TURNO, não da conversa. Um turno que não rodou
+                    # tool nenhuma está relatando trabalho de turnos anteriores, e a
+                    # guarda não tem jurisdição sobre o que não viu acontecer.
+                    # Medido na session-b407c213: "me mostra as imagens que baixou"
+                    # foi acusado porque os `curl` (exit=0, imagens no disco) tinham
+                    # rodado no turno ANTERIOR — e a rodada forçada empurrou o modelo
+                    # a "verificar" o sandbox com `run_command`, que roda na máquina
+                    # do usuário e nunca acharia /workspace.
+                    and tool_trace
+                    and _claims_sandbox_artifact(content)
+                    and not _trace_backs_artifact_claim(
+                        tool_trace, _claimed_artifact_targets(content), files_out
+                    )
+                ):
+                    artifact_claim_retried = True
+                    force_next = True
+                    targets = _claimed_artifact_targets(content)
+                    if slog:
+                        slog.log_event(
+                            "Anti-alegação-de-artefato",
+                            "A resposta afirmou ter criado/baixado arquivo no sandbox, mas "
+                            "nenhuma tool bem-sucedida deste turno tocou "
+                            f"{sorted(targets) or 'nenhum caminho citado'} — round extra "
+                            f"para VERIFICAR antes de reafirmar.\n\n> {content[:200]}",
+                        )
+                    logger.warning(
+                        "[Cognitive] alegação de artefato sem respaldo no tool_trace "
+                        "(alvos=%s) — forçando verificação",
+                        sorted(targets),
+                    )
+                    messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=MessageRole.USER,
+                            content=(
+                                "PARE: você afirmou que o arquivo existe, mas nenhuma tool "
+                                "que rodou com SUCESSO neste turno criou isso — atenção que "
+                                "um `neo_bash` com exit_code diferente de 0 NÃO fez nada. "
+                                "Verifique AGORA com `neo_list_files` no caminho que você "
+                                "citou. Se estiver lá, siga. Se NÃO estiver, diga o que "
+                                "realmente aconteceu (o que falhou e por quê) — não repita "
+                                "a alegação. Dizer que entregou sem ter entregue é o pior "
+                                "resultado possível."
+                            ),
+                        )
+                    )
+                    continue
+
                 final_text = content
                 if slog:
                     slog.log_llm_response("COGNITIVE", final_text, duration_ms=llm_ms, model=model_name)
@@ -3574,6 +4994,9 @@ class AIService:
             # Feed tool results back as a user message (text-based, like AgentExecutor).
             messages.append(Message(role=MessageRole.ASSISTANT, content=content))
             result_lines: list[str] = []
+            # Blocos de conversa recuperada deste round — entram como SYSTEM,
+            # separados do histórico e do slot de resultado de tool (ver abaixo).
+            recall_blocks: list[str] = []
             for tc in tool_calls:
                 # Tool client-actuating (request_user_file/save_generated_file): o
                 # disco/picker do usuário só existe no cliente — não dá para rodar
@@ -3595,10 +5018,35 @@ class AIService:
                 tr = await tool_executor.execute_tool_call(tc)
                 if tr.error:
                     result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
+                elif tc.name == "conversation_recall" and isinstance(tr.result, dict):
+                    # Conversa antiga NÃO pode entrar pelo mesmo canal do resto:
+                    # os resultados de tool viram um Message(USER) e o modelo lê
+                    # isso como "foi dito agora", emendando a resposta a partir
+                    # dali. O corpo vai como SYSTEM (bloco delimitado, com data e
+                    # autor em cada linha, ver render_recall_block) e aqui fica só
+                    # o resumo de uma linha, para o texto não aparecer duas vezes.
+                    result_lines.append(
+                        f"Tool: {tc.name}\nResult: {tr.result.get('resumo', '')}"
+                    )
+                    bloco = str(tr.result.get("bloco") or "").strip()
+                    if bloco:
+                        recall_blocks.append(bloco)
                 else:
                     result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
                 if tool_trace is not None:
                     tool_trace.append(_summarize_tool_call(tc.name, tc.arguments, tr))
+                # Atuou no navegador DO USUÁRIO? Só aqui dá pra saber: `tr.name` é o
+                # nome PÓS-portão (o gate rebaixa local→servidor quando o usuário não
+                # pediu a tela dele) e o `ok` do payload distingue a ordem aceita da
+                # que voltou com erro. Ver `_drop_music_handoff_after_browser`.
+                if (
+                    browser_actuation is not None
+                    and not tr.error
+                    and (getattr(tr, "name", None) or tc.name) == _USER_BROWSER_TOOL
+                    and isinstance(tr.result, dict)
+                    and tr.result.get("ok")
+                ):
+                    browser_actuation.append(_USER_BROWSER_TOOL)
                 if tc.name == "file_save" and not tr.error and isinstance(tr.result, dict):
                     fid = tr.result.get("file_id")
                     if fid:
@@ -3625,11 +5073,40 @@ class AIService:
                                 ", ".join(f"`{t.name}`" for t in fresh),
                             )
                 if slog:
-                    slog.log_event(
-                        "Cognitive Tool Result",
-                        f"`{tc.name}` → " + (f"ERRO: {tr.error}" if tr.error else str(tr.result)[:600]),
-                    )
+                    if not tr.error and tc.name == "conversation_recall" and isinstance(tr.result, dict):
+                        # O `bloco` inteiro (~900 tokens de conversa antiga) não
+                        # cabe aqui: o que importa depurar é O QUE a busca achou
+                        # e por qual trilho.
+                        slog.log_event(
+                            "Recall de conversas",
+                            f"termos={tr.result.get('termos')} "
+                            f"trilho={tr.result.get('trilho')} "
+                            f"conversas={tr.result.get('total_conversas')} "
+                            f"mensagens={tr.result.get('total_mensagens')} "
+                            f"tem_mais={tr.result.get('tem_mais')} "
+                            f"proxima_before={tr.result.get('proxima_busca_before')}\n\n"
+                            + str(tr.result.get("bloco") or "")[:1500],
+                        )
+                    else:
+                        # O nome EFETIVO, não o que o modelo pediu: o portão do
+                        # navegador rebaixa/promove entre `browser_local_task` e
+                        # `browser_task`, e o log mostrando só a escolha do modelo
+                        # afirmava "mexeu no navegador dele" quando o que rodou foi
+                        # o headless do servidor (sessão 0939a295 — foi o que
+                        # escondeu a dupla atuação da música por um turno inteiro).
+                        _eff = getattr(tr, "name", None) or tc.name
+                        _rotulo = (
+                            f"`{tc.name}`"
+                            if _eff == tc.name
+                            else f"`{tc.name}` → portão: `{_eff}`"
+                        )
+                        slog.log_event(
+                            "Cognitive Tool Result",
+                            f"{_rotulo} → " + (f"ERRO: {tr.error}" if tr.error else str(tr.result)[:600]),
+                        )
             messages.append(Message(role=MessageRole.USER, content="\n\n".join(result_lines)))
+            for bloco in recall_blocks:
+                messages.append(Message(role=MessageRole.SYSTEM, content=bloco))
 
         return final_text
 
@@ -3781,30 +5258,49 @@ class AIService:
         sends every turn) into a short, readable note so the cognitive core knows what
         is open/playing and can control it or answer "o que tá tocando?".
         """
-        from core.skills.music.service import parse_media_context
+        from core.skills.music.service import (
+            describe_tabs,
+            parse_media_context,
+            tab_has_media,
+        )
 
         tabs = (parse_media_context(metadata) or {}).get("browser_tabs") or []
-        lines = []
-        for t in tabs:
-            if not isinstance(t, dict):
-                continue
-            site = t.get("site") or "?"
-            title = (t.get("title") or t.get("url") or "").strip()
-            playing = " (tocando)" if t.get("playing") else ""
-            lines.append(f"- {site}: {title}{playing}".rstrip())
+        lines = [f"- {linha}" for linha in describe_tabs(tabs)]
         if not lines:
             return None
+        # Se NENHUMA aba tem player, "pausa isso" não tem alvo. Dizer isso aqui
+        # em vez de deixar o modelo deduzir da lista: com uma aba na home aberta
+        # ele mandava pausar, a extensão não achava player e o turno terminava
+        # com "pausei" sem ter pausado nada.
+        tem_alvo = any(
+            tab_has_media(t) is not False for t in tabs if isinstance(t, dict)
+        )
+        aviso = (
+            ""
+            if tem_alvo
+            else "\nNENHUMA dessas abas tem vídeo/música carregado — não há o que "
+            "pausar, pular ou retomar. Se ele pedir controle, diga que não tem nada "
+            "tocando (ou toque algo, se for isso que ele quer)."
+        )
         return (
             "## Mídia aberta no navegador (tempo real)\n"
-            "Abas de música/vídeo abertas agora:\n"
+            "Abas de música/vídeo abertas agora, da mais relevante para a menos:\n"
             + "\n".join(lines)
-            + "\nSe o usuário pedir pra PAUSAR, RETOMAR/dar play, PULAR, VOLTAR ou mudar "
+            + aviso
+            + "\n\nComo ler cada linha: **TOCANDO/pausado** é o estado real do player "
+            "(vídeo no mudo continua TOCANDO); **som na guia** é o ícone de "
+            "auto-falante — a ausência dele com o player tocando significa mudo, não "
+            "parado; **música/vídeo comum** é a classificação do próprio YouTube; "
+            "**nada aberto pra tocar** é aba sem player (home, feed, busca), que não "
+            "aceita comando nenhum; **ANÚNCIO no ar** quer dizer que o som do momento "
+            "é comercial, então não anuncie isso como a faixa.\n"
+            "Se o usuário pedir pra PAUSAR, RETOMAR/dar play, PULAR, VOLTAR ou mudar "
             "VOLUME dessa mídia, você DEVE emitir ao final o bloco "
             "[[HANDOFF:music]]<ação>[[/HANDOFF]] (ação = pausar | retomar | próxima | "
             "anterior | mudo | aumentar volume | abaixar volume) — é ELE que executa de "
             "verdade. NUNCA diga que pausou/voltou/pulou SEM emitir o bloco. Use também "
-            "estas abas pra responder o que está tocando. Se nada estiver tocando, diga "
-            "isso em vez de fingir que controlou."
+            "estas abas pra responder o que está tocando, há quanto tempo e quanto "
+            "falta. Se nada estiver tocando, diga isso em vez de fingir que controlou."
         )
 
     def _get_ha_adapter(self) -> "HomeAssistantAdapter | None":
@@ -4111,6 +5607,20 @@ class AIService:
                 global_executor=self.agent.tool_executor,
                 devices_executor=DevicesExecutor(db=self.db),
                 user_id=user_id,
+                # Alvo implícito de device_control quando o usuário não cita
+                # aparelho nenhum ("abaixa o volume").
+                current_device_id=(metadata or {}).get("device_id"),
+            )
+
+            # browser_task/deep_research/job_* aparecem no catálogo de SERVER_TOOL
+            # (registry global), mas só o JobToolExecutor por-request sabe executá-las.
+            ctx_executor = self._with_job_tools(
+                ctx_executor,
+                user_id=user_id,
+                session_id=session_id,
+                can_show_images=self._client_renders_inline_images(metadata),
+                user_message=user_message,
+                metadata=metadata,
             )
 
             # Scope search_pks to this user too (same per-request seam): the global
@@ -4205,6 +5715,12 @@ class AIService:
             if live:
                 task = f"{task}\n\n{_LIVE_STYLE_INSTRUCTION}"
 
+            # Entrada por voz: mesmo mecanismo (sufixo no task). Vale ainda MAIS aqui
+            # do que no DIRECT_RESPONSE — é o caminho que executa tool com argumento
+            # literal, e é onde um token mal transcrito viraria caminho/id inventado.
+            if self._is_voice_input(metadata) or str(session_id) in self._voice_input_sessions:
+                task = f"{task}\n\n{_VOICE_INPUT_INSTRUCTION}"
+
             # Registro da situação: mesmo mecanismo do live (sufixo no task),
             # já que o SERVER_TOOL não passa pelo PromptContextSelector.
             if register is not None:
@@ -4221,8 +5737,19 @@ class AIService:
             final_text = result.get("final_response", "Tarefa concluída.")
             iterations = result.get("iterations", 1)
             tool_ms = (time.monotonic() - t0) * 1000
+            # O status vem do AgentExecutor: "completed" | "failed" | "timeout".
+            # Gravar success=True fixo escondia a falha — o log dizia "Sucesso"
+            # embaixo de "Todas as ferramentas falharam".
+            ok = result.get("status") == ExecutionStatus.COMPLETED.value
             if slog:
-                slog.log_tool_result(decision.tool_name or "agent", success=True, result=final_text, duration_ms=tool_ms, execution="server-side")
+                slog.log_tool_result(
+                    decision.tool_name or "agent",
+                    success=ok,
+                    result=final_text if ok else None,
+                    error=None if ok else final_text,
+                    duration_ms=tool_ms,
+                    execution="server-side",
+                )
 
         except Exception as e:
             logger.exception("Server tool execution failed")
@@ -4643,6 +6170,142 @@ class AIService:
             },
         )
 
+    async def _resolve_file_by_name(
+        self, candidate: str, session_id: UUID | None
+    ) -> Any | None:
+        """Casa um `file_id` que na verdade é um NOME contra o catálogo.
+
+        Só resolve quando não há dúvida: um nome exato, e — havendo mais de um
+        arquivo com o mesmo nome (gerar o mesmo zip duas vezes é rotina) — o mais
+        recente da sessão, senão o mais recente no geral. Um casamento por
+        aproximação aqui entregaria o arquivo ERRADO ao usuário, que é pior do que
+        não entregar; por isso nada de `ilike %x%` decidindo sozinho.
+        """
+        name = (candidate or "").strip().strip("'\"")
+        # Um UUID que não existe é id alucinado de verdade, não nome — não inventar.
+        if not name or "/" in name or _UUID_LIKE.match(name):
+            return None
+        try:
+            found = await self.file_store.list_files(q=name, limit=50)
+        except Exception as e:  # noqa: BLE001 — resolução best-effort nunca derruba o turno
+            logger.warning("[CLIENT_TOOL] lookup de arquivo por nome falhou: %s", e)
+            return None
+        exact = [f for f in found if (f.name or "").lower() == name.lower()]
+        if not exact:
+            return None
+        same_session = [f for f in exact if session_id and f.session_id == session_id]
+        pool = same_session or exact
+        return max(pool, key=lambda f: f.created_at)
+
+    async def _verify_promise_continuation(
+        self,
+        user_message: str,
+        reply_text: str,
+        work_note: str | None,
+        dispatched: list[str] | None = None,
+    ) -> "Handoff | None":
+        """Backstop: a reply that PROMISES work but emitted no [[HANDOFF:continuar]].
+
+        The prompt contract alone does not hold. Measured on the first end-to-end run
+        of this feature: the instruction was injected verbatim, and the model still
+        closed with "Vou ver os nomes reais e baixar os melhores pro site" and no
+        block — the same failure the feature exists to remove. This mirrors the music
+        verifier: a cheap, temperature-0 call decides whether the reply intended to
+        keep working and, if so, writes the concrete next order.
+
+        Fails safe to None (turn simply ends, as it does today) on any error.
+        """
+        # Deterministic pre-filter: only pay for the call when the reply actually
+        # reads like a promise. Keeps every ordinary cognitive turn at zero cost.
+        if not _looks_like_promise(reply_text):
+            return None
+
+        try:
+            from modules.intent_config import get_classifier_config
+            cfg = await get_classifier_config(self.db)
+            provider = self.llm.get_provider(cfg["provider"])
+            model = cfg["model"]
+        except Exception:
+            try:
+                provider = self.llm.get_provider()
+                model = None
+            except Exception:
+                return None
+
+        # Regra extra só quando há o que despachar: turno sem handoff mantém o
+        # prompt idêntico ao de antes, e o modelo nunca lê sobre uma seção ausente.
+        dispatch_rule = (
+            "promised=false TAMBÉM quando o trabalho anunciado JÁ É uma das ações "
+            "listadas em \"Ações já despachadas\": elas foram disparadas neste mesmo "
+            "turno e já estão acontecendo — a frase é o assistente narrando o que "
+            "despachou, não uma pendência. Só responda true nesse caso se a resposta "
+            "prometer algo A MAIS que nenhuma ação despachada cobre, e então `order` "
+            "é só essa sobra.\n"
+        ) if dispatched else ""
+
+        sys = (
+            "Você decide se a resposta do assistente PROMETEU continuar trabalhando "
+            "agora sem ter entregado o resultado. Responda SÓ com JSON válido, sem "
+            'markdown: {"promised":true|false,"order":"a próxima ação concreta no '
+            'imperativo, ou \\"\\""}.\n'
+            "promised=true quando a resposta anuncia trabalho futuro que o próprio "
+            "assistente faria (\"vou baixar\", \"sigo tentando\", \"já te mando\", "
+            "\"deixa comigo\", \"vou ver os nomes e baixar\").\n"
+            "promised=false quando a resposta ENTREGA o resultado, faz uma PERGUNTA e "
+            "espera decisão do usuário, recusa, ou é só conversa.\n"
+            + dispatch_rule
+            + "`order` deve ser a ação técnica concreta que falta, derivada do que a "
+            "resposta prometeu — nunca uma repetição do que já falhou."
+        )
+        user = f"Pedido original: {user_message}\nResposta do Neo: {reply_text}"
+        if dispatched:
+            user += "\nAções já despachadas neste turno (já vão acontecer):\n" + "\n".join(
+                f"- {d}" for d in dispatched
+            )
+        if work_note:
+            user += f"\nO que já foi feito neste turno:\n{work_note}"
+
+        try:
+            resp = await provider.complete(
+                messages=[
+                    Message(role=MessageRole.SYSTEM, content=sys),
+                    Message(role=MessageRole.USER, content=user),
+                ],
+                tools=None,
+                model=model,
+                temperature=0.0,
+                # 160 tokens + raciocínio ligado = resposta VAZIA, e o backstop cai
+                # no except sem nunca decidir nada. Medido: com o classificador em
+                # openrouter/qwen3.5-flash este verificador falhou com
+                # "Expecting value: line 1 column 1 (char 0)" enquanto a resposta do
+                # Neo dizia "Vou de outra fonte livre" — exatamente o turno que o
+                # ciclo devia ter continuado. O reasoning vem LIGADO por padrão no
+                # OpenRouter e consome o orçamento antes de sobrar conteúdo, então
+                # `disable_thinking` é obrigatório aqui, e a folga de tokens é a
+                # segunda linha de defesa se algum provider ignorar a intenção.
+                max_tokens=700,
+                disable_thinking=True,
+            )
+            raw = (resp.get_content() or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning("[SELF-HANDOFF] verifier failed (turn ends as before): %s", e)
+            return None
+
+        if not data.get("promised"):
+            return None
+        order = str(data.get("order") or "").strip()
+        if not order:
+            return None
+        return Handoff(
+            target_intent=IntentType.DIRECT_RESPONSE,
+            input_text=order,
+            reason="promise_verifier",
+            is_self=True,
+        )
+
     async def _verify_music_decision(
         self, user_message: str, reply_text: str
     ) -> "Handoff | None":
@@ -4683,7 +6346,14 @@ class AIService:
                 tools=None,
                 model=model,
                 temperature=0.0,
-                max_tokens=120,
+                # Mesmo conserto do verificador de promessa (§5 do
+                # docs/self-continuation-plan.md): o OpenRouter liga raciocínio por
+                # DEFAULT e o ignora no max_tokens, então com o teto curto a resposta
+                # voltava sendo "Thinking Process:…" — content não-JSON, `except`, e
+                # o verificador falhava EM SILÊNCIO (música que não toca sem motivo
+                # aparente). Ver memória openrouter-reasoning-default-on.
+                max_tokens=700,
+                disable_thinking=True,
             )
             raw = (resp.get_content() or "").strip()
             if raw.startswith("```"):
@@ -5063,6 +6733,28 @@ class AIService:
             if tool_name == "save_generated_file" and self.file_store is not None:
                 file_id = arguments.get("file_id")
                 stored = await self.file_store.get(file_id) if file_id else None
+                # O erro mais comum não é id alucinado: é o classificador pôr o NOME
+                # do arquivo no campo do id ("portifolio-naruto.zip"), porque é isso
+                # que ele vê no histórico. Medido na session-b407c213, onde o zip
+                # existia no catálogo (f17db260…, gerado 4 min antes) e mesmo assim o
+                # turno morreu num "peça de novo". Resolver o nome ANTES de desistir
+                # não relaxa a trava — o arquivo tem que existir de verdade, com id
+                # real; só deixa de exigir que o classificador adivinhe um UUID.
+                if stored is None and file_id:
+                    stored = await self._resolve_file_by_name(str(file_id), session_id)
+                    if stored is not None:
+                        arguments = {**arguments, "file_id": str(stored.id)}
+                        logger.info(
+                            "[CLIENT_TOOL] file_id %r resolvido por nome → %s",
+                            file_id, stored.id,
+                        )
+                        if slog:
+                            slog.log_event(
+                                "file_id resolvido por nome",
+                                f"O classificador mandou {file_id!r} (nome, não id). "
+                                f"Casou com o arquivo {stored.name!r} (id={stored.id}, "
+                                f"{stored.size_bytes} bytes) — seguindo com o id real.",
+                            )
                 if stored is None:
                     logger.warning(
                         "[CLIENT_TOOL] save_generated_file com file_id inválido/inexistente: %r",
@@ -5154,14 +6846,25 @@ class AIService:
     # ---------------------------------------------------------------
 
     async def _file_path_is_grounded(
-        self, path: str, session_id: UUID, user_message: str
+        self, path: str, session_id: UUID, user_message: str, user_id: UUID | None = None
     ) -> bool:
-        """True se ``path`` (ou seu nome-base) foi citado LITERALMENTE pelo usuário.
+        """True se ``path`` for um alvo LEGÍTIMO — não um caminho inventado.
 
         Mesma família da guarda do CLIENT_TOOL (``_ungrounded_path_literals``): o
         cérebro nunca deve subir um caminho que ELE inventou a partir do nome do
-        arquivo — só um que o usuário escreveu nesta conversa. Confere a mensagem
-        do turno e o histórico recente (o caminho pode ter sido dito antes).
+        arquivo. Duas fontes tornam um caminho legítimo:
+
+        * o usuário escreveu (o caminho inteiro ou só o nome) nesta conversa;
+        * o arquivo está no REGISTRO DE ARTEFATOS — ou seja, o próprio Neo o pôs
+          no disco do usuário e sabe onde. Isso é evidência de disco, não chute,
+          e é exatamente o critério que o roteador já usa
+          (``IntentRouter._resolve_artifact_paths``).
+
+        A segunda fonte faltava aqui, e o preço foi a sessão 97774390: o Neo
+        baixou a NFSe, conferiu com um ``ls`` aprovado, anunciou o caminho — e no
+        turno seguinte a guarda tratou o próprio achado como invenção, trocou
+        ``mode="path"`` por um seletor de arquivo e, quando o usuário não
+        escolheu nada, fechou o turno com "não recebi nenhum arquivo".
         """
         needle = (path or "").strip()
         if not needle:
@@ -5175,7 +6878,23 @@ class AIService:
             logger.warning("[files] grounding: histórico indisponível: %s", exc)
         blob = "\n".join(haystacks)
         # Caminho inteiro citado, ou o nome-base (o usuário costuma dizer só o nome).
-        return needle in blob or (len(base) >= 3 and base in blob)
+        if needle in blob or (len(base) >= 3 and base in blob):
+            return True
+
+        # Registro de artefatos: arquivo que o Neo mesmo pôs lá. Best-effort —
+        # registro indisponível só faz a guarda voltar a ser o que era.
+        try:
+            _, artifact_paths = await self._recent_artifacts(user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[files] grounding: registro de artefatos indisponível: %s", exc)
+            return False
+        if not artifact_paths:
+            return False
+        conhecido = artifact_paths.get(base.lower())
+        if conhecido and conhecido.rstrip("/") == needle.rstrip("/"):
+            logger.info("[files] caminho fundamentado pelo registro de artefatos: %r", needle)
+            return True
+        return False
 
     async def _emit_client_actuation(
         self,
@@ -5313,14 +7032,48 @@ class AIService:
                     )
                     return
 
+        # ── Guarda: write_file não escreve no sandbox por engano ──
+        # O modelo confunde as duas máquinas com frequência (já custou um bloqueio
+        # igual no run_command e no CLIENT_TOOL). Aqui o erro seria pior que falhar:
+        # `/workspace/...` NA MÁQUINA DELE criaria uma pasta /workspace de verdade,
+        # no disco errado, e o arquivo sumiria da vista dos dois lados.
+        if tool_name == "write_file":
+            path = str(args.get("path") or "").strip()
+            if path.startswith("/workspace/") or path == "/workspace":
+                final_text = (
+                    "Esse caminho é do meu sandbox, não do seu disco. Se era pra gravar "
+                    "aí dentro eu uso o neo_write_file; se era pra gravar na sua máquina, "
+                    "me diga a pasta do seu lado."
+                )
+                logger.warning("[files] write_file com caminho de sandbox bloqueado: %r", path)
+                if slog:
+                    slog.log_event(
+                        "write_file bloqueado (sandbox ≠ disco do usuário)",
+                        f"`{path}` só existe no sandbox; não foi escrito na máquina do usuário.",
+                    )
+                await self.sessions.add_message(
+                    session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
+                )
+                yield AIServiceResponse(
+                    intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+                    message=final_text, is_final=True, iterations=1,
+                )
+                return
+
         # ── Guarda: pull por caminho citado (nunca um caminho inventado) ──
+        # Caminho que o modelo sabia e a guarda derrubou. Guardado para a
+        # retomada: se o usuário fechar o seletor, a resposta precisa dizer QUAL
+        # arquivo estava em jogo em vez de fingir que nunca houve um.
+        caminho_rebaixado = ""
         if tool_name == "request_user_file":
             mode = str(args.get("mode") or "pick").strip().lower()
             if mode not in ("pick", "path"):
                 mode = "pick"
             if mode == "path":
                 path = str(args.get("path") or "").strip()
-                if not await self._file_path_is_grounded(path, session_id, user_message):
+                if not await self._file_path_is_grounded(
+                    path, session_id, user_message, user_id
+                ):
                     # Não sobe um chute: cai pro picker (o usuário escolhe o arquivo certo).
                     logger.info("[files] request_user_file path %r não fundamentado — caindo pro picker", path)
                     if slog:
@@ -5329,6 +7082,7 @@ class AIService:
                             f"O caminho `{path}` não foi citado pelo usuário; abrindo o seletor em vez de chutar.",
                         )
                     mode = "pick"
+                    caminho_rebaixado = path
                     args.pop("path", None)
             args["mode"] = mode
 
@@ -5341,6 +7095,7 @@ class AIService:
             "stage": bool(args.get("stage")),
             "destination": args.get("destination"),
             "depth": depth,
+            "downgraded_path": caminho_rebaixado,
         }
         if trace is not None:
             self._pending_traces[sid] = trace
@@ -5444,7 +7199,20 @@ class AIService:
         sid = str(session_id)
         if not success:
             low = (error or "").lower()
-            if "cancel" in low or "não escolheu" in low or "nao escolheu" in low:
+            cancelado = "cancel" in low or "não escolheu" in low or "nao escolheu" in low
+            rebaixado = str(pend.get("downgraded_path") or "").strip()
+            if cancelado and rebaixado:
+                # O seletor só abriu porque a guarda de fundamentação derrubou um
+                # caminho que o cérebro TINHA. Responder "não recebi nenhum
+                # arquivo" aqui contradiz o que ele mesmo disse no turno anterior
+                # (sessão 97774390) — some com o arquivo que ele acabou de achar.
+                nome = rebaixado.rsplit("/", 1)[-1]
+                final_text = (
+                    f"Você fechou o seletor. Eu queria pegar o {nome} "
+                    f"(`{rebaixado}`) — se for esse mesmo, me confirme o caminho que eu "
+                    "trago; se for outro arquivo, é só dizer qual."
+                )
+            elif cancelado:
                 final_text = "Sem problema — não recebi nenhum arquivo. Quando quiser, é só me mandar."
             else:
                 final_text = f"Não consegui trazer o arquivo: {error or 'o envio falhou'}."
@@ -5569,12 +7337,18 @@ class AIService:
         slog: "SessionFileLogger | None",
         trace: "MessageTrace | None",
     ) -> AsyncIterator[AIServiceResponse]:
-        """Resultado do ``save_generated_file``: confirma, ou trata a colisão.
+        """Resultado de ``save_generated_file`` ou ``write_file``: confirma ou trata a colisão.
 
         ``status='saved'`` → confirma em uma frase. ``status='conflict'`` → re-entra
         no cognitivo com os dados do arquivo existente pro cérebro decidir (só
         quando for obviamente seguro) ou perguntar antes de reenviar com overwrite.
+
+        As duas tools compartilham este caminho porque devolvem o MESMO envelope
+        (saved/conflict + path). O que muda é o nome que a nota de conflito manda
+        rechamar: mandar o cérebro reenviar por `save_generated_file` um arquivo
+        que ele escreveu com `write_file` o faria procurar um file_id que não existe.
         """
+        which = str((pend or {}).get("tool_name") or "save_generated_file")
         status = None
         path = None
         existing: dict[str, Any] | None = None
@@ -5609,7 +7383,7 @@ class AIService:
                 + (f", modificado em {when}" if when else "")
                 + "). NÃO foi sobrescrito. Decida: se for claramente seguro (ex.: é o "
                 "arquivo que VOCÊ acabou de gerar nesta conversa), reenvie chamando "
-                "save_generated_file com overwrite=true. Se houver qualquer dúvida, "
+                f"{which} com overwrite=true. Se houver qualquer dúvida, "
                 "PERGUNTE ao usuário citando esses dados antes de sobrescrever, ou "
                 "ofereça salvar com outro nome."
             )
@@ -5622,7 +7396,12 @@ class AIService:
 
         # status == "saved" (ou desconhecido, mas sucesso)
         where = f" em {path}" if path else ""
-        final_text = f"Pronto, salvei o arquivo no seu computador{where}."
+        written = payload.get("bytes_written") if isinstance(payload, dict) else None
+        if which == "write_file":
+            size = f" ({written} bytes)" if isinstance(written, int) and written else ""
+            final_text = f"Pronto, escrevi o arquivo{where}{size}."
+        else:
+            final_text = f"Pronto, salvei o arquivo no seu computador{where}."
         await self.sessions.add_message(
             session_id=session_id, role="assistant", content=final_text, generate_embedding=False,
         )
@@ -7212,6 +8991,20 @@ class AIService:
 
     @staticmethod
     def _build_system_context(metadata: dict[str, Any] | None) -> str | None:
+        """Contexto de sistema do turno (SO/pastas) + tolerância de entrada por voz.
+
+        A instrução de voz entra AQUI, e não em cada chamador, porque o turno se
+        reconstrói em vários pontos (plano, retomada depois de ação de arquivo,
+        continuação de client tool) — todos passam por esta função, e nenhum
+        lembraria de reanexar a instrução. Ver docs/voice-input-normalization-plan.md.
+        """
+        base = AIService._build_os_context(metadata)
+        if AIService._is_voice_input(metadata):
+            return "\n\n".join(p for p in (base, _VOICE_INPUT_INSTRUCTION) if p)
+        return base
+
+    @staticmethod
+    def _build_os_context(metadata: dict[str, Any] | None) -> str | None:
         """Build a compact system context string from metadata sent by the desktop client.
 
         The desktop sends OS info in the user_input metadata so the AI knows

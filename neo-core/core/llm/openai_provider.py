@@ -21,6 +21,26 @@ _RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_BACKOFF = (2.0, 5.0, 10.0)
 
 
+def _content_for(message: Message) -> Any:
+    """Corpo da mensagem no formato da API — texto puro ou partes multimodais.
+
+    Só vira lista de partes quando a mensagem carrega imagem: mandar
+    ``[{"type": "text", ...}]`` em TODA mensagem é válido na API mas muda o
+    corpo de todo turno do Neo sem necessidade. Imagem chega como base64 puro
+    (o que o CDP devolve) ou como data URL já pronta.
+    """
+    images = getattr(message, "images", None)
+    if not images:
+        return message.content
+    parts: list[dict[str, Any]] = [{"type": "text", "text": message.content or ""}]
+    for image in images:
+        if not image:
+            continue
+        url = image if image.startswith("data:") else f"data:image/jpeg;base64,{image}"
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
+
+
 def _is_rate_limit(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     if status == 429:
@@ -48,7 +68,18 @@ def _rejects_forced_tool_choice(error: Exception) -> bool:
     """
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     text = str(error).lower()
-    return (status == 400 or "400" in text) and "tool_choice" in text
+    if (status == 400 or "400" in text) and "tool_choice" in text:
+        return True
+    # O OpenRouter recusa pelo ROTEAMENTO, não pelo parâmetro, e por isso não diz
+    # "tool_choice" em lugar nenhum. Com um pin de provedor (``vendor/modelo@slug``)
+    # ele filtra os endpoints por compatibilidade de tool e o pin zera o que sobrou:
+    # sai um 404 "No endpoints found". Medido em 2026-09-02 com
+    # deepseek/deepseek-v4-flash@baidu — o funil vai de 17 endpoints para 6
+    # ("Filter by Tool Compatibility") e daí para 0 ("Filter by Fallback"), porque
+    # o endpoint do Baidu serve tools mas não aceita tool_choice="required".
+    # Mesma limitação de sempre, outro vocabulário; sem reconhecê-la aqui, todo
+    # turno com tool forçada (force_tool_first, skill de finanças) morria.
+    return (status == 404 or "404" in text) and "filter by tool compatibility" in text
 
 
 class OpenAICompletionResponse(CompletionResponse):
@@ -119,7 +150,7 @@ class OpenAIProvider(LLMProvider):
 
             # Converte mensagens para formato OpenAI
             openai_messages = [
-                {"role": msg.role.value, "content": msg.content} for msg in messages
+                {"role": msg.role.value, "content": _content_for(msg)} for msg in messages
             ]
 
             # Prepara parâmetros
@@ -195,7 +226,7 @@ class OpenAIProvider(LLMProvider):
         """Streaming completion with OpenAI — yields StreamChunk events."""
         try:
             openai_messages = [
-                {"role": msg.role.value, "content": msg.content} for msg in messages
+                {"role": msg.role.value, "content": _content_for(msg)} for msg in messages
             ]
 
             params: dict[str, Any] = {

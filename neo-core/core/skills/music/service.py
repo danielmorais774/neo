@@ -124,13 +124,269 @@ def parse_media_context(metadata: dict[str, Any] | None) -> dict[str, Any]:
     return {}
 
 
-def find_music_tab(media_context: dict[str, Any], site: str) -> dict[str, Any] | None:
-    """Return the first open browser tab whose ``site`` matches (e.g. 'youtube')."""
-    tabs = media_context.get("browser_tabs") or []
-    for tab in tabs:
-        if isinstance(tab, dict) and tab.get("site") == site:
-            return tab
+# ── leitura do snapshot da extensão ────────────────────────────────────────
+#
+# A ponte reporta, por aba: o som da guia (`audible` — o ícone de auto-falante),
+# o estado real do player (`paused`/`hasMedia`/`duration`), o TIPO de página
+# (`kind`: watch, home, feed, busca…), se o YouTube classificou aquele vídeo
+# como música (`contentType`) e a faixa/artista que o próprio player publica no
+# centro de mídia do SO. Nada disso é obrigatório: aba de Spotify, aba ainda
+# carregando ou aba onde a injeção falhou chegam só com o básico, e toda leitura
+# aqui degrada para "não sei" em vez de mentir.
+
+
+def tab_has_media(tab: dict[str, Any]) -> bool | None:
+    """Esta aba tem um player com mídia carregada? ``None`` = não deu para saber.
+
+    Distinguir "não tem" de "não sei" é o ponto: uma aba na HOME do YouTube é
+    uma aba do YouTube sem nada para pausar, e mandar um comando para ela falha
+    com "não achei o player". Uma aba que não pôde ser sondada pode muito bem
+    ter vídeo — recusar ali seria pior.
+    """
+    if not isinstance(tab, dict):
+        return None
+    if isinstance(tab.get("hasMedia"), bool):
+        return tab["hasMedia"]
+    if tab.get("audible"):
+        return True
+    # Sem sonda: só a URL responde, e só para as páginas que nunca têm player.
+    if tab.get("kind") in ("home", "feed", "search", "channel", "music_home"):
+        return False
     return None
+
+
+def tab_is_playing(tab: dict[str, Any]) -> bool:
+    """Está tocando AGORA (não pausado). Vídeo no mudo continua tocando."""
+    if not isinstance(tab, dict):
+        return False
+    if isinstance(tab.get("paused"), bool):
+        return not tab["paused"] and tab_has_media(tab) is not False
+    return bool(tab.get("playing") or tab.get("audible"))
+
+
+def _rank(tab: dict[str, Any]) -> tuple[int, int, int]:
+    """Ordem de preferência ao escolher UMA aba: tocando > com mídia > watch."""
+    tocando = 1 if tab_is_playing(tab) else 0
+    com_midia = 1 if tab_has_media(tab) is True else 0
+    pagina = 1 if tab.get("kind") in ("watch", "music", "shorts", "embed") else 0
+    return (tocando, com_midia, pagina)
+
+
+def find_music_tab(
+    media_context: dict[str, Any], site: str, *, require_media: bool = False
+) -> dict[str, Any] | None:
+    """Escolhe a aba daquele site — a que está tocando primeiro, não a primeira.
+
+    Pegar a PRIMEIRA aba do site era o comportamento antigo e é o que faz o
+    comando cair na aba errada quando há duas abas do YouTube abertas: a home
+    numa e a música na outra.
+
+    ``require_media=True`` recusa aba sem player (a home). Serve para
+    pausar/pular, que precisam de algo tocando; para dar play não vale, porque
+    navegar a home para o vídeo é exatamente o reuso que se quer.
+    """
+    tabs = [
+        t
+        for t in (media_context.get("browser_tabs") or [])
+        if isinstance(t, dict) and t.get("site") == site
+    ]
+    if require_media:
+        tabs = [t for t in tabs if tab_has_media(t) is not False]
+    if not tabs:
+        return None
+    return max(tabs, key=_rank)
+
+
+# ── de qual aba dá pra tomar posse ──────────────────────────────────────────
+#
+# Reusar QUALQUER aba do YouTube era o padrão antigo, e ele desperdiça de um
+# jeito e é chato do outro:
+#
+# * reusar uma aba de vídeo que o usuário abriu — mesmo PARADA — tira da frente
+#   dele uma coisa que ele escolheu ver. Aba pausada não é aba livre; muitas
+#   vezes é justamente a que ele vai voltar a ver;
+# * abrir aba nova toda vez enche o navegador de abas de música mortas.
+#
+# A linha entre os dois é POSSE, não estado do player: dá pra tomar a aba que o
+# próprio Neo colocou música nesta conversa (trocar AC/DC por Bon Jovi é a
+# mesma sessão de música continuando) e a que não tem nada carregado (a home do
+# YouTube não perde nada). Qualquer outra aba é do usuário — abre uma nova.
+
+#: Chave em ``conversation_session.session_metadata`` com o que o Neo tocou
+#: nesta conversa (ids de vídeo e de playlist/mix).
+NEO_PLAYED_KEY = "music_neo_played"
+
+#: Teto da lista. Só serve para reconhecer a aba corrente; histórico longo é
+#: peso morto e ainda aumentaria a chance de casar com uma aba antiga que o
+#: usuário reaproveitou para outra coisa.
+NEO_PLAYED_MAX = 12
+
+
+def neo_played_ids(session_metadata: dict[str, Any] | None) -> list[str]:
+    """Ids (vídeo/playlist) que o Neo tocou nesta conversa, mais recente primeiro."""
+    if not isinstance(session_metadata, dict):
+        return []
+    vals = session_metadata.get(NEO_PLAYED_KEY)
+    if not isinstance(vals, list):
+        return []
+    return [str(v) for v in vals if isinstance(v, (str, int)) and str(v).strip()]
+
+
+def remember_played(
+    session_metadata: dict[str, Any] | None, *ids: str | None
+) -> list[str]:
+    """Lista atualizada para gravar de volta: novos na frente, sem repetir."""
+    novos = [str(i).strip() for i in ids if i and str(i).strip()]
+    atual = neo_played_ids(session_metadata)
+    saida: list[str] = []
+    for i in novos + atual:
+        if i not in saida:
+            saida.append(i)
+    return saida[:NEO_PLAYED_MAX]
+
+
+def tab_is_neo_music(tab: dict[str, Any], played: list[str]) -> bool:
+    """Esta aba está com algo que o NEO colocou nesta conversa?
+
+    Casa por ``videoId`` e também por ``listId``: quando o Neo põe um mix/rádio
+    (``list=RD…``), o autoplay do YouTube troca o vídeo sozinho e o id do vídeo
+    deixa de bater — mas a fila continua sendo a que o Neo abriu.
+    """
+    if not played or not isinstance(tab, dict):
+        return False
+    return any(
+        str(tab.get(campo) or "") in played for campo in ("videoId", "listId")
+    )
+
+
+def pick_reuse_tab(
+    media_context: dict[str, Any], played: list[str] | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """A aba que pode ser reaproveitada, e POR QUÊ (a razão vai para o log).
+
+    ``(None, motivo)`` = abre aba nova. Nunca devolve uma aba de vídeo do
+    usuário, tocando ou parada.
+    """
+    played = played or []
+    tabs = [
+        t
+        for t in (media_context.get("browser_tabs") or [])
+        if isinstance(t, dict) and t.get("site") == "youtube"
+    ]
+    if not tabs:
+        return None, "nenhuma aba do YouTube aberta"
+
+    minhas = [t for t in tabs if tab_is_neo_music(t, played)]
+    if minhas:
+        return max(minhas, key=_rank), "aba que o Neo já usou para tocar nesta conversa"
+
+    livres = [t for t in tabs if tab_has_media(t) is False]
+    if livres:
+        return max(livres, key=_rank), "aba sem nada carregado (home/feed/busca)"
+
+    return None, "as abas abertas são vídeos do usuário — não vou tomar nenhuma"
+
+
+def _mmss(seconds: Any) -> str:
+    """Segundos → 4:05 / 1:12:33. Vazio quando não dá para saber."""
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if total < 0:
+        return ""
+    horas, resto = divmod(total, 3600)
+    minutos, segundos = divmod(resto, 60)
+    if horas:
+        return f"{horas}:{minutos:02d}:{segundos:02d}"
+    return f"{minutos}:{segundos:02d}"
+
+
+_KIND_LABEL = {
+    "home": "página inicial (sem vídeo aberto)",
+    "music_home": "página inicial do YouTube Music",
+    "feed": "feed (sem vídeo aberto)",
+    "search": "página de busca",
+    "channel": "página de canal",
+    "playlist": "página de playlist",
+    "results": "página de busca",
+    "shorts": "Shorts",
+}
+
+
+def describe_tab(tab: dict[str, Any]) -> str:
+    """Uma linha legível por aba, só com o que a extensão realmente sabe."""
+    partes: list[str] = [str(tab.get("site") or "?")]
+
+    tem_midia = tab_has_media(tab)
+    if tem_midia is False:
+        partes.append("nada aberto pra tocar")
+    elif tab_is_playing(tab):
+        partes.append("TOCANDO")
+    elif isinstance(tab.get("paused"), bool):
+        partes.append("pausado")
+    elif tab.get("audible"):
+        partes.append("com som")
+    else:
+        partes.append("aberta")
+
+    if tab.get("adShowing"):
+        partes.append("ANÚNCIO no ar (o que toca agora não é a faixa)")
+
+    tipo = tab.get("contentType")
+    if tipo == "music":
+        partes.append("música")
+    elif tipo == "video":
+        partes.append("vídeo comum")
+
+    # Faixa/artista quando o player publica; senão o título da aba.
+    faixa = (tab.get("track") or "").strip()
+    artista = (tab.get("artist") or "").strip()
+    if faixa and artista:
+        partes.append(f'"{faixa}" — {artista}')
+    elif faixa:
+        partes.append(f'"{faixa}"')
+    else:
+        titulo = (tab.get("title") or tab.get("url") or "").strip()
+        if titulo:
+            partes.append(titulo[:120])
+
+    if tab.get("live"):
+        partes.append("ao vivo")
+    elif tem_midia is not False:
+        pos, dur = _mmss(tab.get("currentTime")), _mmss(tab.get("duration"))
+        if pos and dur:
+            pct = tab.get("progress")
+            pct_txt = f" ({round(float(pct) * 100)}%)" if isinstance(pct, (int, float)) else ""
+            partes.append(f"{pos}/{dur}{pct_txt}")
+        elif dur:
+            partes.append(f"duração {dur}")
+
+    # O ícone de auto-falante da guia, e por que ele pode estar apagado.
+    if tab.get("audible"):
+        partes.append("som na guia")
+    elif tab.get("muted"):
+        partes.append("guia no mudo")
+    elif tab.get("pageMuted"):
+        partes.append("player no mudo")
+
+    rotulo = _KIND_LABEL.get(str(tab.get("kind") or ""))
+    if rotulo and tem_midia is not True:
+        partes.append(rotulo)
+
+    if tab.get("probe") in ("denied", "error"):
+        partes.append("(não consegui ler o player desta aba)")
+    elif tab.get("probe") == "loading":
+        partes.append("(ainda carregando)")
+
+    return " · ".join(p for p in partes if p)
+
+
+def describe_tabs(tabs: list[Any]) -> list[str]:
+    """Linhas prontas para o prompt, na mesma ordem de preferência da escolha."""
+    validas = [t for t in tabs if isinstance(t, dict)]
+    validas.sort(key=_rank, reverse=True)
+    return [describe_tab(t) for t in validas]
 
 
 def pick_active_device(devices: list[dict[str, Any]]) -> dict[str, Any] | None:

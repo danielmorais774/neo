@@ -128,6 +128,12 @@ class Message(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list["ToolCall"] | None = None
+    # Imagens que acompanham ESTA mensagem: JPEG/PNG em base64 puro (sem o
+    # prefixo `data:`) ou já como data URL. Quem monta o corpo multimodal é o
+    # provider — aqui só carona. Só faz sentido em mensagens de usuário e só
+    # com modelo de visão; provider que ignora o campo continua funcionando
+    # com o texto (é por isso que `content` nunca vem vazio quando há imagem).
+    images: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +351,7 @@ class ContextLayer(str, Enum):
     NEO_CORE_PINNED = "neo_core_pinned"  # personality, response-rules críticas — pin=True
     NEO_REGISTER    = "neo_register"    # registro da situação (teto de tom) — pin=True
     NEO_AFFECT      = "neo_affect"      # estado emocional (vetor límbico) do Neo com o usuário — pin=True
+    WORKING_MEM     = "working_mem"    # índice do caderno da tarefa atual — scored
     NEO_CORE_CTX    = "neo_core_ctx"   # exemplos, lições, projetos — scored
     USER_PREFS      = "user_prefs"     # preferências do usuário — scored
     USER_PKS        = "user_pks"       # entidades PKS do usuário — scored

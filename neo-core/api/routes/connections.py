@@ -165,6 +165,19 @@ async def test_connection(slug: str, body: dict[str, Any] | None = None) -> dict
 # ── Credenciais (segredo é write-only) ──────────────────────────────────────
 
 
+@router.get("/credential-kinds")
+async def list_credential_kinds() -> dict[str, Any]:
+    """Spec dos tipos: que campos cada um pede além do segredo.
+
+    O painel RENDERIZA o formulário a partir daqui — schema num lugar só. Antes
+    o formulário era fixo (um campo "Segredo") e o tipo não mudava nada, então
+    "usuário e senha" não tinha onde ser digitado.
+    """
+    from core.credentials.kinds import CREDENTIAL_KIND_SPECS
+
+    return {"kinds": [spec.to_dict() for spec in CREDENTIAL_KIND_SPECS]}
+
+
 @router.get("/credentials")
 async def list_credentials() -> dict[str, Any]:
     store = _require_creds()
@@ -181,10 +194,11 @@ async def create_credential(body: dict[str, Any]) -> dict[str, Any]:
             secret=str(body.get("secret") or ""),
             kind=str(body.get("kind") or "token"),
             description=body.get("description"),
+            fields=body.get("fields") or {},
         )
     except Exception as exc:
         code = getattr(exc, "code", None)
-        status = 409 if code == "duplicate_label" else 400
+        status = 409 if code == "duplicate_label" else 400  # bad_fields cai em 400
         raise HTTPException(status_code=status, detail=getattr(exc, "message", str(exc)))
     return info.to_dict()
 
@@ -201,6 +215,7 @@ async def update_credential(credential_id: str, body: dict[str, Any]) -> dict[st
             label=body.get("label"),
             description=body.get("description"),
             kind=body.get("kind"),
+            fields=body.get("fields"),
         )
     except Exception as exc:
         code = getattr(exc, "code", None)

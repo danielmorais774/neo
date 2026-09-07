@@ -32,6 +32,9 @@ async def list_devices_with_status(
     """
     # Late import to avoid circular import with grpc_server (matches api/routes/devices.py)
     from grpc_server import _devices_ws_registry
+    from core.notifications.device_control import get_device_control_broadcaster
+
+    control = get_device_control_broadcaster()
 
     db_devices = await db.get_connected_devices(user_id) if db else []
 
@@ -52,6 +55,15 @@ async def list_devices_with_status(
 
         devices.append({
             "device_id": dev.device_id,
+            # O DONO. Precisa sair na listagem para o painel saber em qual conta
+            # gerar o código de pareamento — com mais de um usuário no banco,
+            # inferir seria chutar em qual conta o aparelho vai cair.
+            "user_id": str(dev.user_id),
+            # O NOME é o que o cérebro usa para endereçar (device_control). Sem
+            # ele na listagem, o modelo não tem como citar o aparelho certo.
+            "name": getattr(dev, "display_name", None)
+            or f"{dev.model} ({dev.os_platform})",
+            "display_name": getattr(dev, "display_name", None),
             "device_type": dev.device_type,
             "model": dev.model,
             "hardware_id": dev.hardware_id,
@@ -62,6 +74,11 @@ async def list_devices_with_status(
             "connected_at_unix": int(dev.created_at.timestamp()) if dev.created_at else 0,
             "is_current_device": False,
             "is_online": is_online,
+            # Controlável só quando o canal de CONTROLE está aberto — é mais
+            # estrito que is_online (presença) e é o que decide se device_control
+            # tem chance de funcionar.
+            "controllable": control.is_connected(dev.device_id),
+            "capabilities": getattr(dev, "capabilities", None) or {},
             "ws_connection_id": dev.ws_connection_id,
         })
 

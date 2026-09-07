@@ -18,7 +18,11 @@ from uuid import UUID
 
 from core.files.tools import FILE_TOOLS
 from modules.config.tools import CONFIG_TOOLS
-from modules.devices.tools import DEVICES_TOOLS
+from modules.conversation_recall import (
+    CONVERSATION_RECALL_TOOL_NAMES,
+    CONVERSATION_RECALL_TOOLS,
+)
+from modules.devices.tools import DEVICE_CONTROL_TOOLS, DEVICES_TOOLS
 from modules.finance import FINANCE_TOOL_NAMES
 from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
@@ -28,6 +32,7 @@ from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
 from modules.web_search.tools import WEB_SEARCH_TOOLS
+from modules.working_memory.tools import WORKING_MEMORY_TOOL_NAMES, WORKING_MEMORY_TOOLS
 from shared import ToolCall, ToolResult, ToolSchema
 
 logger = logging.getLogger(__name__)
@@ -39,7 +44,20 @@ def _by_name(tools: list[ToolSchema], name: str) -> ToolSchema:
 
 COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     _by_name(PKS_SEARCH_TOOLS, "search_pks"),
+    # Arquivo de conversas (docs/conversation-recall-plan.md): o cognitivo só tem
+    # no contexto as mensagens DESTA sessão — "a gente já falou de X?" só tem
+    # resposta honesta indo ao banco. Sem ela o modelo nega de cabeça (foi o que
+    # aconteceu na session-860d0fb1: "não tem nada sobre a França registrado",
+    # com 61 mensagens sobre França no banco).
+    _by_name(CONVERSATION_RECALL_TOOLS, "conversation_recall"),
     _by_name(DEVICES_TOOLS, "list_connected_devices"),
+    # Controle de dispositivo (docs/device-control-plan.md): as 2ª e 3ª tools com
+    # efeito colateral neste conjunto, junto de pks_remember/wm_write. Estão aqui
+    # e não atrás de handoff porque o efeito é imediato e verificável no mesmo
+    # turno — o device responde com o estado REAL, então o cérebro pode dizer
+    # "ficou em 30" em vez de "mandei abaixar". Gated em cognitive_tools_for.
+    _by_name(DEVICE_CONTROL_TOOLS, "device_control"),
+    _by_name(DEVICE_CONTROL_TOOLS, "device_power"),
     _by_name(LOCATION_TOOLS, "get_user_location"),
     _by_name(WEATHER_TOOLS, "get_weather"),
     # Busca web inline (docs/web-search-deep-research-plan.md): leitura GLOBAL
@@ -80,15 +98,28 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     # user-scoped; despacho inline por este executor. Por baixo é o subagente
     # (PKSMemoryPlanner) que estrutura — a tool não escreve cru.
     *PKS_WRITE_TOOLS,
+    # Caderno de trabalho (docs/working-memory-plan.md): wm_write grava a
+    # CONCLUSÃO do trabalho do turno, wm_read a reabre no turno seguinte. É a
+    # 2ª tool com efeito colateral aqui, e a fronteira com pks_remember está
+    # escrita nas duas descriptions — trocar uma pela outra é o risco R1.
+    *WORKING_MEMORY_TOOLS,
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
 # As fin_* NÃO entram no read set default (são gated pela skill 'financas' via
 # tool gating), mas o dispatch delas passa por este executor e exige usuário.
 _USER_SCOPED = frozenset(
-    {"search_pks", "list_connected_devices", "get_user_location"}
+    {
+        "search_pks",
+        "list_connected_devices",
+        "get_user_location",
+        "device_control",
+        "device_power",
+    }
+    | CONVERSATION_RECALL_TOOL_NAMES
     | FINANCE_TOOL_NAMES
     | PKS_WRITE_TOOL_NAMES
+    | WORKING_MEMORY_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -121,6 +152,32 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
         tools = [t for t in tools if t.name not in _FILE_TOOL_NAMES]
     if not getattr(settings, "pks_write_enabled", True):
         tools = [t for t in tools if t.name not in PKS_WRITE_TOOL_NAMES]
+    if not getattr(settings, "working_memory_enabled", False):
+        tools = [t for t in tools if t.name not in WORKING_MEMORY_TOOL_NAMES]
+    if not getattr(settings, "conversation_recall_enabled", True):
+        tools = [t for t in tools if t.name not in CONVERSATION_RECALL_TOOL_NAMES]
+    if not getattr(settings, "neo_device_control_enabled", True):
+        tools = [t for t in tools if t.name != "device_control"]
+    # Energia é gated separado e default OFF: desligar a máquina errada é
+    # irreversível de um jeito que abaixar o volume não é.
+    if not getattr(settings, "neo_device_power_enabled", False):
+        tools = [t for t in tools if t.name != "device_power"]
+    # Cofre + caixa de email: só existem com NEO_CRED_KEY (o cofre é o que guarda
+    # a senha da caixa). Entram INLINE porque o bloco de identidade do prompt diz
+    # "você tem email, use email_inbox" — se a tool só existisse no catálogo do
+    # roteador, o cérebro leria a instrução e não teria como cumpri-la. Import
+    # lazy pelo mesmo motivo das DESKTOP_TOOLS abaixo: evitar ciclo no import.
+    if getattr(settings, "neo_cred_key", ""):
+        from core.credentials.tools import VAULT_TOOLS
+        from core.mailbox.tools import EMAIL_SEND_TOOLS, EMAIL_TOOLS
+
+        # `email_send` é a única tool deste bloco que ATUA para fora; segue a
+        # flag própria, como device_power segue a dele.
+        email = list(EMAIL_TOOLS)
+        if getattr(settings, "neo_email_send_enabled", True):
+            email += EMAIL_SEND_TOOLS
+        have = {t.name for t in tools}
+        tools += [t for t in (*VAULT_TOOLS, *email) if t.name not in have]
     # Tools client-actuating de arquivo (plano "arquivos sob iniciativa do
     # cérebro"): request_user_file (puxa um arquivo do disco do usuário) e
     # save_generated_file (entrega no disco). Só entram com o File Store ligado E
@@ -163,14 +220,27 @@ class CognitiveReadExecutor:
     race) and delegates everything else to the global ToolExecutor.
     """
 
-    def __init__(self, *, global_executor: Any, db: Any, pks_service: Any, user_id: UUID | None) -> None:
+    def __init__(
+        self,
+        *,
+        global_executor: Any,
+        db: Any,
+        pks_service: Any,
+        user_id: UUID | None,
+        session_id: UUID | None = None,
+        embeddings: Any = None,
+        current_device_id: str | None = None,
+    ) -> None:
         self._global = global_executor
         self._user_id = user_id
+        self._session_id = session_id
         self._devices: Any = None
         self._pks_search: Any = None
         self._location: Any = None
         self._finance: Any = None
         self._pks_write: Any = None
+        self._recall: Any = None
+        self._working_memory: Any = None
         # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
         # user-scoped executor avoids mutating the shared global one (no race).
         from modules.voice import VoiceExecutor
@@ -183,12 +253,28 @@ class CognitiveReadExecutor:
         self._config = ConfigExecutor(db=db, registry=build_default_registry())
         self._config.set_context(user_id)
         if user_id is not None:
+            from modules.conversation_recall import ConversationRecallExecutor
             from modules.devices import DevicesExecutor
             from modules.finance import FinanceExecutor
             from modules.pks_search import PKSSearchExecutor
 
+            # Recall de conversas: só precisa do banco (a busca é SQL). O
+            # session_id serve para EXCLUIR a conversa atual do resultado —
+            # sem isso a própria pergunta casa com a busca — e para guardar o
+            # cursor do "foi antes ainda".
+            self._recall = ConversationRecallExecutor(db=db, embeddings=embeddings)
+            self._recall.set_context(user_id, session_id)
+
             self._devices = DevicesExecutor(db=db)
-            self._devices.set_context(user_id)
+            # `current_device_id` é o que faz "abaixa o volume" (sem citar
+            # aparelho) significar ESTE aparelho.
+            self._devices.set_context(user_id, current_device_id)
+            # Caderno de trabalho: precisa do usuário (dono da nota) e da sessão
+            # (é o que faz a nota da tarefa em andamento subir no índice).
+            from modules.working_memory import WorkingMemoryExecutor
+
+            self._working_memory = WorkingMemoryExecutor(db=db)
+            self._working_memory.set_context(user_id, session_id)
             # Finanças (fin_*, gated pela skill 'financas') — executor fresco e
             # user-scoped por request, como devices (o global fica sem usuário).
             self._finance = FinanceExecutor(db=db)
@@ -213,12 +299,17 @@ class CognitiveReadExecutor:
         try:
             if name in _USER_SCOPED and self._user_id is None:
                 raise ValueError(f"{name} requer um usuário identificado.")
-            if name == "list_connected_devices" and self._devices is not None:
+            if (
+                name in ("list_connected_devices", "device_control", "device_power")
+                and self._devices is not None
+            ):
                 result = await self._devices.execute(name, tool_call.arguments)
             elif name == "search_pks" and self._pks_search is not None:
                 result = await self._pks_search.execute(name, tool_call.arguments)
             elif name == "get_user_location" and self._location is not None:
                 result = await self._location.execute(name, tool_call.arguments)
+            elif name in CONVERSATION_RECALL_TOOL_NAMES and self._recall is not None:
+                result = await self._recall.execute(name, tool_call.arguments)
             elif name in ("voice_list", "voice_get"):
                 result = await self._voice.execute(name, tool_call.arguments)
             elif name in ("config_get", "config_list"):
@@ -227,6 +318,8 @@ class CognitiveReadExecutor:
                 result = await self._finance.execute(name, tool_call.arguments)
             elif name in PKS_WRITE_TOOL_NAMES and self._pks_write is not None:
                 result = await self._pks_write.execute(name, tool_call.arguments)
+            elif name in WORKING_MEMORY_TOOL_NAMES and self._working_memory is not None:
+                result = await self._working_memory.execute(name, tool_call.arguments)
             else:
                 # Read-only globals (e.g. get_weather) go through the global executor.
                 return await self._global.execute_tool_call(tool_call)

@@ -59,6 +59,15 @@ def _entry(**kw) -> StoredFile:
     return StoredFile(**base)
 
 
+def _artefatos(path_map: dict[str, str]):
+    """Dublê do registro de artefatos (`_recent_artifacts` devolve bloco + mapa)."""
+
+    async def _recent(user_id):
+        return None, dict(path_map)
+
+    return _recent
+
+
 def _svc(*, store=None, history=None) -> AIService:
     svc = AIService.__new__(AIService)
     svc.file_store = store
@@ -112,6 +121,39 @@ async def test_invented_path_is_not_grounded():
     sid = uuid4()
     assert await svc._file_path_is_grounded("/Users/daniel/Downloads/relatorio.pdf", sid, "manda o relatório") is False
     assert await svc._file_path_is_grounded("", sid, "qualquer") is False
+
+
+@pytest.mark.asyncio
+async def test_path_grounded_pelo_registro_de_artefatos():
+    """Sessão 97774390: o Neo baixou a NFSe, confirmou por `ls` aprovado e
+    anunciou o caminho. O usuário NUNCA escreveu o nome — e a guarda tratava o
+    próprio achado do Neo como invenção, abria o seletor e, com o seletor
+    fechado, o turno acabava em "não recebi nenhum arquivo".
+
+    Arquivo que o Neo mesmo pôs no disco é evidência de disco, não chute — é o
+    mesmo critério que o roteador já usa (`_resolve_artifact_paths`)."""
+    svc = _svc(history=[{"role": "user", "content": "ler o conteudo dele e faz um resumo"}])
+    svc._recent_artifacts = _artefatos(
+        {"nfse_abril.pdf": "/Users/daniel/Downloads/nfse_abril.pdf"}
+    )
+    sid = uuid4()
+    assert await svc._file_path_is_grounded(
+        "/Users/daniel/Downloads/nfse_abril.pdf", sid, "ler o conteudo dele e faz um resumo"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_registro_nao_fundamenta_caminho_de_outra_pasta():
+    """O registro fundamenta o caminho REAL, não o nome. Se o cérebro montou uma
+    pasta diferente da que está registrada, continua sendo chute."""
+    svc = _svc(history=[{"role": "user", "content": "resume pra mim"}])
+    svc._recent_artifacts = _artefatos(
+        {"nfse_abril.pdf": "/Users/daniel/Downloads/nfse_abril.pdf"}
+    )
+    sid = uuid4()
+    assert await svc._file_path_is_grounded(
+        "/Users/daniel/Desktop/nfse_abril.pdf", sid, "resume pra mim"
+    ) is False
 
 
 # ── _emit_client_actuation: PULL ────────────────────────────────────────────
@@ -210,6 +252,48 @@ async def test_resume_cancel_is_friendly_and_final():
         user_message="analisa a planilha", pend={}, slog=None, trace=None,
     ))
     assert out[-1].is_final and "não recebi" in out[-1].message.lower()
+
+
+@pytest.mark.asyncio
+async def test_pull_path_do_registro_nao_abre_o_seletor():
+    """O outro lado da queixa do usuário: "ele abriu uma caixa de seleção de
+    arquivo e pediu para eu selecionar, sendo que ele já sabe o arquivo"."""
+    svc = _svc(history=[{"role": "user", "content": "sobe ele para sandbox"}])
+    svc._recent_artifacts = _artefatos(
+        {"nfse_abril.pdf": "/Users/daniel/Downloads/nfse_abril.pdf"}
+    )
+    sid = uuid4()
+    car = ClientActuationRequested(
+        "request_user_file",
+        {"mode": "path", "path": "/Users/daniel/Downloads/nfse_abril.pdf", "stage": True},
+        "tc9",
+    )
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=sid, user_message="sobe ele para sandbox", user_id=None,
+        metadata=None, trace=None, slog=None,
+    ))
+    args = next(r for r in out if r.tool_request).tool_request["arguments"]
+    assert '"mode": "path"' in args, "caminho conhecido não pode virar seletor"
+    assert "nfse_abril.pdf" in args
+
+
+@pytest.mark.asyncio
+async def test_resume_cancel_diz_qual_arquivo_queria():
+    """Quando o seletor só abriu porque a guarda derrubou um caminho conhecido,
+    fechar o seletor não pode virar "não recebi nenhum arquivo": some com o
+    arquivo que o Neo tinha acabado de localizar e contradiz o turno anterior."""
+    svc = _svc()
+    sid = uuid4()
+    out = await _collect(svc._resume_after_user_file(
+        sid, success=False, result=None, error="usuário não escolheu arquivo",
+        user_message="ler o conteudo dele",
+        pend={"downgraded_path": "/Users/daniel/Downloads/nfse_abril.pdf"},
+        slog=None, trace=None,
+    ))
+    msg = out[-1].message
+    assert out[-1].is_final
+    assert "nfse_abril.pdf" in msg
+    assert "não recebi nenhum arquivo" not in msg.lower()
 
 
 @pytest.mark.asyncio

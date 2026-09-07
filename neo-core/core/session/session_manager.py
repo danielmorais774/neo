@@ -9,6 +9,7 @@ Responsabilidades:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -85,6 +86,9 @@ class PersistentSessionManager:
         self.hybrid_search = hybrid_search
         self.token_counter = token_counter
         self.settings = get_settings()
+        # Referências fortes das tasks de embedding em background (ver
+        # _spawn_embedding_backfill).
+        self._embedding_tasks: set[asyncio.Task[None]] = set()
 
     # ---------------------------------------------------------------
     # Session lifecycle
@@ -95,14 +99,19 @@ class PersistentSessionManager:
         session_id: UUID | None = None,
         user_id: UUID | None = None,
         service: str = "neo-desktop",
+        mode: str | None = None,
     ) -> ConversationSession:
-        """Obtém sessão ativa existente ou cria uma nova."""
+        """Obtém sessão ativa existente ou cria uma nova.
+
+        ``mode`` é o canal do turno (``"live"``, ``"agent"``, ...) e decide só o
+        relógio de inatividade — ver ``_is_expired``.
+        """
         session: ConversationSession | None = None
 
         if session_id:
             session = await self.db.get_conversation_session(session_id)
             if session:
-                if self._is_expired(session):
+                if self._is_expired(session, mode=mode):
                     logger.info(f"Sessão {session.id} expirada por inatividade")
                     await self.close_session(session.id, reason="inactivity")
                     session = await self.db.create_conversation_session(
@@ -141,7 +150,7 @@ class PersistentSessionManager:
         # No session_id provided — fallback to active session
         session = await self.db.get_active_session(user_id=user_id, service=service)
 
-        if session and self._is_expired(session):
+        if session and self._is_expired(session, mode=mode):
             logger.info(f"Sessão {session.id} expirada por inatividade")
             await self.close_session(session.id, reason="inactivity")
             session = None
@@ -204,7 +213,7 @@ class PersistentSessionManager:
         if self.token_counter:
             token_count = self.token_counter.count(content)
 
-        return await self.db.save_message(
+        msg = await self.db.save_message(
             session_id=session_id,
             role=role,
             content=content,
@@ -216,6 +225,37 @@ class PersistentSessionManager:
             user_id=user_id,
             mission_id=mission_id,
         )
+
+        # Resposta do Neo sem embedding: preenche DEPOIS, fora do caminho da
+        # resposta. Todos os ~20 pontos que salvam `assistant` passam
+        # `generate_embedding=False`, e o resultado medido era 0 de 1520
+        # respostas embeddadas — metade da conversa invisível para a busca
+        # vetorial ("o que EU te respondi sobre X" nunca casava). Fazer inline
+        # custaria dezenas de ms de CPU no turno; em background custa zero.
+        if (
+            embedding is None
+            and role == "assistant"
+            and getattr(self.settings, "assistant_embeddings_enabled", True)
+            and self.embeddings.available
+        ):
+            self._spawn_embedding_backfill(msg.id, content)
+
+        return msg
+
+    def _spawn_embedding_backfill(self, message_id: UUID, content: str) -> None:
+        """Agenda o embedding de uma mensagem já salva (fire-and-forget)."""
+        task = asyncio.create_task(self._embed_saved_message(message_id, content))
+        # Sem guardar a referência, o event loop pode coletar a task no meio do
+        # caminho (asyncio só mantém weakrefs) e o embedding some em silêncio.
+        self._embedding_tasks.add(task)
+        task.add_done_callback(self._embedding_tasks.discard)
+
+    async def _embed_saved_message(self, message_id: UUID, content: str) -> None:
+        try:
+            embedding = await self.embeddings.embed(content)
+            await self.db.set_message_embedding(message_id, embedding)
+        except Exception as e:  # noqa: BLE001 — embedding tardio nunca afeta o turno
+            logger.warning("Embedding em background falhou (%s): %s", message_id, e)
 
     async def get_history(
         self,
@@ -423,12 +463,17 @@ class PersistentSessionManager:
         self,
         message: str,
         user_id: UUID | None = None,
-        service: str = "neo-desktop",
+        service: str | None = None,
     ) -> list[MemorySearchResult]:
         """Recupera contexto de sessões e mensagens anteriores.
 
         Usa busca híbrida (vetor + FTS + temporal) se disponível,
         senão fallback para busca vetorial pura.
+
+        ``service=None`` (default) busca em TODOS os canais do usuário. O default
+        antigo era ``"neo-desktop"`` e nenhum chamador passava outro, enquanto o
+        desktop grava as sessões como ``"neo-desktop-tauri"``: a memória entre
+        sessões via 1,8% do corpus. Ver docs/conversation-recall-plan.md §2a.
         """
         # Busca híbrida
         if self.hybrid_search:
@@ -449,7 +494,7 @@ class PersistentSessionManager:
         self,
         message: str,
         user_id: UUID | None,
-        service: str,
+        service: str | None,
     ) -> list[MemorySearchResult]:
         """Fallback: recuperação por vetor puro (comportamento original)."""
         if not self.embeddings.available:
@@ -773,14 +818,31 @@ class PersistentSessionManager:
     # Helpers
     # ---------------------------------------------------------------
 
-    def _is_expired(self, session: ConversationSession) -> bool:
-        """Verifica se sessão expirou por inatividade."""
+    def _is_expired(self, session: ConversationSession, mode: str | None = None) -> bool:
+        """Verifica se sessão expirou por inatividade.
+
+        O relógio depende do canal. No **live** (voz) uma pausa longa realmente
+        encerra a conversa, e cortar ali mantém o ruído de teste de microfone
+        fora das sessões boas. No **chat** a pausa não significa nada: você sai,
+        volta e continua o mesmo assunto — cortar ali decapita o follow-up, que
+        chega numa sessão em branco (foi o que engoliu "converte o preço da
+        ponte que eu tinha pedido", 3h27 depois da resposta que tinha o preço).
+
+        ``mode=None`` (default) é tratado como chat de propósito: os caminhos de
+        retomada de turno — tool_result, aprovação de comando — não carregam o
+        mode, e expirar a sessão no meio de um turno em andamento seria pior
+        ainda do que entre turnos.
+        """
         if session.status != "active":
             return True
-        threshold = datetime.utcnow() - timedelta(
-            minutes=self.settings.session_inactivity_minutes,
+        minutes = (
+            self.settings.session_inactivity_minutes
+            if mode == "live"
+            else self.settings.session_inactivity_chat_minutes
         )
-        return session.last_activity_at < threshold
+        if minutes <= 0:
+            return False
+        return session.last_activity_at < datetime.utcnow() - timedelta(minutes=minutes)
 
     @staticmethod
     def _build_topic_summary(messages: list[ConversationMessage]) -> str:

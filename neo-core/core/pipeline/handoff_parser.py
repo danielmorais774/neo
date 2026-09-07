@@ -30,6 +30,13 @@ _SKILL_TO_INTENT_STATIC: dict[str, IntentType] = {
     "music": IntentType.MUSIC,
 }
 
+# Self-continuation target. Not a skill: it routes back to the cognitive core
+# itself, so the brain can run the NEXT concrete order in the same turn instead
+# of ending it with "sigo tentando" and never coming back. Kept out of
+# _SKILL_TO_INTENT_STATIC so the skill-listing instruction never advertises it as
+# a skill (it gets its own prompt section, built by ai_service).
+SELF_HANDOFF_TARGET = "continuar"
+
 
 def _skill_intent_map() -> dict[str, IntentType]:
     """Fallback estático + manifests pipeline registrados (handoff=True)."""
@@ -68,11 +75,15 @@ def _clean_order(raw: str) -> str:
     return s.strip("<>").strip()
 
 
-def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
+def extract_handoffs(text: str, *, allow_self: bool = True) -> tuple[str, list[Handoff]]:
     """Split ``text`` into (clean_user_text, handoffs).
 
     ``clean_user_text`` has every handoff block removed and whitespace tidied.
     ``handoffs`` contains one ``Handoff`` per well-formed block with a known skill.
+
+    ``allow_self=False`` drops a ``[[HANDOFF:continuar]]`` block (still stripping it
+    from the text) so the self-continuation feature can be turned off at runtime
+    without a stray directive leaking to the user.
     """
     if not text or "[[" not in text:
         return text, []
@@ -82,7 +93,14 @@ def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
     for match in _HANDOFF_RE.finditer(text):
         skill = match.group(1).strip().lower()
         input_text = _clean_order(match.group(2) or "")
-        intent = skill_to_intent.get(skill)
+        is_self = skill == SELF_HANDOFF_TARGET
+        if is_self:
+            if not allow_self:
+                logger.info("[HANDOFF] self-continuation disabled, dropping block")
+                continue
+            intent = IntentType.DIRECT_RESPONSE
+        else:
+            intent = skill_to_intent.get(skill)
         if intent is None:
             logger.warning("[HANDOFF] unknown skill in block, dropping: %r", skill)
             continue
@@ -93,8 +111,9 @@ def extract_handoffs(text: str) -> tuple[str, list[Handoff]]:
             Handoff(
                 target_intent=intent,
                 input_text=input_text,
-                target_skill=skill,
-                reason="cognitive_core_handoff",
+                target_skill=None if is_self else skill,
+                reason="self_continuation" if is_self else "cognitive_core_handoff",
+                is_self=is_self,
             )
         )
 

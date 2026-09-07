@@ -24,8 +24,11 @@ from shared.types import ToolSchema
 class _FakeDevice:
     """Minimal stand-in for the ConnectedDevice model."""
 
-    def __init__(self, device_id: str, *, is_online: bool = False):
+    def __init__(self, device_id: str, *, is_online: bool = False, user_id=None):
         self.device_id = device_id
+        # `user_id` é NOT NULL no modelo real — o fake precisa ter também, senão
+        # ele deixa de representar o que o código de produção sempre recebe.
+        self.user_id = user_id or uuid4()
         self.device_type = "neo-desktop"
         self.model = "TestModel"
         self.hardware_id = "HW-" + device_id

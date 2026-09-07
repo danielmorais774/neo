@@ -15,7 +15,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from core.llm.router import LLMRouter
+from core.llm.router import LLMRouter, supports_vision
 from db.async_client import AsyncPostgresClient
 from modules.model_config import (
     ROLES,
@@ -81,6 +81,34 @@ async def update_model_config(role: str, payload: ModelConfigUpdate) -> dict:
         raise HTTPException(
             status_code=400,
             detail=f"Provider desconhecido '{provider}'. Conhecidos: {', '.join(KNOWN_PROVIDERS)}",
+        )
+
+    # Slot que precisa ENXERGAR: barrar aqui é a diferença entre um erro na cara
+    # do operador e um subsistema que fica cego calado. O driver do navegador
+    # local desliga a visão no primeiro 400 "does not support image" e segue a
+    # tarefa inteira só com o texto do DOM — sem nada no chat.
+    if ROLES[role].vision and supports_vision(payload.model.strip()) is False:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{payload.model.strip()}' não aceita imagem, e este slot é o olho do "
+                "subsistema — escolhê-lo desliga a visão silenciosamente. Use um modelo "
+                "com visão (ex.: openrouter · google/gemini-3.1-flash-lite)."
+            ),
+        )
+
+    # Slot servido por OUTRO container (ver RoleSpec.only_providers): ali a chave
+    # e o base_url são fixos, então um provider de fora não é "pior escolha", é
+    # requisição impossível — e o erro nasceria lá longe, num job assíncrono.
+    if not ROLES[role].accepts(provider):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"O slot '{ROLES[role].label}' só aceita: "
+                f"{', '.join(ROLES[role].only_providers)}. Ele não passa pelo router de "
+                f"LLM do neo-core — quem chama o modelo é outro serviço, com uma única "
+                f"chave configurada."
+            ),
         )
 
     available = _available_providers()

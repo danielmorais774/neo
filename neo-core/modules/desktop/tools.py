@@ -167,6 +167,63 @@ DESKTOP_TOOLS: list[ToolSchema] = [
             ),
         },
     ),
+    # ── Escrita direta no disco do usuário, sem shell ──
+    # Existiu no catálogo até 2026-08-02 e foi REMOVIDA por ser schema sem
+    # executor: o ToolRequest saía e nunca voltava, travando o turno pelos 300s
+    # do timeout do cliente (sessão 2afe5753). Voltou em 2026-08-30 COM o
+    # handler em ai_agent.rs (`write_text_file` em commands/mod.rs) — a ordem
+    # que o teste do catálogo exige.
+    ToolSchema(
+        name="write_file",
+        description=(
+            "Escreve conteúdo de texto num arquivo no computador DO USUÁRIO, em uma "
+            "chamada. USE ESTA em vez de `run_command` com `cat <<EOF`/`echo >` sempre "
+            "que for gravar texto que você mesmo escreveu: pelo shell o conteúdo vira "
+            "heredoc, e aspas, crase, cifrão ou a palavra EOF dentro do texto corrompem "
+            "o arquivo sem erro nenhum. Serve pra criar script, anotação, .env, config, "
+            "csv, markdown. NÃO serve pra entregar arquivo que você gerou no seu sandbox "
+            "e já publicou no catálogo — esse é o `save_generated_file` (que carrega os "
+            "bytes originais, inclusive binário). Nunca sobrescreve às cegas: se o "
+            "arquivo já existir com mode='write', devolve status='conflict' com os dados "
+            "do que está lá pra você decidir ou perguntar."
+        ),
+        module="desktop",
+        execution="client-side",
+        parameters={
+            "path": ToolParameter(
+                type="string",
+                description=(
+                    "Caminho ABSOLUTO ou começando com '~/' (ex: '~/Desktop/notas.md'). "
+                    "Caminho relativo é recusado — o diretório de trabalho do app não é o "
+                    "do usuário. Só escreva onde o usuário pediu; não invente pasta."
+                ),
+                required=True,
+            ),
+            "content": ToolParameter(
+                type="string",
+                description="O texto a gravar, exatamente como deve ficar no arquivo.",
+                required=True,
+            ),
+            "mode": ToolParameter(
+                type="string",
+                description=(
+                    "'write' (padrão) substitui o arquivo; 'append' acrescenta ao fim. "
+                    "'append' nunca dá conflito — acrescentar não destrói o que existe."
+                ),
+                required=False,
+                enum=["write", "append"],
+            ),
+            "overwrite": ToolParameter(
+                type="boolean",
+                description=(
+                    "Só passe true DEPOIS de um status='conflict' e de ter certeza (ou de o "
+                    "usuário confirmar). Na primeira tentativa NUNCA mande true — deixe a "
+                    "ferramenta detectar a colisão."
+                ),
+                required=False,
+            ),
+        },
+    ),
 ]
 
 # Tools "client-actuating" que o núcleo cognitivo aciona no meio do turno: elas
@@ -174,7 +231,7 @@ DESKTOP_TOOLS: list[ToolSchema] = [
 # ClientActuationRequested e o resultado volta pelo round-trip
 # tool_request/tool_result (mesmo trilho de save_generated_file/execute_command).
 FILE_ACTUATION_TOOL_NAMES: frozenset[str] = frozenset(
-    {"request_user_file", "save_generated_file"}
+    {"request_user_file", "save_generated_file", "write_file"}
 )
 
 # Shell no MESMO trilho client-actuating (gated por neo_brain_shell_enabled): o

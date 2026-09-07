@@ -1,6 +1,14 @@
 # Plano — Normalização da entrada de voz (ASR) + tolerância no neo-core
 
-Status: **PLANO** (nada implementado) · 2026-08-02
+Status: **F1–F4 IMPLEMENTADAS E EM PRODUÇÃO** · 2026-08-02 (F5/F6 pendentes — ver §8)
+
+Prova end-to-end no sistema vivo (neo-voice do neo-host, engine Parakeet CPU):
+
+```
+FINAL_TEXT [local-cpu]: Ei Neo! Que horas são agora?  [cru: Ei New! Que horas são agora?]
+```
+
+O ASR escreveu "New"; o cliente recebeu "Neo".
 
 Objetivo: que o Neo receba **o nome dele certo** (e o resto do texto o mais próximo
 possível do que foi dito) quando a mensagem vem do módulo de voz, e que o neo-core
@@ -310,21 +318,45 @@ positivo no corpus digitado. Mesma disciplina de
 `neo-guard-heuristics-measure-on-prod-corpus`: medir contra mensagem real, não chutar
 regex.
 
+### Resultado medido (02/08/2026, antes de ligar)
+
+| corpus | resultado |
+|---|---|
+| 368 turnos de voz | **17 de 18** mensagens com o nome torto corrigidas (94%) + 17 descartes de eco/grunhido (4,6% dos turnos que nem deviam ter virado turno). A única que escapou é lixo puro: `Dashtum, das Tandle, New Dash Tumble` |
+| 1135 turnos digitados | 4 alteradas (0,35%) — e **nenhuma é falso positivo**: `Oi, como vai, Neil?`, `niu o teu nome?` (o nome torto DIGITADO), `New ?` e `Humm`. Em produção o corretor nem roda nesse caminho |
+
+A primeira rodada do eval reprovou: a camada fonética trocou 14 `né?`/`não`/`no` por
+`Neo` — a chave de "não" é "nau" e a de "no" é "nu", ambas a distância 1 de "niu". Foi
+o que criou a keep-list de pt (`_PT_KEEP_DEFAULT`) e a regressão
+`test_fonetica_nao_come_palavra_pt`. Sem medir no corpus real, isso teria ido pra
+produção.
+
 ---
 
 ## 8. Fases
 
-| Fase | Entrega | Depende de |
+| Fase | Entrega | Estado |
 |---|---|---|
-| **F1** | `stt_text.py` + plug em `_finalize`/`_panel_final` + parciais + `raw_text`/`fixes` no WS + testes + kill switch | — |
-| **F2** | `input_source=voice` nas 3 superfícies + `_VOICE_INPUT_INSTRUCTION` + set sticky + `asr_raw` no metadata | F1 (para mandar `asr_raw`) |
-| **F3** | Backstop `core/text/asr_fixups.py` + regra de confirmação de dado exato + guard do PKS | F2 |
-| **F4** | Drop de eco de wake word + `/stt/lexicon` + edição no `VozTab` do neo-panel | F1 |
-| **F5** | Vocabulário dinâmico do PKS | F3 |
-| **F6** (opcional) | Spike do Canary pt-BR | — |
+| **F1** | `stt_text.py` + plug em `_finalize`/`_panel_final` + parciais + `raw_text`/`fixes` no WS + testes + kill switch | ✅ em produção (neo-host) |
+| **F2** | `input_source=voice` nas 3 superfícies + `_VOICE_INPUT_INSTRUCTION` + set sticky + `asr_raw` no metadata | ✅ core em produção; desktop precisa de `tauri dev` |
+| **F3** | Backstop `core/text/asr_fixups.py` (+ a regra de confirmação de dado exato, que virou bullet da instrução) | ✅ em produção |
+| **F4** | Drop de eco de wake word + `/stt/lexicon` + `/stt/normalize` + edição no `VozTab` do neo-panel | ✅ |
+| **F5** | Vocabulário dinâmico do PKS | ⬜ pendente |
+| **F6** (opcional) | Spike do Canary pt-BR | ⬜ pendente |
 
-F1 sozinha já entrega o pedido central ("o Neo recebe o nome certo no input") e é
-reversível por env.
+O guard do PKS ("nome próprio novo vindo de voz não vira entidade sem confirmação",
+§4.4) ficou de fora do código: hoje ele é regra no prompt (bullet do dado exato), não
+trava determinística no `pks_write`.
+
+### O que foi tocado
+
+| Onde | Arquivo |
+|---|---|
+| corretor | `neo-voice/service/stt_text.py` (novo), `neo_voice_server.py` (import, `_finalize`, `_panel_final`, parciais, `/stt/lexicon`, `/stt/normalize`, estado em disco) |
+| testes/eval | `neo-voice/tests/test_stt_text.py` (54), `neo-voice/scripts/eval_stt_fixups.py`, `neo-core/tests/test_voice_input.py` (26) |
+| transporte | `liveVoiceService.ts`, `useLiveMode.ts`, `ChatPage.tsx`, `agentService.ts`, `tauriApi.ts`, `commands/mod.rs`, `services/ai_agent.rs` (`VoiceInput`), `notch_host.rs`, `NeoNotchHost.swift` |
+| core | `modules/desktop/ai_service.py` (`_VOICE_INPUT_INSTRUCTION`, `_is_voice_input`, `_build_system_context`→`_build_os_context`, backstop no início do turno, `_voice_input_sessions`, SERVER_TOOL), `core/text/asr_fixups.py` (novo), `api/routes/context.py` (`metadata` no prompt-preview) |
+| painel | `neo-panel/src/settings/VozTab.tsx` (seção "STT — Corretor da transcrição") |
 
 ---
 
@@ -340,7 +372,31 @@ reversível por env.
 
 ---
 
-## 10. Notas de deploy (não são as de sempre)
+## 10. Como testar de novo (o caminho real, sem falar)
+
+O E2E que validou tudo não precisa de microfone — usa o próprio TTS como boca:
+
+```bash
+# 1. gera o áudio ("Neo" sai como "níu", que é o que o ASR ouve errado)
+curl -s -X POST http://192.168.4.210:5002/tts -H 'Content-Type: application/json' \
+  -d '{"text":"Ei Neo, que horas são agora?","backend":"coqui"}' -o /tmp/say.wav
+
+# 2. joga no WS do STT como se fosse o microfone
+cd neo-voice/service && ./.venv-sys/bin/python ws_feed_wav.py /tmp/say.wav \
+  ws://192.168.4.210:5002/ws/audio
+# << FINAL_TEXT:Ei Neo! Que horas são agora?
+
+# 3. confirma que quem consertou foi o corretor (e não sorte do ASR)
+ssh neo-host "docker logs neo-voice --since 2m | grep FINAL_TEXT"
+# FINAL_TEXT [local-cpu]: Ei Neo! …  [cru: Ei New! …]     <- o cru prova
+```
+
+Dry-run de uma frase, sem áudio nenhum: `POST /stt/normalize {"text": "..."}` (é o que
+o botão "Testar" da aba Voz do neo-panel chama). E para o lado do core, o prompt do
+turno de voz sai inteiro em `POST /api/v1/context/prompt-preview` com
+`metadata: {"input_source": "voice", "os_platform": "darwin"}`.
+
+## 11. Notas de deploy (não são as de sempre)
 
 - **neo-voice não é o neo-core.** Ele roda em container no neo-host (LXC
   `192.168.4.210`, `/root/neo-voice-deploy`) — mudança em `service/*.py` exige rebuild

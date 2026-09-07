@@ -26,7 +26,13 @@ from uuid import UUID
 from cryptography.fernet import Fernet, InvalidToken
 from sqlmodel import select
 
-from db.models.credential import CREDENTIAL_KINDS, Credential
+from core.credentials.kinds import (
+    CREDENTIAL_KINDS,
+    FieldError,
+    describe,
+    normalize_fields,
+)
+from db.models.credential import Credential
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,9 @@ class CredentialInfo:
     label: str
     kind: str
     description: str | None
+    # Campos não-secretos do tipo (usuário, endereço, imap_host…). Viajam em
+    # claro: é o que o painel mostra e o que o cérebro usa para escolher.
+    fields: dict
     hint: str | None
     created_at: datetime
     updated_at: datetime
@@ -64,6 +73,8 @@ class CredentialInfo:
             "label": self.label,
             "kind": self.kind,
             "description": self.description,
+            "fields": self.fields,
+            "fields_summary": describe(self.kind, self.fields),
             "hint": self.hint,
             "ref": self.ref,
             "created_at": self.created_at.isoformat(),
@@ -98,7 +109,13 @@ class CredentialStore:
     # ------------------------------------------------------------------
 
     async def create(
-        self, *, label: str, secret: str, kind: str = "token", description: str | None = None
+        self,
+        *,
+        label: str,
+        secret: str,
+        kind: str = "token",
+        description: str | None = None,
+        fields: dict | None = None,
     ) -> CredentialInfo:
         label = (label or "").strip()
         if not label:
@@ -113,6 +130,7 @@ class CredentialStore:
             label=label,
             kind=kind,
             description=description,
+            fields_json=self._fields(kind, fields),
             value_encrypted=self._fernet.encrypt(secret.encode()),
             hint=secret[-4:] if len(secret) >= 8 else None,
         )
@@ -131,6 +149,7 @@ class CredentialStore:
         label: str | None = None,
         description: str | None = None,
         kind: str | None = None,
+        fields: dict | None = None,
     ) -> CredentialInfo:
         """Atualiza. ``secret`` novo SUBSTITUI o antigo (não há leitura do velho)."""
         entry = await self._get_row(credential_id)
@@ -147,6 +166,12 @@ class CredentialStore:
             entry.kind = kind
         if description is not None:
             entry.description = description
+        # Campos são revalidados contra o tipo FINAL: trocar o kind sem revalidar
+        # deixaria um `username` órfão num token, e o painel mostraria lixo.
+        if fields is not None or kind is not None:
+            entry.fields_json = self._fields(
+                entry.kind, fields if fields is not None else (entry.fields_json or {})
+            )
         if secret:
             entry.value_encrypted = self._fernet.encrypt(secret.encode())
             entry.hint = secret[-4:] if len(secret) >= 8 else None
@@ -192,6 +217,30 @@ class CredentialStore:
         if entry is None:
             return None
         return self._decrypt(entry)
+
+    async def resolve(self, id_or_label: str) -> tuple[CredentialInfo, str] | None:
+        """Info + segredo em claro, juntos — para quem PRECISA dos dois.
+
+        É o caminho do browser (usuário+senha do mesmo login) e do email (endereço
+        + senha de app): pegar o segredo por um lado e os campos por outro daria
+        duas idas ao banco e abriria espaço para casar a senha de uma credencial
+        com o usuário de outra. Continua sendo o único lugar que decifra.
+        """
+        entry = await self._get_row(id_or_label)
+        if entry is None:
+            entry = await self._find_by_label(str(id_or_label))
+        if entry is None:
+            return None
+        return self._info(entry), self._decrypt(entry)
+
+    async def list_by_kind(self, kind: str) -> list[CredentialInfo]:
+        return [info for info in await self.list() if info.kind == kind]
+
+    def _fields(self, kind: str, fields: dict | None) -> dict:
+        try:
+            return normalize_fields(kind, fields)
+        except FieldError as exc:
+            raise CredentialError("bad_fields", str(exc)) from exc
 
     def _decrypt(self, entry: Credential) -> str:
         try:
@@ -245,6 +294,7 @@ class CredentialStore:
             label=entry.label,
             kind=entry.kind,
             description=entry.description,
+            fields=dict(entry.fields_json or {}),
             hint=entry.hint,
             created_at=entry.created_at,
             updated_at=entry.updated_at,

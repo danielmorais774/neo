@@ -28,6 +28,10 @@ class ContextRetrieveResponse(BaseModel):
 class PromptPreviewRequest(BaseModel):
     user_id: UUID = Field(..., description="UUID do usuário")
     user_input: str = Field(..., description="Mensagem bruta do usuário")
+    # Metadata do turno (o mesmo que o cliente manda no gRPC). Serve para prever o
+    # prompt de um turno de VOZ (`{"input_source": "voice", "os_platform": "darwin"}`)
+    # sem precisar falar de verdade — ver docs/voice-input-normalization-plan.md.
+    metadata: dict = Field(default_factory=dict)
 
 
 class CandidateTrace(BaseModel):
@@ -140,6 +144,7 @@ async def prompt_preview(body: PromptPreviewRequest):
     result = await _ai_service.preview_prompt(
         user_id=body.user_id,
         user_message=body.user_input,
+        metadata=body.metadata or None,
     )
 
     candidates = result["candidates"]

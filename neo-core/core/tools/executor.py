@@ -78,11 +78,13 @@ class ToolExecutor:
 
             # Executa baseado no tipo
             if tool.execution == "server-side":
-                result = await self._execute_server_side(tool_call.name, validated_args)
+                result = await self._execute_server_side(
+                    tool_call.name, validated_args, tool_call.id
+                )
             else:
                 # Client-side: delega para o módulo
                 result = await self._execute_client_side(
-                    tool.module, tool_call.name, validated_args
+                    tool.module, tool_call.name, validated_args, tool_call.id
                 )
 
             execution_time = asyncio.get_event_loop().time() - start_time
@@ -106,8 +108,53 @@ class ToolExecutor:
                 execution_time=execution_time,
             )
 
+    async def _dispatch(
+        self,
+        executor: Any,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        timeout: float,
+    ) -> Any:
+        """Chama o executor do módulo aceitando os DOIS contratos que existem no core.
+
+        Metade dos executores fala ``execute(nome, args) -> dict`` (weather,
+        web_search, services, workbench); a outra metade fala
+        ``execute_tool_call(ToolCall) -> ToolResult`` — o contrato do
+        ``AgentExecutor`` (jobs, HA, whatsapp, devices, cofre, email). Este
+        método só sabia o primeiro, então registrar um executor do segundo tipo
+        aqui morria em ``AttributeError: object has no attribute 'execute'``, que
+        o ``except Exception`` de ``execute_tool_call`` transformava na frase
+        genérica "Todas as ferramentas falharam". Foi o que matou ``email_inbox``,
+        ``email_message`` e ``vault_list`` em produção — nos DOIS caminhos, o do
+        roteador e o inline do cérebro (que cai aqui pelo fallthrough do
+        ``CognitiveReadExecutor``).
+
+        ``execute`` vem primeiro de propósito: quem já tem os dois (devices)
+        continua exatamente como estava.
+        """
+        if hasattr(executor, "execute"):
+            return await asyncio.wait_for(
+                executor.execute(tool_name, arguments), timeout=timeout
+            )
+
+        call = ToolCall(id=tool_call_id, name=tool_name, arguments=arguments)
+        result = await asyncio.wait_for(
+            executor.execute_tool_call(call), timeout=timeout
+        )
+        # O ToolResult já traz o erro pronto para humano ("login recusado …
+        # senha de app"). Levantar preserva essa mensagem: o `except` de
+        # execute_tool_call a copia para ToolResult.error, e o AgentExecutor
+        # agora a mostra em vez da frase genérica.
+        if getattr(result, "error", None):
+            raise ToolExecutionError(
+                str(result.error), details={"tool": tool_name}
+            )
+        return getattr(result, "result", result)
+
     async def _execute_server_side(
-        self, tool_name: str, arguments: dict[str, Any]
+        self, tool_name: str, arguments: dict[str, Any], tool_call_id: str = ""
     ) -> Any:
         """
         Executa uma tool server-side via module executor registrado.
@@ -115,6 +162,7 @@ class ToolExecutor:
         Args:
             tool_name: Nome da tool
             arguments: Argumentos validados
+            tool_call_id: Id da tool call (repassado ao executor por-ToolCall)
 
         Returns:
             Resultado da execução
@@ -131,11 +179,13 @@ class ToolExecutor:
         executor = self._module_executors[module]
 
         try:
-            result = await asyncio.wait_for(
-                executor.execute(tool_name, arguments),
+            return await self._dispatch(
+                executor,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                arguments=arguments,
                 timeout=tool.timeout or self.settings.tool_timeout,
             )
-            return result
         except asyncio.TimeoutError:
             raise ToolExecutionError(
                 f"Timeout executando tool server-side '{tool_name}'",
@@ -143,7 +193,11 @@ class ToolExecutor:
             )
 
     async def _execute_client_side(
-        self, module: str, tool_name: str, arguments: dict[str, Any]
+        self,
+        module: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_call_id: str = "",
     ) -> Any:
         """
         Delega execução para o executor do módulo.
@@ -152,6 +206,7 @@ class ToolExecutor:
             module: Nome do módulo
             tool_name: Nome da tool
             arguments: Argumentos validados
+            tool_call_id: Id da tool call (repassado ao executor por-ToolCall)
 
         Returns:
             Resultado da execução
@@ -166,11 +221,13 @@ class ToolExecutor:
 
         # Timeout protection
         try:
-            result = await asyncio.wait_for(
-                executor.execute(tool_name, arguments),
+            return await self._dispatch(
+                executor,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                arguments=arguments,
                 timeout=self.settings.tool_timeout,
             )
-            return result
         except asyncio.TimeoutError:
             raise ToolExecutionError(
                 f"Timeout executando tool '{tool_name}'",

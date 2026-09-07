@@ -24,6 +24,7 @@ from api.routes.missions import _execute_mission_command
 from db.async_client import AsyncPostgresClient
 from db.models import ConversationMessage, Mission
 from modules.desktop import AIService, AIServiceResponse, DesktopService
+from modules.desktop.ai_service import CYCLE_PROGRESS_MARKER
 from shared import NeoError
 from shared.types import MessageType, MissionCommandPayload
 
@@ -506,13 +507,19 @@ async def _stream_ai_events(
                 continue
 
             if resp.message and not resp.is_final:
+                # Um passo de autocontinuação se anuncia com CYCLE_PROGRESS_MARKER.
+                # O cliente Rust já tira o prefixo e troca o rótulo pra "Executando";
+                # aqui não tirava, e o painel mostrava "[[CYCLE]]Continuando (4/8): …"
+                # cru na tela — visto no primeiro ciclo que rodou de ponta a ponta.
+                is_cycle = resp.message.startswith(CYCLE_PROGRESS_MARKER)
                 yield _sse_line(
                     "thinking",
                     {
                         "sessionId": active_session_id,
-                        "type": "processing",
-                        "content": resp.message,
+                        "type": "executing" if is_cycle else "processing",
+                        "content": resp.message[len(CYCLE_PROGRESS_MARKER):] if is_cycle else resp.message,
                         "iteration": resp.iterations,
+                        "cycle": is_cycle,
                     },
                 )
     except Exception:

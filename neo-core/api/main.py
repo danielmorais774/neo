@@ -60,7 +60,7 @@ from db import AsyncPostgresClient
 from modules.desktop import AIService, DesktopService, DESKTOP_TOOLS
 from api.routes.devices import ws_router as devices_ws_router
 from modules.weather import WEATHER_TOOLS, WeatherExecutor
-from modules.devices import DEVICES_TOOLS, DevicesExecutor
+from modules.devices import DEVICE_CONTROL_TOOLS, DEVICES_TOOLS, DevicesExecutor
 from modules.voice import VOICE_TOOLS, VoiceExecutor
 from modules.config import CONFIG_TOOLS, ConfigExecutor, build_default_registry
 from observability.logger import ObservabilityLogger, set_obs
@@ -119,12 +119,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tool_executor=_tool_executor,
         token_counter=token_counter,
         compactor=context_compactor,
+        # Lê o role "cognitive" (aba Modelos do painel) a cada turno.
+        db=_db,
     )
 
     # ── Register tools ────────────────────────────────────────────
     _tool_registry.register_many(DESKTOP_TOOLS)      # client-side
     _tool_registry.register_many(WEATHER_TOOLS)       # server-side
     _tool_registry.register_many(DEVICES_TOOLS)       # server-side
+    # device_control / device_power (docs/device-control-plan.md). Registradas
+    # sempre; quem decide se o cérebro as VÊ são as flags neo_device_control_enabled
+    # e neo_device_power_enabled em cognitive_tools_for.
+    _tool_registry.register_many(DEVICE_CONTROL_TOOLS)  # server-side
     from modules.pks_search import PKS_SEARCH_TOOLS, PKSSearchExecutor
     _tool_registry.register_many(PKS_SEARCH_TOOLS)    # server-side
 
@@ -149,18 +155,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.web_search_executor = _web_search_executor
         print(f"✅ Web search wired (backends={settings.web_search_backends})")
 
+    # Cofre Fernet: só existe com NEO_CRED_KEY. build_credential_store importa
+    # `cryptography` LÁ DENTRO — sem chave, a lib nem é tocada e o broker recusa
+    # 'fernet://' com mensagem clara (só 'env://' funciona).
+    #
+    # Fica FORA do bloco do gateway de propósito: o cofre passou a ter três
+    # consumidores (gateway, tools de email e credenciais do browser), e amarrá-lo
+    # a NEO_GATEWAY_ENABLED faria o email do Neo sumir ao desligar o gateway.
+    from core.credentials import build_credential_store
+
+    _cred_store = build_credential_store(db=_db, key=settings.neo_cred_key)
+    app.state.credential_store = _cred_store
+
+    # Cofre visível ao cérebro (catálogo SEM segredo) + caixa de email do Neo.
+    # Registry e executor no MESMO lugar: registrar a tool sem executor faz o
+    # roteador oferecer algo que morre na hora de rodar (lição das job tools).
+    if _cred_store is not None:
+        from core.credentials.tools import VAULT_TOOLS, VaultToolExecutor
+        from core.mailbox import EMAIL_SEND_TOOLS, EMAIL_TOOLS, MailboxToolExecutor
+
+        _tool_registry.register_many(VAULT_TOOLS)
+        _tool_executor.register_module_executor("vault", VaultToolExecutor(_cred_store))
+        _email_tools = list(EMAIL_TOOLS)
+        if settings.neo_email_send_enabled:
+            _email_tools += EMAIL_SEND_TOOLS
+        _tool_registry.register_many(_email_tools)
+        _tool_executor.register_module_executor("email", MailboxToolExecutor(_cred_store))
+        _nomes = "/".join(t.name for t in _email_tools)
+        print(f"✅ Cofre wired (vault_list + {_nomes})")
+
     # Service Gateway (docs/service-gateway-dsl-plan.md): HTTP arbitrário para
     # serviços cadastrados (HA, GitHub, …) sem o LLM ver credencial. Registry
     # (db + seed das envs), política deny>confirm>allow, broker env://.
     if settings.neo_gateway_enabled:
-        from core.credentials import build_credential_store
         from core.gateway import build_gateway_service
         from modules.services import SERVICE_TOOLS, ServicesExecutor
 
-        # Cofre Fernet (F2): só existe com NEO_CRED_KEY. build_credential_store
-        # importa `cryptography` LÁ DENTRO — sem chave, a lib nem é tocada e o
-        # broker recusa 'fernet://' com mensagem clara (só 'env://' funciona).
-        _cred_store = build_credential_store(db=_db, key=settings.neo_cred_key)
         _gateway_service = build_gateway_service(
             db=_db, settings=settings, fernet_store=_cred_store
         )
@@ -252,8 +282,63 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     db=_db,
                     base_url=settings.browser_agent_url,
                     timeout_s=settings.browser_task_timeout,
+                    # GETTER: o File Store nasce mais abaixo neste mesmo bootstrap
+                    # (o JobManager vem antes), então quem resolve é o runner, na
+                    # hora de guardar o print. Store off = task sem print, só isso.
+                    get_file_store=lambda: getattr(app.state, "file_store", None),
+                    # Mesmo motivo do getter acima: o cofre nasce antes, mas o
+                    # runner só precisa dele na hora de decifrar a credencial.
+                    get_credential_store=lambda: getattr(app.state, "credential_store", None),
+                    default_screenshots=settings.browser_screenshots_default,
+                    max_screenshots=settings.browser_max_screenshots,
                 )
                 print(f"✅ Browser runner wired (url={settings.browser_agent_url})")
+            # Runner do navegador LOCAL (kind=browser_local) — dirige o navegador
+            # da máquina do usuário pelo canal de devices (docs/browser-local-plan.md).
+            _browser_local_runner = None
+            if settings.browser_local_enabled:
+                from core.jobs import build_browser_local_runner
+
+                _browser_local_runner = build_browser_local_runner(
+                    db=_db,
+                    llm_router=_llm_router,
+                    model=settings.browser_local_model,
+                    max_steps=settings.browser_local_max_steps,
+                    job_timeout_s=settings.browser_local_job_timeout,
+                    blocked_domains=tuple(
+                        d.strip()
+                        for d in settings.browser_local_blocked_domains.split(",")
+                        if d.strip()
+                    ),
+                    confirm_sensitive=settings.browser_local_confirm_sensitive,
+                    # Mesmo getter do irmão: o File Store nasce depois do JobManager.
+                    get_file_store=lambda: getattr(app.state, "file_store", None),
+                    max_screenshots=settings.browser_local_max_screenshots,
+                    trace_dir=settings.browser_local_trace_dir,
+                    # O olho do driver. None = modo texto (o comportamento antigo).
+                    vision_model=(
+                        settings.browser_local_vision_model
+                        if settings.browser_local_vision
+                        else None
+                    ),
+                )
+                _vision = (
+                    settings.browser_local_vision_model
+                    if settings.browser_local_vision
+                    else "off"
+                )
+                print(
+                    f"✅ Browser LOCAL runner wired (model={settings.browser_local_model}, "
+                    f"visão={_vision})"
+                )
+            # Vigia de download: laço em código, sem LLM no meio. Só existe se o
+            # navegador local existe — é ele quem enfileira o job.
+            _download_watch_runner = None
+            if settings.browser_local_enabled:
+                from core.jobs import build_download_watch_runner
+
+                _download_watch_runner = build_download_watch_runner(db=_db)
+                print("✅ Download watch runner wired")
             _job_manager = JobManager(
                 db=_db,
                 sandbox=_workbench_sandbox,
@@ -263,6 +348,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 workspace_root=settings.workbench_workspace_root,
                 research_runner=_research_runner,
                 browser_runner=_browser_runner,
+                browser_local_runner=_browser_local_runner,
+                download_watch_runner=_download_watch_runner,
             )
             app.state.job_manager = _job_manager
             print("✅ JobManager created (background jobs)")
@@ -402,6 +489,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pks_search_executor = PKSSearchExecutor(pks_service=_pks)
     _tool_executor.register_module_executor("pks_search", pks_search_executor)
 
+    # Mercado Livre (docs/product-search-plan.md §2). É a ÚNICA porta pro ML: o
+    # site responde 403 a web_fetch e o browser real toma reCAPTCHA. Registrado
+    # só com credencial — sem ela as tools sumiriam do catálogo em vez de falhar
+    # no meio do turno.
+    if settings.ml_app_id and settings.ml_client_secret:
+        from modules.meli import MELI_TOOLS, MeliClient, MeliExecutor
+
+        _tool_registry.register_many(MELI_TOOLS)
+        _tool_executor.register_module_executor(
+            "meli",
+            MeliExecutor(
+                MeliClient(
+                    app_id=settings.ml_app_id,
+                    client_secret=settings.ml_client_secret,
+                )
+            ),
+        )
+        print("✅ Mercado Livre wired (catálogo: fotos/atributos/variações; sem preço)")
+    else:
+        print("⏭️  Mercado Livre OFF (ML_APP_ID/ML_CLIENT_SECRET ausentes no .env da raiz)")
+
     # get_user_location resolves the user's city (PKS → device GPS → ask) and also
     # persists it (save_city). Needs the PKS service; per-request user + GPS scoping
     # happens via set_context in AIService._handle_server_tool.
@@ -416,12 +524,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         f"(workspace={system_pks['workspace_id']}, agent={system_pks['agent_id']})"
     )
 
+    # ── Memória de trabalho — o caderno da tarefa (docs/working-memory-plan.md)
+    # Não registra executor global: as tools wm_* são user-scoped e saem do
+    # CognitiveReadExecutor (mesmo caminho de pks_remember/conversation_recall).
+    # O store aqui serve ao ÍNDICE que o seletor injeta no prompt, e ao GC.
+    _working_memory = None
+    _wm_gc_task = None
+    if settings.working_memory_enabled:
+        from core.working_memory import WorkingMemoryStore
+        from core.working_memory.gc import gc_loop as wm_gc_loop
+
+        _working_memory = WorkingMemoryStore(
+            db=_db,
+            max_note_bytes=settings.working_memory_note_max_bytes,
+            ttl_days=settings.working_memory_ttl_days,
+            max_index_notes=settings.working_memory_max_notes_in_index,
+            read_tail_entries=settings.working_memory_read_tail_entries,
+        )
+        app.state.working_memory = _working_memory
+        _wm_gc_task = asyncio.create_task(
+            wm_gc_loop(_working_memory, settings.working_memory_gc_interval_s)
+        )
+        app.state.working_memory_gc_task = _wm_gc_task
+        print("✅ Memória de trabalho ativa (tools wm_*, índice no prompt)")
+
     # ── Context Selector ─────────────────────────────────────────
     context_selector = PromptContextSelector(
         token_counter=token_counter,
         settings=settings,
         pks=_pks,
         preference_extractor=preference_extractor,
+        working_memory=_working_memory,
     )
     print("✅ PromptContextSelector ready")
     context.set_context_selector(context_selector)
@@ -440,6 +573,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_manager=_job_manager,
         skill_library=_skill_library,
         file_store=_file_store,
+        # Identidade: com uma caixa cadastrada, o Neo sabe o próprio email sem
+        # precisar chamar tool para descobrir (ver _neo_identity_block).
+        credential_store=_cred_store,
     )
     # Panel /context/prompt-preview reproduces the real turn's prompt assembly
     # (classify → recover_context → register → build_prompt) read-only.
@@ -573,6 +709,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except (asyncio.CancelledError, Exception):
             pass
         print("✅ Modo Birra sweeper stopped")
+
+    if _wm_gc_task is not None:
+        _wm_gc_task.cancel()
+        try:
+            await _wm_gc_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        print("✅ Working memory GC stopped")
 
     grpc_server = getattr(app.state, "grpc_server", None)
     if grpc_server is not None:

@@ -1,6 +1,10 @@
 # Memória de Trabalho — spec de implementação
 
-> Status: PLANO (2026-07-31). Nada implementado.
+> Status: **EM PRODUÇÃO desde 2026-08-30**. `working_note` migrada (head
+> `u4v5w6x7y8z9`) e `WORKING_MEMORY_ENABLED=true` no `.env` da raiz
+> (backup `.env.bak-working-memory-20260830`). F0–F3 vieram de 2026-07-31;
+> o **registro de artefatos** (§15) entrou junto da ativação.
+> Ver §14 para o que mudou em relação ao plano original e §15 para o registro.
 > Objetivo: dar ao Neo um **caderno da tarefa atual** — onde ele grava as
 > conclusões que obteve (números apurados, formato de um arquivo, decisão
 > tomada, caminho de um artefato) para que o turno seguinte **não precise reler
@@ -387,3 +391,91 @@ F0–F3 é o mínimo que fecha G1–G5 e G7. F1 sozinha já é usável manualmen
 - Não versiona (sem histórico de edição da nota).
 - Não é compartilhável entre usuários.
 - Não substitui `file_save`: artefato é arquivo, o caderno só aponta pra ele.
+
+---
+
+## §14. O que a implementação mudou (2026-07-31)
+
+Sete desvios do plano, todos com motivo:
+
+| # | Plano dizia | Ficou | Por quê |
+|---|---|---|---|
+| 1 | migração `q0r1s2t3u4v5` | `s2t3u4v5w6x7` ← `r1s2t3u4v5w6` | o id do plano já era do `birra_act`; head real era outro |
+| 2 | `links` como `array` | `string` CSV | **nenhuma** tool do repo usa `array`, e `_format_tools` emite `{"type":"array"}` sem `items` — JSON Schema inválido, risco de 400 no provider |
+| 3 | "regra 12 no CORE" | **regra 13** | a 12 já é do `conversation_recall` |
+| 4 | camada scored genérica | poda por NOTA antes de virar candidato (`_fit_working_index`) | o índice é UM bloco: estourando o budget, `_select_candidates` descartaria o caderno INTEIRO e o modelo perderia até a existência das notas |
+| 5 | GC "opcional (F4)" | entrou junto (`core/working_memory/gc.py`) | 30 linhas no molde do GC do File Store; sem ele o índice cresce para sempre |
+| 6 | decisão do backstop dentro da closure | função de módulo `_autonote_entry()` | a closure vive dentro de um gerador de 600 linhas — a decisão (filtro de tool pesada + dedup do `wm_write`) é onde mora o bug e precisava de teste |
+| 7 | `wm_*` no registry global | só no `CognitiveReadExecutor` | mesmo caminho de `pks_remember`/`conversation_recall`; o executor global **nunca recebe `set_context`**, então uma instância global gravaria com `user_id=None` |
+
+### Arquivos
+
+**Novos:** `db/models/working_note.py` · `alembic/versions/s2t3u4v5w6x7_…` ·
+`core/working_memory/{__init__,store,render,gc}.py` ·
+`modules/working_memory/{__init__,tools,executor}.py` ·
+`tests/working_memory/{test_working_note_store,test_render,test_prompt_layer,test_autonote,test_executor}.py`
+
+**Tocados:** `db/models/__init__.py` · `shared/config.py` (8 settings) ·
+`shared/types.py` (`ContextLayer.WORKING_MEM`) ·
+`core/agent/context_selector.py` (fetch paralelo, camada, budget, poda, regra 13) ·
+`core/cognitive/read_tools.py` (toolset, gating, `_USER_SCOPED`, dispatch) ·
+`api/main.py` (store + GC + injeção no seletor + shutdown) ·
+`modules/desktop/ai_service.py` (`session_id` no `build_prompt`, `_WM_HEAVY_TOOLS`,
+`_autonote_entry`, `_bg_working_note`).
+
+### Como ativar (feito em 2026-08-30)
+
+1. `make migrate` (cria `working_note`) — **já aplicada**.
+2. `WORKING_MEMORY_ENABLED=true` no `.env` da **raiz** (o container só lê esse)
+   \+ `docker compose up -d --no-deps neo-core`. O boot imprime
+   `✅ Memória de trabalho ativa (tools wm_*, índice no prompt)`.
+3. Smoke: mandar um CSV → pedir análise → **mensagem nova** pedindo um recorte →
+   conferir no `app.log` que houve `wm_read` e nenhum `file_read` do arquivo inteiro.
+
+Com a flag off o prompt e o toolset voltam a ser byte-a-byte os de antes — há
+teste para as duas coisas (`test_prompt_layer.py`), e é assim que se reverte.
+
+---
+
+## §15. Registro de artefatos (2026-08-30)
+
+O buraco que a sessão 081cd1c3 expôs: o Neo baixou `nfse_marco.pdf` pelo
+navegador local, disse **em prosa** "está na sua pasta de downloads", e no turno
+seguinte o classificador teve que remontar o caminho de cabeça. Três detalhes
+tornavam isso inevitável:
+
+1. o `dir` real vinha do device em toda resposta de `browser.downloads` e era
+   descartado em `driver.py` (`return listing.get("files")`);
+2. o download acontece **em um job**, fora de qualquer turno — nem o `wm_write`
+   nem o backstop `_bg_working_note` (que vive dentro de `_handle_direct_response`)
+   passam por ali;
+3. o índice do caderno só chega ao cognitivo. Quem monta o comando é o
+   **classificador**, que lê outro canal (`system_context`).
+
+`core/working_memory/artifacts.py` fecha os três com uma nota rolante por usuário
+(slug `artefatos-recentes`) — não uma tabela nova, porque a nota já é por usuário
+(sobrevive à rotação de sessão), já entra no prompt todo turno e já é podada pelo
+começo em 32 KB, que é a política certa para um registro rolante.
+
+**A garantia de leitura é em camadas, e nenhuma delas é "peça pro modelo ler":**
+
+| Camada | Onde | O que garante |
+|---|---|---|
+| O caminho vai no `summary` | `render_summary` | o índice já carrega a resposta — `wm_read` vira exceção, não o caminho feliz |
+| Bloco no `system_context` | `_recent_artifacts` (ai_service) | o **classificador** enxerga (mesma costura do manifesto de anexos) |
+| Reescrita determinística | `_resolve_artifact_paths` (intent_router) | caminho montado de cabeça é trocado pelo REAL antes do dispatch |
+| Âncora de fundamentação | idem | arquivo que o Neo baixou conta como fundamentado — não cai no `needs_plan` |
+
+**Gravação em dois tempos, de propósito:** o runner do navegador registra quando o
+download **começa** (via `on_download` do driver — o arquivo já está no disco dele
+mesmo que ainda enchendo) e confirma no fim; o vigia (`runner_download_watch`)
+grava o veredito final. As três gravações colapsam em UMA linha porque
+`normalize()` tira o sufixo temporário (`.crdownload`) do nome **e do caminho**, e
+`parse_artifacts` deduplica por nome mantendo a última. Tamanho parcial nunca é
+registrado — número que mente é pior que número ausente.
+
+**Deixado de fora de propósito:** subir o `_bg_working_note` para o epílogo comum
+do turno. Num turno `CLIENT_TOOL` o trabalho não aconteceu ainda (o resultado
+volta em `process_tool_result`), e o caminho do shell do cérebro já reentra no
+cognitivo — então a nota automática já cobre esse. Anotar o `tool_trace` de todo
+comando one-shot só encheria o índice, que é o recurso mais caro da feature (R3).

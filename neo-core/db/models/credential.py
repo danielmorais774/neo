@@ -14,11 +14,20 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, LargeBinary, String
+from sqlalchemy import JSON, Column, LargeBinary, String
 from sqlmodel import Field, SQLModel
 
-# Para que serve o segredo — orienta a UI e o consumidor, não muda a cifra.
-CREDENTIAL_KINDS = ("token", "password", "api_key", "basic", "cookie", "cert", "other")
+# Para que serve o segredo — agora o tipo TAMBÉM decide que campos não-secretos
+# a credencial guarda (usuário, endereço de email, host IMAP...).
+#
+# A spec canônica (campos por tipo, validação, rótulos do painel) vive em
+# ``core/credentials/kinds.py`` e é de lá que o store valida. Aqui a lista é
+# repetida de propósito: model NÃO importa de ``core`` — o ``core/__init__``
+# puxa a engine inteira (agent/llm/router), e o alembic, que importa os models
+# direto, morre em circular import com ``db.async_client``.
+CREDENTIAL_KINDS = (
+    "password", "email", "token", "api_key", "basic", "cookie", "cert", "other",
+)
 
 
 class Credential(SQLModel, table=True):
@@ -29,6 +38,14 @@ class Credential(SQLModel, table=True):
     # painel mostra e o que aparece em listagens. NUNCA o valor.
     label: str = Field(sa_column=Column("label", String(80), nullable=False, unique=True))
     kind: str = Field(default="token", sa_column=Column("kind", String(20), nullable=False))
+    # Campos NÃO secretos do tipo (usuário, endereço, imap_host…). Em claro de
+    # propósito: é o que o painel exibe e o que o cérebro lê para escolher a
+    # credencial certa — o segredo continua só em ``value_encrypted``. As chaves
+    # aceitas vêm da whitelist de ``core/credentials/kinds.py``.
+    fields_json: dict = Field(
+        default_factory=dict,
+        sa_column=Column("fields_json", JSON, nullable=False, server_default="{}"),
+    )
     description: Optional[str] = Field(
         default=None, sa_column=Column("description", String(300), nullable=True)
     )

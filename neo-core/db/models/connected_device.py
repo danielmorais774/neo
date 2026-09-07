@@ -1,10 +1,19 @@
-"""Connected device model — tracks devices registered via gRPC."""
+"""Connected device model — tracks devices registered via gRPC.
+
+As colunas de pareamento (``display_name``, ``pairing_token_hash``, ``paired_at``,
+``capabilities``) são o que torna o ``user_id`` um DONO de verdade: até o
+pareamento existir, o ``user_id`` era apenas declarado pelo cliente (o desktop
+manda o que quiser em ``NEO_USER_ID``). Depois dele, o core resolve
+``token → (user_id, device_id)`` e ignora o que o cliente afirma.
+Ver docs/device-control-plan.md §1–§2.
+"""
 
 import uuid
 from datetime import datetime
 
 from sqlmodel import Field, SQLModel
 from sqlalchemy import Column, String, Uuid as SAUuid
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 class ConnectedDevice(SQLModel, table=True):
@@ -32,6 +41,31 @@ class ConnectedDevice(SQLModel, table=True):
     is_online: bool = Field(default=False)
     ws_connection_id: str | None = Field(
         sa_column=Column("ws_connection_id", String(256), nullable=True, default=None),
+    )
+    # ── Pareamento / controle (docs/device-control-plan.md) ──────────────
+    # Nome dado pelo USUÁRIO ("PC da sala"). É por ele que o cérebro endereça o
+    # device — nunca pelo device_id, que é um UUID opaco que o modelo inventa
+    # (mesmo modo de falha do file_id e do entity_id do Home Assistant).
+    display_name: str | None = Field(
+        default=None,
+        sa_column=Column("display_name", String(64), nullable=True, default=None),
+    )
+    # sha256 do token de pareamento. O token cru é mostrado UMA vez, no pair.
+    pairing_token_hash: str | None = Field(
+        default=None,
+        sa_column=Column("pairing_token_hash", String(128), nullable=True, default=None),
+    )
+    paired_at: datetime | None = Field(
+        default=None,
+        sa_column=Column("paired_at", nullable=True, default=None),
+    )
+    # O que ESTE device sabe fazer, informado por ele no pareamento
+    # ({"volume": true, "power": false, ...}). Descoberto, não chutado: sem isso
+    # o cérebro oferece `shutdown` num device que não implementa e a tool falha
+    # DEPOIS de prometer.
+    capabilities: dict | None = Field(
+        default=None,
+        sa_column=Column("capabilities", JSONB, nullable=True, default=None),
     )
     created_at: datetime = Field(
         default_factory=datetime.utcnow,

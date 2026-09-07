@@ -57,11 +57,15 @@ class AgentExecutor:
         tool_executor: ToolExecutor,
         token_counter: TokenCounter | None = None,
         compactor: ContextCompactor | None = None,
+        db: Any | None = None,
     ) -> None:
         self.llm_router = llm_router
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
         self.settings = get_settings()
+        #: Só para ler o role "cognitive" do painel. Opcional de propósito: sem
+        #: db o executor cai no env, que é exatamente o comportamento antigo.
+        self.db = db
 
         self._token_counter = token_counter or TokenCounter(model=self.settings.default_model)
         self._compactor = compactor
@@ -99,6 +103,11 @@ class AgentExecutor:
         """
         max_outer_retries = 3
         loop_hints_injected: set[LoopType] = set()
+
+        # Escolha do painel (role "cognitive") — resolvida UMA vez por turno, e
+        # não a cada iteração: dentro do inner loop uma troca no meio do caminho
+        # significaria metade do turno num modelo e metade em outro.
+        provider, model = await self._resolve_brain(provider, model)
 
         for outer_attempt in range(max_outer_retries):
             try:
@@ -174,6 +183,52 @@ class AgentExecutor:
             iterations=0,
             session_id=session_id,
         )
+
+    async def _resolve_brain(
+        self, provider: str | None, model: str | None
+    ) -> tuple[str, str]:
+        """Provider/modelo do cérebro: override do chamador → painel → env.
+
+        O override explícito ganha sempre (é como o `service.py` deixa alguém
+        pedir um modelo pontual). Sem ele, vale o que o operador escolheu na aba
+        Modelos; e sem escolha, o env — o comportamento que existia antes deste
+        select. Nunca levanta: um erro de leitura aqui derrubaria o turno inteiro
+        por causa de uma preferência, então a falha degrada para o env.
+        """
+        env_provider = provider or self.settings.default_provider
+        env_model = model or self.llm_router.get_default_model(env_provider)
+        if provider and model:
+            return provider, model
+        try:
+            from modules.model_config import get_model_config
+
+            config = await get_model_config(
+                self.db,
+                "cognitive",
+                fallback_provider=env_provider,
+                fallback_model=env_model,
+            )
+            chosen = config.get("provider") or env_provider
+            # Provider gravado mas sem chave configurada (removeram a key depois
+            # da escolha): `get_provider` levantaria e TODO turno morreria por
+            # causa de uma preferência velha. Volta para o env e avisa.
+            if chosen not in self.llm_router.list_available_providers():
+                logger.warning(
+                    "Role 'cognitive' aponta para '%s', que não está configurado — "
+                    "usando %s/%s",
+                    chosen, env_provider, env_model,
+                )
+                return env_provider, env_model
+            return (
+                provider or chosen,
+                model or config.get("model") or env_model,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "resolve cognitive model falhou, usando %s/%s: %s",
+                env_provider, env_model, e,
+            )
+            return env_provider, env_model
 
     # ------------------------------------------------------------------
     # Inner loop
@@ -303,10 +358,7 @@ class AgentExecutor:
                 # 8. Todas as tools falharam?
                 all_failed = all(r.error for r in step.tool_results)
                 if all_failed:
-                    final_response = (
-                        "Todas as ferramentas falharam. "
-                        "Não foi possível completar a tarefa."
-                    )
+                    final_response = self._failure_text(step.tool_results)
                     status = ExecutionStatus.FAILED
                     break
 
@@ -356,6 +408,31 @@ class AgentExecutor:
         ex = executor or self.tool_executor
         tasks = [ex.execute_tool_call(tc) for tc in tool_calls]
         return await asyncio.gather(*tasks)
+
+    @staticmethod
+    def _failure_text(tool_results: list[Any]) -> str:
+        """Texto de "todas falharam" com o MOTIVO, não só o fato.
+
+        A frase genérica escondia erros que já vinham escritos para humano
+        ("login recusado … precisa ser uma SENHA DE APP") e deixava o turno sem
+        rastro: o erro da tool não ia para o chat, nem para o session log, nem
+        para o app.log. Custou duas sessões inteiras de 'Todas as ferramentas
+        falharam' com o motivo real a uma linha de distância.
+        """
+        motivos: list[str] = []
+        for r in tool_results:
+            erro = str(getattr(r, "error", "") or "").strip()
+            if not erro:
+                continue
+            nome = getattr(r, "name", None) or "tool"
+            linha = f"{nome}: {erro[:400]}"
+            if linha not in motivos:
+                motivos.append(linha)
+        if not motivos:
+            return "Todas as ferramentas falharam. Não foi possível completar a tarefa."
+        if len(motivos) == 1:
+            return f"A ferramenta falhou — {motivos[0]}"
+        return "Todas as ferramentas falharam:\n" + "\n".join(f"- {m}" for m in motivos)
 
     @staticmethod
     def _same_message(left: Message, right: Message) -> bool:

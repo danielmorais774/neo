@@ -354,6 +354,8 @@ service_connection
 
 credential            -- [F2] compartilhada com o browser-agent (plano §3.5)
   id uuid PK, label text unique, kind text, value_encrypted bytea, created_at
+  fields_json jsonb     -- [F5] campos NÃO secretos do tipo (username, address,
+                        --      imap_host, domain). Em claro de propósito.
 
 service_request_log
   id uuid PK, ts, user_id, session_id, source text  -- chat|job|skill|panel
@@ -730,6 +732,60 @@ exercitar a feature pelo chat.
   de `build_credential_store()`, chamado só quando há `NEO_CRED_KEY`.
 - **Seeds do `.env` são read-only no painel** (400 no DELETE): quem manda nelas
   é a env. Credencial em uso não some (409) — diz qual conexão a usa.
+
+### F5 — cofre TIPADO, visível ao cérebro (EM PRODUÇÃO 2026-08-25)
+
+O que motivou: *"o type está irrelevante na hora de cadastrar, parece sempre
+aceitar um tipo só; se eu quiser registrar um usuário e senha não aparecem os
+campos; e a description não é usada pelo neo-core no julgamento e escolha do
+item certo no cofre"*. Os três diagnósticos estavam certos:
+
+- `kind` e `description` eram **inertes** — nada no core lia os campos, só
+  ecoava no `to_dict()`;
+- **usuário+senha não cabia**: a credencial guarda UM segredo e o username
+  morava do outro lado, no `auth_config` da *conexão* — logo, um login de site
+  sem conexão nenhuma não tinha onde existir;
+- **não havia "escolha"**: o único consumidor era o broker resolvendo o
+  `credential_ref` que a conexão já apontava. Sem alguém escolhendo, a
+  descrição não tinha para quem falar.
+
+| Peça | Arquivo |
+|---|---|
+| Spec de campos por tipo | `core/credentials/kinds.py` (`CREDENTIAL_KIND_SPECS`) |
+| Coluna `fields_json` | `db/models/credential.py`, alembic `u4v5w6x7y8z9` |
+| Validação (whitelist + obrigatórios) | `CredentialStore._fields` / `normalize_fields` |
+| Spec para o painel | `GET /api/v1/gateway/credential-kinds` |
+| Formulário dirigido pela spec | `neo-panel/src/ServicesPanel.tsx` (`VaultTab`) |
+| Catálogo para o cérebro | `core/credentials/tools.py` (`vault_list`) |
+| Cofre → browser | `core/credentials/browser.py` (`sensitive_data` por domínio) |
+| Caixa de email do Neo | `core/mailbox/` (IMAP, `email_inbox`/`email_message`) |
+| Identidade no prompt | `AIService._neo_identity_block` |
+
+**Decisões que valem registrar:**
+- **Dois destinos, uma regra**: o SEGREDO é único e cifrado; os CAMPOS
+  (`username`, `address`, `imap_host`, `domain`) ficam **em claro**. É essa
+  separação que deixa o painel mostrar "usuário: daniel" e o cérebro escolher
+  sem decifrar nada. Como os nomes vêm da spec (whitelist), não existe "campo
+  livre" onde um segundo segredo entre sem querer — chave desconhecida é 400.
+- **Senha sem domínio é RECUSADA para o browser.** O `sensitive_data` da
+  browser-use só revela o placeholder quando a aba está num domínio que casa
+  com o padrão; sem domínio o valor viraria global e qualquer página poderia
+  colhê-lo por prompt injection. Recusar com "preencha o Domínio de uso" é
+  melhor que degradar em silêncio.
+- **O endereço de email vai em claro, a senha da caixa não vai ao browser.**
+  Endereço é público (é o que se digita num cadastro); ler a caixa é papel do
+  IMAP, não do Chromium.
+- **A identidade ("você tem email, o endereço é X") vai no PROMPT, não atrás de
+  tool.** Se dependesse de descobrir, o Neo pediria o email do USUÁRIO em vez
+  de usar o dele. Cache de 5 min; o endereço é público, a senha nunca aparece.
+- **Tool no registry global ≠ tool que o cérebro tem.** O toolset inline sai de
+  `cognitive_tools_for` (`core/cognitive/read_tools.py`), não do registry —
+  registrar só no registry deixaria a instrução de identidade impossível de
+  cumprir (mesma família do gotcha das job tools).
+- **`db/models/` NÃO importa de `core`.** `core/__init__.py` puxa a engine
+  inteira; o alembic importa os models direto e morre em circular import com
+  `db.async_client`. A lista de kinds é duplicada no model de propósito, com um
+  teste que trava a divergência.
 
 ### F3 — descoberta (EM PRODUÇÃO)
 
