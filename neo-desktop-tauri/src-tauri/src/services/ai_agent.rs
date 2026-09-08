@@ -379,6 +379,13 @@ impl GrpcClient {
                     // tools (open_url / launch_uri / media_command) inline here and
                     // send the ToolResult back so neo-core can confirm the playback.
                     if let Some(core_message::Content::ToolRequest(t)) = &core_msg.content {
+                        // `observar` (docs/playlists-skill-plan.md §7.5): o neo-core só
+                        // manda este campo quando existe inscrição ARMADA para este
+                        // aparelho. É ele que liga a vigia da fila — e a ausência dele
+                        // (o caso normal, "toca um AC/DC") desliga qualquer vigia velha.
+                        if is_media_tool(&t.tool_name) || t.tool_name == "media_command" {
+                            apply_watch_directive(&ext_bridge, &self.device_id, &t.arguments);
+                        }
                         if t.tool_name == "media_command" {
                             // Browser-tab control via the extension bridge (Etapa 3):
                             // round-trips to the extension (focus tab + play videoId).
@@ -1046,6 +1053,41 @@ fn open_target(target: &str) -> Result<(), String> {
         std::process::Command::new("xdg-open").arg(target).spawn()
     };
     result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Liga/desliga a vigia da fila a partir do `observar` da atuação de música.
+///
+/// Sem `observar` a vigia é DESLIGADA de propósito: se o usuário pediu outra
+/// música no meio da fila, o neo-core já pausou a inscrição do lado dele, e
+/// continuar observando aqui só produziria evento que ninguém quer.
+fn apply_watch_directive(bridge: &ExtBridge, device_id: &str, arguments: &str) {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let observar = match args.get("observar") {
+        Some(v) if v.is_object() => v,
+        _ => {
+            bridge.disarm_watch();
+            return;
+        }
+    };
+    let subscription_id = observar
+        .get("inscricao_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let video_id = observar
+        .get("video_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| args.get("videoId").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if subscription_id.is_empty() || video_id.is_empty() {
+        bridge.disarm_watch();
+        return;
+    }
+    let tab_id = observar
+        .get("tab_id")
+        .and_then(|v| v.as_i64())
+        .or_else(|| args.get("tabId").and_then(|v| v.as_i64()));
+    bridge.arm_watch(subscription_id, device_id, tab_id, video_id);
 }
 
 /// Execute a media tool request; returns ``(success, result, error)`` for the

@@ -55,10 +55,37 @@ struct CmdResult {
     error: String,
 }
 
+/// Uma vigia armada: "esta aba está tocando ESTA faixa por conta de uma fila".
+///
+/// Chega junto com a atuação de música (`observar` nos argumentos), quando — e só
+/// quando — o neo-core tem uma inscrição armada para este aparelho. Sem watch a
+/// ponte não fala com o neo-core fora do turno: um "toca um AC/DC" continua sendo
+/// exatamente o que era. Ver docs/playlists-skill-plan.md §7.4.
+#[derive(Clone, Debug)]
+pub struct Watch {
+    pub subscription_id: String,
+    pub device_id: String,
+    pub tab_id: Option<i64>,
+    pub video_id: String,
+    /// Último evento já reportado ("<evento>:<faixa>"). Impede reenviar o mesmo
+    /// aviso a cada snapshot (a extensão manda um a cada ~24s e a cada evento de
+    /// aba) — sem isso a fila pularia várias faixas de uma vez.
+    pub sent: Option<String>,
+}
+
+/// Faltando isto (em segundos) para o fim, já pedimos a próxima. O evento certo
+/// é "está acabando", não "acabou": dá tempo de trocar antes de o autoplay do
+/// YouTube assumir a fila, e não deixa buraco de silêncio entre faixas.
+const ENDING_WINDOW_SECS: f64 = 6.0;
+
 #[derive(Default)]
 struct Inner {
     /// Latest tab snapshot from the connected extension.
     tabs: Vec<MusicTab>,
+    /// Vigia armada pelo neo-core (None = nada a observar, o caso normal).
+    watch: Option<Watch>,
+    /// Já existe um POST de evento em voo? (evita dois avanços simultâneos)
+    reporting: bool,
     /// Writer for the current extension socket (None when nothing is connected).
     conn: Option<mpsc::Sender<Message>>,
     /// Monotonic id of the current connection, so a stale socket's teardown can't
@@ -158,6 +185,134 @@ impl ExtBridge {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Vigia de fila (docs/playlists-skill-plan.md §7.5)
+    // ------------------------------------------------------------------
+
+    /// Arma a vigia. Chamado quando a atuação de música traz `observar`.
+    pub fn arm_watch(
+        &self,
+        subscription_id: &str,
+        device_id: &str,
+        tab_id: Option<i64>,
+        video_id: &str,
+    ) {
+        if let Ok(mut g) = self.inner.lock() {
+            info!(
+                "[ExtBridge] watch armado: aba {:?} faixa {} (inscrição {})",
+                tab_id, video_id, subscription_id
+            );
+            g.watch = Some(Watch {
+                subscription_id: subscription_id.to_string(),
+                device_id: device_id.to_string(),
+                tab_id,
+                video_id: video_id.to_string(),
+                sent: None,
+            });
+        }
+        // A extensão passa a reportar essa aba de segundos em segundos (em vez do
+        // alarme de ~24s): é o que faz a troca acontecer ANTES do fim da faixa,
+        // sem buraco de silêncio e sem disputa com o autoplay.
+        self.push_message(serde_json::json!({
+            "type": "watch",
+            "tabId": tab_id,
+            "videoId": video_id,
+        }));
+    }
+
+    /// Desarma. Chamado quando o neo-core responde `desarmar` ou quando o usuário
+    /// manda tocar outra coisa (a inscrição vira problema do servidor, não daqui).
+    pub fn disarm_watch(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            if g.watch.is_some() {
+                info!("[ExtBridge] watch desarmado");
+            }
+            g.watch = None;
+            g.reporting = false;
+        }
+        self.push_message(serde_json::json!({"type": "unwatch"}));
+    }
+
+    /// Manda uma mensagem à extensão sem esperar resposta (o `send_command`
+    /// espera um `result` correlacionado; aqui é aviso, não comando).
+    fn push_message(&self, value: serde_json::Value) {
+        let sender = match self.inner.lock() {
+            Ok(g) => g.conn.clone(),
+            Err(_) => None,
+        };
+        if let Some(tx) = sender {
+            tokio::spawn(async move {
+                let _ = tx.send(Message::Text(value.to_string().into())).await;
+            });
+        }
+    }
+
+    pub fn watch_armed(&self) -> bool {
+        self.inner.lock().map(|g| g.watch.is_some()).unwrap_or(false)
+    }
+
+    /// Decide se o snapshot atual merece um evento. Marca `reporting` e o `sent`
+    /// ANTES de devolver — quem chama já pode disparar o POST sem correr o risco
+    /// de mandar dois pelo mesmo motivo.
+    fn evaluate_watch(&self) -> Option<(Watch, String, String)> {
+        let mut g = self.inner.lock().ok()?;
+        if g.reporting {
+            return None;
+        }
+        let watch = g.watch.clone()?;
+        let tab = g.tabs.iter().find(|t| match watch.tab_id {
+            Some(id) => t.tab_id == id,
+            None => t
+                .extra
+                .get("videoId")
+                .and_then(|v| v.as_str())
+                .map(|v| v == watch.video_id)
+                .unwrap_or(false),
+        })?;
+
+        let num = |key: &str| tab.extra.get(key).and_then(|v| v.as_f64());
+        let flag = |key: &str| tab.extra.get(key).and_then(|v| v.as_bool());
+        let current_video = tab
+            .extra
+            .get("videoId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // A aba trocou de vídeo sem passar por nós (o usuário navegou, ou o
+        // autoplay assumiu). Reportamos a faixa que ESTÁ lá: o neo-core vê que
+        // não é a esperada e PAUSA a inscrição em vez de brigar pelo player.
+        let (event, reported) = if !current_video.is_empty() && current_video != watch.video_id {
+            ("faixa_terminou".to_string(), current_video)
+        } else if flag("ended").unwrap_or(false) {
+            ("faixa_terminou".to_string(), watch.video_id.clone())
+        } else {
+            let duration = num("duration").unwrap_or(0.0);
+            let position = num("currentTime").unwrap_or(0.0);
+            let live = flag("live").unwrap_or(false);
+            if live || duration <= 0.0 || duration - position > ENDING_WINDOW_SECS {
+                return None;
+            }
+            ("faixa_terminando".to_string(), watch.video_id.clone())
+        };
+
+        let stamp = format!("{}:{}", event, reported);
+        if watch.sent.as_deref() == Some(stamp.as_str()) {
+            return None;
+        }
+        if let Some(w) = g.watch.as_mut() {
+            w.sent = Some(stamp);
+        }
+        g.reporting = true;
+        Some((watch, event, reported))
+    }
+
+    fn end_reporting(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.reporting = false;
+        }
+    }
+
     fn set_connection(&self, sender: mpsc::Sender<Message>) -> u64 {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
@@ -175,6 +330,10 @@ impl ExtBridge {
             if g.conn_id == my_id {
                 g.conn = None;
                 g.tabs.clear();
+                // Sem extensão não há o que observar. A inscrição continua viva
+                // no servidor (e expira pelo TTL) — aqui só paramos de vigiar.
+                g.watch = None;
+                g.reporting = false;
             }
         }
     }
@@ -192,6 +351,14 @@ impl ExtBridge {
                     .unwrap_or_default();
                 if let Ok(mut g) = self.inner.lock() {
                     g.tabs = tabs;
+                }
+                // Só faz alguma coisa se houver watch armado — o filtro na BORDA
+                // (§7.4): sem fila rodando, nenhum evento de mídia vira requisição.
+                if let Some((watch, event, video_id)) = self.evaluate_watch() {
+                    let bridge = self.clone();
+                    tokio::spawn(async move {
+                        report_media_event(bridge, watch, event, video_id).await;
+                    });
                 }
             }
             Some("result") => {
@@ -214,6 +381,113 @@ impl ExtBridge {
             }
             _ => {}
         }
+    }
+}
+
+/// URL HTTP do neo-core (mesma resolução usada pelos comandos do app).
+fn neo_core_http_url() -> String {
+    std::env::var("NEO_CORE_HTTP_URL")
+        .or_else(|_| std::env::var("NEO_CORE_API_URL"))
+        .ok()
+        .or_else(|| {
+            std::env::var("NEO_CORE_URL")
+                .ok()
+                .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8000".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Conta ao neo-core que a faixa observada está acabando — e **executa a resposta**.
+///
+/// A resposta do POST É o comando (docs/playlists-skill-plan.md §7.5): um round
+/// trip, sem canal de push novo e sem mudança no `.proto`. Três respostas
+/// possíveis: `tocar` (manda a próxima para a extensão e re-arma), `desarmar`
+/// (fila acabou / inscrição encerrada) e `nada` (o servidor decidiu ignorar).
+async fn report_media_event(bridge: ExtBridge, watch: Watch, event: String, video_id: String) {
+    let url = format!("{}/api/v1/eventos/midia", neo_core_http_url());
+    let body = serde_json::json!({
+        "device_id": watch.device_id,
+        "canal": "musica",
+        "evento": event,
+        "site": "youtube",
+        "tab_id": watch.tab_id,
+        "video_id": video_id,
+        "inscricao_id": watch.subscription_id,
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("[ExtBridge] cliente HTTP indisponível: {}", e);
+            bridge.end_reporting();
+            return;
+        }
+    };
+    let response = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[ExtBridge] evento de mídia falhou: {}", e);
+            bridge.end_reporting();
+            return;
+        }
+    };
+    let payload: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    let acao = payload.get("acao").and_then(|v| v.as_str()).unwrap_or("nada");
+    info!("[ExtBridge] evento {} → {}", event, acao);
+
+    match acao {
+        "tocar" => {
+            let next_video = payload
+                .get("video_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tab_id = payload
+                .get("tab_id")
+                .and_then(|v| v.as_i64())
+                .or(watch.tab_id);
+            if next_video.is_empty() {
+                bridge.end_reporting();
+                return;
+            }
+            // Re-arma ANTES de tocar: o snapshot seguinte chega em milissegundos
+            // e não pode encontrar a vigia apontando para a faixa velha.
+            bridge.arm_watch(&watch.subscription_id, &watch.device_id, tab_id, &next_video);
+            if let Err(e) = bridge.send_command("play", "youtube", &next_video, tab_id).await {
+                warn!("[ExtBridge] não consegui tocar a próxima da fila: {}", e);
+            }
+            bridge.end_reporting();
+        }
+        "abrir_url" | "abrir_uri" => {
+            let target = payload
+                .get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("uri").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if !target.is_empty() {
+                let opened = if cfg!(target_os = "macos") {
+                    std::process::Command::new("open").arg(target).spawn()
+                } else if cfg!(target_os = "windows") {
+                    std::process::Command::new("cmd")
+                        .args(["/C", "start", "", target])
+                        .spawn()
+                } else {
+                    std::process::Command::new("xdg-open").arg(target).spawn()
+                };
+                if let Err(e) = opened {
+                    warn!("[ExtBridge] não consegui abrir {}: {}", target, e);
+                }
+            }
+            // Fora do YouTube a ponte não enxerga o fim da faixa: a fila para aqui.
+            bridge.disarm_watch();
+        }
+        "desarmar" => bridge.disarm_watch(),
+        _ => bridge.end_reporting(),
     }
 }
 
