@@ -67,6 +67,20 @@ pub struct Watch {
     pub device_id: String,
     pub tab_id: Option<i64>,
     pub video_id: String,
+    /// Código único DESTE despacho (a linha da fila que está tocando). Volta em
+    /// todo evento para o neo-core marcar o status na linha certa, mesmo que a
+    /// fila tenha sido mexida no meio do caminho.
+    pub codigo: String,
+    /// A extensão já mandou evento explícito para esta vigia? Depois do primeiro,
+    /// paramos de inferir pelo snapshot: quem manda no fim da faixa é ela, que vê
+    /// o `<video>` de verdade. Evita os dois caminhos disputando o mesmo evento.
+    pub ext_driven: bool,
+    /// Já vimos a NOSSA faixa nessa aba? Enquanto não, um vídeo diferente ali
+    /// quer dizer "a navegação ainda não chegou" — e não "o usuário trocou".
+    /// Sem isto a vigia se auto-sabota: ela nasce no mesmo instante em que a aba
+    /// ainda mostra a música anterior, reporta "faixa inesperada" e a fila pausa
+    /// sozinha no primeiro segundo (visto em produção em 2026-09-08).
+    pub seen: bool,
     /// Último evento já reportado ("<evento>:<faixa>"). Impede reenviar o mesmo
     /// aviso a cada snapshot (a extensão manda um a cada ~24s e a cada evento de
     /// aba) — sem isso a fila pularia várias faixas de uma vez.
@@ -196,17 +210,22 @@ impl ExtBridge {
         device_id: &str,
         tab_id: Option<i64>,
         video_id: &str,
+        codigo: &str,
     ) {
         if let Ok(mut g) = self.inner.lock() {
             info!(
                 "[ExtBridge] watch armado: aba {:?} faixa {} (inscrição {})",
                 tab_id, video_id, subscription_id
             );
+            let ext_driven = g.watch.as_ref().map(|w| w.ext_driven).unwrap_or(false);
             g.watch = Some(Watch {
                 subscription_id: subscription_id.to_string(),
                 device_id: device_id.to_string(),
                 tab_id,
                 video_id: video_id.to_string(),
+                codigo: codigo.to_string(),
+                ext_driven,
+                seen: false,
                 sent: None,
             });
         }
@@ -217,6 +236,7 @@ impl ExtBridge {
             "type": "watch",
             "tabId": tab_id,
             "videoId": video_id,
+            "codigo": codigo,
         }));
     }
 
@@ -260,36 +280,58 @@ impl ExtBridge {
             return None;
         }
         let watch = g.watch.clone()?;
-        let tab = g.tabs.iter().find(|t| match watch.tab_id {
-            Some(id) => t.tab_id == id,
-            None => t
-                .extra
-                .get("videoId")
-                .and_then(|v| v.as_str())
-                .map(|v| v == watch.video_id)
-                .unwrap_or(false),
-        })?;
+        if watch.ext_driven {
+            // A extensão está reportando os eventos do player. Inferir pelo
+            // snapshot aqui só produziria evento duplicado (e um deles atrasado).
+            return None;
+        }
+        // Tudo que precisamos da aba vira valor PRÓPRIO aqui: logo abaixo
+        // mexemos em `g.watch`, e um empréstimo de `g.tabs` vivo impediria.
+        let (current_video, ended, duration, position, live) = {
+            let tab = g.tabs.iter().find(|t| match watch.tab_id {
+                Some(id) => t.tab_id == id,
+                None => t
+                    .extra
+                    .get("videoId")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v == watch.video_id)
+                    .unwrap_or(false),
+            })?;
+            let num = |key: &str| tab.extra.get(key).and_then(|v| v.as_f64());
+            let flag = |key: &str| tab.extra.get(key).and_then(|v| v.as_bool());
+            (
+                tab.extra
+                    .get("videoId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                flag("ended").unwrap_or(false),
+                num("duration").unwrap_or(0.0),
+                num("currentTime").unwrap_or(0.0),
+                flag("live").unwrap_or(false),
+            )
+        };
 
-        let num = |key: &str| tab.extra.get(key).and_then(|v| v.as_f64());
-        let flag = |key: &str| tab.extra.get(key).and_then(|v| v.as_bool());
-        let current_video = tab
-            .extra
-            .get("videoId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        if !current_video.is_empty() && current_video == watch.video_id {
+            if let Some(w) = g.watch.as_mut() {
+                w.seen = true;
+            }
+        }
+        let seen = g.watch.as_ref().map(|w| w.seen).unwrap_or(false);
+        if !seen {
+            // A navegação ainda não chegou nesta aba. Calar aqui é o certo:
+            // reportar agora seria inventar um fim que não houve.
+            return None;
+        }
 
-        // A aba trocou de vídeo sem passar por nós (o usuário navegou, ou o
-        // autoplay assumiu). Reportamos a faixa que ESTÁ lá: o neo-core vê que
-        // não é a esperada e PAUSA a inscrição em vez de brigar pelo player.
+        // A aba trocou de vídeo DEPOIS de a nossa ter aparecido (o usuário
+        // navegou, ou o autoplay assumiu). Reportamos a faixa que ESTÁ lá: o
+        // neo-core vê que não é a esperada e PAUSA a inscrição em vez de brigar.
         let (event, reported) = if !current_video.is_empty() && current_video != watch.video_id {
             ("faixa_terminou".to_string(), current_video)
-        } else if flag("ended").unwrap_or(false) {
+        } else if ended {
             ("faixa_terminou".to_string(), watch.video_id.clone())
         } else {
-            let duration = num("duration").unwrap_or(0.0);
-            let position = num("currentTime").unwrap_or(0.0);
-            let live = flag("live").unwrap_or(false);
             if live || duration <= 0.0 || duration - position > ENDING_WINDOW_SECS {
                 return None;
             }
@@ -357,8 +399,57 @@ impl ExtBridge {
                 if let Some((watch, event, video_id)) = self.evaluate_watch() {
                     let bridge = self.clone();
                     tokio::spawn(async move {
-                        report_media_event(bridge, watch, event, video_id).await;
+                        let codigo = watch.codigo.clone();
+                        report_media_event(bridge, watch, event, video_id, codigo).await;
                     });
+                }
+            }
+            // A extensão viu o player: começou, está acabando, acabou. É o
+            // caminho BOM (ela enxerga o <video>); o snapshot vira só reserva.
+            Some("media_event") => {
+                let event = parsed
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let video_id = parsed
+                    .get("videoId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let codigo = parsed
+                    .get("codigo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let watch = match self.inner.lock() {
+                    Ok(mut g) => {
+                        if let Some(w) = g.watch.as_mut() {
+                            w.ext_driven = true;
+                        }
+                        g.watch.clone()
+                    }
+                    Err(_) => None,
+                };
+                // Sem vigia armada o evento é descartado AQUI: é a primeira das
+                // três camadas que protegem o pedido avulso de música.
+                if let Some(watch) = watch {
+                    if !event.is_empty() {
+                        let bridge = self.clone();
+                        let reported = if video_id.is_empty() {
+                            watch.video_id.clone()
+                        } else {
+                            video_id
+                        };
+                        let codigo = if codigo.is_empty() {
+                            watch.codigo.clone()
+                        } else {
+                            codigo
+                        };
+                        tokio::spawn(async move {
+                            report_media_event(bridge, watch, event, reported, codigo).await;
+                        });
+                    }
                 }
             }
             Some("result") => {
@@ -405,7 +496,13 @@ fn neo_core_http_url() -> String {
 /// trip, sem canal de push novo e sem mudança no `.proto`. Três respostas
 /// possíveis: `tocar` (manda a próxima para a extensão e re-arma), `desarmar`
 /// (fila acabou / inscrição encerrada) e `nada` (o servidor decidiu ignorar).
-async fn report_media_event(bridge: ExtBridge, watch: Watch, event: String, video_id: String) {
+async fn report_media_event(
+    bridge: ExtBridge,
+    watch: Watch,
+    event: String,
+    video_id: String,
+    codigo: String,
+) {
     let url = format!("{}/api/v1/eventos/midia", neo_core_http_url());
     let body = serde_json::json!({
         "device_id": watch.device_id,
@@ -414,6 +511,7 @@ async fn report_media_event(bridge: ExtBridge, watch: Watch, event: String, vide
         "site": "youtube",
         "tab_id": watch.tab_id,
         "video_id": video_id,
+        "codigo": codigo,
         "inscricao_id": watch.subscription_id,
     });
 
@@ -455,9 +553,20 @@ async fn report_media_event(bridge: ExtBridge, watch: Watch, event: String, vide
                 bridge.end_reporting();
                 return;
             }
+            let next_codigo = payload
+                .get("codigo")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // Re-arma ANTES de tocar: o snapshot seguinte chega em milissegundos
             // e não pode encontrar a vigia apontando para a faixa velha.
-            bridge.arm_watch(&watch.subscription_id, &watch.device_id, tab_id, &next_video);
+            bridge.arm_watch(
+                &watch.subscription_id,
+                &watch.device_id,
+                tab_id,
+                &next_video,
+                &next_codigo,
+            );
             if let Err(e) = bridge.send_command("play", "youtube", &next_video, tab_id).await {
                 warn!("[ExtBridge] não consegui tocar a próxima da fila: {}", e);
             }

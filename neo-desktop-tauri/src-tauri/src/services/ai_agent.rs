@@ -1087,7 +1087,11 @@ fn apply_watch_directive(bridge: &ExtBridge, device_id: &str, arguments: &str) {
         .get("tab_id")
         .and_then(|v| v.as_i64())
         .or_else(|| args.get("tabId").and_then(|v| v.as_i64()));
-    bridge.arm_watch(subscription_id, device_id, tab_id, video_id);
+    let codigo = observar
+        .get("codigo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    bridge.arm_watch(subscription_id, device_id, tab_id, video_id, codigo);
 }
 
 /// Execute a media tool request; returns ``(success, result, error)`` for the
