@@ -421,6 +421,61 @@ cadastro de negócio. A **fila** continua sendo dataset da skill.
 11. **Um `event_list` no painel** (que inscrições estão armadas, desde quando, o
     que dispararam). 20 linhas de tela que economizam uma tarde de debug.
 
+### 7.9 Código por item, status real e autoplay (ajuste de 2026-09-08)
+
+O desenho original marcava a linha como "tocando" no momento do **despacho** e
+inferia o fim pelo snapshot. Duas coisas estavam erradas nisso: "mandei tocar"
+não é "está tocando", e quem enxerga o `<video>` é a extensão, não o snapshot.
+
+**Código único por despacho.** Cada item despachado recebe um `codigo` de 8 hex
+gravado na linha da fila (`campo_codigo`). Ele viaja para o aparelho, e volta em
+todos os eventos. É ele — e não "quem estiver como tocando" — que diz qual linha
+atualizar. A mesma música enfileirada duas vezes tem dois códigos: o código
+identifica a **reprodução**, não a faixa. Ele também aparece no popup da
+extensão, então dá para casar "o que estou ouvindo" com "o que o Neo acha que
+está tocando" sem abrir o banco.
+
+**Quatro estados, e cada um quer dizer uma coisa:**
+
+```
+pendente → despachada → tocando → tocada
+             (mandei)   (o player   (a extensão
+                        confirmou)   viu acabar)
+```
+
+`faixa_iniciou` é um evento de **status**: não faz a fila andar, não passa pela
+dedup e não re-arma nada. Isso importa mais do que parece — ele e o
+`faixa_terminando` da mesma faixa dividem a chave de dedup (`<aba>:<faixa>`), e
+se o status carimbasse a chave, o "está acabando" chegaria como repetido e a
+fila **travaria na primeira música**.
+
+**Quem controla o fim é a extensão.** Ela mantém uma máquina de estados por
+código (armada → tocando → terminando → terminou), sonda a aba observada a cada
+2s e emite um evento por transição, uma vez só. O caminho antigo (inferir pelo
+snapshot no desktop) continua como reserva e se desliga sozinho no primeiro
+evento explícito (`ext_driven`) — os dois nunca disputam o mesmo fim.
+
+**Autoplay desligado no fluxo.** Enquanto o Neo dirige, a extensão clica no
+`.ytp-autonav-toggle-button` da aba observada. Sem isso o YouTube escolhe a
+próxima música e briga com a fila — o usuário vê a faixa trocar para algo que
+ele não pediu. Fora deste fluxo nada é tocado: a preferência do usuário no resto
+do navegador continua como está.
+
+**A janela de chegada (bug real, medido em produção).** No primeiro teste de
+verdade a fila pausou sozinha em 16 segundos: a vigia nasce no mesmo instante em
+que a aba **ainda mostra a música anterior**, o lado do Neo leu "vídeo diferente
+do esperado" e concluiu "o usuário assumiu o player". A correção é uma distinção
+que faltava: enquanto a nossa faixa não aparecer **nenhuma vez** naquela aba,
+vídeo diferente ali significa "a navegação ainda não chegou", não "trocaram".
+Passados 30s sem ela aparecer, a vigia se desliga calada — inventar um fim que
+não houve é pior do que parar.
+
+**A extensão diz que está sob controle.** Badge roxo com `▶` e um bloco no popup
+("Controlado pelo neo-core" + fase + código). A diferença entre "a ponte está
+conectada" e "o Neo está no comando do player agora" precisava ser visível.
+
+---
+
 ### 7.9 Fases dessa parte
 
 | Fase | Entrega | Como se prova |

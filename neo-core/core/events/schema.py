@@ -23,7 +23,13 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,32}$")
 
 #: Eventos que o barramento conhece hoje. Fechado de propósito: um nome errado
 #: no SKILL.md vira inscrição que nunca dispara, e isso é caríssimo de debugar.
-KNOWN_EVENTS = ("faixa_terminando", "faixa_terminou", "faixa_pulada")
+KNOWN_EVENTS = ("faixa_iniciou", "faixa_terminando", "faixa_terminou", "faixa_pulada")
+
+#: Eventos que fazem a fila ANDAR. Os demais (``faixa_iniciou``) só atualizam
+#: estado — e por isso não passam pela dedup nem re-armam a inscrição: se
+#: passassem, o "começou a tocar" comeria a vez do "está acabando" da mesma
+#: faixa (mesma chave de dedup) e a fila travaria na primeira música.
+ADVANCING_EVENTS = ("faixa_terminando", "faixa_terminou", "faixa_pulada")
 
 #: Canais (superfícies). "musica" é o único com transporte implementado.
 KNOWN_CHANNELS = ("musica",)
@@ -54,6 +60,10 @@ class EventTrigger(BaseModel):
     campo_link: str = "link"
     campo_titulo: str = ""
     campo_estado: str = ""
+    #: Campo que guarda o CÓDIGO único do item despachado. É ele que o aparelho
+    #: devolve em cada evento, e é ele que faz "marcar quem começou a tocar"
+    #: acertar a linha certa mesmo se a fila mudou no meio do caminho.
+    campo_codigo: str = ""
     #: {"despachada": "tocando", "anterior": "tocada"} — os valores que o runner
     #: grava no `campo_estado` ao avançar. Vazio = não marca nada (a fila vira
     #: um loop infinito na mesma linha, então o runner recusa).
@@ -102,6 +112,11 @@ class EventTrigger(BaseModel):
                 raise TriggerError(
                     "'proxima_da_fila' exige 'campo_estado' e marca.despachada — sem marcar "
                     "a linha despachada a fila repetiria a mesma faixa para sempre."
+                )
+            if "faixa_iniciou" in self.quando and not self.marca.get("tocando"):
+                raise TriggerError(
+                    "quem escuta 'faixa_iniciou' precisa de marca.tocando — é o estado "
+                    "que separa 'mandei tocar' de 'está tocando de verdade'."
                 )
         if self.encerra_quando not in ("fila_vazia", "nunca"):
             raise TriggerError(

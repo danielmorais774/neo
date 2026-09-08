@@ -6315,6 +6315,9 @@ class AIService:
             "inscricao_id": str(live.id),
             "video_id": args.get("videoId") or live.expected_ref,
             "tab_id": args.get("tabId") or (live.target or {}).get("tab_id"),
+            # Código do item da fila que está sendo tocado: volta em cada evento
+            # e é ele que marca o status na linha certa.
+            "codigo": getattr(live, "current_code", ""),
         }
 
     async def _resolve_file_by_name(

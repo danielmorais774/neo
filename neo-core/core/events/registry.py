@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _COLUMNS = (
     "id, user_id, device_id, channel, events, target, expected_ref, handler_ref, "
-    "handler_snapshot, state, reason, fires, max_fires, consecutive_errors, "
+    "handler_snapshot, state, reason, fires, max_fires, consecutive_errors, current_code, "
     "session_id, expires_at, last_event_at, last_event_key, enabled, created_at, updated_at"
 )
 
@@ -57,7 +57,7 @@ class Subscription:
     __slots__ = (
         "id", "user_id", "device_id", "channel", "events", "target", "expected_ref",
         "handler_ref", "handler_snapshot", "state", "reason", "fires", "max_fires",
-        "consecutive_errors", "session_id", "expires_at", "last_event_at",
+        "consecutive_errors", "current_code", "session_id", "expires_at", "last_event_at",
         "last_event_key", "enabled", "created_at", "updated_at",
     )
 
@@ -76,6 +76,7 @@ class Subscription:
         self.fires: int = int(row.fires or 0)
         self.max_fires: int = int(row.max_fires or 0)
         self.consecutive_errors: int = int(row.consecutive_errors or 0)
+        self.current_code: str = getattr(row, "current_code", "") or ""
         self.session_id: uuid.UUID | None = row.session_id
         self.expires_at: datetime | None = row.expires_at
         self.last_event_at: datetime | None = row.last_event_at
@@ -202,6 +203,7 @@ class SubscriptionRegistry:
         handler_ref: str,
         handler_snapshot: dict[str, Any] | None = None,
         expected_ref: str = "",
+        current_code: str = "",
         session_id: uuid.UUID | None = None,
         ttl_minutes: int = 120,
         max_fires: int = 200,
@@ -223,6 +225,7 @@ class SubscriptionRegistry:
             "fires": 0,
             "max_fires": int(max_fires),
             "consecutive_errors": 0,
+            "current_code": current_code or "",
             "session_id": session_id,
             "expires_at": now + timedelta(minutes=max(1, int(ttl_minutes))),
             "last_event_key": "",

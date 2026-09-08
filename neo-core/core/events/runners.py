@@ -15,6 +15,7 @@ comprometida faria o Neo abrir qualquer coisa.
 from __future__ import annotations
 
 import logging
+import secrets
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -61,7 +62,9 @@ async def _resolve_dataset(ctx: RunnerContext, slug: str) -> Any:
     return await ctx.dataset_registry.resolve(slug, user_id=ctx.user_id)
 
 
-def _play_action(link: str, target: dict[str, Any], titulo: str) -> dict[str, Any] | None:
+def _play_action(
+    link: str, target: dict[str, Any], titulo: str, codigo: str = ""
+) -> dict[str, Any] | None:
     """Traduz o link salvo na ação concreta que o aparelho sabe executar.
 
     YouTube com aba conhecida vira `media_command` (reusa a aba, sem piscar);
@@ -80,6 +83,7 @@ def _play_action(link: str, target: dict[str, Any], titulo: str) -> dict[str, An
             "url": parsed.url,
             "tab_id": target.get("tab_id"),
             "titulo": titulo,
+            "codigo": codigo,
         }
     if parsed.service == "spotify":
         return {
@@ -88,17 +92,55 @@ def _play_action(link: str, target: dict[str, Any], titulo: str) -> dict[str, An
             "uri": parsed.uri,
             "url": parsed.url,
             "titulo": titulo,
+            "codigo": codigo,
         }
-    return {"acao": "abrir_url", "servico": parsed.service, "url": parsed.url, "titulo": titulo}
+    return {
+        "acao": "abrir_url",
+        "servico": parsed.service,
+        "url": parsed.url,
+        "titulo": titulo,
+        "codigo": codigo,
+    }
+
+
+async def _find_by_code(ctx: RunnerContext, dataset: Any, codigo: str) -> dict[str, Any] | None:
+    """A linha do código despachado. É o que torna o status PRECISO.
+
+    Sem código a gente marcaria "quem estiver como tocando", que erra assim que a
+    fila é mexida no meio (o usuário reordena, some uma linha, entra outra).
+    """
+    trigger = ctx.trigger
+    if not codigo or not trigger.campo_codigo:
+        return None
+    listed = await ctx.dataset_service.list_rows(
+        dataset, user_id=ctx.user_id, filtro={trigger.campo_codigo: codigo}, limite=1,
+    )
+    rows = listed.get("linhas", [])
+    return rows[0] if rows else None
+
+
+async def _mark(ctx: RunnerContext, dataset: Any, row: dict[str, Any], estado: str) -> None:
+    await ctx.dataset_service.update_row(
+        dataset,
+        user_id=ctx.user_id,
+        row_id=uuid.UUID(str(row["id"])),
+        campos={ctx.trigger.campo_estado: estado},
+        actor="evento",
+    )
 
 
 async def proxima_da_fila(ctx: RunnerContext) -> RunnerResult:
-    """Despacha a próxima linha pendente da fila e marca o estado das linhas.
+    """Máquina de estados da fila, dirigida pelos eventos do aparelho.
 
-    A ordem das escritas importa: marcamos a linha ANTES de responder. Se o
-    aparelho não executar, perdemos uma faixa; se marcássemos depois, um evento
-    repetido despacharia a mesma faixa duas vezes — e essa é a falha que o
-    usuário vê ("ele repetiu a música três vezes").
+    - ``faixa_iniciou``  → a linha daquele CÓDIGO vira "tocando" (começou de
+      verdade — antes disso ela estava só "despachada", que é diferente);
+    - ``faixa_terminando``/``faixa_terminou`` → fecha a linha do código e
+      despacha a próxima pendente, com um código novo.
+
+    A ordem das escritas no avanço importa: marcamos a linha nova ANTES de
+    responder. Se o aparelho não executar, perde-se uma faixa; se marcássemos
+    depois, um evento repetido despacharia a mesma faixa duas vezes — e essa é a
+    falha que o usuário vê ("ele repetiu a música três vezes").
     """
     trigger = ctx.trigger
     dataset = await _resolve_dataset(ctx, trigger.fila)
@@ -106,31 +148,46 @@ async def proxima_da_fila(ctx: RunnerContext) -> RunnerResult:
     if service is None:
         raise RuntimeError("DatasetService indisponível")
 
+    evento = str(ctx.event.get("evento") or "")
+    codigo_evento = str(ctx.event.get("codigo") or "")
     estado_campo = trigger.campo_estado
     despachada = trigger.marca.get("despachada") or ""
+    tocando = trigger.marca.get("tocando") or despachada
     anterior = trigger.marca.get("anterior") or ""
     pulada = trigger.marca.get("pulada") or ""
 
-    # 1. A que estava tocando vira "tocada" — o evento que chegou é justamente
-    #    o fim dela. Sem isso ela continuaria elegível e a fila travaria nela.
-    if anterior and despachada:
-        try:
-            tocando = await service.list_rows(
-                dataset, user_id=ctx.user_id, filtro={estado_campo: despachada}, limite=5,
-            )
-            for row in tocando.get("linhas", []):
-                await service.update_row(
-                    dataset,
-                    user_id=ctx.user_id,
-                    row_id=uuid.UUID(str(row["id"])),
-                    campos={estado_campo: anterior},
-                    actor="evento",
-                )
-        except Exception as exc:  # noqa: BLE001 — não impede o avanço
-            logger.warning("[events] não marquei a faixa anterior: %s", exc)
+    # ---- começou a tocar: só muda status, a fila não anda -------------------
+    if evento == "faixa_iniciou":
+        row = await _find_by_code(ctx, dataset, codigo_evento)
+        if row is None:
+            return RunnerResult(reason=f"início sem linha para o código {codigo_evento or '-'}")
+        if str(row.get(estado_campo) or "") == tocando:
+            return RunnerResult(reason="já estava marcada como tocando")
+        await _mark(ctx, dataset, row, tocando)
+        titulo = str(row.get(trigger.campo_titulo) or "") if trigger.campo_titulo else ""
+        return RunnerResult(
+            reason=f"'{titulo or codigo_evento}' começou a tocar",
+            touched={"linha": str(row["id"]), "codigo": codigo_evento},
+        )
 
-    # 2. Próxima pendente, na ordem da fila. Linha sem link tocável é pulada —
-    #    marcada, para não voltar na próxima rodada.
+    # ---- acabou (ou está acabando): fecha a atual e despacha a próxima ------
+    fechada = None
+    if anterior:
+        fechada = await _find_by_code(ctx, dataset, codigo_evento)
+        if fechada is not None:
+            await _mark(ctx, dataset, fechada, anterior)
+        else:
+            # Sem código (evento vindo do caminho de fallback do desktop): fecha
+            # o que estiver em voo, senão a fila trava na mesma linha.
+            for estado in {tocando, despachada}:
+                if not estado:
+                    continue
+                listed = await service.list_rows(
+                    dataset, user_id=ctx.user_id, filtro={estado_campo: estado}, limite=5,
+                )
+                for row in listed.get("linhas", []):
+                    await _mark(ctx, dataset, row, anterior)
+
     skipped: list[str] = []
     for _ in range(_MAX_SKIPS):
         listed = await service.list_rows(
@@ -152,32 +209,35 @@ async def proxima_da_fila(ctx: RunnerContext) -> RunnerResult:
         row = rows[0]
         row_id = uuid.UUID(str(row["id"]))
         titulo = str(row.get(trigger.campo_titulo) or "") if trigger.campo_titulo else ""
-        action = _play_action(str(row.get(trigger.campo_link) or ""), ctx.subscription.target, titulo)
+        # Código NOVO a cada despacho: identifica esta reprodução, não a música.
+        # A mesma faixa enfileirada duas vezes tem dois códigos — e é isso que
+        # deixa o "começou"/"terminou" casarem com a linha certa.
+        codigo = secrets.token_hex(4) if trigger.campo_codigo else ""
+        action = _play_action(
+            str(row.get(trigger.campo_link) or ""), ctx.subscription.target, titulo, codigo
+        )
         if action is None:
             skipped.append(titulo or str(row_id))
-            await service.update_row(
-                dataset,
-                user_id=ctx.user_id,
-                row_id=row_id,
-                campos={estado_campo: pulada or anterior or despachada},
-                actor="evento",
-            )
+            await _mark(ctx, dataset, row, pulada or anterior or despachada)
             continue
 
-        # 3. Marca ANTES de responder (ver docstring).
+        campos: dict[str, Any] = {estado_campo: despachada}
+        if trigger.campo_codigo:
+            campos[trigger.campo_codigo] = codigo
         await service.update_row(
-            dataset,
-            user_id=ctx.user_id,
-            row_id=row_id,
-            campos={estado_campo: despachada},
-            actor="evento",
+            dataset, user_id=ctx.user_id, row_id=row_id, campos=campos, actor="evento",
         )
         expected = str(action.get("video_id") or action.get("uri") or action.get("url") or "")
         return RunnerResult(
             action=action,
             expected_ref=expected,
-            reason=f"despachei '{titulo or expected}'",
-            touched={"linha": str(row_id), "puladas": skipped},
+            reason=f"despachei '{titulo or expected}' (código {codigo or '-'})",
+            touched={
+                "linha": str(row_id),
+                "codigo": codigo,
+                "fechada": str(fechada["id"]) if fechada else "",
+                "puladas": skipped,
+            },
         )
 
     return RunnerResult(

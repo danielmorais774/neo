@@ -32,13 +32,14 @@ datasets:
       - {name: musica_titulo, type: texto, label: Música, required: true, max: 200}
       - {name: link, type: texto, label: Link, max: 500}
       - {name: servico, type: opcao, label: Serviço, options: [spotify, youtube, youtube_music, deezer, apple_music, outro]}
-      - {name: estado, type: opcao, label: Estado, options: [pendente, tocando, tocada, pulada]}
+      - {name: estado, type: opcao, label: Estado, options: [pendente, despachada, tocando, tocada, pulada]}
       - {name: posicao, type: inteiro, label: Posição}
       - {name: quando, type: data_hora, label: Tocar a partir de}
       - {name: musica, type: relacao, label: Música (id), dataset: musicas}
+      - {name: codigo, type: texto, label: Código, max: 16}
 eventos:
   - nome: fila_musica
-    quando: [faixa_terminando, faixa_terminou]
+    quando: [faixa_iniciou, faixa_terminando, faixa_terminou]
     canal: musica
     faz: proxima_da_fila
     fila: fila
@@ -47,7 +48,8 @@ eventos:
     campo_link: link
     campo_titulo: musica_titulo
     campo_estado: estado
-    marca: {despachada: tocando, anterior: tocada}
+    campo_codigo: codigo
+    marca: {despachada: despachada, tocando: tocando, anterior: tocada, pulada: pulada}
     encerra_quando: fila_vazia
 enabled: true
 version: 1
@@ -84,6 +86,7 @@ Três cadastros: `playlists` (a coleção), `musicas` (as faixas salvas) e `fila
 1. Enfileire na ordem: `data_create(dataset="fila", campos={"musica_titulo": ...,
    "link": ..., "servico": ..., "estado": "pendente", "posicao": 1})`, 2, 3…
    Copie o `link` da música — a fila é autossuficiente de propósito.
+   **Nunca preencha `codigo`**: quem gera é o sistema, na hora de despachar.
 2. Para o Neo tocar sozinho, **na mesma resposta**:
    a. pegue a primeira linha pendente (`data_list(dataset="fila",
       filtro={"estado": "pendente"}, ordem="posicao asc", limite=1)`);
@@ -91,8 +94,12 @@ Três cadastros: `playlists` (a coleção), `musicas` (as faixas salvas) e `fila
       linha>")` — a inscrição fica grudada NESSA faixa;
    c. mande tocar essa faixa (handoff de música com o link).
    Quando ela estiver acabando, a próxima linha `pendente` é despachada
-   sozinha, sem passar por você. O estado das linhas (`tocando`/`tocada`) é
-   atualizado pelo próprio gatilho.
+   sozinha, sem passar por você.
+
+   O estado anda sozinho e quer dizer coisas diferentes:
+   `pendente` → `despachada` (mandei tocar) → `tocando` (o player confirmou que
+   começou) → `tocada`. Quem confirma o `tocando` e o fim é a extensão, pelo
+   `codigo` daquele despacho.
 3. Parar: `event_unsubscribe()` ou "para a fila". Ver o que está armado:
    `event_list()`.
 4. Se a pessoa pedir outra música no meio da fila, **não** re-inscreva: a fila

@@ -113,6 +113,12 @@ class EventSubscription(SQLModel, table=True):
     )
     expires_at: Optional[datetime] = Field(default=None, nullable=True)
     last_event_at: Optional[datetime] = Field(default=None, nullable=True)
+    # Código do despacho em curso — o mesmo que viaja até o aparelho e volta em
+    # cada evento. É ele que identifica a LINHA da fila que está tocando (a
+    # mesma música enfileirada duas vezes tem dois códigos).
+    current_code: str = Field(
+        default="", sa_column=Column("current_code", String(16), nullable=False, server_default="")
+    )
     # Último `event_id` aceito. Dedup barato: o mesmo evento reenviado (reconnect
     # da extensão, alarme + listener juntos) não avança a fila duas vezes.
     last_event_key: str = Field(

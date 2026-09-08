@@ -34,7 +34,7 @@ USER = uuid.uuid4()
 
 TRIGGER_RAW = {
     "nome": "fila_musica",
-    "quando": ["faixa_terminando", "faixa_terminou"],
+    "quando": ["faixa_iniciou", "faixa_terminando", "faixa_terminou"],
     "canal": "musica",
     "faz": "proxima_da_fila",
     "fila": "fila",
@@ -43,7 +43,13 @@ TRIGGER_RAW = {
     "campo_link": "link",
     "campo_titulo": "musica_titulo",
     "campo_estado": "estado",
-    "marca": {"despachada": "tocando", "anterior": "tocada"},
+    "campo_codigo": "codigo",
+    "marca": {
+        "despachada": "despachada",
+        "tocando": "tocando",
+        "anterior": "tocada",
+        "pulada": "pulada",
+    },
     "encerra_quando": "fila_vazia",
 }
 
@@ -63,7 +69,7 @@ class _Row:
             user_id=USER,
             device_id="mac-daniel",
             channel="musica",
-            events=["faixa_terminando", "faixa_terminou"],
+            events=["faixa_iniciou", "faixa_terminando", "faixa_terminou"],
             target={"site": "youtube", "tab_id": 42},
             expected_ref="AAA",
             handler_ref="playlists.fila_musica",
@@ -73,6 +79,7 @@ class _Row:
             fires=0,
             max_fires=200,
             consecutive_errors=0,
+            current_code="",
             session_id=None,
             expires_at=agora + timedelta(hours=2),
             last_event_at=None,
@@ -300,7 +307,7 @@ async def test_evento_repetido_nao_avanca_a_fila():
     subs = FakeSubs([sub])
     service = FakeDatasetService([
         {"id": uuid.uuid4(), "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
-         "estado": "pendente", "posicao": 2},
+         "estado": "pendente", "posicao": 2, "codigo": ""},
     ])
     resposta = await _router(subs, service=service).handle(
         {"device_id": "mac-daniel", "evento": "faixa_terminou", "site": "youtube",
@@ -320,9 +327,9 @@ async def test_despacha_a_proxima_e_rearma():
     tocando_id, proxima_id = uuid.uuid4(), uuid.uuid4()
     service = FakeDatasetService([
         {"id": tocando_id, "musica_titulo": "A", "link": "https://youtu.be/AAAAAAAAAAA",
-         "estado": "tocando", "posicao": 1},
+         "estado": "tocando", "posicao": 1, "codigo": "cafe1234"},
         {"id": proxima_id, "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
-         "estado": "pendente", "posicao": 2},
+         "estado": "pendente", "posicao": 2, "codigo": ""},
     ])
     sub = Subscription(_Row(expected_ref="AAAAAAAAAAA"))
     subs = FakeSubs([sub])
@@ -336,10 +343,14 @@ async def test_despacha_a_proxima_e_rearma():
     assert resposta["video_id"] == "BBBBBBBBBBB"
     assert resposta["tab_id"] == 42
     assert resposta["rearmar"]["ref"] == "BBBBBBBBBBB"
-    # A que acabou vira "tocada"; a nova, "tocando" — antes de responder.
+    # A que acabou vira "tocada"; a nova, "despachada" (ainda não confirmou que
+    # começou — quem confirma é o `faixa_iniciou` da extensão).
     estados = {str(r["id"]): r["estado"] for r in service.rows}
     assert estados[str(tocando_id)] == "tocada"
-    assert estados[str(proxima_id)] == "tocando"
+    assert estados[str(proxima_id)] == "despachada"
+    # E ela ganhou um código único, que volta na ação para o aparelho ecoar.
+    codigo = next(r["codigo"] for r in service.rows if r["id"] == proxima_id)
+    assert codigo and resposta["codigo"] == codigo
     # E a inscrição passa a esperar a faixa nova.
     assert sub.expected_ref == "BBBBBBBBBBB"
     assert sub.fires == 1
@@ -364,9 +375,10 @@ async def test_linha_sem_link_e_pulada_e_marcada():
     """Linha sem link tocável não pode travar a fila nem voltar na rodada seguinte."""
     sem_link, com_link = uuid.uuid4(), uuid.uuid4()
     service = FakeDatasetService([
-        {"id": sem_link, "musica_titulo": "sem link", "link": "", "estado": "pendente", "posicao": 1},
+        {"id": sem_link, "musica_titulo": "sem link", "link": "", "estado": "pendente",
+         "posicao": 1, "codigo": ""},
         {"id": com_link, "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
-         "estado": "pendente", "posicao": 2},
+         "estado": "pendente", "posicao": 2, "codigo": ""},
     ])
     trigger = EventTrigger.model_validate(TRIGGER_RAW)
     ctx = RunnerContext(
@@ -380,7 +392,7 @@ async def test_linha_sem_link_e_pulada_e_marcada():
     )
     resultado = await proxima_da_fila(ctx)
     assert resultado.action["video_id"] == "BBBBBBBBBBB"
-    assert [r["estado"] for r in service.rows if r["id"] == sem_link] == ["tocada"]
+    assert [r["estado"] for r in service.rows if r["id"] == sem_link] == ["pulada"]
 
 
 @pytest.mark.asyncio
@@ -502,3 +514,97 @@ async def test_subscribe_sem_device_recusa():
             "event_subscribe", {"gatilho": "playlists.fila_musica", "faixa": "AAA"}
         )
     assert "aparelho" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Código por item + status dirigido pela extensão
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_faixa_iniciou_marca_tocando_pelo_codigo_e_nao_avanca():
+    """'despachada' e 'tocando' são coisas diferentes: a segunda só acontece
+    quando o player confirma. E confirmar não pode fazer a fila andar."""
+    despachada_id, proxima_id = uuid.uuid4(), uuid.uuid4()
+    service = FakeDatasetService([
+        {"id": despachada_id, "musica_titulo": "A", "link": "https://youtu.be/AAAAAAAAAAA",
+         "estado": "despachada", "posicao": 1, "codigo": "ab12cd34"},
+        {"id": proxima_id, "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
+         "estado": "pendente", "posicao": 2, "codigo": ""},
+    ])
+    sub = Subscription(_Row(expected_ref="AAAAAAAAAAA"))
+    subs = FakeSubs([sub])
+
+    resposta = await _router(subs, service=service).handle(
+        {"device_id": "mac-daniel", "evento": "faixa_iniciou", "site": "youtube",
+         "tab_id": 42, "video_id": "AAAAAAAAAAA", "codigo": "ab12cd34"}
+    )
+
+    assert resposta["acao"] == "nada"
+    estados = {str(r["id"]): r["estado"] for r in service.rows}
+    assert estados[str(despachada_id)] == "tocando"
+    assert estados[str(proxima_id)] == "pendente"  # a fila NÃO andou
+    assert sub.expected_ref == "AAAAAAAAAAA"       # nem re-armou
+
+
+@pytest.mark.asyncio
+async def test_iniciou_nao_come_a_vez_do_terminando():
+    """Os dois eventos são da MESMA faixa (mesma chave de dedup). Se o status
+    carimbasse a chave, o 'está acabando' viria como repetido e a fila travaria
+    na primeira música — o bug mais chato possível, porque parece 'não funciona'."""
+    atual, proxima = uuid.uuid4(), uuid.uuid4()
+    service = FakeDatasetService([
+        {"id": atual, "musica_titulo": "A", "link": "https://youtu.be/AAAAAAAAAAA",
+         "estado": "despachada", "posicao": 1, "codigo": "ab12cd34"},
+        {"id": proxima, "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
+         "estado": "pendente", "posicao": 2, "codigo": ""},
+    ])
+    sub = Subscription(_Row(expected_ref="AAAAAAAAAAA"))
+    router = _router(FakeSubs([sub]), service=service)
+    evento = {"device_id": "mac-daniel", "site": "youtube", "tab_id": 42,
+              "video_id": "AAAAAAAAAAA", "codigo": "ab12cd34"}
+
+    await router.handle({**evento, "evento": "faixa_iniciou"})
+    resposta = await router.handle({**evento, "evento": "faixa_terminando"})
+
+    assert resposta["acao"] == "tocar"
+    assert resposta["video_id"] == "BBBBBBBBBBB"
+
+
+@pytest.mark.asyncio
+async def test_cada_despacho_tem_codigo_proprio():
+    """A mesma música enfileirada duas vezes gera dois códigos: o código
+    identifica a REPRODUÇÃO, não a faixa."""
+    linhas = [
+        {"id": uuid.uuid4(), "musica_titulo": "repetida", "link": "https://youtu.be/AAAAAAAAAAA",
+         "estado": "pendente", "posicao": i, "codigo": ""}
+        for i in (1, 2)
+    ]
+    service = FakeDatasetService(linhas)
+    trigger = EventTrigger.model_validate(TRIGGER_RAW)
+    ctx = RunnerContext(
+        trigger=trigger, subscription=Subscription(_Row()), event={}, user_id=USER,
+        db=None, dataset_registry=FakeRegistry(), dataset_service=service,
+    )
+    primeiro = await proxima_da_fila(ctx)
+    # a primeira saiu de 'pendente', então a segunda rodada pega a outra linha
+    segundo = await proxima_da_fila(ctx)
+    assert primeiro.action["codigo"] and segundo.action["codigo"]
+    assert primeiro.action["codigo"] != segundo.action["codigo"]
+
+
+@pytest.mark.asyncio
+async def test_status_de_codigo_desconhecido_nao_mexe_em_nada():
+    """Código que não existe (fila trocada no meio) não pode marcar linha errada."""
+    linha = uuid.uuid4()
+    service = FakeDatasetService([
+        {"id": linha, "musica_titulo": "A", "link": "https://youtu.be/AAAAAAAAAAA",
+         "estado": "despachada", "posicao": 1, "codigo": "ab12cd34"},
+    ])
+    subs = FakeSubs([Subscription(_Row(expected_ref="AAAAAAAAAAA"))])
+    await _router(subs, service=service).handle(
+        {"device_id": "mac-daniel", "evento": "faixa_iniciou", "site": "youtube",
+         "tab_id": 42, "video_id": "AAAAAAAAAAA", "codigo": "naoexiste"}
+    )
+    assert service.updates == []
+    assert service.rows[0]["estado"] == "despachada"

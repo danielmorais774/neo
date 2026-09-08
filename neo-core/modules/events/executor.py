@@ -13,6 +13,7 @@ o próprio Neo acabou de fazer, ou não inscreve.
 from __future__ import annotations
 
 import logging
+import secrets
 import uuid
 from typing import Any
 
@@ -151,6 +152,11 @@ class EventsExecutor:
             reason="substituída por uma inscrição nova",
         )
 
+        # A PRIMEIRA faixa é despachada pelo cérebro (o handoff de música), não
+        # pelo runner — então é aqui que ela ganha o código e sai de "pendente".
+        # Sem isso o "começou a tocar" da faixa 1 não teria linha para casar.
+        codigo = await self._stamp_first_item(trigger, faixa)
+
         minutos = int(args.get("minutos") or _DEFAULT_TTL_MINUTES)
         sub = await self._subs.create(
             user_id=self._user_id,
@@ -161,6 +167,7 @@ class EventsExecutor:
             handler_ref=handler_ref,
             handler_snapshot=trigger.model_dump(),
             expected_ref=faixa,
+            current_code=codigo,
             session_id=self._session_id,
             ttl_minutes=max(1, min(minutos, _MAX_TTL_MINUTES)),
         )
@@ -173,6 +180,47 @@ class EventsExecutor:
                 "sozinho. Para parar: 'para a fila'."
             ),
         }
+
+    async def _stamp_first_item(self, trigger: Any, faixa: str) -> str:
+        """Marca a linha da fila que casa com ``faixa`` como despachada + código.
+
+        Best-effort de propósito: se a fila não estiver montada ainda, ou o link
+        não casar, a inscrição continua valendo — só o status da primeira faixa
+        fica sem correlação. Nunca derruba o subscribe.
+        """
+        if not getattr(trigger, "campo_codigo", "") or not getattr(trigger, "fila", ""):
+            return ""
+        registry = getattr(self._router, "_datasets", None)
+        service = self._router._service() if hasattr(self._router, "_service") else None
+        if registry is None or service is None:
+            return ""
+        try:
+            dataset = await registry.resolve(trigger.fila, user_id=self._user_id)
+            listed = await service.list_rows(
+                dataset,
+                user_id=self._user_id,
+                filtro=dict(trigger.filtro or {}),
+                ordem=trigger.ordem,
+                limite=10,
+            )
+            for row in listed.get("linhas", []):
+                if _canonical_ref(str(row.get(trigger.campo_link) or "")) != faixa:
+                    continue
+                codigo = secrets.token_hex(4)
+                campos = {trigger.campo_codigo: codigo}
+                if trigger.campo_estado and trigger.marca.get("despachada"):
+                    campos[trigger.campo_estado] = trigger.marca["despachada"]
+                await service.update_row(
+                    dataset,
+                    user_id=self._user_id,
+                    row_id=uuid.UUID(str(row["id"])),
+                    campos=campos,
+                    actor="evento",
+                )
+                return codigo
+        except Exception as exc:  # noqa: BLE001 — fila ausente não impede inscrever
+            logger.debug("[events] não marquei a primeira faixa: %s", exc)
+        return ""
 
     async def _unsubscribe(self, args: dict[str, Any]) -> dict[str, Any]:
         sub_id = str(args.get("id") or "").strip()
@@ -216,6 +264,7 @@ def _describe(sub: Any) -> dict[str, Any]:
         "eventos": sub.events,
         "alvo": sub.target,
         "faixa_esperada": sub.expected_ref,
+        "codigo": getattr(sub, "current_code", ""),
         "estado": sub.state,
         "motivo": sub.reason,
         "disparos": sub.fires,

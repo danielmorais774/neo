@@ -29,7 +29,7 @@ from typing import Any
 
 from core.events.registry import Subscription, SubscriptionRegistry
 from core.events.runners import RUNNERS, RunnerContext, RunnerResult
-from core.events.schema import EventTrigger, TriggerError, parse_triggers
+from core.events.schema import ADVANCING_EVENTS, EventTrigger, TriggerError, parse_triggers
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,9 @@ class EventRouter:
         event = str(payload.get("evento") or payload.get("event") or "").strip().lower()
         device_id = str(payload.get("device_id") or "").strip()
         ref = str(payload.get("video_id") or payload.get("ref") or "").strip()
+        # Código do item da fila que o aparelho está reportando. É ele que faz o
+        # status acertar a LINHA certa (e não "o que estiver como tocando").
+        codigo = str(payload.get("codigo") or "").strip()
         target = {
             k: v
             for k, v in {
@@ -141,15 +144,28 @@ class EventRouter:
             fresh = await self._subs.get(sub.id)
             if fresh is None or not fresh.is_live():
                 return {**NOTHING, "motivo": "inscrição não está mais armada"}
-            return await self._dispatch(fresh, channel=channel, event=event, ref=ref, target=target)
+            return await self._dispatch(
+                fresh, channel=channel, event=event, ref=ref, target=target, codigo=codigo
+            )
 
     async def _dispatch(
-        self, sub: Subscription, *, channel: str, event: str, ref: str, target: dict[str, Any]
+        self,
+        sub: Subscription,
+        *,
+        channel: str,
+        event: str,
+        ref: str,
+        target: dict[str, Any],
+        codigo: str = "",
     ) -> dict[str, Any]:
         key = self.event_key(sub.target or target, ref)
+        # Evento de STATUS (faixa_iniciou) não faz a fila andar: não passa pela
+        # dedup nem carimba a chave. Se passasse, o "começou a tocar" comeria a
+        # vez do "está acabando" da mesma faixa e a fila travaria na primeira.
+        advancing = event in ADVANCING_EVENTS
 
         # (2) repetido ou atrasado — mesma chave, mesma resposta.
-        if key and key == sub.last_event_key:
+        if advancing and key and key == sub.last_event_key:
             await self._log(sub, channel, event, key, "ignorado", "evento repetido ou atrasado")
             return {**NOTHING, "motivo": "evento repetido"}
 
@@ -162,7 +178,7 @@ class EventRouter:
             return {**NOTHING, "motivo": "faixa não é a da fila; inscrição pausada"}
 
         # (4) tetos.
-        if sub.max_fires and sub.fires >= sub.max_fires:
+        if advancing and sub.max_fires and sub.fires >= sub.max_fires:
             await self._subs.end(sub.id, "teto de disparos atingido")
             await self._log(sub, channel, event, key, "encerrado", "teto de disparos")
             return {"acao": "desarmar", "motivo": "teto de disparos atingido"}
@@ -181,7 +197,13 @@ class EventRouter:
         ctx = RunnerContext(
             trigger=trigger,
             subscription=sub,
-            event={"evento": event, "ref": ref, "target": target, "canal": channel},
+            event={
+                "evento": event,
+                "ref": ref,
+                "codigo": codigo,
+                "target": target,
+                "canal": channel,
+            },
             user_id=sub.user_id,
             db=self._db,
             dataset_registry=self._datasets,
@@ -203,20 +225,33 @@ class EventRouter:
             await self._log(sub, channel, event, key, "erro", str(exc))
             return {**NOTHING, "motivo": f"erro no gatilho: {exc}"}
 
-        return await self._apply(sub, result, channel=channel, event=event, key=key)
+        return await self._apply(
+            sub, result, channel=channel, event=event, key=key, advancing=advancing
+        )
 
     async def _apply(
-        self, sub: Subscription, result: RunnerResult, *, channel: str, event: str, key: str
+        self,
+        sub: Subscription,
+        result: RunnerResult,
+        *,
+        channel: str,
+        event: str,
+        key: str,
+        advancing: bool = True,
     ) -> dict[str, Any]:
         updates: dict[str, Any] = {
             "consecutive_errors": 0,
             "last_event_at": datetime.utcnow(),
-            "last_event_key": key,
             "reason": (result.reason or "")[:500],
         }
+        if advancing:
+            updates["last_event_key"] = key
         if result.action is not None:
             updates["fires"] = sub.fires + 1
             updates["expected_ref"] = (result.expected_ref or "")[:128]
+            # O código do despacho novo passa a ser o "que estou vigiando": é ele
+            # que o aparelho devolve nos próximos eventos.
+            updates["current_code"] = str(result.action.get("codigo") or "")[:16]
         if result.end:
             updates["state"] = "encerrada"
 
