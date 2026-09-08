@@ -1223,6 +1223,25 @@ class IntentRouter:
             tool_arguments = None
             raw_command = None
 
+        # A skill de música é HANDOFF-ONLY (core/skills/music/__init__.py): o
+        # roteador nunca despacha direto para ela. O classificador, porém, às
+        # vezes resolve fazer isso sozinho — "Sim, inicia a minha fila para
+        # tocar" saiu como SERVER_TOOL/tool_name="music" (sessão e8170c41,
+        # 2026-09-08) e o turno morreu em "Todas as ferramentas falharam":
+        # naquele trilho as tools rodam pelo executor GLOBAL, que não tem
+        # usuário, então `data_list`/`event_list` recusam ("precisa de um
+        # usuário identificado"). Pior: fila e cadastros só existem no
+        # cognitivo, que é quem lê a skill.
+        if (tool_name or "").strip().lower() == "music" or (
+            str(data.get("skill_name") or "").strip().lower() == "music"
+        ):
+            logger.warning(
+                "Router: classificador despachou direto para a skill de música "
+                "(intent=%s) — devolvendo ao cognitivo, que é quem lê a fila",
+                getattr(intent, "value", intent),
+            )
+            return self._music_decision(user_message)
+
         # Rede do áudio do navegador (ver _BROWSER_AUDIO_COMMAND): qualquer
         # comando improvisado para mexer no som/player de um navegador vira
         # pedido de música — o cognitivo decide e o bloco atua pela extensão.

@@ -6285,6 +6285,29 @@ class AIService:
         observar = await self._watch_for_actuation(user_id, metadata, args)
         if observar:
             args["observar"] = observar
+            # Fila SEMPRE pela extensão. `open_url` entrega a URL ao sistema
+            # operacional: abre uma aba que a ponte não escolheu, e é a ponte
+            # que precisa registrar o listener de fim de faixa e travar o
+            # autoplay. Com `media_command` a extensão navega a aba (criando uma
+            # se não houver) e passa a mandar no player. A `url` viaja junto
+            # como plano B, para o desktop abrir sozinho se a ponte estiver fora.
+            video_id = str(observar.get("video_id") or "")
+            if tool_name == "open_url" and video_id:
+                url_original = str(args.get("url") or "")
+                tool_name = "media_command"
+                args = {
+                    "action": "play",
+                    "target": "youtube",
+                    "videoId": video_id,
+                    "url": url_original,
+                    "observar": observar,
+                }
+                if observar.get("tab_id") not in (None, ""):
+                    args["tabId"] = observar["tab_id"]
+                logger.info(
+                    "[music] fila: open_url → media_command (a extensão precisa "
+                    "dirigir a aba para travar o autoplay)"
+                )
 
         # desktop/browser → dispatch a client tool; the final confirmation comes from
         # process_tool_result (flow="music_actuation"), truthful to the real outcome.

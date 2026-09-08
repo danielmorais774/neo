@@ -707,3 +707,35 @@ async def test_sem_inscricao_nenhuma_o_observar_nao_existe():
         {"videoId": "ACDC1234567"},
     )
     assert observar is None
+
+
+@pytest.mark.asyncio
+async def test_fila_troca_open_url_por_media_command():
+    """A fila tem que tocar PELA EXTENSÃO: é ela que registra o listener de fim
+    de faixa e trava o autoplay. `open_url` entrega a URL ao sistema operacional
+    e abre uma aba que a ponte não escolheu (sessão e8170c41, 08/09)."""
+    from modules.desktop import ai_service as mod
+
+    sub = Subscription(_Row(state="armada", expected_ref="AAAAAAAAAAA", current_code="ab12"))
+    subs = FakeSubs([sub])
+    ai = _FakeAI(_router(subs))
+
+    args = {"url": "https://www.youtube.com/watch?v=AAAAAAAAAAA"}
+    observar = await mod.AIService._watch_for_actuation(
+        ai, USER, {"device_id": "mac-daniel"}, args
+    )
+    assert observar is not None
+    assert observar["video_id"] == "AAAAAAAAAAA"   # tirado da URL, não inventado
+    assert observar["codigo"] == "ab12"
+
+
+def test_conversao_de_open_url_esta_no_handler():
+    """Guarda de regressão do trecho que faz a troca — ele mora no _handle_music
+    e é fácil de perder num refactor."""
+    import inspect
+
+    from modules.desktop.ai_service import AIService
+
+    fonte = inspect.getsource(AIService._handle_music)
+    assert 'tool_name == "open_url"' in fonte
+    assert 'tool_name = "media_command"' in fonte

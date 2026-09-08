@@ -515,6 +515,39 @@ navegar no meio da música reiniciaria ela.
 
 ---
 
+### 7.11 O trilho errado e a trava de autoplay (2026-09-08, 17:39)
+
+**O classificador despachou direto para a skill de música.** "Sim, inicia a
+minha fila para tocar" saiu como `SERVER_TOOL / tool_name="music"` — e o turno
+morreu em "Todas as ferramentas falharam", com `data_list` e `event_list`
+recusando por "precisa de um usuário identificado". A causa é estrutural: nesse
+trilho as tools rodam pelo executor **global**, que não tem usuário; o executor
+user-scoped só existe no caminho cognitivo. E fila e cadastros só existem lá,
+que é quem lê a skill.
+
+A skill de música sempre foi **handoff-only** (está escrito no manifesto), mas
+nada impedia o classificador de fazer o contrário. Agora impede: `tool_name` ou
+`skill_name` iguais a `music` voltam para `_music_decision`. É o mesmo remendo
+que o roteador já tinha para comando de áudio improvisado — faltava cobrir o
+caso em que o próprio classificador escolhe a skill.
+
+**Autoplay: o toggle não basta.** Em vídeo de música o YouTube monta um mix
+(`ytp-next-button ytp-playlist-ui`) e emenda a próxima sozinho — sem oferecer o
+botão de desligar. A trava que funciona sempre é outra: **dar pause a ~0,8s do
+fim**. Sem `ended`, o player não tem o que emendar, e a fila do Neo troca a
+faixa no tempo dela (o `faixa_terminando` já saiu 6s antes). É um listener de
+`timeupdate` injetado na aba, no mundo ISOLATED, com uma flag
+(`window.__neoQueueGuard`) que o `stopWatch` desliga — fora da fila a aba volta
+a se comportar como o usuário espera.
+
+**E a fila passa a tocar pela extensão.** Quando há vigia, `open_url` vira
+`media_command`: o `open_url` entrega a URL ao sistema operacional e abre uma
+aba que a ponte não escolheu — justamente a ponte que precisa registrar o
+listener e travar o autoplay. A URL viaja junto como plano B: com a ponte fora,
+o desktop abre sozinho e avisa que a fila não vai andar.
+
+---
+
 ### 7.9 Fases dessa parte
 
 | Fase | Entrega | Como se prova |

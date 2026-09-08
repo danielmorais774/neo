@@ -120,3 +120,62 @@ def test_pergunta_de_abas_aceita_tab_em_ingles():
 def test_verbo_forte_sozinho_nao_basta_sem_objeto_de_midia():
     """A camada de afordância vale para a ABERTURA da ordem, não no meio dela."""
     assert IntentRouter._is_music_request("depois a gente toca nisso") is False
+
+
+# ---------------------------------------------------------------------------
+# A skill de música é handoff-only — nem o classificador pode despachar direto
+# ---------------------------------------------------------------------------
+
+
+def _classificar(payload: dict) -> "object":
+    """Roda o parser do classificador sobre uma resposta LLM crua."""
+    import json
+
+    from shared.types import IntentType
+
+    router = IntentRouter.__new__(IntentRouter)
+    router.tool_registry = None
+    return router._parse_classification(json.dumps(payload), payload.get("_msg", ""))
+
+
+def test_classificador_despachando_music_volta_para_o_cognitivo():
+    """Sessão e8170c41 (08/09 17:39): "Sim, inicia a minha fila para tocar" saiu
+    como SERVER_TOOL/tool_name="music". Naquele trilho as tools rodam pelo
+    executor GLOBAL, sem usuário — `data_list` e `event_list` recusaram e o turno
+    morreu em "Todas as ferramentas falharam". Fila e cadastros só existem no
+    cognitivo, que é quem lê a skill."""
+    from shared.types import IntentType
+
+    decisao = _classificar({
+        "intent": "SERVER_TOOL",
+        "tool_name": "music",
+        "tool_arguments": {"task": "iniciar fila de música"},
+        "skill_name": "music",
+        "confidence": 0.95,
+        "_msg": "Sim, inicia a minha fila para tocar",
+    })
+    assert decisao.intent == IntentType.DIRECT_RESPONSE
+    assert decisao.skill_hint == "music"
+
+
+def test_skill_name_music_sozinho_tambem_volta():
+    from shared.types import IntentType
+
+    decisao = _classificar({
+        "intent": "SKILL",
+        "skill_name": "music",
+        "confidence": 0.9,
+        "_msg": "manda tocar a fila",
+    })
+    assert decisao.intent == IntentType.DIRECT_RESPONSE
+    assert decisao.skill_hint == "music"
+
+
+def test_outra_skill_nao_e_afetada():
+    decisao = _classificar({
+        "intent": "SERVER_TOOL",
+        "tool_name": "get_weather",
+        "confidence": 0.9,
+        "_msg": "como vai estar o tempo amanha",
+    })
+    assert decisao.skill_hint != "music"
