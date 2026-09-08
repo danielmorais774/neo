@@ -100,10 +100,15 @@ Três cadastros: `playlists` (a coleção), `musicas` (as faixas salvas) e `fila
    `pendente` → `despachada` (mandei tocar) → `tocando` (o player confirmou que
    começou) → `tocada`. Quem confirma o `tocando` e o fim é a extensão, pelo
    `codigo` daquele despacho.
-3. Parar: `event_unsubscribe()` ou "para a fila". Ver o que está armado:
+3. **Retomar ou recomeçar a fila** ("coloca a fila de novo", "continua a
+   fila", "toca do começo"): chame `event_list()` primeiro. Se a inscrição
+   estiver **pausada** ou não existir, chame `event_subscribe` DE NOVO com a
+   faixa que você vai tocar agora. Inscrição pausada não dispara: sem
+   re-inscrever, a fila não anda. Reinscrever substitui a antiga — não duplica.
+4. Parar: `event_unsubscribe()` ou "para a fila". Ver o que está armado:
    `event_list()`.
-4. Se a pessoa pedir outra música no meio da fila, **não** re-inscreva: a fila
-   pausa sozinha e ela retoma pedindo ("continua a fila").
+5. Se a pessoa pedir uma música que NÃO é da fila, é só tocar: a fila se pausa
+   sozinha. Ela volta quando a pessoa pedir a fila de novo (passo 3).
 
 ## Regras
 - Só afirme que salvou/alterou se o retorno trouxer `conferido`.

@@ -1354,6 +1354,21 @@ _MUSIC_HANDOFF_INSTRUCTION = (
 # confirms these truthfully and skips the generic recovery flow.
 _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
 
+def _video_id_of(url: str) -> str:
+    """videoId de uma URL de atuação ("" quando não é YouTube)."""
+    if not url:
+        return ""
+    try:
+        from core.skills.music.service import parse_direct_link
+
+        parsed = parse_direct_link(url)
+    except Exception:  # noqa: BLE001
+        return ""
+    if parsed is not None and parsed.service == "youtube" and parsed.kind == "video":
+        return parsed.id
+    return ""
+
+
 def _media_context_of(metadata: dict[str, Any] | None) -> dict[str, Any]:
     """`media_context` do turno ({} em qualquer problema).
 
@@ -6290,11 +6305,21 @@ class AIService:
     async def _watch_for_actuation(
         self, user_id: UUID | None, metadata: dict[str, Any] | None, args: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """`observar` da atuação de música — só quando há inscrição armada.
+        """`observar` da atuação de música — a cola entre "mandei tocar" e a fila.
 
-        Uma consulta indexada por (device, canal, estado), e só no turno em que o
-        Neo vai tocar alguma coisa. Sem inscrição devolve None e nada muda: é a
-        primeira das três camadas que protegem o pedido avulso (§7.4).
+        Três decisões, todas determinísticas (nada aqui depende do modelo):
+
+        - inscrição ARMADA e a faixa é a esperada → observa (o caso normal);
+        - inscrição PAUSADA e a faixa é justamente a que ela esperava → **retoma**.
+          É o que conserta "coloca a fila pra tocar de novo": o cérebro pode até
+          esquecer de reinscrever, mas mandar tocar a faixa da fila JÁ é dizer
+          que a fila voltou (medido em 2026-09-08: a fila não andou porque a
+          inscrição tinha ficado pausada e ninguém a re-armou);
+        - inscrição armada mas a faixa é OUTRA → pausa. O usuário pediu música
+          fora da fila, e a fila não pode continuar por cima disso.
+
+        Sem inscrição nenhuma devolve None e nada muda — é a primeira das três
+        camadas que protegem o pedido avulso (§7.4).
         """
         router = getattr(self, "event_router", None)
         device_id = (metadata or {}).get("device_id")
@@ -6303,18 +6328,52 @@ class AIService:
         try:
             subs = await router._subs.list(
                 user_id=user_id, device_id=str(device_id), channel="musica",
-                states=("armada",), limit=5,
+                states=("armada", "pausada"), limit=10,
             )
         except Exception as exc:  # noqa: BLE001 — barramento fora não atrapalha o play
             logger.debug("[music] inscrições indisponíveis: %s", exc)
             return None
-        live = next((s for s in subs if s.is_live()), None)
+        if not subs:
+            return None
+
+        tocando = str(args.get("videoId") or "")
+        if not tocando:
+            tocando = _video_id_of(str(args.get("url") or args.get("uri") or ""))
+
+        live = next((s for s in subs if s.state == "armada" and s.is_live()), None)
+        pausada = next(
+            (s for s in subs if s.state == "pausada" and tocando and s.expected_ref == tocando),
+            None,
+        )
+
+        if live is not None and tocando and live.expected_ref and live.expected_ref != tocando:
+            # Música fora da fila: a fila para aqui, e o aparelho desarma.
+            try:
+                await router._subs.pause(
+                    live.id, "o usuário pediu outra música — fila pausada"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[music] não pausei a inscrição: %s", exc)
+            return None
+
+        if live is None and pausada is not None:
+            try:
+                live = await router._subs.update(
+                    pausada.id, state="armada", reason="retomada ao tocar a faixa da fila"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[music] não retomei a inscrição: %s", exc)
+                return None
         if live is None:
             return None
+
         return {
             "inscricao_id": str(live.id),
-            "video_id": args.get("videoId") or live.expected_ref,
-            "tab_id": args.get("tabId") or (live.target or {}).get("tab_id"),
+            "video_id": tocando or live.expected_ref,
+            # `tab_id` só quando a atuação REUSOU uma aba conhecida. Num
+            # `open_url` a música abre numa aba nova e o id antigo mandaria a
+            # vigia olhar a aba errada — melhor a extensão achar pelo vídeo.
+            "tab_id": args.get("tabId"),
             # Código do item da fila que está sendo tocado: volta em cada evento
             # e é ele que marca o status na linha certa.
             "codigo": getattr(live, "current_code", ""),

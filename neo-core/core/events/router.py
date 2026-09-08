@@ -129,9 +129,35 @@ class EventRouter:
         if not device_id or not event:
             return {**NOTHING, "motivo": "evento sem device_id/evento"}
 
-        sub = await self._subs.live_for_event(
-            device_id=device_id, channel=channel, event=event, target=target
-        )
+        # O aparelho devolve o `inscricao_id` que NÓS entregamos junto com a
+        # ordem de tocar. Quando ele vem, é a identificação mais forte que
+        # existe — e resolve o caso em que a música abriu numa ABA NOVA (o
+        # `open_url` faz isso): o alvo gravado aponta para a aba velha e o
+        # casamento por aba recusaria o evento da fila que nós mesmos tocamos.
+        sub = None
+        sub_id = str(payload.get("inscricao_id") or "").strip()
+        if sub_id:
+            try:
+                candidate = await self._subs.get(uuid.UUID(sub_id))
+            except (ValueError, TypeError):
+                candidate = None
+            if (
+                candidate is not None
+                and candidate.device_id == device_id
+                and candidate.is_live()
+                and (not candidate.events or event in candidate.events)
+            ):
+                sub = candidate
+                # A aba mudou debaixo da inscrição: seguimos o player.
+                new_tab = target.get("tab_id")
+                if new_tab not in (None, "") and str((sub.target or {}).get("tab_id") or "") != str(new_tab):
+                    novo_alvo = {**(sub.target or {}), "tab_id": new_tab}
+                    await self._subs.update(sub.id, target=novo_alvo)
+                    sub.target = novo_alvo
+        if sub is None:
+            sub = await self._subs.live_for_event(
+                device_id=device_id, channel=channel, event=event, target=target
+            )
         if sub is None:
             # O caso mais comum e o mais importante: NÃO havia inscrição. É o
             # "toca um AC/DC" — nada acontece, e nem entra no log (senão o log

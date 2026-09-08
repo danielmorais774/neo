@@ -608,3 +608,102 @@ async def test_status_de_codigo_desconhecido_nao_mexe_em_nada():
     )
     assert service.updates == []
     assert service.rows[0]["estado"] == "despachada"
+
+
+# ---------------------------------------------------------------------------
+# Aba nova e retomada — os dois defeitos do teste real de 2026-09-08
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evento_de_aba_nova_casa_pelo_id_da_inscricao():
+    """`open_url` abre uma aba NOVA: o alvo gravado aponta para a velha. Se o
+    casamento fosse só por aba, o evento da fila que nós mesmos tocamos seria
+    recusado — e a fila ficaria parada sem ninguém entender por quê."""
+    proxima = uuid.uuid4()
+    service = FakeDatasetService([
+        {"id": proxima, "musica_titulo": "B", "link": "https://youtu.be/BBBBBBBBBBB",
+         "estado": "pendente", "posicao": 2, "codigo": ""},
+    ])
+    sub = Subscription(_Row(target={"site": "youtube", "tab_id": 42}, expected_ref="AAAAAAAAAAA"))
+    subs = FakeSubs([sub])
+
+    resposta = await _router(subs, service=service).handle({
+        "device_id": "mac-daniel", "evento": "faixa_terminando", "site": "youtube",
+        "tab_id": 999, "video_id": "AAAAAAAAAAA", "inscricao_id": str(sub.id),
+    })
+
+    assert resposta["acao"] == "tocar"
+    # E a inscrição passa a seguir a aba nova.
+    assert sub.target["tab_id"] == 999
+
+
+@pytest.mark.asyncio
+async def test_evento_de_outra_aba_sem_id_continua_recusado():
+    """A tolerância vale só para o `inscricao_id` que NÓS entregamos: um evento
+    solto de outra aba continua não sendo desta inscrição."""
+    sub = Subscription(_Row(target={"site": "youtube", "tab_id": 42}))
+    subs = FakeSubs([sub])
+    resposta = await _router(subs).handle({
+        "device_id": "mac-daniel", "evento": "faixa_terminou", "site": "youtube",
+        "tab_id": 999, "video_id": "AAA",
+    })
+    assert resposta["acao"] == "nada"
+    assert sub.state == "armada"
+
+
+class _FakeAI:
+    """Só o que `_watch_for_actuation` usa do AIService."""
+
+    def __init__(self, router):
+        self.event_router = router
+
+
+@pytest.mark.asyncio
+async def test_tocar_a_faixa_da_fila_retoma_inscricao_pausada():
+    """'coloca a fila de novo pra tocar': mandar tocar a faixa que a inscrição
+    pausada esperava JÁ é dizer que a fila voltou. Sem isto o cérebro precisa
+    lembrar de reinscrever — e no teste real de 2026-09-08 ele não lembrou."""
+    from modules.desktop.ai_service import AIService
+
+    sub = Subscription(_Row(state="pausada", expected_ref="AAAAAAAAAAA"))
+    subs = FakeSubs([sub])
+    observar = await AIService._watch_for_actuation(
+        _FakeAI(_router(subs)),
+        USER,
+        {"device_id": "mac-daniel"},
+        {"videoId": "AAAAAAAAAAA"},
+    )
+    assert observar is not None
+    assert observar["inscricao_id"] == str(sub.id)
+    assert sub.state == "armada"
+
+
+@pytest.mark.asyncio
+async def test_tocar_musica_fora_da_fila_pausa_a_inscricao():
+    """O outro lado da mesma moeda: música que não é da fila para a fila."""
+    from modules.desktop.ai_service import AIService
+
+    sub = Subscription(_Row(state="armada", expected_ref="AAAAAAAAAAA"))
+    subs = FakeSubs([sub])
+    observar = await AIService._watch_for_actuation(
+        _FakeAI(_router(subs)),
+        USER,
+        {"device_id": "mac-daniel"},
+        {"videoId": "ACDC1234567"},
+    )
+    assert observar is None       # nada a observar → o aparelho desarma
+    assert sub.state == "pausada"
+
+
+@pytest.mark.asyncio
+async def test_sem_inscricao_nenhuma_o_observar_nao_existe():
+    from modules.desktop.ai_service import AIService
+
+    observar = await AIService._watch_for_actuation(
+        _FakeAI(_router(FakeSubs([]))),
+        USER,
+        {"device_id": "mac-daniel"},
+        {"videoId": "ACDC1234567"},
+    )
+    assert observar is None

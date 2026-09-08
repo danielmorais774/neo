@@ -476,6 +476,45 @@ conectada" e "o Neo está no comando do player agora" precisava ser visível.
 
 ---
 
+### 7.10 O que o primeiro uso real quebrou (2026-09-08, sessão e8170c41)
+
+Três defeitos encadeados, todos visíveis no log da sessão. Vale registrar porque
+nenhum deles aparece em teste de unidade — eles moram nas juntas.
+
+**1. Inscrição pausada é inscrição morta, e ninguém a ressuscitava.** No pedido
+"coloca a fila de novo para tocar começo da primeira de novo", o cérebro chamou
+`event_list` (viu `pausada`), chamou `data_list` e foi direto para o handoff —
+**sem `event_subscribe`**. Como o roteador só considera `state='armada'`, nenhum
+evento casaria: a fila nunca andaria, com tudo o mais funcionando.
+
+Duas correções, e a ordem importa:
+- **sistema** (a que vale): mandar tocar a faixa que a inscrição pausada esperava
+  JÁ É dizer que a fila voltou → `_watch_for_actuation` **retoma** a inscrição
+  sozinha. E o inverso também virou regra: tocar uma faixa que NÃO é a esperada
+  **pausa** a fila, em vez de deixá-la seguir por cima do que o usuário pediu.
+- **prompt** (reforço): o SKILL.md ganhou o passo "retomar/recomeçar". Sozinho
+  ele não bastaria — "garantir que ele lembre" nunca é prompt.
+
+**2. `open_url` abre uma ABA NOVA e o alvo apontava para a velha.** A atuação
+não reusou a aba (a pipeline só reusa aba que o Neo colocou música), então a
+música foi para uma aba nova enquanto `target.tab_id` continuava na antiga —
+e o casamento por aba recusaria todos os eventos. Agora o evento carrega o
+`inscricao_id` que nós mesmos entregamos: quando ele vem, ele manda, e o alvo é
+**atualizado** para a aba nova. A tolerância vale só para esse id — evento solto
+de outra aba continua recusado. Do lado da extensão, a vigia acha a aba pelo
+`videoId` quando o `tabId` não serve.
+
+**3. O autoplay não foi desligado — e o YouTube tinha virado RÁDIO.** A aba
+estava em `watch?v=…&list=RD…&start_radio=1`. Duas causas somadas: (a) a vigia
+nunca foi armada (defeitos 1 e 2), então a extensão nunca recebeu o `watch` que
+dispara o `disableAutoplay`; (b) mesmo armada, o toggle de autonav **não impede
+um rádio** — com `list=RD…` ativo o "próximo" vem da fila do YouTube. Agora, ao
+confirmar a faixa, a extensão também **volta para a URL canônica** (sem `list`/
+`start_radio`), matando o rádio. Só na confirmação, quando a faixa está em ~0s:
+navegar no meio da música reiniciaria ela.
+
+---
+
 ### 7.9 Fases dessa parte
 
 | Fase | Entrega | Como se prova |
