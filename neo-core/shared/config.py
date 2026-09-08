@@ -365,6 +365,14 @@ class Settings(BaseSettings):
         "neo_data, tools data_*, instalador de skills e tela /dados do painel. "
         "Default OFF — rollback é desligar a flag.",
     )
+    # ── Barramento de eventos (docs/playlists-skill-plan.md §7) ────────
+    neo_events_enabled: bool = Field(
+        default=False,
+        description="Liga as inscrições de evento: tools event_*, endpoint "
+        "/api/v1/eventos/midia e o despacho automático da próxima faixa de uma "
+        "fila. Default OFF — com a flag desligada nenhum evento é aceito e "
+        "nenhuma inscrição é criada (o pedido avulso de música fica idêntico).",
+    )
     neo_tool_index_enabled: bool = Field(
         default=False,
         description="Coloca tool_find/tool_run no read set do cognitivo. O ÍNDICE é "

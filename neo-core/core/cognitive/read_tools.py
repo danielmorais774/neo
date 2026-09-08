@@ -30,6 +30,7 @@ from modules.pks_write import PKS_WRITE_TOOL_NAMES, PKS_WRITE_TOOLS
 from modules.services.tools import SERVICE_TOOLS
 from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.datasets.tools import DATA_DEFINE_TOOL_NAMES, DATA_TOOL_NAMES
+from modules.events.tools import EVENT_TOOL_NAMES
 from modules.tool_index.tools import TOOL_INDEX_TOOL_NAMES
 
 #: data_* + data_define — todas user-scoped (os cadastros são de um dono).
@@ -126,6 +127,7 @@ _USER_SCOPED = frozenset(
     | PKS_WRITE_TOOL_NAMES
     | WORKING_MEMORY_TOOL_NAMES
     | DATASET_TOOL_NAMES
+    | EVENT_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -246,6 +248,8 @@ class CognitiveReadExecutor:
         embeddings: Any = None,
         current_device_id: str | None = None,
         dataset_registry: Any = None,
+        event_router: Any = None,
+        media_context: dict[str, Any] | None = None,
     ) -> None:
         self._global = global_executor
         self._user_id = user_id
@@ -255,6 +259,7 @@ class CognitiveReadExecutor:
         self._location: Any = None
         self._finance: Any = None
         self._datasets: Any = None
+        self._events: Any = None
         self._tool_index: Any = None
         self._pks_write: Any = None
         self._recall: Any = None
@@ -310,6 +315,27 @@ class CognitiveReadExecutor:
                 self._datasets.set_context(user_id)
             except Exception as exc:  # noqa: BLE001 — feature off/ausente não derruba o turno
                 logger.debug("[cognitive] datasets indisponíveis: %s", exc)
+            # Inscrições de evento (event_*, gated pela skill que declara
+            # `eventos:`). O contexto é o ponto: device + aba tocando vêm daqui,
+            # não do modelo. É o que permite `event_subscribe` recusar inscrição
+            # no vazio sem depender do bom senso do LLM.
+            if event_router is not None:
+                try:
+                    from modules.events import EventsExecutor
+
+                    self._events = EventsExecutor(
+                        db=db,
+                        registry=getattr(event_router, "_subs", None),
+                        router=event_router,
+                    )
+                    self._events.set_context(
+                        user_id,
+                        session_id=session_id,
+                        device_id=current_device_id,
+                        media_context=media_context or {},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[cognitive] eventos indisponíveis: %s", exc)
             if pks_service is not None:
                 self._pks_search = PKSSearchExecutor(pks_service=pks_service)
                 self._pks_search.set_context(user_id)
@@ -359,6 +385,8 @@ class CognitiveReadExecutor:
                 result = await self._finance.execute(name, tool_call.arguments)
             elif name in DATASET_TOOL_NAMES and self._datasets is not None:
                 result = await self._datasets.execute(name, tool_call.arguments)
+            elif name in EVENT_TOOL_NAMES and self._events is not None:
+                result = await self._events.execute(name, tool_call.arguments)
             elif name in TOOL_INDEX_TOOL_NAMES:
                 result = await self._tool_index_executor().execute(name, tool_call.arguments)
             elif name in PKS_WRITE_TOOL_NAMES and self._pks_write is not None:

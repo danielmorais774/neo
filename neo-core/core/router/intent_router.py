@@ -365,6 +365,11 @@ _SKILL_OWNED_TOOL_PREFIXES = (
     # pela descoberta que ensina os campos reais. `tool_` cobre o agregador
     # (tool_find/tool_run), pelo mesmo motivo.
     "data_", "tool_",
+    # Inscrições de evento (docs/playlists-skill-plan.md §7.7): armar um gatilho
+    # exige saber a aba e a faixa que ACABARAM de tocar — contexto que só o
+    # cognitivo tem. O classificador roteando para event_subscribe inventaria
+    # alvo, que é justamente o que não pode existir: inscrição no vazio.
+    "event_",
 )
 
 # request_user_file (plano "arquivos sob iniciativa do cérebro") é client-side mas

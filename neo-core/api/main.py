@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections, datasets
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections, datasets, events
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -631,6 +631,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     print("✅ PromptContextSelector ready")
     context.set_context_selector(context_selector)
 
+    # ── Barramento de eventos (docs/playlists-skill-plan.md §7) ───
+    # Inscrições concretas (aparelho + aba + faixa) que deixam o Neo despachar a
+    # próxima faixa de uma fila sozinho. Sem inscrição não há evento: um pedido
+    # avulso de música continua custando exatamente o que custava.
+    _event_registry = None
+    _event_router = None
+    if settings.neo_events_enabled:
+        try:
+            from core.events import EventRouter, SubscriptionRegistry
+            from modules.events import EVENT_TOOLS, EventsExecutor
+
+            _event_registry = SubscriptionRegistry(db=_db)
+
+            def _dataset_service_factory():
+                """DatasetService fresco por disparo (o registry é o singleton)."""
+                if _dataset_registry is None:
+                    return None
+                from core.datasets.service import DatasetService
+
+                return DatasetService(db=_db, registry=_dataset_registry)
+
+            _event_router = EventRouter(
+                db=_db,
+                registry=_event_registry,
+                skill_library=_skill_library,
+                dataset_registry=_dataset_registry,
+                dataset_service_factory=_dataset_service_factory,
+                broker=_notification_broker,
+            )
+            # Registradas para DESPACHAR; ficam fora do read set do cognitivo —
+            # quem as destrava é o skill_read da skill que declara `eventos:`.
+            _tool_registry.register_many(EVENT_TOOLS)
+            _tool_executor.register_module_executor(
+                "events",
+                EventsExecutor(db=_db, registry=_event_registry, router=_event_router),
+            )
+            _aggregator.mirror_registry(_tool_registry)
+            _aggregator.bind_many(
+                EVENT_TOOLS, origin="core", source="modules/events",
+                tags=["evento", "inscricao"], replace=True,
+            )
+            app.state.event_registry = _event_registry
+            app.state.event_router = _event_router
+            print(f"✅ Eventos wired ({len(EVENT_TOOLS)} tools event_*)")
+        except Exception as _exc:  # noqa: BLE001 — barramento fora não derruba o boot
+            print(f"⚠️  Barramento de eventos indisponível ({_exc})")
+            _event_registry = None
+            _event_router = None
+    events.set_dependencies(_event_registry, _event_router, db=_db)
+
     _ai_service = AIService(
         llm_router=_llm_router,
         intent_router=intent_router,
@@ -645,6 +695,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_manager=_job_manager,
         skill_library=_skill_library,
         dataset_registry=_dataset_registry,
+        # Barramento de eventos: é por ele que o turno ganha as tools event_*
+        # com o alvo concreto do que acabou de tocar.
+        event_router=_event_router,
         file_store=_file_store,
         # Identidade: com uma caixa cadastrada, o Neo sabe o próprio email sem
         # precisar chamar tool para descobrir (ver _neo_identity_block).
@@ -855,6 +908,7 @@ app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(datasets.install_router)
 app.include_router(datasets.router)
+app.include_router(events.router)
 app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
 # identity is bound via a signed `state`. See api/routes/spotify.py.

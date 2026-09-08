@@ -50,7 +50,7 @@ _EDITABLE_SUFFIXES = frozenset({".md", ".txt", ".py", ".sh", ".json", ".yaml", "
 # Ordem estável do frontmatter gerado (o resto do YAML original é preservado).
 _FRONTMATTER_KEYS = (
     "name", "description", "keywords", "kind", "register", "group", "discovery",
-    "tools", "datasets", "screens", "env", "requires", "enabled", "version",
+    "tools", "datasets", "screens", "eventos", "env", "requires", "enabled", "version",
 )
 # Modos de descoberta (docs/datasets-crud-plan.md §8.2): quanto do catálogo
 # esta skill paga em TODA mensagem.
@@ -103,6 +103,11 @@ class SkillEntry(BaseModel):
     # Telas publicadas no neo-panel. Vazio + datasets → o instalador publica a
     # tela padrão de cada cadastro ("prepara a tela CRUD se necessário").
     screens: list[Any] = []
+    # --- Gatilhos de evento (docs/playlists-skill-plan.md §7.6) --------------
+    # Cada item é uma receita NOMEADA (`faz:` só aceita runner que existe em
+    # core/events/runners.py). Declarar `eventos:` destrava as tools event_*,
+    # do mesmo jeito que `datasets:` destrava as data_*.
+    eventos: list[Any] = []
     # Orçamento de tokens (§8): como esta skill aparece no catálogo do prompt.
     #   keyword — só quando a mensagem casa (PADRÃO das skills novas)
     #   always  — 1 linha em toda mensagem (o comportamento antigo de todas)
@@ -261,6 +266,22 @@ class SkillLibrary:
         screens = meta.get("screens") or []
         if not isinstance(screens, list):
             raise ValueError("'screens' precisa ser uma lista")
+        eventos = meta.get("eventos") or []
+        if not isinstance(eventos, list):
+            raise ValueError("'eventos' precisa ser uma lista")
+        if eventos:
+            # Gatilho podre não derruba a skill (ela continua servindo para ler e
+            # para as data_*) — mas some do `eventos`, porque uma inscrição em
+            # receita inválida seria uma fila que nunca anda e ninguém sabe por quê.
+            from core.events.schema import TriggerError, parse_triggers
+
+            try:
+                parse_triggers(eventos, skill=name)
+            except TriggerError as exc:
+                logger.warning(
+                    "[SkillLibrary] '%s': eventos ignorados (%s)", name, exc
+                )
+                eventos = []
 
         # discovery inválido não derruba a skill — cai no padrão e avisa.
         discovery = str(meta.get("discovery") or "").strip().lower()
@@ -298,6 +319,7 @@ class SkillLibrary:
             tone_register=register,
             datasets=datasets,
             screens=screens,
+            eventos=eventos,
             discovery=discovery,
             group=str(meta.get("group") or "").strip().lower(),
         )
@@ -398,6 +420,16 @@ class SkillLibrary:
                 names += [t.name for t in DATA_TOOLS]
             except Exception as exc:  # noqa: BLE001 — módulo ausente não derruba o gating
                 logger.warning("[SkillLibrary] data tools indisponíveis: %s", exc)
+        # Declarar `eventos:` destrava as event_* — mesma mecânica do `datasets:`.
+        # Só com a feature ligada: sem ela a tool existiria no prompt e recusaria
+        # no uso, que é a pior das combinações (o modelo tenta e leva erro).
+        if entry.eventos and getattr(self.settings, "neo_events_enabled", False):
+            try:
+                from modules.events.tools import EVENT_TOOLS
+
+                names += [t.name for t in EVENT_TOOLS]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SkillLibrary] event tools indisponíveis: %s", exc)
         return list(dict.fromkeys(names))
 
     def tools_for(self, name: str) -> list[Any]:
@@ -414,7 +446,7 @@ class SkillLibrary:
             return []
         # `datasets:` habilita o gating mesmo numa skill instructional — o que
         # define se há tool a destravar é o que a skill declara, não o `kind`.
-        if entry.kind != "tool_backed" and not entry.datasets:
+        if entry.kind != "tool_backed" and not entry.datasets and not entry.eventos:
             return []
         names = self.tool_names_for(name)
         if not names:
@@ -490,6 +522,22 @@ class SkillLibrary:
                 d if isinstance(d, str) else str((d or {}).get("slug") or (d or {}).get("nome") or "")
                 for d in entry.datasets
             ]
+        # Gatilhos declarados: o modelo precisa do NOME exato para o
+        # event_subscribe (é '<skill>.<nome>'), senão ele inventa um.
+        if entry.eventos and getattr(self.settings, "neo_events_enabled", False):
+            try:
+                from core.events.schema import parse_triggers
+
+                result["eventos"] = [
+                    {
+                        "gatilho": f"{entry.name}.{t.nome}",
+                        "quando": t.quando,
+                        "faz": t.faz,
+                    }
+                    for t in parse_triggers(entry.eventos, skill=entry.name)
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SkillLibrary] '%s': eventos não descritos (%s)", entry.name, exc)
         declared = self.tool_names_for(entry.name)
         if declared:
             registered = [t.name for t in self.tools_for(entry.name)]

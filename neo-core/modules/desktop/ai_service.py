@@ -1354,6 +1354,20 @@ _MUSIC_HANDOFF_INSTRUCTION = (
 # confirms these truthfully and skips the generic recovery flow.
 _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
 
+def _media_context_of(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """`media_context` do turno ({} em qualquer problema).
+
+    Import local de propósito: `core.skills.music.service` puxa o resto da skill
+    de música, e este módulo é importado no boot.
+    """
+    try:
+        from core.skills.music.service import parse_media_context
+
+        return parse_media_context(metadata) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # A ÚNICA tool pela qual o núcleo cognitivo mexe no navegador que o usuário está
 # olhando. `browser_task` não entra: roda escondida no servidor e não abre aba
 # nenhuma na tela dele. Existe para a guarda de dupla atuação da música (sessão
@@ -1675,6 +1689,7 @@ class AIService:
         job_manager: Any = None,
         skill_library: Any = None,
         dataset_registry: Any = None,
+        event_router: Any = None,
         file_store: Any = None,
         credential_store: Any = None,
     ) -> None:
@@ -1698,6 +1713,9 @@ class AIService:
         # neo_datasets_enabled está off — o CognitiveReadExecutor cai no
         # caminho sem cadastros e nada muda.
         self.dataset_registry = dataset_registry
+        # Barramento de eventos (docs/playlists-skill-plan.md §7). None com a
+        # flag off — sem ele as tools event_* nem chegam ao prompt.
+        self.event_router = event_router
         # FileStore — catálogo de arquivos (docs/file-store-plan.md). None (flag
         # off) → metadata["attachments"] é ignorado e nenhum manifesto é injetado.
         self.file_store = file_store
@@ -3823,6 +3841,12 @@ class AIService:
                     # cache das definições é compartilhado); o executor por
                     # request é que carrega o dono das linhas.
                     dataset_registry=getattr(self, "dataset_registry", None),
+                    # Inscrições de evento: o roteador é o singleton do app, e o
+                    # `media_context` é o que dá à tool o ALVO concreto (a aba em
+                    # que o Neo acabou de tocar) sem o modelo ter que adivinhar
+                    # tabId — a defesa contra inscrição no vazio.
+                    event_router=getattr(self, "event_router", None),
+                    media_context=_media_context_of(metadata),
                 )
                 # The cognitive core's toolset = read tools + (when enabled) its own
                 # agent tools: the workbench sandbox (neo_*, dispatched through the
@@ -6224,6 +6248,16 @@ class AIService:
             )
             return
 
+        # Inscrição armada para este aparelho? Então a atuação leva junto o
+        # `observar` (docs/playlists-skill-plan.md §7.5): é ele que faz o desktop
+        # vigiar ESTA aba e avisar quando a faixa estiver acabando. Sem inscrição
+        # o campo simplesmente não existe — e um "toca um AC/DC" continua sendo
+        # exatamente o que era, sem vigilância nenhuma.
+        args = dict(args)
+        observar = await self._watch_for_actuation(user_id, metadata, args)
+        if observar:
+            args["observar"] = observar
+
         # desktop/browser → dispatch a client tool; the final confirmation comes from
         # process_tool_result (flow="music_actuation"), truthful to the real outcome.
         tool_call_id = str(uuid4())
@@ -6252,6 +6286,36 @@ class AIService:
                 "command": summary,  # carried to process_tool_result for the confirmation
             },
         )
+
+    async def _watch_for_actuation(
+        self, user_id: UUID | None, metadata: dict[str, Any] | None, args: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """`observar` da atuação de música — só quando há inscrição armada.
+
+        Uma consulta indexada por (device, canal, estado), e só no turno em que o
+        Neo vai tocar alguma coisa. Sem inscrição devolve None e nada muda: é a
+        primeira das três camadas que protegem o pedido avulso (§7.4).
+        """
+        router = getattr(self, "event_router", None)
+        device_id = (metadata or {}).get("device_id")
+        if router is None or user_id is None or not device_id:
+            return None
+        try:
+            subs = await router._subs.list(
+                user_id=user_id, device_id=str(device_id), channel="musica",
+                states=("armada",), limit=5,
+            )
+        except Exception as exc:  # noqa: BLE001 — barramento fora não atrapalha o play
+            logger.debug("[music] inscrições indisponíveis: %s", exc)
+            return None
+        live = next((s for s in subs if s.is_live()), None)
+        if live is None:
+            return None
+        return {
+            "inscricao_id": str(live.id),
+            "video_id": args.get("videoId") or live.expected_ref,
+            "tab_id": args.get("tabId") or (live.target or {}).get("tab_id"),
+        }
 
     async def _resolve_file_by_name(
         self, candidate: str, session_id: UUID | None

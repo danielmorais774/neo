@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 _ACCENT_MAP = {
@@ -111,6 +112,104 @@ def clean_query(text: str) -> str:
         out = re.sub(pattern, " ", out, flags=re.IGNORECASE)
     out = " ".join(out.split()).strip(" ,.-")
     return out or (text or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Link concreto na ordem (docs/playlists-skill-plan.md §6)
+# ---------------------------------------------------------------------------
+# Quando o cognitivo já resolveu O QUE tocar — porque leu o link de um cadastro,
+# de uma playlist salva ou o usuário colou a URL — buscar de novo é errado duas
+# vezes: gasta uma chamada de API e pode achar OUTRA coisa ("Tá Escrito" tem 40
+# uploads no YouTube). Estes parsers deixam a pipeline pular a busca.
+#
+# Nada aqui aceita texto livre: o que não casar com um dos formatos conhecidos
+# volta como None e o fluxo normal (busca) segue valendo.
+
+_YT_VIDEO_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^\s]*&)?v=|embed/|shorts/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+_YT_LIST_RE = re.compile(r"[?&]list=([A-Za-z0-9_-]{2,})")
+_SPOTIFY_URL_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(track|playlist|album|artist)/([A-Za-z0-9]{22})"
+)
+_SPOTIFY_URI_RE = re.compile(r"\bspotify:(track|playlist|album|artist):([A-Za-z0-9]{22})\b")
+_ANY_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+@dataclass(frozen=True)
+class DirectLink:
+    """Um alvo concreto extraído da ordem — nunca vem de busca.
+
+    ``service``: "youtube" | "spotify" | "outro".
+    ``kind``: "video" | "playlist" | "album" | "artist" | "url".
+    ``id``: id do vídeo/recurso quando existe (o que a extensão precisa).
+    ``uri``: ``spotify:playlist:…`` para o app nativo; vazio fora do Spotify.
+    ``url``: URL canônica para abrir no navegador.
+    """
+
+    service: str
+    kind: str
+    id: str = ""
+    uri: str = ""
+    url: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.url or self.uri or self.id
+
+
+def parse_direct_link(text: str) -> DirectLink | None:
+    """Extrai um alvo tocável da ordem, ou None quando não há link nenhum.
+
+    Ordem de preferência: YouTube (vídeo, depois playlist), Spotify (URL e URI)
+    e por fim qualquer http(s) — Deezer, Apple Music, rádio — que só sabe abrir
+    numa aba. O texto ao redor é ignorado: "toca https://… pra mim" funciona.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    match = _YT_VIDEO_RE.search(raw)
+    if match:
+        video_id = match.group(1)
+        # Link canônico de propósito: a URL da aba costuma carregar `list=` (o
+        # mix que o YouTube deriva sozinho) e `t=`, e é exatamente isso que faz
+        # o autoplay assumir a fila de volta.
+        return DirectLink(
+            service="youtube",
+            kind="video",
+            id=video_id,
+            url=f"https://www.youtube.com/watch?v={video_id}",
+        )
+
+    if "youtube.com" in raw or "youtu.be" in raw:
+        listed = _YT_LIST_RE.search(raw)
+        if listed:
+            list_id = listed.group(1)
+            return DirectLink(
+                service="youtube",
+                kind="playlist",
+                id=list_id,
+                url=f"https://www.youtube.com/playlist?list={list_id}",
+            )
+
+    match = _SPOTIFY_URL_RE.search(raw) or _SPOTIFY_URI_RE.search(raw)
+    if match:
+        kind, resource_id = match.group(1), match.group(2)
+        return DirectLink(
+            service="spotify",
+            kind=kind,
+            id=resource_id,
+            uri=f"spotify:{kind}:{resource_id}",
+            url=f"https://open.spotify.com/{kind}/{resource_id}",
+        )
+
+    match = _ANY_URL_RE.search(raw)
+    if match:
+        url = match.group(0).rstrip(".,;)")
+        return DirectLink(service="outro", kind="url", url=url)
+    return None
 
 
 def parse_media_context(metadata: dict[str, Any] | None) -> dict[str, Any]:

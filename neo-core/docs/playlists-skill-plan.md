@@ -1,6 +1,36 @@
 # Plano — Skill `playlists` (playlists + músicas, zero código)
 
-> Status: **SÓ PLANO** · 2026-09-07 · Autor: Claude + Daniel
+> Status: **IMPLEMENTADO (fases 1–4.1) em 2026-09-08** · Autor: Claude + Daniel
+>
+> Em produção: migração `w6x7y8z9a0b1` aplicada, skill `playlists` instalada
+> (3 cadastros em `neo_data`), `NEO_EVENTS_ENABLED=true`, 24 testes novos
+> (`tests/skills/test_events.py`), suíte em 2075 passes.
+>
+> **Desvios do plano na implementação** (o resto saiu como está escrito abaixo):
+> - `event_subscribe` exige a **faixa** concreta, não a aba. A aba entra depois,
+>   pelo `observar` da atuação — porque no fluxo real o cérebro sabe o link da
+>   linha da fila ANTES de tocar, e só saberia o `tab_id` depois. Trocar a
+>   exigência manteve a regra ("nada de inscrição no vazio") e fez o ciclo caber
+>   em UM turno.
+> - O link da fila é normalizado para o id canônico no subscribe
+>   (`https://youtu.be/AAA` → `AAA`). Sem isso a PRIMEIRA faixa seria
+>   "inesperada" (a fila guarda URL, a extensão reporta `videoId`) e a inscrição
+>   se pausaria sozinha no primeiro evento — o bug que parece "não funciona".
+> - Quem arma o watch é a própria atuação de música: `_watch_for_actuation`
+>   consulta as inscrições armadas e injeta `observar` nos argumentos. Sem
+>   inscrição o campo não existe e o desktop **desarma** — inclusive quando o
+>   usuário pede outra música no meio da fila.
+> - A vigia mora no `ext_bridge.rs` (não num serviço novo): ele já tem os dois
+>   lados (snapshot da extensão e `send_command`), e é lá que o filtro de borda
+>   custa zero quando não há fila.
+> - Runners implementados: `proxima_da_fila` e `avisa_no_chat`. `marca_linha`
+>   não entrou — não apareceu caso de uso que os dois não cubram.
+> - A dedup e a detecção de evento ATRASADO usam a mesma chave (`<aba>:<faixa>`):
+>   depois de avançar, um `faixa_terminou` da faixa velha chega como repetido em
+>   vez de virar "faixa inesperada" e pausar a fila sem motivo.
+> - Fase 3 (tocar link salvo) saiu como `parse_direct_link` em
+>   `core/skills/music/service.py`, reusado pelo runner — o mesmo parser decide o
+>   que é vídeo, playlist, URI do Spotify ou URL solta nos dois caminhos.
 >
 > Uma pasta, um arquivo: `neo-core/skills/playlists/SKILL.md`. Duas tabelas de
 > verdade no Postgres, tela pronta no painel, o Neo salvando e consultando por
