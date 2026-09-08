@@ -1003,7 +1003,25 @@ async fn run_media_command(bridge: &ExtBridge, arguments: &str) -> (bool, String
     let tab_id = args.get("tabId").and_then(|v| v.as_i64());
     match bridge.send_command(action, target, video_id, tab_id).await {
         Ok(()) => (true, "comando enviado à extensão".to_string(), String::new()),
-        Err(e) => (false, String::new(), e),
+        Err(e) => {
+            // Plano B da fila: o neo-core converte `open_url` em `media_command`
+            // para que a EXTENSÃO dirija a aba (é ela que trava o autoplay). Se
+            // a ponte estiver fora, ainda assim tocamos — só sem a fila andar
+            // sozinha, o que é melhor do que silêncio.
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if !url.is_empty() {
+                warn!("[Media] ponte fora ({}) — abrindo {} pelo sistema", e, url);
+                return match open_target(url) {
+                    Ok(()) => (
+                        true,
+                        format!("abriu {} (sem a extensão: a fila não vai andar sozinha)", url),
+                        String::new(),
+                    ),
+                    Err(e2) => (false, String::new(), e2),
+                };
+            }
+            (false, String::new(), e)
+        }
     }
 }
 
