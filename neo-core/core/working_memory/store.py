@@ -16,16 +16,34 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import and_, not_
 from sqlmodel import select
 
 from core.working_memory.render import render_tail, split_entries, stamp, to_brazil
 from db.models.working_note import LIVE_STATUS, NOTE_STATUSES, WorkingNote
 
 logger = logging.getLogger(__name__)
+
+AUTO_ORIGIN = "auto"
+
+
+@dataclass(slots=True)
+class IndexPage:
+    """O índice do caderno mais o que ficou de fora.
+
+    ``truncated`` existe porque a omissão precisa ser DITA. Antes, quem montava
+    o prompt só sabia comparar a lista recebida com ela mesma, então uma nota
+    cortada pelo teto do store sumia em silêncio — o modelo lia um índice que
+    parecia completo. Ver ``PromptContextSelector._fit_working_index``.
+    """
+
+    notes: list[WorkingNote] = field(default_factory=list)
+    truncated: bool = False
 
 # [[alvo]] — nota, file:<id> ou path:/workspace/…
 _LINK_RE = re.compile(r"\[\[([^\[\]\n]{1,120})\]\]")
@@ -102,12 +120,14 @@ class WorkingMemoryStore:
         max_note_bytes: int = 32 * 1024,
         ttl_days: int = 30,
         max_index_notes: int = 8,
+        index_auto_quota: int = 2,
         read_tail_entries: int = 4,
     ) -> None:
         self._db = db
         self.max_note_bytes = max_note_bytes
         self.ttl_days = ttl_days
         self.max_index_notes = max_index_notes
+        self.index_auto_quota = index_auto_quota
         self.read_tail_entries = read_tail_entries
 
     # ------------------------------------------------------------------
@@ -265,24 +285,57 @@ class WorkingMemoryStore:
 
     async def index(
         self, *, user_id: UUID | None, session_id: UUID | None = None, limit: int | None = None
-    ) -> list[WorkingNote]:
+    ) -> IndexPage:
         """Notas ativas para o índice do prompt, já na ordem de exibição.
 
         Ordem: nota tocada NESTA sessão primeiro, depois ``pinned``, depois a
         mais recente. A tarefa em andamento é o que interessa; o resto é
         contexto de fundo.
+
+        **A quota é o ponto desta função.** Uma linha do índice só se paga se
+        deixar o modelo DECIDIR abrir aquela nota — e a linha de uma nota
+        automática é ``registro automático do que foi executado nesta sessão``,
+        idêntica em todas elas (o texto é fixo em ``append_auto``). São linhas
+        entre as quais não dá para escolher, e mesmo assim eram elas que
+        enchiam o índice: como o backstop escreve uma nota por sessão e a toca
+        todo turno, elas sempre ganham na ordenação por recência.
+
+        Medido na base do Daniel em 2026-09-07: **28 notas automáticas contra 3
+        do modelo**, e as 8 vagas do índice foram para as automáticas. A nota
+        `playlist-mix-youtube` — que respondia ao pedido daquele turno
+        ("toca a 10 do exies") — ficou em 10º e não apareceu; o cérebro nem viu
+        o nome para poder chamar ``wm_read``, e gastou 40 buscas na web atrás de
+        algo que estava escrito no próprio caderno (session-e135f053).
+
+        Então: nota da sessão atual, ``pinned`` e nota escrita pelo MODELO
+        entram por mérito; automática de OUTRA sessão disputa só
+        ``index_auto_quota`` vagas. Não é sobre espaço — é sobre informação:
+        cinco linhas indistinguíveis não ajudam mais que duas.
         """
         if user_id is None:
-            return []
-        rows = await self._select_index(user_id, (limit or self.max_index_notes) * 3)
-        rows.sort(
+            return IndexPage()
+        cap = limit or self.max_index_notes
+
+        # Duas consultas em vez de uma: a antiga pegava as N*3 mais recentes e
+        # priorizava em Python, o que não alcança uma nota do modelo empurrada
+        # para fora dessa janela pelas automáticas — exatamente o caso acima
+        # (`nfse-novembro-resumo`, de 31/08, estava além das 24 primeiras).
+        kept, more = await self._select_index(
+            user_id, cap, session_id=session_id, auto_only=False
+        )
+        quota = max(0, min(self.index_auto_quota, cap - len(kept)))
+        filler, more_filler = await self._select_index(
+            user_id, quota, session_id=session_id, auto_only=True
+        )
+        kept.extend(filler)
+        kept.sort(
             key=lambda n: (
                 0 if (session_id is not None and n.session_id == session_id) else 1,
                 0 if n.pinned else 1,
                 -(n.updated_at or datetime.min).timestamp(),
             )
         )
-        return rows[: (limit or self.max_index_notes)]
+        return IndexPage(notes=kept, truncated=more or more_filler)
 
     # ------------------------------------------------------------------
     # GC
@@ -373,15 +426,47 @@ class WorkingMemoryStore:
             )
             return result.scalars().first()
 
-    async def _select_index(self, user_id: UUID, limit: int) -> list[WorkingNote]:
+    async def _select_index(
+        self,
+        user_id: UUID,
+        limit: int,
+        *,
+        session_id: UUID | None = None,
+        auto_only: bool = False,
+    ) -> tuple[list[WorkingNote], bool]:
+        """Uma metade do índice (ver a quota em :meth:`index`) e se sobrou nota.
+
+        ``auto_only=False`` traz o que entra por mérito (nota da sessão atual,
+        ``pinned``, nota do modelo); ``True`` traz só o enchimento automático de
+        outras sessões. Busca ``limit + 1`` linhas para responder "tem mais?"
+        sem pagar um ``COUNT`` a cada turno — e roda mesmo com ``limit=0``, que
+        é justamente quando a resposta precisa ser verdadeira (índice cheio de
+        notas de mérito ainda tem que avisar que existe automática de fora).
+        """
+        is_filler = [
+            WorkingNote.origin == AUTO_ORIGIN,
+            WorkingNote.pinned.is_(False),  # type: ignore[attr-defined]
+        ]
+        if session_id is not None:
+            # `is_distinct_from` e não `!=`: nota com `session_id` NULL daria
+            # NULL na comparação e cairia fora dos DOIS lados da consulta.
+            is_filler.append(
+                WorkingNote.session_id.is_distinct_from(session_id)  # type: ignore[attr-defined]
+            )
+        predicate = and_(*is_filler)
         async with self._db.get_session() as session:
             result = await session.execute(
                 select(WorkingNote)
-                .where(WorkingNote.user_id == user_id, WorkingNote.status == LIVE_STATUS)
+                .where(
+                    WorkingNote.user_id == user_id,
+                    WorkingNote.status == LIVE_STATUS,
+                    predicate if auto_only else not_(predicate),
+                )
                 .order_by(WorkingNote.updated_at.desc())  # type: ignore[attr-defined]
-                .limit(limit)
+                .limit(limit + 1)
             )
-            return list(result.scalars().all())
+            rows = list(result.scalars().all())
+        return rows[:limit], len(rows) > limit
 
     async def _persist(self, note: WorkingNote) -> WorkingNote:
         async with self._db.get_session() as session:

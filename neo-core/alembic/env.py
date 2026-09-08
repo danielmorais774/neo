@@ -21,6 +21,11 @@ from db.models.pks import (  # noqa: F401
     PKSWorkspace,
     PKSWorkspaceLink,
 )
+from db.models.dataset import (  # noqa: F401
+    DatasetAudit,
+    DatasetDefinition,
+    SkillInstall,
+)
 
 config = context.config
 
@@ -37,6 +42,19 @@ if config.config_file_name is not None:
 
 target_metadata = SQLModel.metadata
 
+# Schema dos cadastros generativos (docs/datasets-crud-plan.md §9.4). As tabelas
+# de lá nascem em RUNTIME (DDL do instalador) e por isso não estão no
+# SQLModel.metadata — sem este filtro, o primeiro `alembic revision
+# --autogenerate` proporia DROP TABLE para todo cadastro do usuário.
+DATA_SCHEMA = "neo_data"
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    """Mantém o autogenerate cego para tudo que mora em ``neo_data``."""
+    if getattr(obj, "schema", None) == DATA_SCHEMA:
+        return False
+    return True
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -45,6 +63,8 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
+        include_schemas=False,
     )
 
     with context.begin_transaction():
@@ -60,7 +80,10 @@ def run_migrations_online() -> None:
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection,
+            target_metadata=target_metadata,
+            include_object=include_object,
+            include_schemas=False,
         )
 
         with context.begin_transaction():

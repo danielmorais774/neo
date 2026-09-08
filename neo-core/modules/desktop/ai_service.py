@@ -419,6 +419,58 @@ def _dedup_tools_by_name(tools: list[Any]) -> list[Any]:
         )
     return out
 
+# Tools que competem com o bloco [[HANDOFF:music]] num turno de música. O bloco é
+# quem atua de verdade: ele chega na skill, que manda `media_command` para a
+# extensão do navegador — instantâneo e reusando a aba já aberta. Estas três
+# fazem "a mesma coisa" de um jeito pior, e o modelo prefere a TOOL ao bloco.
+_MUSIC_TURN_TEMPTATIONS = frozenset({"browser_local_task", "browser_task", "run_command"})
+
+# `device_control` muta/abaixa o volume da MÁQUINA. Quando o pedido é sobre a
+# ABA ("muta essa aba tocando esse video"), usá-la é desproporcional e foi o que
+# aconteceu: o Neo silenciou o MacBook inteiro (volume 81% → mudo) e AINDA
+# emitiu o handoff — duas atuações, uma delas errada (sessão 0565907e). Fora
+# desse recorte ela fica: "abaixa o volume" sem citar aba pode ser a máquina
+# mesmo, e tirar a tool ali seria trocar um erro por outro.
+_MEDIA_TAB_ANCHORS = (
+    "aba", "abas", "guia", "guias", "tab", "tabs",
+    "video", "player", "youtube", "spotify", "navegador",
+)
+
+
+def _targets_browser_tab(user_message: str) -> bool:
+    """A ordem é sobre a ABA do navegador (e não sobre a máquina)?"""
+    texto = "".join(
+        c
+        for c in unicodedata.normalize("NFD", (user_message or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    return any(re.search(rf"\b{a}\b", texto) for a in _MEDIA_TAB_ANCHORS)
+
+
+def _drop_music_turn_temptations(
+    tools: list[Any], skill_hint: str | None, user_message: str = ""
+) -> list[Any]:
+    """Tira do turno de música as tools que desviam a atuação para fora da skill.
+
+    Medido em produção: "toca duality do slipknot" virou job de
+    `browser_local_task` (26 s dirigindo o Edge passo a passo) e "coloca uma
+    musica do meu mix" virou `browser_task` num Chromium headless da VPS, que
+    morreu no anti-bot do YouTube — as duas com o bloco ali, de graça. E
+    "consegue mutar essa aba" virou `run_command` improvisando `osascript` para
+    o Chrome numa máquina que usa Edge.
+
+    Mesmo argumento do ``search_pks`` quando há skill ativa: a tool que não deve
+    ser usada neste turno não é opção, é tentação. Fora do turno de música nada
+    muda.
+    """
+    if skill_hint != "music":
+        return tools
+    fora = set(_MUSIC_TURN_TEMPTATIONS)
+    if _targets_browser_tab(user_message):
+        fora.add("device_control")
+    return [t for t in tools if getattr(t, "name", None) not in fora]
+
+
 # A resposta AFIRMA ter executado algo (passado, não promessa). Usado para barrar a
 # mentira quando nenhuma tool da skill rodou no turno — o modelo dizia "registrei,
 # pode confiar" com zero chamadas (sessão d4e2ba0f). Só formas no passado: "posso
@@ -1286,6 +1338,11 @@ _MUSIC_HANDOFF_INSTRUCTION = (
     "tocou ou pulou SEM emitir o bloco; senão NADA acontece e você fica mentindo. "
     "Resolva pedidos vagos ('aquela que eu curto') usando o gosto do PKS e ponha algo "
     "concreto/buscável (ou a palavra exata da ação) dentro do bloco.\n"
+    "- NÃO use o navegador para tocar (`browser_local_task`/`browser_task`) nem "
+    "invente comando de terminal: o bloco é o caminho — ele manda o comando direto "
+    "para a extensão do navegador, que reusa a aba aberta. Dirigir o navegador "
+    "passo a passo leva ~30s, abre aba nova e já falhou em produção; o bloco é "
+    "instantâneo.\n"
     "- Se NESTE MESMO turno você já mandou o navegador DO USUÁRIO abrir/tocar "
     "(`browser_local_task`), isso JÁ É tocar: escreva a resposta e feche com "
     "[[NO_MUSIC]]. Emitir o bloco também abriria uma SEGUNDA aba, com outra música "
@@ -1617,6 +1674,7 @@ class AIService:
         context_selector: PromptContextSelector | None = None,
         job_manager: Any = None,
         skill_library: Any = None,
+        dataset_registry: Any = None,
         file_store: Any = None,
         credential_store: Any = None,
     ) -> None:
@@ -1636,6 +1694,10 @@ class AIService:
         # SkillLibrary — skills declarativas SKILL.md (docs/skills-library-plan.md).
         # None (flag off) → sem catálogo no prompt e sem tool gating.
         self.skill_library = skill_library
+        # Registry de cadastros (docs/datasets-crud-plan.md). None quando a flag
+        # neo_datasets_enabled está off — o CognitiveReadExecutor cai no
+        # caminho sem cadastros e nada muda.
+        self.dataset_registry = dataset_registry
         # FileStore — catálogo de arquivos (docs/file-store-plan.md). None (flag
         # off) → metadata["attachments"] é ignorado e nenhum manifesto é injetado.
         self.file_store = file_store
@@ -3757,6 +3819,10 @@ class AIService:
                     # volume", sem citar aparelho, significar ESTE aparelho
                     # (docs/device-control-plan.md §5).
                     current_device_id=(metadata or {}).get("device_id"),
+                    # Cadastros generativos: o registry é o singleton do app (o
+                    # cache das definições é compartilhado); o executor por
+                    # request é que carrega o dono das linhas.
+                    dataset_registry=getattr(self, "dataset_registry", None),
                 )
                 # The cognitive core's toolset = read tools + (when enabled) its own
                 # agent tools: the workbench sandbox (neo_*, dispatched through the
@@ -3792,6 +3858,11 @@ class AIService:
                 # É aqui que o toolset vira "um nome, um schema" — antes disso as
                 # camadas não têm como se enxergar.
                 cognitive_tools = _dedup_tools_by_name(cognitive_tools)
+                # Turno de música: o bloco [[HANDOFF:music]] é o atuador; as
+                # tools de navegador/terminal saem da mesa (ver o helper).
+                cognitive_tools = _drop_music_turn_temptations(
+                    cognitive_tools, decision.skill_hint, user_message
+                )
                 _skill_tool_names = {t.name for t in _autoloaded_tools}
                 _used_tools: set[str] = set()
                 full_response = await self._run_cognitive_tool_loop(
@@ -5283,7 +5354,13 @@ class AIService:
             "tocando (ou toque algo, se for isso que ele quer)."
         )
         return (
-            "## Mídia aberta no navegador (tempo real)\n"
+            "## Mídia aberta no navegador DO USUÁRIO (tempo real)\n"
+            "Esta lista vem da extensão Neo Music Bridge, que roda no navegador DA "
+            "MÁQUINA DELE e reporta a cada turno. É o navegador dele, não o do "
+            "servidor/sandbox: você ENXERGA estas abas. Nunca diga que não vê o "
+            "navegador dele, nem chame estas abas de 'navegador do servidor' — e "
+            "não precisa abrir tarefa de navegador para saber o que está aberto ou "
+            "tocando, está tudo aqui.\n"
             "Abas de música/vídeo abertas agora, da mais relevante para a menos:\n"
             + "\n".join(lines)
             + aviso
@@ -5293,7 +5370,13 @@ class AIService:
             "parado; **música/vídeo comum** é a classificação do próprio YouTube; "
             "**nada aberto pra tocar** é aba sem player (home, feed, busca), que não "
             "aceita comando nenhum; **ANÚNCIO no ar** quer dizer que o som do momento "
-            "é comercial, então não anuncie isso como a faixa.\n"
+            "é comercial, então não anuncie isso como a faixa; **canal** é quem "
+            "publicou o vídeo, e o **link** no fim da linha é a URL REAL dele — se "
+            "ele pedir o link, copie essa exatamente, NUNCA monte uma URL de "
+            "cabeça.\n"
+            "MUDO/VOLUME DA ABA ≠ MUDO DA MÁQUINA: o bloco abaixo age no player "
+            "desta aba. `device_control` silencia o computador INTEIRO — só use se "
+            "ele pedir a máquina, nunca para 'muta essa aba'.\n"
             "Se o usuário pedir pra PAUSAR, RETOMAR/dar play, PULAR, VOLTAR ou mudar "
             "VOLUME dessa mídia, você DEVE emitir ao final o bloco "
             "[[HANDOFF:music]]<ação>[[/HANDOFF]] (ação = pausar | retomar | próxima | "

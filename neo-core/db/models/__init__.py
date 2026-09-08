@@ -33,6 +33,7 @@ from .gateway import ServiceConnection, ServiceRequestLog
 from .stored_file import StoredFile
 from .birra_act import BirraAct
 from .working_note import WorkingNote
+from .dataset import DatasetAudit, DatasetDefinition, SkillInstall
 
 __all__ = [
     "User",
@@ -67,4 +68,7 @@ __all__ = [
     "StoredFile",
     "BirraAct",
     "WorkingNote",
+    "DatasetDefinition",
+    "DatasetAudit",
+    "SkillInstall",
 ]

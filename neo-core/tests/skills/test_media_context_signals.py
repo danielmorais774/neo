@@ -64,6 +64,43 @@ def test_guia_muda_pelo_usuario_aparece_separada_do_player():
     assert "guia no mudo" in describe_tab(aba)
 
 
+# ── canal e link ────────────────────────────────────────────────────────────
+
+
+def test_canal_e_link_entram_na_linha():
+    """O que o usuário pede em texto: "de que canal é isso?" e "manda o link"."""
+    aba = _aba(
+        hasMedia=True,
+        paused=False,
+        contentType="video",
+        title="Dante Vs Vergil",
+        channel="Canal do Zé",
+        videoUrl="https://www.youtube.com/watch?v=6_kZHhqeByA",
+    )
+    linha = describe_tab(aba)
+    assert "canal Canal do Zé" in linha
+    assert "https://www.youtube.com/watch?v=6_kZHhqeByA" in linha
+
+
+def test_canal_igual_ao_artista_nao_repete():
+    """Em música o player publica o canal como artista — dizer duas vezes é ruído."""
+    aba = _aba(hasMedia=True, paused=False, track="Last Resort", artist="Papa Roach",
+               channel="papa roach")
+    assert describe_tab(aba).count("Papa Roach") == 1
+    assert "canal" not in describe_tab(aba)
+
+
+def test_sem_link_nao_inventa_nada():
+    """Aba de Spotify / home: a extensão manda vazio e a linha fica sem link."""
+    aba = _aba(
+        site="spotify",
+        url="https://open.spotify.com/playlist/x",
+        title="Rock Classics",
+        videoUrl="",
+    )
+    assert describe_tab(aba) == "spotify · aberta · Rock Classics"
+
+
 # ── tem o que controlar? ────────────────────────────────────────────────────
 
 

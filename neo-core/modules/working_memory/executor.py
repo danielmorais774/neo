@@ -47,6 +47,7 @@ class WorkingMemoryExecutor:
             max_note_bytes=getattr(settings, "working_memory_note_max_bytes", 32768),
             ttl_days=getattr(settings, "working_memory_ttl_days", 30),
             max_index_notes=getattr(settings, "working_memory_max_notes_in_index", 8),
+            index_auto_quota=getattr(settings, "working_memory_index_auto_quota", 2),
             read_tail_entries=getattr(settings, "working_memory_read_tail_entries", 4),
         )
         self._user_id: UUID | None = None

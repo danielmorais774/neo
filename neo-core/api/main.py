@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections, datasets
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -405,6 +405,59 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from core.skills.home_assistant import home_assistant_manifest  # noqa: F401
     from core.skills.music import music_manifest  # noqa: F401
 
+    # ── Cadastros generativos (docs/datasets-crud-plan.md) ────────
+    # Tabelas criadas em RUNTIME no schema neo_data, seis tools genéricas
+    # parametrizadas por slug e um instalador que roda uma vez por skill.
+    # Flag OFF = nada disto existe para o cliente (rollback = desligar).
+    _dataset_registry = None
+    _skill_installer = None
+    if settings.neo_datasets_enabled:
+        from core.datasets import DatasetRegistry
+        from core.skills.installer import SkillInstaller
+        from modules.datasets import ALL_DATASET_TOOLS, DatasetsExecutor
+
+        _dataset_registry = DatasetRegistry(db=_db)
+        # Registradas no registry global para DESPACHAR; ficam fora do read set
+        # do cognitivo — quem as destrava é o skill_read (tool gating).
+        _tool_registry.register_many(ALL_DATASET_TOOLS)
+        _tool_executor.register_module_executor(
+            "datasets", DatasetsExecutor(db=_db, registry=_dataset_registry)
+        )
+        app.state.dataset_registry = _dataset_registry
+        print(f"✅ Datasets wired ({len(ALL_DATASET_TOOLS)} tools data_*, schema neo_data)")
+
+    # ── Agregador de tools (docs/datasets-crud-plan.md §2) ────────
+    # Espelha TUDO que foi registrado até aqui e dá endereço único a cada tool,
+    # venha ela de modules/*, do gerador de cadastros ou de uma skill instalada.
+    # É o que `SkillLibrary.tools_for` consulta para o gating.
+    from core.tools.aggregator import get_aggregator
+
+    _aggregator = get_aggregator()
+    _mirrored = _aggregator.mirror_registry(_tool_registry)
+    if _dataset_registry is not None:
+        from modules.datasets import ALL_DATASET_TOOLS as _DS_TOOLS
+
+        _aggregator.bind_many(
+            _DS_TOOLS, origin="dataset", source="core/datasets", tags=["cadastro", "crud"],
+            replace=True,
+        )
+    if settings.neo_tool_index_enabled:
+        from modules.tool_index import TOOL_INDEX_TOOLS, ToolIndexExecutor
+
+        _tool_registry.register_many(TOOL_INDEX_TOOLS)
+        _tool_index_executor = ToolIndexExecutor(aggregator=_aggregator)
+        # O dispatcher é o executor GLOBAL aqui; no caminho cognitivo o
+        # CognitiveReadExecutor injeta a si mesmo, para que tool_run alcance os
+        # executores user-scoped (senão fin_*/data_* voltariam vazias).
+        _tool_index_executor.set_dispatcher(_tool_executor.execute_tool_call)
+        _tool_executor.register_module_executor("tool_index", _tool_index_executor)
+        _aggregator.bind_many(
+            TOOL_INDEX_TOOLS, origin="core", source="modules/tool_index", tags=["meta"],
+            replace=True,
+        )
+    app.state.tool_aggregator = _aggregator
+    print(f"✅ Tool aggregator ready ({_mirrored} espelhadas · {_aggregator.stats()})")
+
     # ── Skills Library — skills declarativas SKILL.md ─────────────
     # Catálogo de 1 linha/skill no prompt cognitivo + corpo sob demanda via
     # skill_read (progressive disclosure). Ver docs/skills-library-plan.md.
@@ -420,7 +473,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         _tool_registry.register_many(SKILLS_LIBRARY_TOOLS)
         _tool_executor.register_module_executor(
-            "skills_library", SkillsLibraryExecutor(_skill_library)
+            "skills_library", SkillsLibraryExecutor(_skill_library, _dataset_registry)
         )
 
         # Tools "gated" por skill (tool_backed): registradas no executor/registry
@@ -444,6 +497,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # toda skill tool_backed (falso alarme que já custou um diagnóstico).
         _skill_library.load()
         app.state.skill_library = _skill_library
+        # As tools gated (sql_*, fin_*) foram registradas ACIMA do load — o
+        # agregador precisa de uma segunda passada para indexá-las.
+        _aggregator.mirror_registry(_tool_registry)
+        if _dataset_registry is not None:
+            try:
+                _known = await _dataset_registry.all()
+                _skill_library.set_known_datasets([d.slug for d in _known])
+                _skill_installer = SkillInstaller(
+                    db=_db,
+                    library=_skill_library,
+                    dataset_registry=_dataset_registry,
+                    aggregator=_aggregator,
+                    settings=settings,
+                )
+                app.state.skill_installer = _skill_installer
+                print(f"✅ Skill installer ready ({len(_known)} cadastro(s) conhecido(s))")
+            except Exception as _exc:  # noqa: BLE001 — cadastro fora do ar não derruba o boot
+                print(f"⚠️  Datasets indisponíveis no boot ({_exc}) — gate de datasets fica aberto")
         print(
             f"✅ Skills library ready ({len(_skill_library.all())} skill(s) "
             f"from {settings.skills_library_path})"
@@ -539,6 +610,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_note_bytes=settings.working_memory_note_max_bytes,
             ttl_days=settings.working_memory_ttl_days,
             max_index_notes=settings.working_memory_max_notes_in_index,
+            index_auto_quota=settings.working_memory_index_auto_quota,
             read_tail_entries=settings.working_memory_read_tail_entries,
         )
         app.state.working_memory = _working_memory
@@ -572,6 +644,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         context_selector=context_selector,
         job_manager=_job_manager,
         skill_library=_skill_library,
+        dataset_registry=_dataset_registry,
         file_store=_file_store,
         # Identidade: com uma caixa cadastrada, o Neo sabe o próprio email sem
         # precisar chamar tool para descobrir (ver _neo_identity_block).
@@ -642,6 +715,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wire skills route (neo-panel → Skills page). _skill_library é None quando
     # a flag está off — a rota responde 503 em vez de sumir.
     skills.set_dependencies(_skill_library, _tool_registry)
+    # Cadastros + instalador (docs/datasets-crud-plan.md). Com a flag off os dois
+    # ficam None e as rotas respondem 503 — a feature não existe para o cliente.
+    datasets.set_dependencies(_dataset_registry, db=_db, installer=_skill_installer)
 
     # ── Legacy DesktopService (REST routes) ───────────────────────
     _desktop_service = DesktopService(
@@ -777,6 +853,8 @@ app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(requ
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(datasets.install_router)
+app.include_router(datasets.router)
 app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
 # identity is bound via a signed `state`. See api/routes/spotify.py.

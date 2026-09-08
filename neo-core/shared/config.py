@@ -358,6 +358,37 @@ class Settings(BaseSettings):
         description="Diretório raiz das skills declarativas (cada uma em "
         "<name>/SKILL.md). No container, ./neo-core/skills montado em /app/skills.",
     )
+    # ── Cadastros generativos (docs/datasets-crud-plan.md) ─────────────
+    neo_datasets_enabled: bool = Field(
+        default=False,
+        description="Liga os cadastros generativos: tabelas em runtime no schema "
+        "neo_data, tools data_*, instalador de skills e tela /dados do painel. "
+        "Default OFF — rollback é desligar a flag.",
+    )
+    neo_tool_index_enabled: bool = Field(
+        default=False,
+        description="Coloca tool_find/tool_run no read set do cognitivo. O ÍNDICE é "
+        "montado de qualquer jeito (o gating por skill usa ele); esta flag controla só "
+        "se as duas tools chegam ao prompt — custam ~150 tokens por turno, então nasce "
+        "OFF e liga quando você quiser o dispatcher genérico.",
+    )
+    neo_skill_auto_install: bool = Field(
+        default=False,
+        description="Aplica sozinho o plano de instalação ADITIVO quando o SKILL.md "
+        "muda (campo novo). Destrutivo nunca é automático. Default OFF.",
+    )
+    neo_skill_py_tools_enabled: bool = Field(
+        default=False,
+        description="Permite que uma skill traga o próprio tools.py, importado DENTRO "
+        "do neo-core (banco + NEO_CRED_KEY + LAN). Instalação humana apenas — nenhuma "
+        "tool do modelo cria skill com tools.py. Default OFF.",
+    )
+    skills_discovery_default: str = Field(
+        default="always",
+        description="Modo de descoberta das skills que não declaram 'discovery:' — "
+        "'always' (comportamento histórico: 1 linha de catálogo em toda mensagem) ou "
+        "'keyword' (só quando a mensagem casa; economiza tokens com muitas skills).",
+    )
     skills_catalog_max_entries: int = Field(
         default=30, ge=1, le=200,
         description="Máximo de skills no catálogo do prompt cognitivo; acima disso "
@@ -494,6 +525,13 @@ class Settings(BaseSettings):
     working_memory_max_notes_in_index: int = Field(
         default=8, ge=1,
         description="Máximo de notas ativas listadas no índice injetado no prompt",
+    )
+    working_memory_index_auto_quota: int = Field(
+        default=2, ge=0,
+        description="Quantas vagas do índice uma nota AUTOMÁTICA de outra sessão pode ocupar. "
+        "O resumo delas é fixo ('registro automático…'), então são indistinguíveis entre si: "
+        "sem teto, o backstop (uma nota por sessão, tocada todo turno) toma o índice inteiro na "
+        "recência e expulsa as notas que o modelo escreveu de propósito. 0 desliga o enchimento.",
     )
     working_memory_note_max_bytes: int = Field(
         default=32768, ge=1024,

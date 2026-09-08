@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 
 from core.agent.context_selector import PromptContextSelector
+from core.working_memory.store import IndexPage
 from shared.config import Settings
 from shared.types import ContextLayer, IntentType, RoutingDecision
 
@@ -29,7 +30,7 @@ def _note(slug, summary, updated_at, session_id=None):
     )
 
 
-def _selector(*, enabled: bool, notes=None, budget: int = 700):
+def _selector(*, enabled: bool, notes=None, budget: int = 700, truncated: bool = False):
     token_counter = MagicMock()
     token_counter.count = lambda text: len(text.split()) * 2
 
@@ -44,7 +45,9 @@ def _selector(*, enabled: bool, notes=None, budget: int = 700):
     settings.working_memory_enabled = enabled
 
     wm = MagicMock()
-    wm.index = AsyncMock(return_value=list(notes or []))
+    # O store devolve IndexPage (notas + "sobrou algo de fora"), não uma lista:
+    # é esse segundo campo que faz o rodapé de omissão aparecer no prompt.
+    wm.index = AsyncMock(return_value=IndexPage(notes=list(notes or []), truncated=truncated))
 
     sel = PromptContextSelector(
         token_counter=token_counter, settings=settings, working_memory=wm,
@@ -125,7 +128,7 @@ async def test_indice_grande_e_podado_por_nota_nunca_sumindo_inteiro():
     layer = next(c for c in trace if c.layer == ContextLayer.WORKING_MEM)
     assert layer.included is True
     assert layer.est_tokens <= 400
-    assert "ficaram de fora por espaço" in prompt
+    assert "não couberam aqui" in prompt
     assert "[[nota-0]]" in prompt   # a de maior prioridade sobreviveu
     assert "[[nota-7]]" not in prompt  # a de menor foi podada
 

@@ -161,6 +161,16 @@ class MusicPipeline(SkillPipeline):
             "volume_up": "Volume pra cima 🔊", "volume_down": "Volume pra baixo 🔉",
         }
         summary = labels.get(action, "Feito")
+        if action == "mute":
+            # A extensão ALTERNA o mudo (`video.muted = !video.muted`), então o
+            # rótulo depende de como a aba está AGORA — dizer "Mutei" ao
+            # desmutar é mentira barata e visível. Sem a sonda (`pageMuted`
+            # ausente) não dá para saber qual dos dois vai acontecer.
+            estado = tab.get("pageMuted")
+            if isinstance(estado, bool):
+                summary = "Desmutei" if estado else "Mutei"
+            else:
+                summary = "Alternei o mudo"
         return SkillResult(
             ok=True,
             message=f"{summary} 🎵",

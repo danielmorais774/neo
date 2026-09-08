@@ -36,7 +36,11 @@ _ACTION_RULES = [
     ("previous", r"\b(anterior|previous)\b"),
     ("volume_up", r"\b(aumenta|aumentar|sobe|subir)\b"),
     ("volume_down", r"\b(abaixa|abaixar|diminui|diminuir|baixa|baixar)\b"),
-    ("mute", r"\b(mudo|muta|mutar|silencia|silenciar)\b"),
+    # `desmuta` casa aqui de propósito: a extensão ALTERNA o mudo, então
+    # desmutar é o mesmo comando. Sem esta entrada, "desmuta" não casava
+    # nenhuma regra (o \b não pega "muta" dentro de "desmuta") e caía em
+    # "play" — o Neo ia BUSCAR "desmuta" no YouTube.
+    ("mute", r"\b(mudo|muta|mutar|mute|desmuta|desmutar|silencia|silenciar)\b"),
     ("pause", r"\b(pausa|pausar|pause|stop|interrompe)\b"),
     ("resume", r"(\b(retoma|retomar|continua|continuar|continue|despausa|despausar|resume)\b"
                r"|\b(da|dar|de)\s+(o\s+)?play\b|\bplay de novo\b|\bvolta(r)? a tocar\b)"),
@@ -351,6 +355,12 @@ def describe_tab(tab: dict[str, Any]) -> str:
         if titulo:
             partes.append(titulo[:120])
 
+    # Quem publicou. Só quando acrescenta: em música o mediaSession costuma
+    # repetir o canal no artista, e dizer "Papa Roach · canal Papa Roach" é ruído.
+    canal = (tab.get("channel") or "").strip()
+    if canal and canal.casefold() != artista.casefold():
+        partes.append(f"canal {canal}")
+
     if tab.get("live"):
         partes.append("ao vivo")
     elif tem_midia is not False:
@@ -373,6 +383,12 @@ def describe_tab(tab: dict[str, Any]) -> str:
     rotulo = _KIND_LABEL.get(str(tab.get("kind") or ""))
     if rotulo and tem_midia is not True:
         partes.append(rotulo)
+
+    # O link REAL do vídeo, já limpo pela extensão. É o que evita o Neo montar
+    # uma URL de cabeça quando o usuário pede "manda o link".
+    link = (tab.get("videoUrl") or "").strip()
+    if link:
+        partes.append(link)
 
     if tab.get("probe") in ("denied", "error"):
         partes.append("(não consegui ler o player desta aba)")

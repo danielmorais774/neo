@@ -1,6 +1,45 @@
 # Plano — Skills Instaláveis: Agregador de Tools + Cadastros Generativos
 
-> Status: **SÓ PLANO** · 2026-09-06 (rev. 2) · Autor: Claude + Daniel
+> Status: **IMPLEMENTADO (F0–F7) em 2026-09-06** · Autor: Claude + Daniel
+>
+> Flag mestra `NEO_DATASETS_ENABLED` **ligada** em prod. Migração
+> `v5w6x7y8z9a0` aplicada. 56 testes novos (`tests/skills/test_datasets.py`),
+> suíte cheia em 1977 passes.
+>
+> **Desvios do plano na implementação:**
+> - `discovery` NASCE `always` (o comportamento histórico), não `keyword`. Trocar
+>   o default é decisão de operação (`SKILLS_DISCOVERY_DEFAULT`), nunca efeito
+>   colateral de deploy: skill que some do catálogo é skill que o cérebro não
+>   descobre mais. As skills de cadastro declaram `discovery: keyword`
+>   explicitamente, então já nascem baratas. **Medido**: catálogo neutro
+>   continua em 385 tokens com 3 cadastros instalados.
+> - `tool_find`/`tool_run` ficam FORA do read set por default
+>   (`NEO_TOOL_INDEX_ENABLED=false`): custam ~150 tokens/turno e o caminho
+>   preferido continua o schema tipado destravado pelo `skill_read`. O ÍNDICE é
+>   montado sempre — é dele que o gating vive.
+> - `tools_for` passou a funcionar também em skill `instructional` que declare
+>   `datasets:`. O que define se há tool a destravar é o que a skill declara,
+>   não o `kind`.
+> - Colunas de cadastro nascem **sem `NOT NULL`**: obrigatoriedade é validada na
+>   aplicação (schema), porque tornar um campo obrigatório depois de a tabela ter
+>   linhas faria o `ALTER … SET NOT NULL` falhar no meio do `apply`.
+> - `_requires_ok` tira do catálogo a skill cujo cadastro não existe, mas o gate
+>   é **fail-open** até o registry carregar (`_known_datasets is None`) — melhor
+>   uma skill a mais no catálogo do que o catálogo sumir por lentidão do Postgres.
+> - `parse_schema`/`parse_fields` desembrulham o `ValidationError` do pydantic
+>   numa frase. Sem isso o erro que chega ao modelo é
+>   `1 validation error for DatasetSchema\nfields.0.name\n  Value error, …` —
+>   ruído justamente para quem deveria corrigir o argumento.
+> - `alembic/env.py` ganhou `include_object` + `include_schemas=False` (§9.4). Era
+>   obrigatório: sem ele o próximo `autogenerate` proporia DROP em todo cadastro.
+> - `data_define` só ACRESCENTA campo. Remover/trocar tipo é destrutivo e vive no
+>   painel, com humano na frente.
+> - `tool_run` só executa binding `server-side`: tool client-side levanta
+>   `ClientActuationRequested` no loop cognitivo, e passá-la por aqui quebraria
+>   esse fluxo em silêncio.
+> - **Não implementado (F8)**: `tools.py` de skill (flag existe, default off),
+>   campos `relacao`/`arquivo` no painel (backend aceita; a tela mostra input de
+>   id), `data_export`/`data_import` para o sandbox, e o índice semântico da §8.2.
 >
 > Objetivo: uma skill é um **pacote instalável**. Ela se descreve num `.md`; na
 > instalação o neo-core **analisa o que ela precisa**, cria as tabelas, liga as
@@ -9,9 +48,23 @@
 >
 > Caso motivador (Daniel): "quero atender clientes — cadastro um skill e ele já
 > me gera um CRUD de produtos, salva no banco e busca pra mim quando eu precisar".
->
-> **Rev. 2** acrescenta as três peças que faltavam: o **agregador de tools** (§2),
-> o **ciclo de instalação** (§3) e o **orçamento de tokens** (§8).
+
+## Onde o código mora
+
+| peça | arquivo |
+|---|---|
+| Contrato de schema + tipos fechados | `core/datasets/schema.py` |
+| Construtor de DDL | `core/datasets/ddl.py` |
+| Registry (cache + resolução de nome) | `core/datasets/registry.py` |
+| CRUD (read-back, soft delete, filtros) | `core/datasets/service.py` |
+| Agregador de tools | `core/tools/aggregator.py` |
+| Instalador plan/apply/verify | `core/skills/installer.py` |
+| Tools `data_*` | `modules/datasets/` |
+| `tool_find`/`tool_run` | `modules/tool_index/` |
+| Rotas do painel + instalador | `api/routes/datasets.py` |
+| Tela genérica | `neo-panel/src/DadosPanel.tsx` |
+| Meta-skill | `skills/criar-cadastro/SKILL.md` |
+| Migração | `alembic/versions/v5w6x7y8z9a0_*.py` |
 
 ---
 

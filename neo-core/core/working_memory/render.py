@@ -85,9 +85,15 @@ def render_index(
             line += f" · {summary}"
         lines.append(line)
     if truncated:
+        # Não prometa o que não dá para cumprir: não existe tool de LISTAR
+        # notas, só `wm_read` por nome exato. O conselho antigo ("se você
+        # lembrar do nome") mandava o modelo lembrar de um nome que ele nunca
+        # viu. O que ele PODE fazer é perguntar — e é isso que a linha diz.
         lines.append(
-            "- (notas mais antigas ficaram de fora por espaço — elas continuam "
-            "acessíveis por `wm_read` se você lembrar do nome)"
+            "- (há mais notas ativas que não couberam aqui. Só dá para abrir uma "
+            "nota pelo nome exato, então, se o assunto do pedido parecer trabalho "
+            "que você já fez e não estiver na lista acima, pergunte ao usuário em "
+            "vez de refazer tudo do zero)"
         )
     lines.append(_INDEX_FOOTER)
     return "\n".join(lines)

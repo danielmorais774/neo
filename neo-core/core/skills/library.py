@@ -48,7 +48,13 @@ _MAX_FILE_BYTES = 256 * 1024
 _EDITABLE_DIRS = ("references", "scripts")
 _EDITABLE_SUFFIXES = frozenset({".md", ".txt", ".py", ".sh", ".json", ".yaml", ".yml", ".csv", ".sql"})
 # Ordem estável do frontmatter gerado (o resto do YAML original é preservado).
-_FRONTMATTER_KEYS = ("name", "description", "keywords", "kind", "register", "tools", "env", "requires", "enabled", "version")
+_FRONTMATTER_KEYS = (
+    "name", "description", "keywords", "kind", "register", "group", "discovery",
+    "tools", "datasets", "screens", "env", "requires", "enabled", "version",
+)
+# Modos de descoberta (docs/datasets-crud-plan.md §8.2): quanto do catálogo
+# esta skill paga em TODA mensagem.
+_DISCOVERY_MODES = ("always", "keyword", "oculta")
 _WRITABLE_KINDS = ("instructional", "scripted", "tool_backed")
 
 # Kinds das skills declarativas; "pipeline" é reservado ao merge com os
@@ -89,6 +95,22 @@ class SkillEntry(BaseModel):
     # sombrear ``BaseModel.register``. Ver docs/context-register-plan.md.
     tone_register: str | None = None
 
+    # --- Cadastros generativos (docs/datasets-crud-plan.md §7.1) -------------
+    # Aceita três formas: o slug puro ("produtos" — referência a um cadastro que
+    # já existe), o objeto inline com `campos:`, e o slug + `datasets/<slug>.yaml`
+    # na pasta da skill. Quem normaliza é o SkillInstaller._dataset_specs.
+    datasets: list[Any] = []
+    # Telas publicadas no neo-panel. Vazio + datasets → o instalador publica a
+    # tela padrão de cada cadastro ("prepara a tela CRUD se necessário").
+    screens: list[Any] = []
+    # Orçamento de tokens (§8): como esta skill aparece no catálogo do prompt.
+    #   keyword — só quando a mensagem casa (PADRÃO das skills novas)
+    #   always  — 1 linha em toda mensagem (o comportamento antigo de todas)
+    #   oculta  — nunca; só por nome exato ou tool_find
+    discovery: str = "always"
+    # Skills do mesmo grupo colapsam numa ÚNICA linha de catálogo.
+    group: str = ""
+
     # pipeline-only (nível 4) — preenchidos no merge com SkillManifest (F4).
     intent_type: Any | None = None
     handoff: bool = False
@@ -112,6 +134,11 @@ class SkillLibrary:
         # Skills puladas no load (pasta → motivo). Só existiam no log; o painel
         # precisa delas para mostrar "1 skill inválida" e deixar corrigir.
         self._errors: list[dict[str, str]] = []
+        # Slugs de cadastro que EXISTEM no banco. `None` = ainda não sabemos
+        # (boot antes do registry carregar) e aí o gate de `datasets:` fica
+        # aberto — fail-open: melhor uma skill a mais no catálogo do que o
+        # catálogo inteiro sumindo porque o Postgres demorou a responder.
+        self._known_datasets: set[str] | None = None
 
     # ------------------------------------------------------------------
     # Load / reload
@@ -228,6 +255,35 @@ class SkillLibrary:
                 )
                 register = None
 
+        datasets = meta.get("datasets") or []
+        if not isinstance(datasets, list):
+            raise ValueError("'datasets' precisa ser uma lista")
+        screens = meta.get("screens") or []
+        if not isinstance(screens, list):
+            raise ValueError("'screens' precisa ser uma lista")
+
+        # discovery inválido não derruba a skill — cai no padrão e avisa.
+        discovery = str(meta.get("discovery") or "").strip().lower()
+        if discovery not in _DISCOVERY_MODES:
+            if discovery:
+                logger.warning(
+                    "[SkillLibrary] '%s': discovery inválido %r — usando 'always' "
+                    "(use um de: %s)",
+                    name, discovery, ", ".join(_DISCOVERY_MODES),
+                )
+            # Sem declaração explícita vale o DEFAULT DA INSTÂNCIA, que nasce
+            # "always" — exatamente o comportamento de antes deste plano. Trocar
+            # o default para "keyword" (economia da §8) é decisão de operação, e
+            # não pode acontecer como efeito colateral de um deploy: uma skill
+            # que some do catálogo é uma skill que o cérebro não descobre mais.
+            # As skills geradas pelo instalador declaram `discovery: keyword`
+            # explicitamente, então já nascem baratas.
+            discovery = str(
+                getattr(self.settings, "skills_discovery_default", "always") or "always"
+            ).strip().lower()
+            if discovery not in _DISCOVERY_MODES:
+                discovery = "always"
+
         entry = SkillEntry(
             name=name,
             description=description,
@@ -240,6 +296,10 @@ class SkillLibrary:
             enabled=bool(meta.get("enabled", True)),
             version=int(meta.get("version", 1)),
             tone_register=register,
+            datasets=datasets,
+            screens=screens,
+            discovery=discovery,
+            group=str(meta.get("group") or "").strip().lower(),
         )
 
         # tool_backed com tool não registrada: entra no catálogo, mas avisa — a
@@ -279,8 +339,34 @@ class SkillLibrary:
         """Existe pasta com SKILL.md para ``name`` — inclusive se ela não carregou."""
         return (self._skill_dir(name) / "SKILL.md").is_file()
 
+    def set_known_datasets(self, slugs: Any) -> None:
+        """Informa quais cadastros existem (chamado no boot e após instalar).
+
+        Sem isso o cérebro leria uma skill que aponta para tabela que não existe
+        e só descobriria no erro da tool — o mesmo tipo de falha silenciosa que
+        as tools fantasma criavam.
+        """
+        self._known_datasets = {str(s).strip().lower() for s in (slugs or [])}
+
+    def _dataset_slugs(self, entry: SkillEntry) -> list[str]:
+        out = []
+        for raw in entry.datasets or []:
+            slug = raw if isinstance(raw, str) else (raw or {}).get("slug") or (raw or {}).get("nome")
+            if slug:
+                out.append(str(slug).strip().lower())
+        return out
+
     def _requires_ok(self, entry: SkillEntry) -> bool:
         """Gates de runtime: um require insatisfeito tira a skill do catálogo."""
+        if entry.datasets and self._known_datasets is not None:
+            faltando = [s for s in self._dataset_slugs(entry) if s not in self._known_datasets]
+            if faltando:
+                logger.info(
+                    "[SkillLibrary] '%s' fora do catálogo: cadastro(s) ausente(s) %s "
+                    "— instale a skill pelo painel",
+                    entry.name, ", ".join(faltando),
+                )
+                return False
         for req in entry.requires:
             if req == "workbench":
                 if not getattr(self.settings, "workbench_enabled", False):
@@ -294,20 +380,57 @@ class SkillLibrary:
                 )
         return True
 
-    def tools_for(self, name: str) -> list[Any]:
-        """ToolSchemas destravadas pela leitura de uma skill tool_backed.
+    def tool_names_for(self, name: str) -> list[str]:
+        """Nomes das tools desta skill: as declaradas + as implícitas do cadastro.
 
-        Resolve os nomes no ToolRegistry global — só devolve tools realmente
-        registradas (o gating nunca oferece uma tool que não despacha).
+        Declarar ``datasets:`` é o que faz uma skill ganhar as ``data_*`` sem
+        listá-las uma a uma — e é o que permite ``write_skill`` aceitar uma skill
+        nova sem código Python novo, sem abrir a porta para tool arbitrária.
         """
         entry = self.get(name)
-        if entry is None or entry.kind != "tool_backed" or self.tool_registry is None:
+        if entry is None:
             return []
-        schemas = []
-        for tool_name in entry.tools:
-            if self.tool_registry.exists(tool_name):
-                schemas.append(self.tool_registry.get(tool_name))
-        return schemas
+        names = list(entry.tools)
+        if entry.datasets:
+            try:
+                from modules.datasets.tools import DATA_TOOLS
+
+                names += [t.name for t in DATA_TOOLS]
+            except Exception as exc:  # noqa: BLE001 — módulo ausente não derruba o gating
+                logger.warning("[SkillLibrary] data tools indisponíveis: %s", exc)
+        return list(dict.fromkeys(names))
+
+    def tools_for(self, name: str) -> list[Any]:
+        """ToolSchemas destravadas pela leitura de uma skill.
+
+        Resolve os nomes no AGREGADOR (core/tools/aggregator.py), que espelha o
+        ToolRegistry do boot e ainda conhece as tools de origem `dataset`/`skill`.
+        Nome que não resolve é PULADO: o gating nunca oferece ao modelo uma tool
+        que o executor não sabe despachar — foi assim que nasceram as client
+        tools fantasma que travavam 300s.
+        """
+        entry = self.get(name)
+        if entry is None:
+            return []
+        # `datasets:` habilita o gating mesmo numa skill instructional — o que
+        # define se há tool a destravar é o que a skill declara, não o `kind`.
+        if entry.kind != "tool_backed" and not entry.datasets:
+            return []
+        names = self.tool_names_for(name)
+        if not names:
+            return []
+        try:
+            from core.tools.aggregator import get_aggregator
+
+            schemas = get_aggregator().schemas_for(names)
+            if schemas:
+                return schemas
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SkillLibrary] agregador indisponível (%s) — caindo no registry", exc)
+        # Fallback: agregador vazio (boot antigo, teste isolado) → registry.
+        if self.tool_registry is None:
+            return []
+        return [self.tool_registry.get(n) for n in names if self.tool_registry.exists(n)]
 
     # ------------------------------------------------------------------
     # Leitura (nível 1 de disclosure — tool skill_read)
@@ -359,9 +482,18 @@ class SkillLibrary:
                 pass
         extras = self._list_extras(entry)
         result.update(extras)
-        if entry.kind == "tool_backed" and entry.tools:
+        # Cadastros declarados: quem enriquece com o schema é o executor (a
+        # consulta ao registry é async e este método é sync). Aqui só vai a
+        # lista — é ela que o executor usa para montar o bloco.
+        if entry.datasets:
+            result["datasets"] = [
+                d if isinstance(d, str) else str((d or {}).get("slug") or (d or {}).get("nome") or "")
+                for d in entry.datasets
+            ]
+        declared = self.tool_names_for(entry.name)
+        if declared:
             registered = [t.name for t in self.tools_for(entry.name)]
-            missing = [t for t in entry.tools if t not in registered]
+            missing = [t for t in declared if t not in registered]
             result["tools_unlocked"] = registered
             if missing:
                 result["tools_unavailable"] = missing
@@ -472,6 +604,10 @@ class SkillLibrary:
         enabled: bool = True,
         version: int = 1,
         register: str | None = None,
+        datasets: list[Any] | None = None,
+        screens: list[Any] | None = None,
+        discovery: str | None = None,
+        group: str | None = None,
     ) -> SkillEntry:
         """Cria/sobrescreve o SKILL.md de ``name``. Valida antes; recarrega depois.
 
@@ -499,18 +635,43 @@ class SkillLibrary:
             raise ValueError(f"Corpo acima de {_MAX_BODY_BYTES // 1024} KB — mova detalhe para references/.")
 
         tools = [t.strip() for t in (tools or []) if t and t.strip()]
+        datasets = list(datasets or [])
+        screens = list(screens or [])
+
+        # Declarar `datasets:` JÁ é declarar tools: o gating soma as data_* em
+        # tool_names_for. É isto que faz uma skill nova ganhar capacidade sem
+        # código Python novo — sem afrouxar o resto: `tools:` continua tendo de
+        # existir no registry/agregador.
         if kind == "tool_backed":
-            if not tools:
-                raise ValueError("Uma skill tool_backed precisa declarar ao menos uma tool.")
-            if self.tool_registry is not None:
-                missing = [t for t in tools if not self.tool_registry.exists(t)]
-                if missing:
-                    raise ValueError(
-                        f"Tools não registradas no neo-core: {', '.join(missing)}. "
-                        "Uma tool nova exige código (modules/<x>/ + api/main.py)."
-                    )
+            if not tools and not datasets:
+                raise ValueError(
+                    "Uma skill tool_backed precisa declarar ao menos uma tool "
+                    "(ou um cadastro em 'datasets', que traz as tools data_*)."
+                )
+            missing = [t for t in tools if not self._tool_exists(t)]
+            if missing:
+                raise ValueError(
+                    f"Tools não registradas no neo-core: {', '.join(missing)}. "
+                    "Uma tool nova exige código (modules/<x>/ + api/main.py) — ou "
+                    "declare 'datasets' para ganhar as tools de cadastro."
+                )
         elif tools:
             raise ValueError(f"'tools' só vale para kind=tool_backed (esta é {kind}).")
+
+        for raw in datasets:
+            slug = raw if isinstance(raw, str) else (raw or {}).get("slug") or (raw or {}).get("nome")
+            if not slug:
+                raise ValueError(f"entrada inválida em 'datasets': {raw!r} (falta o slug).")
+            from core.datasets.schema import validate_identifier
+
+            validate_identifier(str(slug), what="slug do cadastro")
+
+        discovery = (discovery or "").strip().lower() or None
+        if discovery is not None and discovery not in _DISCOVERY_MODES:
+            raise ValueError(
+                f"discovery inválido: {discovery!r}. Use um de: {', '.join(_DISCOVERY_MODES)}."
+            )
+        group = (group or "").strip().lower() or None
 
         register = (register or "").strip().lower() or None
         if register is not None:
@@ -545,6 +706,14 @@ class SkillLibrary:
             meta["register"] = register
         if tools:
             meta["tools"] = tools
+        if datasets:
+            meta["datasets"] = datasets
+        if screens:
+            meta["screens"] = screens
+        if discovery:
+            meta["discovery"] = discovery
+        if group:
+            meta["group"] = group
         if env:
             meta["env"] = [e.strip() for e in env if e and e.strip()]
         if requires:
@@ -561,6 +730,17 @@ class SkillLibrary:
             raise ValueError(f"Skill gravada mas recusada pelo loader: {reason}")
         logger.info("[SkillLibrary] write_skill name=%s kind=%s enabled=%s", name, kind, enabled)
         return entry
+
+    def _tool_exists(self, tool_name: str) -> bool:
+        """A tool existe em ALGUMA origem? (agregador primeiro, registry depois)"""
+        try:
+            from core.tools.aggregator import get_aggregator
+
+            if get_aggregator().exists(tool_name):
+                return True
+        except Exception:  # noqa: BLE001 — agregador é opcional
+            pass
+        return self.tool_registry is not None and self.tool_registry.exists(tool_name)
 
     def set_enabled(self, name: str, enabled: bool) -> SkillEntry:
         """Liga/desliga a skill reescrevendo só o ``enabled:`` do frontmatter."""
@@ -686,13 +866,21 @@ class SkillLibrary:
         if not entries:
             return None
 
+        # Orçamento (docs/datasets-crud-plan.md §8): antes de qualquer teto, tira
+        # do catálogo quem não precisa estar nele NESTA mensagem. Skill `always`
+        # (o padrão histórico) continua sempre; `keyword` só entra quando a
+        # mensagem casa; `oculta` nunca — só por nome exato ou tool_find.
+        entries = self._discovery_filter(entries, user_message or "")
+        if not entries:
+            return None
+
         max_entries = int(getattr(self.settings, "skills_catalog_max_entries", 30))
         truncated = False
         if len(entries) > max_entries:
             entries = self._prefilter(entries, user_message or "", max_entries)
             truncated = True
 
-        lines = [f"- {e.name} — {e.description}" for e in entries]
+        lines = self._catalog_lines(entries)
         note = (
             "## Suas skills (procedimentos prontos)\n"
             "Você tem uma biblioteca de skills — instruções e ferramentas prontas "
@@ -844,6 +1032,58 @@ class SkillLibrary:
 
     _MATCH_NOTE_MAX_SKILLS = 2
 
+    def _discovery_filter(
+        self, entries: list[SkillEntry], user_message: str
+    ) -> list[SkillEntry]:
+        """Aplica o modo de descoberta de cada skill (§8.2 do plano).
+
+        É aqui que 20 cadastros instalados deixam de custar ~400 tokens em toda
+        mensagem: eles nascem `discovery: keyword` e só aparecem quando o assunto
+        aparece. Skill sem `keywords` declarada em modo `keyword` seria
+        indescobrível — essa cai para `always`, que é o comportamento seguro.
+        """
+        msg = _norm(user_message)
+        out: list[SkillEntry] = []
+        for entry in entries:
+            mode = (entry.discovery or "always").lower()
+            if mode == "oculta":
+                continue
+            if mode == "keyword" and entry.keywords:
+                name_token = _norm(entry.name.replace("-", " "))
+                hit = bool(msg) and (
+                    name_token in msg
+                    or any(_keyword_hit(_norm(k), msg) for k in entry.keywords if k)
+                )
+                if not hit:
+                    continue
+            out.append(entry)
+        return out
+
+    def _catalog_lines(self, entries: list[SkillEntry]) -> list[str]:
+        """Uma linha por skill — MENOS as agrupadas, que viram uma linha só.
+
+        `group: cadastros` com 20 skills passa de ~400 tokens para ~25. O modelo
+        continua sabendo que elas existem e como abrir cada uma (`skill_read`).
+        """
+        lines: list[str] = []
+        groups: dict[str, list[SkillEntry]] = {}
+        for entry in entries:
+            if entry.group:
+                groups.setdefault(entry.group, []).append(entry)
+            else:
+                lines.append(f"- {entry.name} — {entry.description}")
+        for group, members in sorted(groups.items()):
+            if len(members) == 1:
+                only = members[0]
+                lines.append(f"- {only.name} — {only.description}")
+                continue
+            names = ", ".join(sorted(m.name for m in members))
+            lines.append(
+                f"- {group} ({len(members)}) — {names}. "
+                f'Chame skill_read("<nome>") no que casar com o pedido.'
+            )
+        return lines
+
     def _prefilter(
         self, entries: list[SkillEntry], user_message: str, max_entries: int
     ) -> list[SkillEntry]:
@@ -882,11 +1122,26 @@ class SkillLibrary:
         run_command/CLIENT_TOOL. Só nomes+keywords (barato); nunca o corpo.
         """
         self.maybe_reload()
-        entries = self.all()
+        # O SEGUNDO vazamento de tokens (§8.1): esta nota é paga em TODA mensagem
+        # do classificador, não só nas do cognitivo. Skill `oculta` não entra, e
+        # cada grupo entra uma vez só — o router não precisa saber que existem 20
+        # cadastros, só que o assunto é do cérebro.
+        entries = [e for e in self.all() if (e.discovery or "always") != "oculta"]
         if not entries:
             return None
-        parts = []
+        parts, seen_groups = [], set()
         for e in entries[: self._ROUTER_NOTE_MAX_SKILLS]:
+            if e.group:
+                if e.group in seen_groups:
+                    continue
+                seen_groups.add(e.group)
+                group_keywords = sorted(
+                    {k for m in entries if m.group == e.group for k in m.keywords}
+                )[: self._ROUTER_NOTE_MAX_KEYWORDS]
+                parts.append(
+                    f"{e.group} ({', '.join(group_keywords)})" if group_keywords else e.group
+                )
+                continue
             kws = ", ".join(e.keywords[: self._ROUTER_NOTE_MAX_KEYWORDS])
             parts.append(f"{e.name} ({kws})" if kws else e.name)
         return (

@@ -67,7 +67,11 @@ def test_render_index_vazio_quando_nao_ha_nota():
 
 def test_render_index_avisa_quando_podou():
     text = render_index([_note("n", "s", datetime(2026, 7, 31, 12, 0))], truncated=True)
-    assert "ficaram de fora por espaço" in text
+    assert "não couberam aqui" in text
+    # E manda perguntar em vez de "lembrar do nome": não existe tool de listar
+    # notas, então lembrar de um nome nunca visto não era conselho, era ruído.
+    assert "pergunte ao usuário" in text
+    assert "lembrar do nome" not in text
 
 
 # ── corpo ───────────────────────────────────────────────────────────────────

@@ -29,6 +29,11 @@ from modules.pks_search.tools import PKS_SEARCH_TOOLS
 from modules.pks_write import PKS_WRITE_TOOL_NAMES, PKS_WRITE_TOOLS
 from modules.services.tools import SERVICE_TOOLS
 from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
+from modules.datasets.tools import DATA_DEFINE_TOOL_NAMES, DATA_TOOL_NAMES
+from modules.tool_index.tools import TOOL_INDEX_TOOL_NAMES
+
+#: data_* + data_define — todas user-scoped (os cadastros são de um dono).
+DATASET_TOOL_NAMES = DATA_TOOL_NAMES | DATA_DEFINE_TOOL_NAMES
 from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
 from modules.web_search.tools import WEB_SEARCH_TOOLS
@@ -120,6 +125,7 @@ _USER_SCOPED = frozenset(
     | FINANCE_TOOL_NAMES
     | PKS_WRITE_TOOL_NAMES
     | WORKING_MEMORY_TOOL_NAMES
+    | DATASET_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -208,6 +214,15 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
             for t in DESKTOP_TOOLS
             if t.name in SHELL_ACTUATION_TOOL_NAMES and t.name not in have
         ]
+    # Agregador de tools (docs/datasets-crud-plan.md §2.3): o dispatcher genérico
+    # é FALLBACK — só entra no prompt quando ligado explicitamente, porque custa
+    # ~150 tokens por turno e o caminho preferido continua sendo o schema tipado
+    # destravado pelo skill_read.
+    if getattr(settings, "neo_tool_index_enabled", False):
+        from modules.tool_index.tools import TOOL_INDEX_TOOLS
+
+        have = {t.name for t in tools}
+        tools += [t for t in TOOL_INDEX_TOOLS if t.name not in have]
     if user_id is None:
         tools = [t for t in tools if t.name not in _USER_SCOPED]
     return tools
@@ -230,6 +245,7 @@ class CognitiveReadExecutor:
         session_id: UUID | None = None,
         embeddings: Any = None,
         current_device_id: str | None = None,
+        dataset_registry: Any = None,
     ) -> None:
         self._global = global_executor
         self._user_id = user_id
@@ -238,6 +254,8 @@ class CognitiveReadExecutor:
         self._pks_search: Any = None
         self._location: Any = None
         self._finance: Any = None
+        self._datasets: Any = None
+        self._tool_index: Any = None
         self._pks_write: Any = None
         self._recall: Any = None
         self._working_memory: Any = None
@@ -279,6 +297,19 @@ class CognitiveReadExecutor:
             # user-scoped por request, como devices (o global fica sem usuário).
             self._finance = FinanceExecutor(db=db)
             self._finance.set_context(user_id)
+            # Cadastros (data_*, gated pela skill que declara `datasets:`) —
+            # executor fresco e user-scoped, como devices/finance. O registry é
+            # o singleton do app: o cache das definições é compartilhado, o
+            # CONTEXTO (quem é o dono das linhas) é por request.
+            try:
+                from core.datasets import DatasetRegistry
+                from modules.datasets import DatasetsExecutor
+
+                registry = dataset_registry or DatasetRegistry(db=db)
+                self._datasets = DatasetsExecutor(db=db, registry=registry)
+                self._datasets.set_context(user_id)
+            except Exception as exc:  # noqa: BLE001 — feature off/ausente não derruba o turno
+                logger.debug("[cognitive] datasets indisponíveis: %s", exc)
             if pks_service is not None:
                 self._pks_search = PKSSearchExecutor(pks_service=pks_service)
                 self._pks_search.set_context(user_id)
@@ -292,6 +323,16 @@ class CognitiveReadExecutor:
 
                 self._pks_write = PKSWriteExecutor(pks_service=pks_service)
                 self._pks_write.set_context(user_id)
+
+    def _tool_index_executor(self) -> Any:
+        """tool_run despachando por ESTE executor — é o que faz o dispatcher
+        genérico alcançar as tools user-scoped (fin_*, data_*). Mandá-lo para o
+        executor global traria resultado vazio: lá não há usuário."""
+        if self._tool_index is None:
+            from modules.tool_index import ToolIndexExecutor
+
+            self._tool_index = ToolIndexExecutor(dispatcher=self.execute_tool_call)
+        return self._tool_index
 
     async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         start = asyncio.get_event_loop().time()
@@ -316,6 +357,10 @@ class CognitiveReadExecutor:
                 result = await self._config.execute(name, tool_call.arguments)
             elif name in FINANCE_TOOL_NAMES and self._finance is not None:
                 result = await self._finance.execute(name, tool_call.arguments)
+            elif name in DATASET_TOOL_NAMES and self._datasets is not None:
+                result = await self._datasets.execute(name, tool_call.arguments)
+            elif name in TOOL_INDEX_TOOL_NAMES:
+                result = await self._tool_index_executor().execute(name, tool_call.arguments)
             elif name in PKS_WRITE_TOOL_NAMES and self._pks_write is not None:
                 result = await self._pks_write.execute(name, tool_call.arguments)
             elif name in WORKING_MEMORY_TOOL_NAMES and self._working_memory is not None:

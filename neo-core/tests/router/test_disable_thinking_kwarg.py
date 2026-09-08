@@ -39,6 +39,14 @@ def _client_that_captures():
     class _Client:
         chat = _Chat()
 
+        def with_options(self, **_kwargs):
+            """O ``complete()`` pede o client sem o retry interno do SDK.
+
+            O dublê tem que oferecer a mesma interface do ``AsyncOpenAI``; como
+            ele não repete nada sozinho, devolver a si mesmo já é ``max_retries=0``.
+            """
+            return self
+
     return _Client()
 
 

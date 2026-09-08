@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from core.agent.token_counter import TokenCounter
     from core.pks.service import PKSService
     from core.session.preference_extractor import PreferenceExtractor
-    from core.working_memory.store import WorkingMemoryStore
+    from core.working_memory.store import IndexPage, WorkingMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class PromptContextSelector:
         (
             (neo_core_text, prefs_text, pks_result, pks_context),
             affect_state,
-            working_notes,
+            working_page,
         ) = await asyncio.gather(
             self._fetch_parallel(
                 user_message=user_message,
@@ -225,12 +225,15 @@ class PromptContextSelector:
         # e a decisão que ele muda ("já apurei isso, não vou reler o arquivo")
         # precisa ser tomada antes de qualquer coisa. Só o índice — o corpo sai
         # por wm_read. Scored (não pinned) para respeitar o budget da camada.
+        working_notes = working_page.notes
         if working_notes:
             # O índice é UM bloco: se ele passasse do budget, _select_candidates
             # descartaria o caderno inteiro por "budget" e o modelo perderia até
             # a existência das notas. Então a poda é por NOTA, aqui, sacrificando
             # as de menor prioridade (o sort do store já deixou as certas no fim).
-            index_text, kept = self._fit_working_index(working_notes)
+            index_text, kept = self._fit_working_index(
+                working_notes, truncated=working_page.truncated
+            )
             if index_text:
                 working_notes = kept
                 # Nota tocada nesta sessão = tarefa em andamento, relevância
@@ -408,18 +411,26 @@ class PromptContextSelector:
             logger.warning("[ContextSelector] affect fetch failed: %s", e)
             return None
 
-    def _fit_working_index(self, notes: list[Any]) -> tuple[str, list[Any]]:
+    def _fit_working_index(
+        self, notes: list[Any], *, truncated: bool = False
+    ) -> tuple[str, list[Any]]:
         """Renderiza o índice cabendo no budget da camada, podando as últimas notas.
 
         Devolve (texto, notas_mantidas). Texto vazio quando nem uma nota cabe —
         aí o caderno simplesmente não entra neste turno.
+
+        ``truncated`` chega de fora porque a omissão começa ANTES daqui: o store
+        já cortou pelo teto do índice e pela quota. Comparar a lista com ela
+        mesma (o que se fazia aqui) só enxergava a poda por budget, então uma
+        nota deixada de fora lá em cima sumia sem aviso e o modelo lia um índice
+        que parecia completo.
         """
         from core.working_memory.render import render_index
 
         budget = getattr(self._settings, "context_budget_working_mem", 700)
         kept = list(notes)
         while kept:
-            text = render_index(kept, truncated=len(kept) < len(notes))
+            text = render_index(kept, truncated=truncated or len(kept) < len(notes))
             if self._tc.count(text) <= budget:
                 return text, kept
             kept.pop()
@@ -427,22 +438,24 @@ class PromptContextSelector:
 
     async def _fetch_working_notes(
         self, *, user_id: UUID | None, session_id: UUID | None
-    ) -> list[Any]:
-        """Notas ativas do caderno para o índice. Lista vazia quando desligado.
+    ) -> "IndexPage":
+        """Notas ativas do caderno para o índice. Página vazia quando desligado.
 
         Uma query indexada por ``(user_id, status, updated_at)``; roda junto com
         PKS/prefs no mesmo gather, então não acrescenta latência ao turno. Nunca
         levanta — caderno indisponível é caderno vazio, não turno quebrado.
         """
+        from core.working_memory.store import IndexPage
+
         if getattr(self._settings, "working_memory_enabled", False) is not True:
-            return []
+            return IndexPage()
         if self._wm is None or user_id is None:
-            return []
+            return IndexPage()
         try:
             return await self._wm.index(user_id=user_id, session_id=session_id)
         except Exception as e:  # pragma: no cover - caderno nunca derruba o prompt
             logger.warning("[ContextSelector] leitura do caderno falhou: %s", e)
-            return []
+            return IndexPage()
 
     async def _safe_retrieve_system_context(
         self, user_message: str, register: "Register | None" = None

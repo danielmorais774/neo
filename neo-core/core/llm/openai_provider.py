@@ -20,6 +20,51 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_BACKOFF = (2.0, 5.0, 10.0)
 
+#: Modelos que já recusaram ``tool_choice`` forçado, por (modelo, pin de provedor).
+#:
+#: O 404 do OpenRouter com pin (ver ``_rejects_forced_tool_choice``) é um fato de
+#: INFRA, não um erro transitório: o endpoint do Baidu serve tools mas não aceita
+#: ``required``, e vai recusar de novo no próximo turno. Sem esta memória, todo
+#: turno com tool forçada (``force_tool_first``, skill autocarregada) paga uma
+#: ida e volta de ~2s só para ouvir o mesmo não — medido na session-d94dc42f.
+#:
+#: Vive pelo processo. É a granularidade certa: a capacidade só muda quando o
+#: gateway muda o roteamento do endpoint, e o neo-core reinicia a cada `--reload`,
+#: o que já dá a re-sondagem de graça.
+_FORCED_TOOL_CHOICE_UNSUPPORTED: set[tuple[str, str]] = set()
+
+
+def _pinned_provider(params: dict[str, Any]) -> str:
+    """Slug do provedor de infra fixado nesta chamada (ou "" quando livre).
+
+    O pin mora em ``extra_body["provider"]["order"]`` — escrito pelo
+    ``OpenRouterProvider`` a partir do sufixo ``@slug``. Entra na chave do cache
+    acima porque a recusa é do ENDPOINT, não do modelo: o mesmo
+    ``deepseek/deepseek-v4-flash`` aceita ``required`` quando o gateway pode
+    escolher outro endpoint.
+    """
+    pin = (params.get("extra_body") or {}).get("provider") or {}
+    if not isinstance(pin, dict):
+        return ""
+    order = pin.get("order") or []
+    return str(order[0]) if order else ""
+
+
+def _is_transient(error: Exception) -> bool:
+    """Falha de transporte/servidor que vale repetir (5xx, timeout, conexão caída).
+
+    Existe porque o ``complete()`` desliga o retry do SDK (ver lá) para ser o
+    DONO ÚNICO da política. Só desligar deixaria o turno mais frágil do que era:
+    o SDK também repetia 5xx e queda de conexão, não só 429. Isto recompõe essa
+    metade dentro da mesma escada de backoff.
+    """
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    if isinstance(status, int) and status >= 500:
+        return True
+    return isinstance(error, (httpx.TimeoutException, httpx.TransportError)) or type(
+        error
+    ).__name__ in ("APIConnectionError", "APITimeoutError", "InternalServerError")
+
 
 def _content_for(message: Message) -> Any:
     """Corpo da mensagem no formato da API — texto puro ou partes multimodais.
@@ -130,6 +175,27 @@ class OpenAIProvider(LLMProvider):
             ),
         )
 
+    @property
+    def _client_no_sdk_retry(self) -> AsyncOpenAI:
+        """O mesmo client, com a escada de retry INTERNA do SDK desligada.
+
+        Só para o ``complete()``, que tem escada própria — ver o comentário lá.
+        ``with_options`` reaproveita o ``httpx.AsyncClient`` (e portanto o pool de
+        conexões keep-alive), então isto não abre conexão nova; o cache é só para
+        não reconstruir o wrapper a cada chamada.
+
+        A memoização é contra o ``self.client`` ATUAL de propósito: as subclasses
+        (OpenRouter, DeepSeek) trocam ``self.client`` depois de ``__init__`` para
+        apontar para outra base_url. Guardar o derivado em ``__init__`` deixaria
+        um client apontando para ``api.openai.com`` dentro do provider errado —
+        falha caríssima de achar, porque a chave até existe.
+        """
+        cached = getattr(self, "_no_sdk_retry_cache", None)
+        if cached is None or cached[0] is not self.client:
+            cached = (self.client, self.client.with_options(max_retries=0))
+            self._no_sdk_retry_cache = cached
+        return cached[1]
+
     async def complete(
         self,
         messages: list[Message],
@@ -147,6 +213,13 @@ class OpenAIProvider(LLMProvider):
             # DeepSeekProvider); para os demais é ruído e precisa sumir — indo
             # junto no corpo, a API responde 400 e derruba o turno.
             kwargs.pop("disable_thinking", None)
+
+            # Idem: intenção do chamador, não parâmetro da API. `True` = "não gaste
+            # a escada de backoff com 429, levanta na primeira e me deixa consertar
+            # a ROTA". Quem usa é o OpenRouterProvider quando há um pin de provedor
+            # trancado: dormir 17s esperando um pool lotado esvaziar é pior que
+            # soltar o pin na hora e deixar o gateway achar um endpoint livre.
+            bail_on_rate_limit = bool(kwargs.pop("bail_on_rate_limit", False))
 
             # Converte mensagens para formato OpenAI
             openai_messages = [
@@ -171,16 +244,39 @@ class OpenAIProvider(LLMProvider):
             else:
                 params.pop("tool_choice", None)
 
+            # Já sabemos que este endpoint recusa tool forçada? Então não gaste a
+            # ida e volta para descobrir de novo — desce direto para "auto", que é
+            # onde o retry abaixo terminaria de qualquer jeito.
+            unsupported_key = (str(params["model"]), _pinned_provider(params))
+            if (
+                forces_tool_call(params.get("tool_choice"))
+                and unsupported_key in _FORCED_TOOL_CHOICE_UNSUPPORTED
+            ):
+                logger.debug(
+                    "[OpenAI] %r no provedor %r já recusou tool forçada antes — "
+                    "indo direto de 'auto' (a obrigação fica no texto da mensagem)",
+                    unsupported_key[0], unsupported_key[1] or "livre",
+                )
+                params["tool_choice"] = "auto"
+
             # Rate limit (429) é transitório: o TPM da org se renova em segundos. Sem
             # retry, o turno morria virando "Erro ao processar: 429" — que ainda por
             # cima entra no histórico e envenena os turnos seguintes.
+            #
+            # `max_retries=0` desliga a escada INTERNA do SDK só nesta chamada: com
+            # as duas ligadas cada tentativa daqui virava 3 requests (o SDK repete
+            # 2x por conta própria), 12 requests por round — que além de somarem
+            # ~5s de sono invisível ainda alimentavam o rate limiter do qual
+            # estávamos tentando escapar. O `stream_complete` continua com o padrão
+            # do SDK: lá não existe escada nossa para assumir o lugar.
+            client = self._client_no_sdk_retry
             last_error: Exception | None = None
             downgraded_tool_choice = False
             for attempt in range(_RATE_LIMIT_RETRIES + 1):
                 try:
-                    response = await self.client.chat.completions.create(**params)
+                    response = await client.chat.completions.create(**params)
                     return OpenAICompletionResponse(response)
-                except Exception as e:  # noqa: BLE001 — só 429/tool_choice são retentáveis
+                except Exception as e:  # noqa: BLE001 — só 429/5xx/tool_choice são retentáveis
                     last_error = e
                     # Modelo que não aceita tool forçada: refaz com "auto" em vez
                     # de derrubar o turno. Uma vez só — se falhar de novo, o erro
@@ -191,18 +287,31 @@ class OpenAIProvider(LLMProvider):
                         and _rejects_forced_tool_choice(e)
                     ):
                         downgraded_tool_choice = True
+                        _FORCED_TOOL_CHOICE_UNSUPPORTED.add(unsupported_key)
                         logger.warning(
-                            "[OpenAI] modelo %r recusou tool_choice=%r — refazendo com "
-                            "'auto' (a obrigação da tool fica só no texto da mensagem)",
-                            params.get("model"), params.get("tool_choice"),
+                            "[OpenAI] modelo %r no provedor %r recusou tool_choice=%r — "
+                            "refazendo com 'auto' (a obrigação da tool fica só no texto "
+                            "da mensagem) e memorizando para os próximos turnos",
+                            unsupported_key[0], unsupported_key[1] or "livre",
+                            params.get("tool_choice"),
                         )
                         params["tool_choice"] = "auto"
                         continue
-                    if not _is_rate_limit(e) or attempt == _RATE_LIMIT_RETRIES:
+                    # Pin trancado + 429: o chamador consegue consertar a ROTA, e
+                    # isso vale mais que qualquer espera. Sai já, sem dormir.
+                    if bail_on_rate_limit and _is_rate_limit(e):
+                        logger.info(
+                            "[OpenAI] 429 com rota fixada — devolvendo na hora para o "
+                            "chamador liberar o fallback (sem gastar o backoff)"
+                        )
+                        raise
+                    retryable = _is_rate_limit(e) or _is_transient(e)
+                    if not retryable or attempt == _RATE_LIMIT_RETRIES:
                         raise
                     delay = _RATE_LIMIT_BACKOFF[attempt]
                     logger.warning(
-                        "[OpenAI] rate limit (429) — retry %d/%d em %.1fs",
+                        "[OpenAI] %s — retry %d/%d em %.1fs",
+                        "rate limit (429)" if _is_rate_limit(e) else f"falha transitória ({type(e).__name__})",
                         attempt + 1, _RATE_LIMIT_RETRIES, delay,
                     )
                     await asyncio.sleep(delay)

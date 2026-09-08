@@ -88,6 +88,13 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     # pin, o gateway escolheria outro a cada chamada, com outro preço e outro teto.
     # É texto puro (não lê imagem), então fica fora de _VISION_MODELS de propósito.
     "deepseek/deepseek-v4-flash@baidu": "openrouter",
+    # O MESMO modelo sem pin. Precisa estar aqui explicitamente, e não só como
+    # opção do seletor: sem esta linha `get_provider_for_model` não acha o ID,
+    # cai no provider default e o turno vai parar em `api.deepseek.com` — que é
+    # outra carteira, hoje com saldo zero (402 "Insufficient Balance"). O ID com
+    # barra é do GATEWAY; o sem barra (`deepseek-v4-flash`, linha 40) é que é a
+    # API direta da DeepSeek. Eles não são intercambiáveis.
+    "deepseek/deepseek-v4-flash": "openrouter",
 }
 
 

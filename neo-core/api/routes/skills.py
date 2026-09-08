@@ -58,6 +58,14 @@ class SkillWrite(BaseModel):
     kind: str = Field("instructional", description="instructional | scripted | tool_backed")
     keywords: list[str] = []
     tools: list[str] = Field([], description="Só kind=tool_backed; tools já registradas.")
+    # Cadastros generativos (docs/datasets-crud-plan.md §7.1): slug puro, objeto
+    # com `campos`, ou slug + datasets/<slug>.yaml na pasta da skill.
+    datasets: list = []
+    screens: list = []
+    discovery: str | None = Field(
+        None, description="always | keyword | oculta — quanto de catálogo esta skill paga."
+    )
+    group: str | None = Field(None, description="Colapsa skills do mesmo grupo numa linha.")
     env: list[str] = []
     enabled: bool = True
     version: int = 1
@@ -87,7 +95,14 @@ def _entry_payload(lib: SkillLibrary, entry: SkillEntry) -> dict:
     if not entry.enabled:
         reason = "desligada"
     elif not available:
-        reason = f"requisito não satisfeito: {', '.join(entry.requires)}"
+        faltando = [
+            slug for slug in lib._dataset_slugs(entry)
+            if lib._known_datasets is not None and slug not in lib._known_datasets
+        ]
+        if faltando:
+            reason = f"cadastro não instalado: {', '.join(faltando)}"
+        else:
+            reason = f"requisito não satisfeito: {', '.join(entry.requires)}"
     return {
         "name": entry.name,
         "description": entry.description,
@@ -95,6 +110,10 @@ def _entry_payload(lib: SkillLibrary, entry: SkillEntry) -> dict:
         "kind": entry.kind,
         "register": entry.tone_register,
         "tools": entry.tools,
+        "datasets": entry.datasets,
+        "screens": entry.screens,
+        "discovery": entry.discovery,
+        "group": entry.group,
         "env": entry.env,
         "requires": entry.requires,
         "enabled": entry.enabled,
@@ -146,7 +165,18 @@ async def list_tools():
     _lib()
     if _tool_registry is None:
         return {"tools": []}
-    return {"tools": sorted(_tool_registry.list_names())}
+    # Índice do agregador (docs/datasets-crud-plan.md §2): além dos nomes, de
+    # ONDE cada tool veio. É o que deixa a aba Skills mostrar "esta tool é do
+    # cadastro", "esta veio de modules/finance" — sem isso o dropdown é uma
+    # lista chapada de 80 nomes sem procedência.
+    catalogo = []
+    try:
+        from core.tools.aggregator import get_aggregator
+
+        catalogo = [b.to_dict() | {"assinatura": b.signature()} for b in get_aggregator().all()]
+    except Exception as exc:  # noqa: BLE001 — agregador é opcional
+        logger.warning("[skills] agregador indisponível: %s", exc)
+    return {"tools": sorted(_tool_registry.list_names()), "catalogo": catalogo}
 
 
 @router.get("/catalog")
@@ -228,6 +258,10 @@ def _write(lib: SkillLibrary, name: str, payload: SkillWrite) -> dict:
             enabled=payload.enabled,
             version=payload.version,
             register=payload.tone_register,
+            datasets=payload.datasets,
+            screens=payload.screens,
+            discovery=payload.discovery,
+            group=payload.group,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

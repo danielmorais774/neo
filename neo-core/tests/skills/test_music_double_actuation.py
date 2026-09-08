@@ -178,6 +178,26 @@ def test_controle_manda_o_tabid_da_aba_escolhida():
     assert res.extra["actuation"]["args"]["tabId"] == 1976597174
 
 
+def _abas_mudo(page_muted):
+    aba = {"site": "youtube", "tabId": 1, "kind": "watch", "hasMedia": True,
+           "url": "https://www.youtube.com/watch?v=x"}
+    if page_muted is not None:
+        aba["pageMuted"] = page_muted
+    return {"browser_tabs": [aba]}
+
+
+def test_mudo_diz_o_que_vai_acontecer_de_verdade():
+    """A extensão ALTERNA o mudo: "Mutei" numa aba já muda seria mentira.
+
+    O roteador manda `desmuta`/`tira o mudo` para a MESMA ação `mute` (é o mesmo
+    comando na extensão), então o rótulo é a única coisa que distingue os dois.
+    """
+    assert _pipeline()._control("mute", _abas_mudo(False)).message.startswith("Mutei")
+    assert _pipeline()._control("mute", _abas_mudo(True)).message.startswith("Desmutei")
+    # Sem sonda não dá para saber qual dos dois vai acontecer — não chute.
+    assert "Alternei" in _pipeline()._control("mute", _abas_mudo(None)).message
+
+
 @pytest.mark.asyncio
 async def test_sem_aba_aberta_nao_ha_tabid_e_abre_url():
     """Nada aberto → `open_url`, o caminho que não passa pela extensão."""

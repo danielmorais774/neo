@@ -9,6 +9,7 @@ Routes to one of:
 import json
 import logging
 import re
+import unicodedata
 from typing import Any
 
 from core.llm.router import LLMRouter
@@ -167,7 +168,7 @@ _MUSIC_CONTROL_VERBS = (
     "proxima", "proximo", "pula", "pular", "avanca", "avancar", "passa", "passar",
     "anterior", "volta", "voltar", "retrocede",
     "aumenta", "aumentar", "abaixa", "abaixar", "diminui", "diminuir", "baixa", "baixar",
-    "muta", "mutar", "silencia", "silenciar",
+    "muta", "mutar", "mute", "desmuta", "desmutar", "silencia", "silenciar",
 )
 # Unambiguous media-control verbs. These refer to the media ALREADY playing, so
 # they route to the music skill even WITHOUT a media noun — anaphoric follow-ups
@@ -180,6 +181,12 @@ _MUSIC_CONTROL_VERBS = (
 _MUSIC_STRONG_CONTROL_VERBS = (
     "pausa", "pausar", "despausa", "despausar",
     "retoma", "retomar", "pula", "pular", "play",
+    # Mudo: em pt-BR "muta/desmuta" só existe para som de mídia, então não
+    # precisa de substantivo. Sem isto, "consegue mutar essa aba do super
+    # xandão" caía no classificador, que improvisou `osascript` para o Google
+    # Chrome (o usuário usa Edge) e errou a sintaxe 5 vezes seguidas —
+    # enquanto a extensão reportava a aba, com tabId, no mesmo turno.
+    "muta", "mutar", "mute", "desmuta", "desmutar",
 )
 # Unambiguous "resume what's playing" phrases. These route to the music skill even
 # WITHOUT a media noun (so "dá play de novo" / "volta a tocar" don't fall to
@@ -197,8 +204,94 @@ _MUSIC_NOUNS = (
     "samba", "forro", "reggae", "jazz", "blues", "trap", "lofi", "gospel",
     "eletronica", "axe", "piseiro", "arrocha", "bossa", "hip hop",
     "volume", "video",
+    # A aba/guia É o objeto da mídia quando ele fala do que está tocando
+    # ("abaixa o volume dessa aba", "silencia essa guia"). Já eram substantivos
+    # do guard de STATUS (_MEDIA_TAB_NOUNS); faltava valerem para o CONTROLE.
+    "aba", "abas", "guia", "guias",
 )
 _MUSIC_SERVICES = ("spotify", "youtube", "deezer", "soundcloud", "yt music")
+
+# ── "toca <faixa/artista>" — a ordem de play que não diz a palavra "música" ──
+#
+# O guard acima exige verbo + (substantivo de música OU serviço). A frase mais
+# comum do Daniel não tem nenhum dos dois: "toca duality do slipknot agora"
+# nomeia a FAIXA. Sem casar aqui, ela caía no classificador LLM, que devolvia
+# `browser_local_task` — o cérebro abria um job e dirigia o Edge passo a passo
+# (~26s) em vez do bloco [[HANDOFF:music]], que é instantâneo e usa a extensão.
+#
+# Duas camadas, para não transformar todo "coloca X" em música:
+#   1. AFORDÂNCIA — verbos que, abrindo uma ordem, só significam reproduzir
+#      mídia. "coloca/bota/põe" NÃO entram: no corpus real eles colocam salário,
+#      coluna de tabela, cor de lâmpada e piada.
+#   2. ÂNCORA — para os polissêmicos, exige pista explícita de play ("pra
+#      tocar", "tocando"), e qualquer objeto de outro domínio mata o palpite.
+#
+# MEDIDO contra as 1865 mensagens de usuário do banco: 12 novas frases entram,
+# 12/12 são pedido de música de verdade, 0 falso positivo. As que ficam de fora
+# são declarativas ("Ela não botou pra tocar, não") — não são ordem.
+_MUSIC_PLAY_IMPERATIVES = ("toca", "toque", "reproduz", "reproduzir")
+_MUSIC_PLAY_AMBIGUOUS = (
+    "coloca", "colocar", "coloque", "bota", "botar", "bote",
+    "poe", "poem", "ponha", "tocar",
+)
+_MUSIC_PLAY_CUES = (
+    "pra tocar", "para tocar", "pra toca", "para toca", "tocando", "toca ai", "de som",
+)
+# Objeto de OUTRO domínio na frase → não é música, por mais que o verbo pareça.
+_MUSIC_FOREIGN_OBJECTS = (
+    "arquivo", "arquivos", "pasta", "codigo", "script", "texto", "documento",
+    "planilha", "pdf", "foto", "imagem", "print", "luz", "lampada", "alarme",
+    "despertador", "lembrete", "agenda", "email", "whatsapp", "mensagem", "grupo",
+    "terminal", "comando", "tabela", "coluna", "colunas", "linha", "senha", "cofre",
+    "nota", "notas", "anotacoes", "caderno", "roupa", "assunto", "salario", "piada",
+    "alternativa", "celular",
+)
+# "toca no assunto", "toca na porta": o verbo forte pede objeto DIRETO; com
+# preposição ele deixa de ser ordem de tocar mídia.
+_MUSIC_PLAY_PREPOSITION = re.compile(r"^\w+\s+(no|na|nos|nas|em)\b")
+
+# A RECLAMAÇÃO de que o controle não pegou ("nao mutou ela", "não tocou"). É o
+# pior momento para errar o roteamento: o usuário já está irritado porque a ação
+# anterior falhou, e a frase não tem verbo no imperativo nem substantivo de
+# música — na sessão 7687b737 ela foi parar em `device_control` e virou agente de
+# navegador clicando na tela. Exige negação + verbo de controle no passado +
+# frase curta, para não pegar narrativa ("o container não parou desde ontem").
+# REDE DE SEGURANÇA sobre a saída do classificador. Três sessões seguidas
+# (ace000b8, 7687b737, 0565907e) produziram a MESMA improvisação para controlar
+# o som do navegador:
+#     osascript -e 'tell application "Google Chrome" to set volume of tab 1 …'
+# Nunca funciona — o Chrome não expõe volume por AppleScript (morre em syntax
+# error) e a máquina usa Edge. E é a pergunta errada: quem mexe na aba é a
+# extensão, pelo bloco [[HANDOFF:music]]. Enumerar as frases que levam a isso é
+# perder: a rede olha o COMANDO que saiu, não a frase que entrou.
+_BROWSER_AUDIO_COMMAND = re.compile(
+    r"(chrome|edge|safari|firefox|brave|chromium|navegador)[\s\S]{0,120}"
+    r"(volume|mute|muted|mudo|silenc|som\b|audio|pause|play\b)",
+    re.I,
+)
+# Irmão do anterior: dirigir o navegador por AppleScript para ABRIR mídia
+#     tell application "Google Chrome" to set URL of active tab … youtube.com/watch
+# (sessão 0565907e, interação 6 — a resposta ao pedido "usar a extensão de
+# bridge", ironicamente). Não tem palavra de volume, então a rede de áudio não
+# pega; e continua sendo o app errado na máquina errada. Aqui NÃO forçamos
+# música: "abre o youtube pra eu ver os comentários" é pedido legítimo de
+# navegador. Só matamos o comando improvisado e devolvemos o turno ao cognitivo,
+# que tem `browser_local_task` (o navegador DELE) e o bloco de música.
+_BROWSER_MEDIA_URL_COMMAND = re.compile(
+    r"(chrome|edge|safari|firefox|brave|chromium)[\s\S]{0,200}"
+    r"(youtube\.com|youtu\.be|music\.youtube|open\.spotify)",
+    re.I,
+)
+# Print do navegador DO SERVIDOR não responde pergunta sobre a mídia DELE.
+_SERVER_BROWSER_TOOLS = frozenset({"browser_screenshot", "browser_task"})
+_USER_MEDIA_ANCHORS = (
+    "youtube", "you tube", "spotify", "musica", "tocando", "player",
+    "aba", "abas", "tab", "tabs", "guia", "guias",
+)
+
+_MUSIC_COMPLAINT = re.compile(
+    r"\bn[ãa]o\s+(mutou|pausou|pulou|tocou|parou|retomou|abaixou|aumentou)\b"
+)
 
 # Media-STATUS questions ("quais abas do YouTube estão abertas?", "o que tá
 # tocando?", "como tá o YouTube?") must go to the cognitive core, which gets a
@@ -206,13 +299,38 @@ _MUSIC_SERVICES = ("spotify", "youtube", "deezer", "soundcloud", "yt music")
 # otherwise sends "quais abas abertas" to run_command (osascript inspecting
 # Chrome) — the exact misroute seen in the screenshot. Patterns run on accent-
 # stripped, whitespace-collapsed text. See neo-music-feature.
-_MEDIA_TAB_NOUNS = ("aba", "abas", "guia", "guias")
+# "tab"/"tabs" em inglês: o Daniel escreve os dois ("quais tab aberta com
+# youtube no momento?"). Sem eles a pergunta não casava o guard, ia para o
+# classificador, que respondeu com `browser_screenshot` do navegador DO
+# SERVIDOR e concluiu "não tem navegador rodando, então não tem aba do
+# YouTube" — com a aba tocando no `media_context` daquele mesmo turno.
+_MEDIA_TAB_NOUNS = ("aba", "abas", "guia", "guias", "tab", "tabs")
 _MEDIA_STATUS_CTX = (
     "youtube", "you tube", "spotify", "navegador", "chrome", "edge",
     "musica", "video", "tocando", "aberta", "abertas", "aberto", "abertos", "player",
 )
 _MEDIA_PLAYING_QUERY = re.compile(r"\b(o que|que|qual|quais)\b.*\b(tocando|toca|rolando)\b")
 _MEDIA_QUESTION_STARTS = ("tem ", "tem alguma", "existe ", "ta aberta", "tao aberta")
+# "ta vendo o video aberto no YouTube?", "digo vc enchega a aba aberta?" — o
+# usuário pergunta se o Neo ENXERGA, não "quais abas". Sem isto a pergunta caiu
+# no classificador, que respondeu com `browser_screenshot` do navegador DO
+# SERVIDOR: "Tô vendo nada aqui do meu lado não — seu navegador não transmite
+# tela pra mim" (sessão 0565907e), com as abas dele no media_context do turno.
+# As grafias erradas estão de propósito: é assim que ele digita.
+_MEDIA_SEEING = re.compile(r"\b(ve|ver|vendo|veja|enxerg\w*|ench[ae]rg?\w*)\b")
+# Contexto ESTREITO para a pergunta de percepção — só o que é mídia mesmo.
+# "navegador" ficou de fora de propósito: "acessa o meu google drive pelo menu
+# navegador local e VEJA se tem nfse de abril" é ordem de tarefa no navegador,
+# não pergunta sobre aba de mídia, e virar status quebraria o download.
+_MEDIA_SEEING_CTX = (
+    "youtube", "you tube", "spotify", "musica", "tocando", "player",
+    "aba", "abas", "tab", "tabs", "guia", "guias", "video",
+)
+# Verbo de AÇÃO no navegador → é tarefa, não pergunta de percepção.
+_BROWSER_ACTION_VERBS = re.compile(
+    r"\b(acessa|acessar|abre|abrir|entra|entrar|navega|navegar|baixa|baixar|"
+    r"clica|clicar|busca|buscar|procura|procurar|pesquisa|pesquisar|preenche|preencher)\b"
+)
 
 # Tools owned by a skill — excluded from the router's tool palette (Workstream A).
 # The router routes to the SKILL via skill_name; the skill picks its own tools.
@@ -240,6 +358,13 @@ _SKILL_OWNED_TOOL_PREFIXES = (
     # File Store (docs/file-store-plan.md §4): tools do catálogo são do tool loop
     # do cognitivo — quem ativa é o manifesto do anexo, não o classificador.
     "file_",
+    # Cadastros generativos (docs/datasets-crud-plan.md §9.1): as data_* só
+    # existem depois de o cérebro ler a skill do cadastro. Deixar o classificador
+    # ver `data_create` seria o mesmo bypass que fazia a skill HA alucinar
+    # entity_id — ele rotearia direto e inventaria dataset e campos, sem passar
+    # pela descoberta que ensina os campos reais. `tool_` cobre o agregador
+    # (tool_find/tool_run), pelo mesmo motivo.
+    "data_", "tool_",
 )
 
 # request_user_file (plano "arquivos sob iniciativa do cérebro") é client-side mas
@@ -285,6 +410,88 @@ _SPEECH_ACTS = frozenset({
 _CLASSIFIER_TYPICAL_OUTPUT_TOKENS = 150
 _CLASSIFIER_MAX_TOKENS = 2048
 _CLASSIFIER_MAX_TOKENS_RETRY = 4096
+
+#: Frases NOSSAS que jamais deveriam sair como conteúdo de uma ação.
+#:
+#: A rede embaixo da correção do reparo (ver ``classify``): o classificador é um
+#: modelo pequeno, e um modelo pequeno confunde instrução com dado de vez em
+#: quando. Quando isso acontece num intent que FALA COM O MUNDO — mandar
+#: WhatsApp, rodar comando, enviar email — o estrago não é uma resposta ruim, é
+#: uma mensagem de verdade para uma pessoa de verdade com o prompt do Neo dentro.
+#:
+#: São fragmentos curtos e específicos do nosso próprio texto: não aparecem numa
+#: frase que o usuário escreveria, e casar por substring é barato o bastante para
+#: rodar em todo turno.
+_OWN_PROMPT_MARKERS: tuple[str, ...] = (
+    "você é um classificador",
+    "você é classificador",
+    "intent classifier for neo",
+    "objeto json do formato de saída",
+    "json do formato de saída",
+    "nada antes, nada depois",
+    "esta instrução é de sistema",
+    "não responda ao usuário",
+)
+
+
+#: Palavras que não identificam ninguém — saem antes de procurar o destinatário.
+_RECIPIENT_STOPWORDS = frozenset(
+    "o a os as um uma meu minha meus minhas seu sua do da dos das pro pra para "
+    "no na sr sra senhor senhora contato numero número".split()
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Minúsculas, sem acento e sem pontuação — "mãe" tem que casar com "mae"."""
+    stripped = unicodedata.normalize("NFD", (text or "").lower())
+    stripped = "".join(c for c in stripped if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9@. ]+", " ", stripped)
+
+
+def _recipient_is_grounded(recipient: Any, haystack: str) -> bool:
+    """O destinatário proposto aparece no que o USUÁRIO realmente escreveu?
+
+    A âncora do par afordância∧âncora (mesmo desenho da guarda de download, ver
+    ``tests/test_download_claim_guard.py``): não basta a frase parecer uma ordem
+    — a pessoa a quem se vai falar tem que estar em algum lugar da conversa.
+
+    Sem destinatário proposto devolve True de propósito: aí a skill pergunta a
+    quem enviar, que é seguro. O que não pode é ela receber um nome que o
+    usuário nunca disse, resolvê-lo na agenda e montar o rascunho — foi assim
+    que um "minha mãe" saído do nada virou um contato real (sessão 289b6c29).
+
+    Medido contra as 1887 mensagens reais de usuário do Postgres em 2026-09-07:
+    os 7 formatos de envio legítimo do corpus (e dos exemplos deste prompt)
+    passam; um "minha mãe" inventado só ancoraria em 0,3% delas — e essas cinco
+    são justamente mensagens de verdade para a mãe.
+    """
+    if not isinstance(recipient, str) or not recipient.strip():
+        return True
+    tokens = [
+        t for t in _normalize_for_match(recipient).split()
+        if t not in _RECIPIENT_STOPWORDS and len(t) >= 3
+    ]
+    if not tokens:
+        return True  # só palavra vazia ("a", "o") — nada de concreto para ancorar
+    field = _normalize_for_match(haystack)
+    return any(t in field for t in tokens)
+
+
+def _echoes_own_prompt(value: Any) -> bool:
+    """O modelo devolveu o NOSSO texto como se fosse conteúdo do usuário?
+
+    Percorre estruturas (``tool_arguments`` é dict, e o texto pode estar em
+    qualquer chave) porque o campo exato varia por intent — o que importa é que
+    nenhuma parte do payload de uma ação carregue instrução nossa.
+    """
+    if isinstance(value, str):
+        low = value.lower()
+        return any(marker in low for marker in _OWN_PROMPT_MARKERS)
+    if isinstance(value, dict):
+        return any(_echoes_own_prompt(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_echoes_own_prompt(v) for v in value)
+    return False
 
 
 def _strip_accents(text: str) -> str:
@@ -669,17 +876,38 @@ class IntentRouter:
                         "Router: classificador respondeu em prosa em vez de JSON — "
                         "retentando com instrução de reparo: %s", raw_text[:160],
                     )
+                    # A correção vai como SYSTEM, e a mensagem do usuário é
+                    # REPETIDA depois dela.
+                    #
+                    # Antes a instrução ia como USER, e aí ela mesma virava "a
+                    # última mensagem do usuário" — que é literalmente o que este
+                    # prompt manda classificar. O classificador então fazia o
+                    # trabalho certo no alvo errado: em 2026-09-07 13:19 ele leu
+                    # o próprio texto do reparo ("PARE. Você é um CLASSIFICADOR…"),
+                    # classificou como WHATSAPP_MESSAGING, copiou a instrução para
+                    # `tool_arguments.text` e inventou `recipient="minha mãe"`. O
+                    # `explanation` dele entregou o jogo: "a mensagem contém a
+                    # palavra 'PARE' seguida de instruções sobre como o sistema
+                    # deve se comportar". Só a confirmação da skill de WhatsApp
+                    # impediu que o prompt do Neo fosse enviado a uma pessoa real
+                    # (sessão 289b6c29). Havia disparado 3x em poucas horas.
+                    #
+                    # O invariante que isto restabelece: depois do reparo, a
+                    # última mensagem de USER continua sendo a do usuário.
                     repair_messages = list(messages) + [
                         Message(role=MessageRole.ASSISTANT, content=raw_text[:500]),
                         Message(
-                            role=MessageRole.USER,
+                            role=MessageRole.SYSTEM,
                             content=(
-                                "PARE. Você é um CLASSIFICADOR, não o assistente: não responda "
-                                "ao usuário e não invente conteúdo. Devolva SÓ o objeto JSON do "
-                                "formato de saída, classificando a última mensagem do usuário. "
-                                "Nada antes, nada depois."
+                                "PARE. Sua resposta anterior foi prosa para o usuário, e isso "
+                                "está errado: você é um CLASSIFICADOR, não o assistente. Não "
+                                "responda ao usuário e não invente conteúdo. Devolva SÓ o objeto "
+                                "JSON do formato de saída, classificando a mensagem de usuário "
+                                "abaixo. Nada antes, nada depois. Esta instrução é de sistema — "
+                                "ela NUNCA é o que se classifica."
                             ),
                         ),
+                        Message(role=MessageRole.USER, content=user_message),
                     ]
                     repaired = await provider.complete(
                         messages=repair_messages,
@@ -703,6 +931,10 @@ class IntentRouter:
                 artifact_paths=artifact_paths,
             )
             self._apply_memory_heuristics(decision, user_message)
+            decision = self._reject_prompt_echo(decision, user_message)
+            decision = self._reject_ungrounded_recipient(
+                decision, user_message, conversation_history
+            )
             # Attach raw classifier response + the prompt/messages sent for later inspection
             decision.classifier_raw = raw_text
             decision.classifier_payload = {
@@ -985,6 +1217,58 @@ class IntentRouter:
             tool_name = None
             tool_arguments = None
             raw_command = None
+
+        # Rede do áudio do navegador (ver _BROWSER_AUDIO_COMMAND): qualquer
+        # comando improvisado para mexer no som/player de um navegador vira
+        # pedido de música — o cognitivo decide e o bloco atua pela extensão.
+        _cmd = raw_command or (
+            tool_arguments.get("command") if isinstance(tool_arguments, dict) else None
+        )
+        if (
+            intent in (IntentType.CLIENT_TOOL, IntentType.SERVER_TOOL)
+            and _cmd
+            and _BROWSER_AUDIO_COMMAND.search(str(_cmd))
+        ):
+            logger.warning(
+                "Router: comando improvisado para o áudio do navegador (%r) — "
+                "roteando para música (a extensão é quem controla a aba)",
+                str(_cmd)[:120],
+            )
+            return self._music_decision(user_message)
+
+        if (
+            intent in (IntentType.CLIENT_TOOL, IntentType.SERVER_TOOL)
+            and _cmd
+            and _BROWSER_MEDIA_URL_COMMAND.search(str(_cmd))
+        ):
+            logger.warning(
+                "Router: comando improvisado para abrir mídia no navegador (%r) — "
+                "devolvendo ao cognitivo (browser_local_task / bloco de música)",
+                str(_cmd)[:120],
+            )
+            intent = IntentType.DIRECT_RESPONSE
+            tool_name = None
+            tool_arguments = None
+            raw_command = None
+
+        # Pergunta sobre a mídia DELE não se responde com print do navegador do
+        # SERVIDOR: "ta vendo o video aberto no YouTube?" virou browser_screenshot
+        # e a resposta foi "não tem navegador rodando" (sessão 0565907e), com as
+        # abas dele no media_context do mesmo turno.
+        if (
+            intent == IntentType.SERVER_TOOL
+            and tool_name in _SERVER_BROWSER_TOOLS
+            and any(
+                re.search(rf"\b{a}\b", _strip_accents(user_message.lower()))
+                for a in _USER_MEDIA_ANCHORS
+            )
+        ):
+            logger.warning(
+                "Router: %s para pergunta sobre a mídia do USUÁRIO — "
+                "roteando para o media_context (cognitivo)",
+                tool_name,
+            )
+            return self._media_status_decision(user_message)
 
         # Grounding guard: um comando de shell que cita um caminho de arquivo
         # ESPECÍFICO (com extensão) que não apareceu em lugar nenhum da conversa é
@@ -1495,6 +1779,9 @@ class IntentRouter:
         # instead of run_command (session-e54f, "Da play de novo" → osascript).
         if any(p in compact for p in _MUSIC_RESUME_PHRASES):
             return True
+        # "nao mutou ela" — reclamação de que o controle não pegou.
+        if len(compact.split()) <= 8 and _MUSIC_COMPLAINT.search(compact):
+            return True
         # Unambiguous control verbs (pausa/pula/play/retoma) refer to the media
         # already playing — anaphoric follow-ups ("pausa aí de novo", "dá um play
         # nela") carry no noun, so route them to music here. See neo-music-feature.
@@ -1508,7 +1795,32 @@ class IntentRouter:
             return False
         has_noun = cls._token_hits(compact, list(_MUSIC_NOUNS)) >= 1
         has_service = any(svc in compact for svc in _MUSIC_SERVICES)
-        return has_noun or has_service
+        if has_noun or has_service:
+            return True
+        # Última camada: a ordem de play que nomeia a FAIXA, não a palavra
+        # "música" ("toca duality do slipknot"). Ver _is_music_play_order.
+        return cls._is_music_play_order(compact)
+
+    @classmethod
+    def _is_music_play_order(cls, compact: str) -> bool:
+        """True para "toca <faixa/artista>" — ordem de play sem palavra de música.
+
+        Recebe o texto já sem acento e com espaços colapsados. Precisão medida
+        no corpus real do banco (ver o bloco de constantes acima): 12/12.
+        """
+        palavras = compact.split()
+        if not palavras or len(palavras) > 12:
+            return False
+        if any(
+            re.search(rf"\b{re.escape(obj)}\b", compact)
+            for obj in _MUSIC_FOREIGN_OBJECTS
+        ):
+            return False
+        if palavras[0] in _MUSIC_PLAY_IMPERATIVES:
+            return not _MUSIC_PLAY_PREPOSITION.match(compact)
+        if palavras[0] in _MUSIC_PLAY_AMBIGUOUS:
+            return any(cue in compact for cue in _MUSIC_PLAY_CUES)
+        return False
 
     def _music_decision(self, message: str) -> RoutingDecision:
         """Route a music request to the cognitive core with a music handoff hint."""
@@ -1556,13 +1868,30 @@ class IntentRouter:
         if has_tab and has_ctx and is_question:
             return True
 
+        # "ta vendo o video aberto no YouTube?" — pergunta de PERCEPÇÃO, não de
+        # listagem, e não pode engolir ordem de tarefa no navegador.
+        if (
+            _MEDIA_SEEING.search(compact)
+            and any(re.search(rf"\b{c}\b", compact) for c in _MEDIA_SEEING_CTX)
+            and not _BROWSER_ACTION_VERBS.search(compact)
+        ):
+            return True
+
         # "o que tá tocando?", "que música está tocando agora?"
         if _MEDIA_PLAYING_QUERY.search(compact):
             return True
 
         # "como tá o YouTube?", "status do YouTube/player/navegador"
-        if ("status" in compact or "como esta" in compact or "como ta " in compact) and any(
-            s in compact for s in ("youtube", "musica", "player", "spotify", "navegador")
+        # A mesma exclusão de ordem-de-tarefa: "acessar pelo menu navegador local
+        # a amazon e veja qual o ULTIMO STATUS na entrega" é tarefa de navegador,
+        # e casava aqui só por ter "status" + "navegador" (FP que já existia).
+        if (
+            ("status" in compact or "como esta" in compact or "como ta " in compact)
+            and any(
+                s in compact
+                for s in ("youtube", "musica", "player", "spotify", "navegador")
+            )
+            and not _BROWSER_ACTION_VERBS.search(compact)
         ):
             return True
 
@@ -1731,6 +2060,95 @@ class IntentRouter:
             explanation="Fallback: resposta direta",
         )
         self._apply_memory_heuristics(decision, message)
+        return decision
+
+    def _reject_prompt_echo(
+        self, decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """Classificação que carrega o NOSSO prompt como conteúdo não vira ação.
+
+        Determinística e sem LLM, no molde das guardas do núcleo cognitivo. Só
+        atua quando o payload ecoa instrução nossa E o usuário não a escreveu —
+        perguntar "o que significa 'você é um classificador'?" continua passando.
+
+        Cai no cognitivo em vez de levantar: o turno tem que sobreviver, e o
+        cérebro lê o pedido de verdade. O que não pode é a instrução chegar numa
+        skill que fala com o mundo — foi assim que o prompt do Neo virou rascunho
+        de WhatsApp para um contato real (sessão 289b6c29, 2026-09-07).
+        """
+        payload = (decision.tool_arguments, decision.raw_command)
+        if not _echoes_own_prompt(payload):
+            return decision
+        if _echoes_own_prompt(user_message):
+            return decision  # o usuário falou disso de propósito; não é eco nosso
+
+        logger.error(
+            "[Router] classificação DESCARTADA: o payload ecoa o prompt do próprio "
+            "Neo (intent=%s tool=%s skill=%s) — caindo no cognitivo. args=%.200s",
+            decision.intent, decision.tool_name, decision.skill_name,
+            str(decision.tool_arguments),
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.skill_name = None
+        decision.skill_hint = None
+        decision.requires_approval = False
+        decision.explanation = (
+            "classificação descartada: o conteúdo proposto era instrução interna do "
+            "Neo, não algo que o usuário pediu"
+        )
+        return decision
+
+    def _reject_ungrounded_recipient(
+        self,
+        decision: RoutingDecision,
+        user_message: str,
+        conversation_history: list[dict[str, str]] | None,
+    ) -> RoutingDecision:
+        """WhatsApp para alguém que o usuário nunca citou não é pedido dele.
+
+        A REGRA DURA do prompt exige ``speech_act=imperative`` e alta confiança —
+        e as duas passaram no incidente da sessão 289b6c29, porque "PARE." É um
+        imperativo e o modelo estava 95% confiante. É o formato errado de teste:
+        ele descreve como a frase foi CONJUGADA, não se ela é sobre mandar
+        mensagem. Toda ordem é imperativa.
+
+        O teste que faltava é sobre CONTEÚDO, e roda em código, não no prompt: o
+        destinatário tem que existir na conversa. Sem isso, o classificador
+        podia inventar a pessoa (`recipient="minha mãe"` num turno sobre uma
+        playlist de rock), o pipeline resolvia o apelido numa agenda de verdade
+        e montava o rascunho para um número de verdade.
+
+        Olha a mensagem E o histórico recente (a mesma janela que o
+        classificador vê), porque "manda: chego 19h" depois de combinar o
+        contato é legítimo e não repete o nome.
+        """
+        if decision.intent is not IntentType.WHATSAPP_MESSAGING:
+            return decision
+        args = decision.tool_arguments or {}
+        recipient = args.get("recipient") or args.get("contact") or args.get("to")
+        haystack = user_message or ""
+        for msg in (conversation_history or [])[-6:]:
+            haystack += " " + str(msg.get("content") or "")
+        if _recipient_is_grounded(recipient, haystack):
+            return decision
+
+        logger.error(
+            "[Router] WHATSAPP_MESSAGING DESCARTADO: destinatário %r não aparece na "
+            "mensagem nem no histórico recente — caindo no cognitivo. msg=%.120s",
+            recipient, user_message,
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.skill_name = None
+        decision.requires_approval = False
+        decision.explanation = (
+            f"classificação descartada: o destinatário {recipient!r} não foi citado "
+            "pelo usuário nesta conversa"
+        )
         return decision
 
     def _apply_memory_heuristics(self, decision: RoutingDecision, message: str) -> None:

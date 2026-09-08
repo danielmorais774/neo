@@ -36,13 +36,28 @@ class MemoryStore(WorkingMemoryStore):
     async def _select_one(self, user_id, slug):
         return self.rows.get((user_id, slug))
 
-    async def _select_index(self, user_id, limit):
+    async def _select_index(self, user_id, limit, *, session_id=None, auto_only=False):
+        """Mesmo contrato do método real: uma metade da quota + "tem mais?".
+
+        `filler` = automática, não fixada e de OUTRA sessão — as três condições
+        do `and_` lá no store. Manter o dublê fiel é o que deixa a lógica de
+        quota testável sem Postgres.
+        """
+        def is_filler(n):
+            return (
+                n.origin == "auto"
+                and not n.pinned
+                and (session_id is None or n.session_id != session_id)
+            )
+
         rows = [
             n for n in self.rows.values()
-            if n.user_id == user_id and n.status == "active"
+            if n.user_id == user_id
+            and n.status == "active"
+            and is_filler(n) == auto_only
         ]
         rows.sort(key=lambda n: n.updated_at, reverse=True)
-        return rows[:limit]
+        return rows[:limit], len(rows) > limit
 
     async def _persist(self, note):
         self.rows[(note.user_id, note.slug)] = note
@@ -183,9 +198,10 @@ async def test_index_prioriza_nota_da_sessao_atual(store):
                       session_id=uuid4(), now=datetime(2026, 7, 31, 18, 0))
     await store.write(user_id=USER, slug="desta-sessao", content="tarefa em curso",
                       session_id=SESSION, now=datetime(2026, 7, 30, 9, 0))
-    notes = await store.index(user_id=USER, session_id=SESSION)
+    page = await store.index(user_id=USER, session_id=SESSION)
     # A da sessão atual vem primeiro mesmo sendo MAIS ANTIGA.
-    assert [n.slug for n in notes] == ["desta-sessao", "antiga"]
+    assert [n.slug for n in page.notes] == ["desta-sessao", "antiga"]
+    assert page.truncated is False
 
 
 @pytest.mark.asyncio
@@ -194,14 +210,16 @@ async def test_index_ignora_arquivada_e_respeita_teto(store):
         await store.write(user_id=USER, slug=f"n{i}", content="x",
                           now=datetime(2026, 7, 31, 10, i))
     await store.write(user_id=USER, slug="n0", content="acabou", status="done")
-    notes = await store.index(user_id=USER, limit=3)
-    assert len(notes) == 3
-    assert "n0" not in [n.slug for n in notes]
+    page = await store.index(user_id=USER, limit=3)
+    assert len(page.notes) == 3
+    assert "n0" not in [n.slug for n in page.notes]
+    assert page.truncated is True, "cortou pelo teto — o prompt tem que dizer isso"
 
 
 @pytest.mark.asyncio
 async def test_index_sem_usuario_e_vazio(store):
-    assert await store.index(user_id=None) == []
+    page = await store.index(user_id=None)
+    assert page.notes == [] and page.truncated is False
 
 
 # ── leitura ─────────────────────────────────────────────────────────────────
@@ -245,3 +263,96 @@ async def test_append_auto_usa_slug_da_sessao_e_nunca_levanta(store):
     # Sem usuário / sem conteúdo: devolve None em vez de estourar no background.
     assert await store.append_auto(user_id=None, session_id=SESSION, entry="x") is None
     assert await store.append_auto(user_id=USER, session_id=SESSION, entry="  ") is None
+
+
+# ── quota do índice (o caso da session-e135f053) ────────────────────────────
+
+async def _base_do_daniel(store):
+    """Reproduz a distribuição real medida em 2026-09-07: 28 auto × 3 model.
+
+    As automáticas são MAIS recentes que as do modelo — é o que acontece de
+    verdade, porque o backstop escreve uma por sessão e a toca em todo turno.
+    """
+    for i in range(3):
+        await store.write(
+            user_id=USER, slug=f"nota-do-modelo-{i}", content=f"conclusao {i}",
+            origin="model", now=datetime(2026, 9, 1, 10, i),
+        )
+    for i in range(28):
+        await store.write(
+            user_id=USER, slug=f"sessao-{i:02d}", content="rodou tool",
+            summary="registro automático do que foi executado nesta sessão",
+            origin="auto", session_id=uuid4(), now=datetime(2026, 9, 5, 10, i),
+        )
+
+
+@pytest.mark.asyncio
+async def test_automatica_nao_expulsa_nota_do_modelo_do_indice(store):
+    """O defeito da session-e135f053, em teste.
+
+    Antes: as 8 vagas iam para as 8 automáticas mais recentes e
+    `playlist-mix-youtube` (10ª por recência) não aparecia — o cérebro não via
+    nem o NOME para chamar `wm_read` e refez na web trabalho já anotado.
+    """
+    await _base_do_daniel(store)
+    page = await store.index(user_id=USER, limit=8)
+    slugs = [n.slug for n in page.notes]
+
+    assert [s for s in slugs if s.startswith("nota-do-modelo")] == [
+        "nota-do-modelo-2", "nota-do-modelo-1", "nota-do-modelo-0",
+    ], "nota escrita de propósito entra por mérito, mesmo sendo mais antiga"
+    assert len([s for s in slugs if s.startswith("sessao-")]) == 2, "quota respeitada"
+    assert page.truncated is True, "26 automáticas ficaram de fora — tem que avisar"
+
+
+@pytest.mark.asyncio
+async def test_quota_nao_desperdica_vaga_quando_nao_ha_automatica(store):
+    """Sem automática o índice não fica com buraco — a quota é teto, não reserva."""
+    for i in range(5):
+        await store.write(user_id=USER, slug=f"m{i}", content="x", origin="model",
+                          now=datetime(2026, 9, 1, 10, i))
+    page = await store.index(user_id=USER, limit=8)
+    assert len(page.notes) == 5 and page.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_automatica_da_sessao_atual_nao_gasta_quota(store):
+    """A nota automática DESTA sessão é a tarefa viva — entra por mérito.
+
+    Ela é a única automática que o modelo consegue situar ("o que eu já fiz
+    agora"), então não disputa as vagas de enchimento com as de outros dias.
+    """
+    await store.write(user_id=USER, slug="sessao-atual", content="rodou tool",
+                      origin="auto", session_id=SESSION,
+                      now=datetime(2026, 9, 5, 9, 0))
+    for i in range(5):
+        await store.write(user_id=USER, slug=f"sessao-velha-{i}", content="x",
+                          origin="auto", session_id=uuid4(),
+                          now=datetime(2026, 9, 5, 10, i))
+    page = await store.index(user_id=USER, session_id=SESSION, limit=8)
+    slugs = [n.slug for n in page.notes]
+    assert slugs[0] == "sessao-atual", "a da sessão atual vem primeiro"
+    assert len([s for s in slugs if s.startswith("sessao-velha")]) == 2
+
+
+@pytest.mark.asyncio
+async def test_pinned_atravessa_a_quota(store):
+    """`pinned` é a saída manual: fixar uma automática a tira do enchimento."""
+    for i in range(5):
+        await store.write(user_id=USER, slug=f"s{i}", content="x", origin="auto",
+                          session_id=uuid4(), now=datetime(2026, 9, 5, 10, i))
+    fixada = store.rows[(USER, "s0")]
+    fixada.pinned = True
+    page = await store.index(user_id=USER, limit=8)
+    assert "s0" in [n.slug for n in page.notes], "fixada entra mesmo sendo a mais antiga"
+
+
+@pytest.mark.asyncio
+async def test_quota_zero_desliga_o_enchimento(store):
+    store.index_auto_quota = 0
+    await _base_do_daniel(store)
+    page = await store.index(user_id=USER, limit=8)
+    assert [n.slug for n in page.notes] == [
+        "nota-do-modelo-2", "nota-do-modelo-1", "nota-do-modelo-0",
+    ]
+    assert page.truncated is True

@@ -78,6 +78,7 @@ def store_for(db: Any) -> Any | None:
         max_note_bytes=settings.working_memory_note_max_bytes,
         ttl_days=settings.working_memory_ttl_days,
         max_index_notes=settings.working_memory_max_notes_in_index,
+        index_auto_quota=settings.working_memory_index_auto_quota,
         read_tail_entries=settings.working_memory_read_tail_entries,
     )
 

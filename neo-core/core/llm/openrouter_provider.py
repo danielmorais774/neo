@@ -117,6 +117,18 @@ class OpenRouterProvider(OpenAIProvider):
         return bare
 
     @staticmethod
+    def _pin_is_locked(kwargs: dict[str, Any]) -> bool:
+        """Esta chamada tem um pin de provedor TRANCADO (sem fallback)?
+
+        É a condição que torna o backoff por 429 um desperdício: com o fallback
+        trancado não existe segunda rota para a espera destravar — o pool do
+        provedor fixado ou esvazia sozinho, ou não. Quem sabe consertar é o
+        ``_relax_provider_pin`` logo abaixo, e ele precisa da vez.
+        """
+        pin = (kwargs.get("extra_body") or {}).get("provider") or {}
+        return isinstance(pin, dict) and pin.get("allow_fallbacks") is False
+
+    @staticmethod
     def _relax_provider_pin(kwargs: dict[str, Any], exc: Exception) -> bool:
         """Provedor fixado LOTADO: mantém a preferência, libera a saída.
 
@@ -195,11 +207,23 @@ class OpenRouterProvider(OpenAIProvider):
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                # Com o pin trancado, o 429 tem que voltar NA HORA: quem conserta é
+                # o `_relax_provider_pin` no except, e ele estava sendo chamado
+                # depois de 17s de sono da escada de cima — o conserto barato
+                # esperando o caro fracassar. Medido na session-d94dc42f: a resposta
+                # final levou 36,8s, dos quais ~30s foram backoff contra um pool
+                # lotado; solto o pin, a mesma chamada passou de primeira. Sem pin
+                # trancado a flag não vai (aí o backoff é a única saída mesmo).
+                bail_on_rate_limit=self._pin_is_locked(kwargs),
                 **kwargs,
             )
         except LLMProviderError as e:
             if self._relax_provider_pin(kwargs, e):
+                # `False` explícito: agora o fallback está liberado, então esperar
+                # volta a fazer sentido — a escada completa de 429 é a rede desta
+                # segunda tentativa, e não existe terceira.
                 return await super().complete(
+                    bail_on_rate_limit=False,
                     messages=messages,
                     tools=tools,
                     model=model,

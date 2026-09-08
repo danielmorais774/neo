@@ -58,6 +58,15 @@ class _CapturingDeepSeek:
         return self.seen
 
 
+async def _dorme_nada(_segundos):
+    """Substitui ``asyncio.sleep`` nos testes de backoff.
+
+    O que está sob teste é QUANTAS vezes a escada repete e sob quais condições —
+    não os 2+5+10s reais, que só fariam a suíte durar 17s por caso.
+    """
+    return None
+
+
 def _tool():
     from shared import ToolSchema
     from shared.types import ToolParameter
@@ -134,11 +143,24 @@ class _Rejects400OnForcedChoice:
 
         self.chat = _Chat()
 
+    def with_options(self, **_kwargs):
+        """O ``complete()`` pede o client sem o retry interno do SDK.
+
+        O dublê precisa oferecer a mesma interface do ``AsyncOpenAI`` real; como
+        ele não repete nada por conta própria, devolver a si mesmo já reproduz o
+        efeito de ``max_retries=0``.
+        """
+        return self
+
 
 @pytest.mark.asyncio
 async def test_openai_degrada_para_auto_quando_tool_choice_e_recusado():
-    from core.llm.openai_provider import OpenAIProvider
+    from core.llm.openai_provider import (
+        _FORCED_TOOL_CHOICE_UNSUPPORTED,
+        OpenAIProvider,
+    )
 
+    _FORCED_TOOL_CHOICE_UNSUPPORTED.clear()
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider.client = _Rejects400OnForcedChoice()
     provider.model = "modelo-que-pensa"
@@ -148,6 +170,34 @@ async def test_openai_degrada_para_auto_quando_tool_choice_e_recusado():
     )
     assert resp.get_content() == "ok", "o turno tem que sobreviver"
     assert provider.client.calls == ["required", "auto"], "degrada uma vez, não fica em loop"
+
+
+@pytest.mark.asyncio
+async def test_recusa_de_tool_forcada_e_memorizada_entre_chamadas():
+    """A 2ª chamada já sai em "auto" — a recusa é de infra, não é transitória.
+
+    Sem isto, todo turno com skill autocarregada paga uma ida e volta só para
+    ouvir o mesmo 404/400 (medido na session-d94dc42f: ~2s por turno).
+    """
+    from core.llm.openai_provider import (
+        _FORCED_TOOL_CHOICE_UNSUPPORTED,
+        OpenAIProvider,
+    )
+
+    _FORCED_TOOL_CHOICE_UNSUPPORTED.clear()
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = _Rejects400OnForcedChoice()
+    provider.model = "modelo-que-pensa"
+
+    for _ in range(2):
+        await provider.complete(
+            messages=[], tools=[_tool()], model="modelo-que-pensa", tool_choice="required",
+        )
+
+    assert provider.client.calls == ["required", "auto", "auto"], (
+        "a segunda chamada não pode repetir a tentativa que já se sabe condenada"
+    )
+    _FORCED_TOOL_CHOICE_UNSUPPORTED.clear()
 
 
 @pytest.mark.asyncio
@@ -171,6 +221,9 @@ async def test_openai_nao_degrada_erro_que_nao_e_de_tool_choice():
                 completions = _Completions()
 
             self.chat = _Chat()
+
+        def with_options(self, **_kwargs):
+            return self
 
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider.client = _AlwaysFails()
@@ -351,3 +404,179 @@ async def test_complete_nao_refaz_duas_vezes(monkeypatch):
     with pytest.raises(LLMProviderError):
         await sob.complete(messages=[], model="deepseek/deepseek-v4-flash@baidu")
     assert chamadas["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pin_trancado_pede_para_nao_gastar_o_backoff(monkeypatch):
+    """Com pin trancado o 429 tem que voltar NA HORA; solto, o backoff volta a valer.
+
+    É a inversão que custava os ~30s da session-d94dc42f: o conserto barato
+    (trocar de rota) estava esperando o caro (dormir 2+5+10s) fracassar primeiro.
+    """
+    from core.llm.openai_provider import OpenAIProvider
+    from core.llm.openrouter_provider import OpenRouterProvider
+    from shared.exceptions import LLMProviderError
+
+    flags: list = []
+
+    async def fake_complete(self, **kwargs):
+        flags.append(kwargs.get("bail_on_rate_limit"))
+        if len(flags) == 1:
+            raise LLMProviderError("Error code: 429 - rate-limited upstream")
+        return "resposta"
+
+    monkeypatch.setattr(OpenAIProvider, "complete", fake_complete)
+    sob = OpenRouterProvider.__new__(OpenRouterProvider)
+
+    assert await sob.complete(messages=[], model="deepseek/deepseek-v4-flash@baidu") == "resposta"
+    assert flags == [True, False], (
+        "1ª chamada (pin trancado) sai na hora; 2ª (fallback liberado) pode esperar"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sem_pin_o_backoff_continua_sendo_a_unica_saida(monkeypatch):
+    """Sem pin não há rota a consertar — a flag não vai, a escada é a rede."""
+    from core.llm.openai_provider import OpenAIProvider
+    from core.llm.openrouter_provider import OpenRouterProvider
+
+    flags: list = []
+
+    async def fake_complete(self, **kwargs):
+        flags.append(kwargs.get("bail_on_rate_limit"))
+        return "resposta"
+
+    monkeypatch.setattr(OpenAIProvider, "complete", fake_complete)
+    sob = OpenRouterProvider.__new__(OpenRouterProvider)
+
+    await sob.complete(messages=[], model="deepseek/deepseek-v4-flash")
+    assert flags == [False]
+
+
+@pytest.mark.asyncio
+async def test_bail_on_rate_limit_nao_vaza_para_a_api(monkeypatch):
+    """A flag é intenção nossa: se chegar no corpo da request, a API responde 400."""
+    from core.llm.openai_provider import OpenAIProvider
+
+    seen: dict = {}
+
+    class _Client:
+        def __init__(self):
+            class _Completions:
+                @staticmethod
+                async def create(**params):
+                    seen.update(params)
+                    class _Msg:
+                        content = "ok"
+                        tool_calls = None
+                    class _Choice:
+                        message = _Msg()
+                        finish_reason = "stop"
+                    class _Resp:
+                        choices = [_Choice()]
+                    return _Resp()
+
+            class _Chat:
+                completions = _Completions()
+
+            self.chat = _Chat()
+
+        def with_options(self, **_kwargs):
+            return self
+
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = _Client()
+    provider.model = "m"
+
+    await provider.complete(messages=[], model="m", bail_on_rate_limit=True)
+    assert "bail_on_rate_limit" not in seen
+
+
+# ── 6. desligar o retry do SDK não pode custar a rede contra 5xx ────────────
+@pytest.mark.asyncio
+async def test_falha_transitoria_e_repetida_pela_escada_nossa(monkeypatch):
+    """5xx/conexão caída continuam sendo repetidos depois do `max_retries=0`.
+
+    Antes, quem repetia 5xx era a escada INTERNA do SDK. Ao desligá-la (para não
+    triplicar cada tentativa nossa e alimentar o rate limiter), essa metade da
+    resiliência tinha que vir para cá — senão a economia de latência viraria
+    fragilidade: um 502 do gateway derrubaria o turno inteiro de primeira.
+    """
+    import asyncio as _asyncio
+
+    from core.llm.openai_provider import OpenAIProvider
+
+    monkeypatch.setattr(_asyncio, "sleep", _dorme_nada)
+    tentativas = {"n": 0}
+
+    class _Flaky:
+        def __init__(self):
+            class _Completions:
+                @staticmethod
+                async def create(**_params):
+                    tentativas["n"] += 1
+                    if tentativas["n"] < 3:
+                        erro = RuntimeError("Error code: 503 - upstream unavailable")
+                        erro.status_code = 503
+                        raise erro
+                    class _Msg:
+                        content = "ok"
+                        tool_calls = None
+                    class _Choice:
+                        message = _Msg()
+                        finish_reason = "stop"
+                    class _Resp:
+                        choices = [_Choice()]
+                    return _Resp()
+
+            class _Chat:
+                completions = _Completions()
+
+            self.chat = _Chat()
+
+        def with_options(self, **_kwargs):
+            return self
+
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = _Flaky()
+    provider.model = "m"
+
+    resp = await provider.complete(messages=[], model="m")
+    assert resp.get_content() == "ok"
+    assert tentativas["n"] == 3, "repetiu o 503 em vez de derrubar o turno"
+
+
+@pytest.mark.asyncio
+async def test_erro_de_conteudo_nao_e_repetido(monkeypatch):
+    """400 de conteúdo sobe na primeira: repetir só queima tempo e dinheiro."""
+    import asyncio as _asyncio
+
+    from core.llm.openai_provider import OpenAIProvider
+    from shared import LLMProviderError
+
+    monkeypatch.setattr(_asyncio, "sleep", _dorme_nada)
+    tentativas = {"n": 0}
+
+    class _Recusa:
+        def __init__(self):
+            class _Completions:
+                @staticmethod
+                async def create(**_params):
+                    tentativas["n"] += 1
+                    raise RuntimeError("Error code: 400 - context length exceeded")
+
+            class _Chat:
+                completions = _Completions()
+
+            self.chat = _Chat()
+
+        def with_options(self, **_kwargs):
+            return self
+
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = _Recusa()
+    provider.model = "m"
+
+    with pytest.raises(LLMProviderError):
+        await provider.complete(messages=[], model="m")
+    assert tentativas["n"] == 1
