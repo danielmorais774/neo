@@ -128,7 +128,8 @@ class ConversationRecallExecutor:
             sess = await self._db.get_conversation_session(self._session_id)
             if sess is None:
                 return
-            meta = dict(sess.extra_metadata or {})
+            atual = getattr(sess, "extra_metadata", None)
+            meta = dict(atual) if isinstance(atual, dict) else {}
             meta["recall"] = {
                 "query": result.query,
                 "terms": result.terms,

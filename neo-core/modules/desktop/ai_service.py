@@ -1354,6 +1354,19 @@ _MUSIC_HANDOFF_INSTRUCTION = (
 # confirms these truthfully and skips the generic recovery flow.
 _MUSIC_ACTUATION_TOOLS = frozenset({"open_url", "launch_uri", "media_command"})
 
+def _session_meta(session: Any) -> dict[str, Any]:
+    """`extra_metadata` da sessão como DICT, sempre.
+
+    A coluna é JSONB livre e já apareceu em produção como lista
+    (``[null, {...}]``, ver AsyncPostgresClient.merge_session_metadata). Um
+    turno inteiro morria com `'list' object has no attribute 'get'` — e a
+    conversa ficava inutilizável, porque toda mensagem seguinte relia a mesma
+    linha. Aqui o dado torto vira `{}`: perde-se um detalhe, não a conversa.
+    """
+    meta = getattr(session, "extra_metadata", None)
+    return meta if isinstance(meta, dict) else {}
+
+
 def _video_id_of(url: str) -> str:
     """videoId de uma URL de atuação ("" quando não é YouTube)."""
     if not url:
@@ -2555,7 +2568,7 @@ class AIService:
                 # follow-up can still recover the rotated-away conversation,
                 # instead of orphaning it forever.
                 session.extra_metadata = {
-                    **(session.extra_metadata or {}),
+                    **_session_meta(session),
                     "created_after_rotated_session_id": str(sid),
                     "created_after_rotation_reason": "topic_change",
                 }
@@ -2754,7 +2767,7 @@ class AIService:
         clarification_round = 1
         allow_clarification = True
         forced_clarification = False
-        pending_clar = (session.extra_metadata or {}).get("pending_clarification")
+        pending_clar = _session_meta(session).get("pending_clarification")
         if pending_clar:
             prev_round = int(pending_clar.get("round", 1))
             clarification_round = prev_round + 1
@@ -2762,7 +2775,7 @@ class AIService:
             forced_clarification = True
             # Clear the pending state up front so a failure can't trap the session.
             session.extra_metadata = {
-                k: v for k, v in (session.extra_metadata or {}).items()
+                k: v for k, v in _session_meta(session).items()
                 if k != "pending_clarification"
             }
             await self.db.update_session(session)
@@ -4067,7 +4080,7 @@ class AIService:
                 sess = await self.db.get_conversation_session(session_id)
                 if sess is not None:
                     sess.extra_metadata = {
-                        **(sess.extra_metadata or {}),
+                        **_session_meta(sess),
                         "pending_clarification": {
                             "original_message": user_message,
                             "clarifying_question": clar_question,
@@ -4558,7 +4571,7 @@ class AIService:
             sess = await self.db.get_conversation_session(session_id)
             if sess is None:
                 return
-            meta = dict(sess.extra_metadata or {})
+            meta = dict(_session_meta(sess))
             current = dict(meta.get("active_skill") or {})
             if renew:
                 meta["active_skill"] = {"name": renew, "turns_left": _SKILL_STICKY_TURNS}
@@ -4611,7 +4624,7 @@ class AIService:
             sess = await self.db.get_conversation_session(session_id)
             if sess is None:
                 return
-            meta = dict(sess.extra_metadata or {})
+            meta = dict(_session_meta(sess))
             current = dict(meta.get("recall") or {})
             if not current:
                 return

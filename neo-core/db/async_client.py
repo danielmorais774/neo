@@ -247,6 +247,12 @@ class AsyncPostgresClient:
         usá-la para guardar um detalhe de skill faria o turno concorrente que
         rotaciona o tópico perder a atualização. O ``||`` do jsonb resolve no
         próprio banco — sem leitura prévia, sem corrida.
+
+        O ``CASE`` não é paranoia: ``COALESCE`` só cobre o NULL do SQL, e a
+        coluna também guarda o **null do JSON**. E ``'null'::jsonb || '{...}'``
+        no Postgres não dá objeto — dá ``[null, {...}]``, um ARRAY. Uma linha
+        assim quebra TODO turno da sessão daí em diante (`'list' object has no
+        attribute 'get'`), e foi exatamente o que aconteceu em 2026-09-08.
         """
         if not patch:
             return
@@ -256,7 +262,11 @@ class AsyncPostgresClient:
                     """
                     UPDATE conversation_session
                     SET session_metadata =
-                        COALESCE(session_metadata, '{}'::jsonb) || CAST(:patch AS jsonb)
+                        CASE
+                            WHEN jsonb_typeof(session_metadata) = 'object'
+                            THEN session_metadata
+                            ELSE '{}'::jsonb
+                        END || CAST(:patch AS jsonb)
                     WHERE id = :session_id
                     """
                 ),

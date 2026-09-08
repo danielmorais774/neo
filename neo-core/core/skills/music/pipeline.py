@@ -121,7 +121,9 @@ class MusicPipeline(SkillPipeline):
         except Exception as e:  # noqa: BLE001
             logger.warning("[Music] não li a sessão %s: %s", session_id, e)
             return {}
-        return getattr(sess, "extra_metadata", None) or {}
+        meta = getattr(sess, "extra_metadata", None)
+        # Só dict serve: a coluna é JSONB livre e já veio como lista de prod.
+        return meta if isinstance(meta, dict) else {}
 
     async def _remember_played(
         self, session_id: UUID | None, *ids: str | None
