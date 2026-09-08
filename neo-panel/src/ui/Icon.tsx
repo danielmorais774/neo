@@ -10,9 +10,16 @@ export type IconName =
   | 'key' | 'chat' | 'bug' | 'logs' | 'vision' | 'frame' | 'graph'
   | 'mission' | 'search' | 'device' | 'robot' | 'brain' | 'emotion'
   | 'skill' | 'music' | 'gear' | 'refresh' | 'warn' | 'file' | 'mic'
-  | 'siren';
+  | 'siren' | 'table';
 
 const PATHS: Record<IconName, ReactNode> = {
+  // Cadastros generativos (/dados): grade de dados — lista + colunas.
+  table: (
+    <>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="M3 10h18M9 10v9M15 10v9" />
+    </>
+  ),
   key: (
     <>
       <circle cx="8" cy="15" r="3.2" />

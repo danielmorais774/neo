@@ -121,7 +121,12 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: st
     // O sufixo `@baidu` fixa o provedor de infra do gateway (o neo-core o
     // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
     // provedor, com outro preço e outro teto de saída.
+    //
+    // As DUAS entradas existem de propósito (ver o comentário longo no catálogo
+    // gêmeo do desktop, neo-desktop-tauri/src/lib/models.ts): pin = preço do
+    // Baidu num pool que satura; sem pin = qualquer endpoint livre, sem espera.
     { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu) — 1M contexto, barato' },
+    { value: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash (auto) — sem pin, preço varia' },
   ],
 };
 
