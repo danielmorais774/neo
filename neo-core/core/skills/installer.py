@@ -588,12 +588,23 @@ class SkillInstaller:
         return None
 
     def _tool_names(self, entry: Any) -> list[str]:
-        """Tools declaradas + as ``data_*`` implícitas de quem tem cadastro."""
+        """Declaradas + as implícitas: ``data_*`` de quem tem cadastro e
+        ``event_*`` de quem declara ``eventos:``.
+
+        Precisa bater com ``SkillLibrary.tool_names_for``, senão o `verify` diz
+        que a skill tem menos capacidade do que ela realmente destrava no turno.
+        """
         names = list(getattr(entry, "tools", []) or [])
         if getattr(entry, "datasets", None):
             from modules.datasets.tools import DATA_TOOLS
 
             names += [t.name for t in DATA_TOOLS]
+        if getattr(entry, "eventos", None) and getattr(
+            self._settings, "neo_events_enabled", False
+        ):
+            from modules.events.tools import EVENT_TOOLS
+
+            names += [t.name for t in EVENT_TOOLS]
         return list(dict.fromkeys(names))
 
     def _screens(self, entry: Any) -> list[dict[str, Any]]:

@@ -1,6 +1,6 @@
 ---
 name: playlists
-description: 'Playlists e músicas salvas: guardar playlist (com link do Spotify/YouTube), anexar música numa playlist, montar fila de reprodução e listar o que está salvo. Use quando falarem em salvar/guardar/anexar/enfileirar música ou playlist.'
+description: 'Playlists, músicas salvas e fila de reprodução: guardar, anexar música numa playlist, enfileirar e consultar. Use quando falarem em salvar, guardar, anexar ou enfileirar música/playlist.'
 keywords: [playlist, playlists, salvar musica, salva essa musica, guarda essa musica, anexa na playlist, minhas playlists, o que tem na playlist, fila de musica, enfileira, repertorio]
 kind: tool_backed
 group: cadastros
