@@ -285,6 +285,10 @@ export interface ElectronAPI {
   // Gate anti-eco: o webview avisa quando o TTS dele fala, p/ a voz do próprio
   // Neo não disparar o wake word ("Ei Neo") no sidecar.
   wakeTtsState: (speaking: boolean) => Promise<void>;
+  // Modo Live aberto DENTRO do app (overlay): a ilha da notch acende as mesmas
+  // asas da sessão nativa — microfone de um lado do recorte, stop do outro.
+  // Sem isto, o Live in-app deixaria a notch totalmente escondida.
+  notchLiveUi: (active: boolean, state?: string, level?: number) => Promise<void>;
   // Sessões anteriores — a fonte é o neo-core (tabela conversation_session);
   // o desktop não mantém índice local. Rejeita se o core estiver inacessível.
   listSessions: (limit?: number) => Promise<SessionInfo[]>;
@@ -740,6 +744,8 @@ export const electronAPI: ElectronAPI = {
   wakeDeletePhrase: (slug: string) => invoke('wake_delete_phrase', { slug }),
   wakeEnroll: (slug: string) => invoke('wake_enroll', { slug }),
   wakeTtsState: (speaking: boolean) => invoke('wake_tts_state', { speaking }),
+  notchLiveUi: (active: boolean, state?: string, level?: number) =>
+    invoke('notch_live_ui', { active, state: state ?? null, level: level ?? null }),
 
   // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
   listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),

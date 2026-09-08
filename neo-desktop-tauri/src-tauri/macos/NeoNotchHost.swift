@@ -234,9 +234,68 @@ enum CP {
     static let hairline = NSColor(calibratedRed: 1.0, green: 0.118, blue: 0.176, alpha: 0.35)     // app-border
     static let textMuted = NSColor.white.withAlphaComponent(0.38)
     static let cardRadius: CGFloat = 4
+    /// Preto do recorte da notch. A pilula do Modo Live precisa da MESMA cor
+    /// da camera housing: com o vidro translucido dos outros estados, a "asa"
+    /// aparece como um retangulo claro colado num buraco preto.
+    static let notchBlack = NSColor(calibratedRed: 0.016, green: 0.012, blue: 0.016, alpha: 1.0)
 
     static func mono(_ size: CGFloat, _ weight: NSFont.Weight = .semibold) -> NSFont {
         NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+    }
+}
+
+/// Relogio e resposta de nivel COMPARTILHADOS pelas superficies do Modo Live:
+/// a ilha (asas em volta do recorte), o chip logo abaixo da notch e o HUD que o
+/// webview desenha dentro da janela (`LiveOverlayCyberpunk.css`).
+///
+/// Existe porque as tres rodavam ISOLADAS: cada uma com o proprio periodo de
+/// animacao e -- pior -- com uma curva de VU diferente, entao a mesma voz mexia
+/// as barras de cada superficie numa altura e num ritmo diferentes. Aqui os
+/// numeros sao os keyframes do CSS, e o relogio e o de PAREDE (o mesmo do CSS):
+/// contar quadros faz o nativo atrasar em relacao ao webview no primeiro frame
+/// que cair.
+///
+/// Mexeu aqui? A curva de nivel tem um espelho em `src/lib/liveMotion.ts`.
+enum LiveMotion {
+    /// Periodos das barras do equalizador, em segundos (cyberBar1..5 no CSS).
+    static let barPeriods: [Double] = [1.1, 0.9, 1.3, 1.0, 1.2]
+    /// Piscada dos pontos de "processando" (cyberDotBlink1..3): mesmo periodo,
+    /// cada ponto acendendo num instante diferente do ciclo.
+    static let dotPeriod: Double = 1.2
+    static let dotOffsets: [CGFloat] = [0.1, 0.5, 0.8]
+    /// Constante de tempo do VU = `transition: transform 0.09s` do equalizador.
+    static let levelSmoothing: Double = 0.09
+    /// Entrada/saida do Modo Live = `cyberLiveIn 0.28s` do HUD do webview. As
+    /// duas superficies tem de acabar de abrir no MESMO instante.
+    static let enterDuration: Double = 0.28
+    static let exitDuration: Double = 0.18
+
+    /// 0...1 dentro de um ciclo de `period` segundos, ancorado no relogio.
+    static func phase(_ period: Double, at time: Double = CACurrentMediaTime()) -> CGFloat {
+        CGFloat(time.truncatingRemainder(dividingBy: period) / period)
+    }
+
+    /// Onda 0...1 equivalente a um keyframe `0%,100% -> 50%` com ease-in-out
+    /// (que e exatamente meia cossenoide).
+    static func wave(_ period: Double, at time: Double = CACurrentMediaTime()) -> CGFloat {
+        0.5 - 0.5 * cos(phase(period, at: time) * 2 * .pi)
+    }
+
+    /// Alpha 0.2...1 de um ponto de "processando", com o pico curto do keyframe.
+    static func blink(index: Int, at time: Double = CACurrentMediaTime()) -> CGFloat {
+        let t = phase(dotPeriod, at: time)
+        let offset = dotOffsets[index % dotOffsets.count]
+        return 0.2 + 0.8 * pow(max(0, cos((t - offset) * 2 * .pi)), 6)
+    }
+
+    /// RMS do microfone -> nivel 0...1. Ganho 8, gama 0.65 e piso de ruido 0.18
+    /// (fala normal tem RMS ~0.02-0.15, entao sem ganho a barra nao sai do lugar
+    /// e sem piso o ruido de sala deixa o equalizador inflado parado).
+    /// ESPELHO EXATO de `levelFromRms` em src/lib/liveMotion.ts.
+    static func level(rms: Float) -> CGFloat {
+        let curved = powf(min(1, max(0, rms) * 8), 0.65)
+        let floorNoise: Float = 0.18
+        return CGFloat(min(1, max(0, (curved - floorNoise) / (1 - floorNoise))))
     }
 }
 
@@ -309,16 +368,22 @@ func cpDrawLabel(_ text: String, in rect: NSRect, size: CGFloat, weight: NSFont.
 
 enum IslandState {
     case idle
+    /// Modo Live ligado: a ilha vira uma pilula que ABRACA o recorte da notch,
+    /// microfone numa asa e stop na outra. E o unico estado que aparece sozinho,
+    /// sem ninguem passar o mouse -- por isso so tem dois alvos e nada mais.
+    case live
     case peek
     case expanded
 }
 
 /// What the expanded stage area is currently showing.
+/// O que a area central da ilha EXPANDIDA esta mostrando. Nao ha estado de
+/// escuta: a ilha nao captura audio -- o microfone dela liga o Modo Live, que
+/// tem as proprias superficies (asas + chip).
 enum Activity {
     case none        // notifications list
-    case listening   // mic open, showing live caption
     case thinking    // agent turn in flight
-    case answering   // agent answered, possibly speaking
+    case answering   // agent answered
 }
 
 struct NotchNotification {
@@ -328,6 +393,24 @@ struct NotchNotification {
     let subtitle: String
     let createdAt: TimeInterval
     let primaryAction: String? // action_type of the first action, if any
+}
+
+/// Recorte fisico da notch (a camera housing) de uma tela.
+///
+/// O macOS nao expoe a notch: expoe as duas areas UTILIZAVEIS da barra de menu,
+/// uma de cada lado dela. O que sobra entre as duas E a notch. Tela sem notch
+/// (monitor externo, Mac mais velho) devolve nil, e a pilula do Modo Live vira
+/// uma barrinha comum, sem miolo cego.
+enum NotchGeometry {
+    static func size(on screen: NSScreen) -> NSSize? {
+        guard #available(macOS 12.0, *),
+              let left = screen.auxiliaryTopLeftArea,
+              let right = screen.auxiliaryTopRightArea
+        else { return nil }
+        let width = screen.frame.width - left.width - right.width
+        guard width > 1 else { return nil }
+        return NSSize(width: width, height: max(left.height, right.height))
+    }
 }
 
 // MARK: - Fullscreen detection
@@ -721,8 +804,9 @@ final class VoiceController: NSObject {
 
     private func processCaptured(_ buffer: AVAudioPCMBuffer) {
         framesReceived += 1
-        // VU meter from the raw float input. Speech RMS is small (~0.02–0.15),
-        // so apply a perceptual gain + curve, otherwise the bars barely move.
+        // VU meter from the raw float input. A curva mora em LiveMotion, nao aqui:
+        // ela e a MESMA do webview, senao a mesma voz mexe as barras da ilha e as
+        // do HUD do app em alturas diferentes.
         if let ch = buffer.floatChannelData, buffer.frameLength > 0 {
             let n = Int(buffer.frameLength)
             var sum: Float = 0
@@ -730,7 +814,7 @@ final class VoiceController: NSObject {
             for i in 0..<n { sum += p[i] * p[i] }
             let rms = sqrtf(sum / Float(n))
             if rms > diagPeakRms { diagPeakRms = rms }
-            let level = CGFloat(min(1, powf(min(1, rms * 11), 0.6)))
+            let level = LiveMotion.level(rms: rms)
             DispatchQueue.main.async { [weak self] in
                 self?.onLevel?(level)
             }
@@ -1026,23 +1110,32 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     var activity: Activity = .none { didSet { needsDisplay = true } }
     var caption: String = "" { didSet { needsDisplay = true } }   // live transcript / answer
     var errorText: String? { didSet { needsDisplay = true } }
-    var isListening = false {
-        didSet {
-            if isListening && !oldValue {
-                levelHistory = [CGFloat](repeating: 0, count: levelHistory.count)
-            }
-            needsDisplay = true
-        }
-    }
-    var isSpeaking = false { didSet { needsDisplay = true } }
-    var micLevel: CGFloat = 0 {
-        didSet {
-            levelHistory.removeFirst()
-            levelHistory.append(micLevel)
-            if islandState == .expanded { needsDisplay = true }
-        }
-    }
-    private var levelHistory = [CGFloat](repeating: 0, count: 30)
+
+    // ------------------------------------------------------------ Modo Live
+    /// Sub-estado da sessao Live (listening | thinking | speaking). Mexe so no
+    /// medidor da asa esquerda: o mic e o stop ficam onde estao, sempre.
+    var liveVoiceState: String = "listening" { didSet { needsDisplay = true } }
+    /// Nivel do microfone (0...1), a ~30 Hz. NAO pede redesenho: o proprio timer
+    /// de animacao ja redesenha enquanto a pilula esta aberta.
+    var liveLevel: CGFloat = 0
+    /// Largura do recorte = o miolo CEGO da pilula, onde nada e desenhado porque
+    /// fica atras da camera. Ver NotchGeometry.
+    var notchCoreWidth: CGFloat = 0
+    /// Ponteiro sobre o stop. Vem do `tick` do controller (que ja le o mouse a
+    /// 40 Hz) em vez de uma tracking area, que teria de ser refeita a cada quadro
+    /// da animacao de abertura.
+    var liveHover = false { didSet { if oldValue != liveHover { needsDisplay = true } } }
+    /// Botao de stop das asas.
+    var onLiveStop: (() -> Void)?
+
+    /// 0...1 de quanto o CONTEUDO das asas ja apareceu. A moldura (o painel) tem
+    /// a mola dela; isto e o segundo tempo -- os icones saem de tras da notch
+    /// depois que ela ja comecou a abrir.
+    private var liveReveal: CGFloat = 0
+    private var liveRevealTarget: CGFloat = 0
+    /// Nivel suavizado, so para o medidor nao tremer.
+    private var liveLevelSmooth: CGFloat = 0
+    private var stopHitRect: NSRect = .zero
 
     private let promptField = NSTextField(frame: .zero)
     private let horizontalPadding: CGFloat = 24
@@ -1140,7 +1233,25 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
             self.pulsePhase += 0.12
             self.scanPhase += 0.0037   // ~9s per sweep, matching gdScan
             if self.scanPhase > 1 { self.scanPhase -= 1 }
-            if self.islandState == .expanded { self.needsDisplay = true }
+            if self.islandState == .live {
+                // Mola criticamente amortecida: converge em ~0.3 s sem passar do
+                // ponto. O overshoot fica todo na moldura, que e quem "estica".
+                // Rampa linear aqui + o ease cubico no desenho = exatamente a
+                // duracao do `cyberLiveIn` do HUD do webview.
+                let dt = 1.0 / 30.0
+                let opening = self.liveRevealTarget > self.liveReveal
+                let step = CGFloat(dt / (opening ? LiveMotion.enterDuration : LiveMotion.exitDuration))
+                self.liveReveal = opening
+                    ? min(self.liveRevealTarget, self.liveReveal + step)
+                    : max(self.liveRevealTarget, self.liveReveal - step)
+                // Suavizacao do VU pela CONSTANTE DE TEMPO do CSS, nao por um fator
+                // por quadro: assim ela nao muda se a taxa de redesenho mudar.
+                let alpha = CGFloat(1 - exp(-dt / LiveMotion.levelSmoothing))
+                self.liveLevelSmooth += (self.liveLevel - self.liveLevelSmooth) * alpha
+                self.needsDisplay = true
+            } else if self.islandState == .expanded {
+                self.needsDisplay = true
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         pulseTimer = timer
@@ -1149,6 +1260,26 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     func stopPulse() {
         pulseTimer?.invalidate()
         pulseTimer = nil
+    }
+
+    /// Reinicia a revelacao do conteudo das asas (chamado ao ABRIR o Modo Live).
+    func beginLiveReveal() {
+        liveReveal = 0
+        liveRevealTarget = 1
+        liveLevelSmooth = 0
+        needsDisplay = true
+    }
+
+    /// Apaga o conteudo das asas antes de a moldura encolher.
+    func endLiveReveal() {
+        liveRevealTarget = 0
+        needsDisplay = true
+    }
+
+    /// O stop e o UNICO alvo clicavel da pilula (o mic e indicador). Ponto em
+    /// coordenadas da view.
+    func isOverLiveStop(_ point: NSPoint) -> Bool {
+        stopHitRect != .zero && stopHitRect.insetBy(dx: -6, dy: -6).contains(point)
     }
 
     // -------------------------------------------------------------- drawing
@@ -1160,6 +1291,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
         switch islandState {
         case .idle: drawIdle()
+        case .live: drawLive()
         case .peek: drawPeek()
         case .expanded: drawExpanded()
         }
@@ -1175,13 +1307,95 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         drawGlowDot(center: NSPoint(x: bounds.midX, y: bounds.midY), radius: 2.4)
     }
 
+    /// Pilula do Modo Live: miolo cego (atras da camera), microfone + medidor na
+    /// asa esquerda, stop na direita. Tudo entra deslizando de tras do recorte --
+    /// `liveReveal` e o segundo tempo da animacao, depois da moldura.
+    private func drawLive() {
+        // Mesma cor do recorte: as asas tem de parecer a PROPRIA notch esticando.
+        CP.notchBlack.setFill()
+        bounds.fill()
+
+        let wing = (bounds.width - notchCoreWidth) / 2
+        guard wing > 10 else { stopHitRect = .zero; return }
+
+        let reveal = max(0, min(1, liveReveal))
+        let eased = 1 - pow(1 - reveal, 3)      // ease-out cubico
+        let slide = (1 - eased) * 22            // sai de tras da notch
+        let centerY = bounds.midY
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.cgContext.setAlpha(eased)
+
+        // ---- asa esquerda: microfone + medidor (grupo centrado na asa)
+        let groupWidth: CGFloat = 42
+        let groupX = wing / 2 - groupWidth / 2 - slide
+        // -10.2 e nao -9: o glifo tem haste e base embaixo, entao o centro optico
+        // dele fica ~1.2 pt abaixo do centro da caixa.
+        let mic = NSRect(x: groupX, y: centerY - 10.2, width: 18, height: 18)
+        if liveVoiceState == "listening" {
+            // O halo respira com a voz: e o feedback de "estou te ouvindo" que
+            // se le de longe, sem texto nenhum.
+            let glow = 3 + liveLevelSmooth * 6
+            CP.red.withAlphaComponent(0.10 + 0.24 * min(1, liveLevelSmooth)).setFill()
+            NSBezierPath(ovalIn: mic.insetBy(dx: -glow, dy: -glow)).fill()
+        }
+        drawMicGlyph(in: mic, scale: 1.0, color: liveVoiceState == "thinking"
+            ? CP.red.withAlphaComponent(0.55) : CP.red)
+        drawLiveMeter(x: groupX + 24, centerY: centerY, width: 15, height: 16)
+
+        // ---- asa direita: stop
+        let side: CGFloat = 20
+        let stop = NSRect(x: bounds.maxX - wing / 2 - side / 2 + slide,
+                          y: centerY - side / 2, width: side, height: side)
+        stopHitRect = stop
+        if liveHover {
+            CP.red.withAlphaComponent(0.26).setFill()
+            NSBezierPath(roundedRect: stop.insetBy(dx: -5, dy: -5),
+                         xRadius: CP.cardRadius + 3, yRadius: CP.cardRadius + 3).fill()
+        }
+        let stopPath = NSBezierPath(roundedRect: stop, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
+        (liveHover ? CP.redBright : CP.red).setFill()
+        stopPath.fill()
+        CP.redInk.setFill()
+        NSBezierPath(roundedRect: stop.insetBy(dx: 6.5, dy: 6.5), xRadius: 1, yRadius: 1).fill()
+
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// Tres barrinhas ao lado do mic: seguem a voz enquanto escuta e pulsam
+    /// sozinhas enquanto o Neo pensa/fala. E o que deixa a pilula viva sem
+    /// gastar largura com texto.
+    private func drawLiveMeter(x: CGFloat, centerY: CGFloat, width: CGFloat, height: CGFloat) {
+        let bars = 3
+        let gap: CGFloat = 4
+        let barWidth = (width - CGFloat(bars - 1) * gap) / CGFloat(bars)
+        let now = CACurrentMediaTime()
+        for index in 0..<bars {
+            // Mesmo periodo por barra que o equalizador do HUD (cyberBar1..3).
+            let wave = LiveMotion.wave(LiveMotion.barPeriods[index], at: now)
+            let amount: CGFloat
+            switch liveVoiceState {
+            case "thinking": amount = 0.24 + 0.34 * wave
+            case "speaking": amount = 0.28 + 0.72 * wave
+            default:
+                // O jitter por barra e o que faz o medidor parecer audio, e nao
+                // tres retangulos subindo juntos.
+                amount = max(0.38, min(1, liveLevelSmooth * (1.3 + 0.6 * wave)))
+            }
+            let barHeight = max(3, height * amount)
+            let rect = NSRect(x: x + CGFloat(index) * (barWidth + gap),
+                              y: centerY - barHeight / 2, width: barWidth, height: barHeight)
+            CP.red.withAlphaComponent(0.5 + 0.5 * amount).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
+        }
+    }
+
     private func drawPeek() {
         drawBotIcon(in: NSRect(x: 22, y: 9, width: 28, height: 28))
         cpDrawLabel("Neo", in: NSRect(x: 60, y: 10, width: 90, height: 22), size: 15, weight: .bold, color: .white, tracking: 0.08)
         let dotX = bounds.width - 92
-        drawStatusDot(center: NSPoint(x: dotX, y: 23), active: isListening || isSpeaking)
-        let label = isSpeaking ? "falando" : (isListening ? "ouvindo" : "online")
-        cpDrawLabel(label, in: NSRect(x: dotX + 12, y: 11, width: 64, height: 22), size: 11, weight: .bold, color: CP.red, tracking: 0.08)
+        drawStatusDot(center: NSPoint(x: dotX, y: 23))
+        cpDrawLabel("online", in: NSRect(x: dotX + 12, y: 11, width: 64, height: 22), size: 11, weight: .bold, color: CP.red, tracking: 0.08)
     }
 
     private func drawExpanded() {
@@ -1201,12 +1415,10 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         let stage = NSRect(x: horizontalPadding, y: stageTop, width: bounds.width - horizontalPadding * 2, height: stageBottom - stageTop)
 
         switch activity {
-        case .listening:
-            drawVoiceStage(in: stage, title: "Ouvindo…", body: caption.isEmpty ? "Pode falar — estou te ouvindo." : caption)
         case .thinking:
             drawVoiceStage(in: stage, title: "Pensando…", body: caption)
         case .answering:
-            drawVoiceStage(in: stage, title: isSpeaking ? "Neo está falando" : "Neo respondeu", body: caption)
+            drawVoiceStage(in: stage, title: "Neo respondeu", body: caption)
         case .none:
             drawNotifications(in: stage)
         }
@@ -1226,39 +1438,28 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         let avatarRect = NSRect(x: card.minX + 18, y: card.minY + 18, width: 34, height: 34)
         drawBotIcon(in: avatarRect)
 
-        // Mic button — solid neon red primary action (btn-send recipe).
+        // Botao de microfone = LIGAR O MODO LIVE (btn-send: vermelho neon solido).
+        // Nao tem estado ligado/desligado: assim que o Live sobe, a ilha vira as
+        // asas em volta do recorte e este cartao sai de cena.
         let micSize: CGFloat = 46
         let mic = NSRect(x: card.maxX - micSize - 16, y: card.minY + (card.height - micSize) / 2, width: micSize, height: micSize)
         micHitRect = mic
         let micPath = NSBezierPath(roundedRect: mic, xRadius: CP.cardRadius, yRadius: CP.cardRadius)
-        (isListening ? CP.redBright : CP.red).setFill()
+        CP.red.setFill()
         micPath.fill()
-        if isListening {
-            // pulsing ring
-            let r = 4 + sin(pulsePhase) * 2
-            CP.red.withAlphaComponent(0.4).setStroke()
-            let ring = NSBezierPath(roundedRect: mic.insetBy(dx: -r, dy: -r), xRadius: CP.cardRadius + r, yRadius: CP.cardRadius + r)
-            ring.lineWidth = 2
-            ring.stroke()
-        }
         drawMicGlyph(in: mic, scale: 0.34, color: CP.redInk)
 
         let textX = avatarRect.maxX + 22
         let textMaxWidth = max(120, mic.minX - textX - 14)
         let greeting: String
         switch activity {
-        case .listening: greeting = "Estou ouvindo…"
         case .thinking: greeting = "Só um instante…"
-        case .answering: greeting = isSpeaking ? "Falando com você" : "Pronto!"
+        case .answering: greeting = "Pronto!"
         case .none: greeting = "Olá, em que posso ajudar?"
         }
         drawText(greeting, in: NSRect(x: textX, y: card.minY + 18, width: textMaxWidth, height: 20), size: 14, weight: .semibold, color: .white, alignment: .left)
 
-        if isListening {
-            drawWaveform(x: textX, y: card.minY + 38, width: min(textMaxWidth, 168), height: 18)
-        } else {
-            drawDottedLine(x: textX, y: card.minY + 43, dots: max(8, Int(min(14, (textMaxWidth / 12)))))
-        }
+        drawDottedLine(x: textX, y: card.minY + 43, dots: max(8, Int(min(14, (textMaxWidth / 12)))))
     }
 
     private func drawPromptCard() {
@@ -1316,7 +1517,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
         fillRoundedCard(card)
 
         // animated accent dot — a single neon red across all activity states.
-        let dotAlpha = activity == .answering && !isSpeaking ? 1.0 : (0.55 + 0.45 * (0.5 + 0.5 * sin(pulsePhase)))
+        let dotAlpha = activity == .answering ? 1.0 : (0.55 + 0.45 * (0.5 + 0.5 * sin(pulsePhase)))
         CP.red.withAlphaComponent(dotAlpha).setFill()
         NSBezierPath(ovalIn: NSRect(x: card.minX + 18, y: card.minY + 20, width: 10, height: 10)).fill()
         cpDrawLabel(title, in: NSRect(x: card.minX + 36, y: card.minY + 15, width: card.width - 52, height: 20), size: 12, weight: .bold, color: NSColor.white.withAlphaComponent(0.85), tracking: 0.06)
@@ -1331,6 +1532,12 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
 
     // ----------------------------------------------------------- hit-test
     override func mouseDown(with event: NSEvent) {
+        if islandState == .live {
+            // A pilula fica POR CIMA da barra de menu: fora do stop ela nao pode
+            // fazer nada, so engolir o clique.
+            if isOverLiveStop(convert(event.locationInWindow, from: nil)) { onLiveStop?() }
+            return
+        }
         guard islandState == .expanded else {
             super.mouseDown(with: event)
             return
@@ -1394,27 +1601,10 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     private func drawThinkingDots(at origin: NSPoint) {
+        let now = CACurrentMediaTime()
         for i in 0..<3 {
-            let phase = pulsePhase - CGFloat(i) * 0.5
-            let a = 0.35 + 0.55 * (0.5 + 0.5 * sin(phase))
-            CP.red.withAlphaComponent(a).setFill()
+            CP.red.withAlphaComponent(LiveMotion.blink(index: i, at: now)).setFill()
             NSBezierPath(ovalIn: NSRect(x: origin.x + CGFloat(i) * 14, y: origin.y, width: 7, height: 7)).fill()
-        }
-    }
-
-    /// Scrolling live waveform: each bar is a sample from `levelHistory`, so the
-    /// shape visibly moves with the voice (newest on the right).
-    private func drawWaveform(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) {
-        let bars = levelHistory.count
-        guard bars > 0 else { return }
-        let gap: CGFloat = 3
-        let barW = max(2, (width - CGFloat(bars - 1) * gap) / CGFloat(bars))
-        for i in 0..<bars {
-            let v = levelHistory[i]
-            let h = max(2.5, v * height)
-            let rect = NSRect(x: x + CGFloat(i) * (barW + gap), y: y + (height - h) / 2, width: barW, height: h)
-            CP.red.withAlphaComponent(0.55 + 0.45 * v).setFill()
-            NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
 
@@ -1559,7 +1749,7 @@ final class NeoIslandView: NSView, NSTextFieldDelegate {
     }
 
     /// Solid red status LED with a soft glow, matching `.header-status.connected`.
-    private func drawStatusDot(center: NSPoint, active: Bool) {
+    private func drawStatusDot(center: NSPoint) {
         let radius: CGFloat = 4
         let rect = NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
         CP.red.withAlphaComponent(0.35).setFill()
@@ -1588,13 +1778,14 @@ final class NotchController {
     private let container: NSView
     private let blur: NSVisualEffectView
     private let islandView: NeoIslandView
-    private let voice = VoiceController()
 
-    /// Emits a prompt for the full agent (set by AppDelegate so it can tag the
-    /// turn's origin — notch vs. Live chip): (texto, veio-do-microfone, cru do ASR).
-    /// A ilha tem AS DUAS entradas (campo de texto e mic), e so a de voz ganha a
-    /// tolerancia a erro de transcricao no neo-core.
-    var onPrompt: ((String, Bool, String?) -> Void)?
+    /// Prompt DIGITADO na ilha, para o agente completo. A ilha nao captura mais
+    /// audio: o microfone dela virou o botao de ligar o Modo Live, que e quem tem
+    /// a sessao de voz (e a tolerancia a erro de ASR no neo-core).
+    var onPrompt: ((String) -> Void)?
+    /// Stop das asas do Modo Live (encerra a sessao, venha ela do chip nativo
+    /// ou do overlay dentro da janela).
+    var onLiveStop: (() -> Void)?
 
     private var state: IslandState = .idle
     private var hoverTimer: Timer?
@@ -1602,11 +1793,14 @@ final class NotchController {
     private var stableBeganAt: TimeInterval?
     private var lastPointer: NSPoint?
 
-    private var lastTurnWasVoice = false
-
     /// Ilha recolhida porque tem alguem em tela cheia (ver FullscreenProbe).
     private var hiddenForFullscreen = false
     private var lastFullscreenPoll: TimeInterval = 0
+
+    /// Quem esta pedindo a pilula de Modo Live: "native" (sessao do chip) e/ou
+    /// "app" (overlay dentro da janela). Ela so se recolhe quando os DOIS soltam,
+    /// senao fechar uma sessao apagaria os controles da outra.
+    private var liveSources: Set<String> = []
 
     private let idleSize = NSSize(width: 138, height: 30)
     private let peekSize = NSSize(width: 460, height: 46)
@@ -1617,6 +1811,12 @@ final class NotchController {
     /// Varrer a lista de janelas custa caro pros 40 Hz do `tick`, e entrar/sair
     /// de tela cheia nao e algo que precise de resposta em milissegundos.
     private let fullscreenPollInterval: TimeInterval = 0.4
+    /// Quanto cada asa avanca para fora do recorte. 62 pt cabem icone + medidor
+    /// sem invadir a area onde a barra de menu costuma ter conteudo.
+    private let liveWingWidth: CGFloat = 62
+    /// A ilha e angular (4 px) por design; a pilula do Live e a excecao, porque
+    /// esta imitando HARDWARE: as quinas de baixo copiam a curva do recorte.
+    private let liveCornerRadius: CGFloat = 11
 
     init(screen: NSScreen) {
         let startFrame = Self.frame(for: idleSize, on: screen)
@@ -1658,21 +1858,27 @@ final class NotchController {
         panel.setFrame(startFrame, display: true)
         panel.orderFrontRegardless()
 
-        wireVoice()
         wireIsland()
     }
 
     private func wireIsland() {
         islandView.onSubmitPrompt = { [weak self] text in
             guard let self else { return }
-            self.lastTurnWasVoice = false
             self.islandView.errorText = nil
             self.islandView.caption = ""
             self.islandView.activity = .thinking
-            self.onPrompt?(text, false, nil)
+            self.onPrompt?(text)
         }
-        islandView.onMicTapped = { [weak self] in
-            self?.voice.toggleListening()
+        islandView.onMicTapped = {
+            // O mic da ilha LIGA o Modo Live -- nao dita mais um prompt avulso.
+            // Quem decide ONDE o Live abre (modal na janela ou chip nativo) e o
+            // Rust, pela mesma regra da wake word; ver `live_request` no
+            // notch_host.rs. A ilha nao se recolhe aqui: quem a substitui pelas
+            // asas e o `setLive` que volta pelo IPC.
+            emitEvent(["type": "live_request"])
+        }
+        islandView.onLiveStop = { [weak self] in
+            self?.onLiveStop?()
         }
         islandView.onNotificationTapped = { id, action in
             if let action {
@@ -1683,51 +1889,11 @@ final class NotchController {
         }
     }
 
-    private func wireVoice() {
-        voice.onPartial = { [weak self] text in
-            guard let self else { return }
-            if self.islandView.activity == .listening { self.islandView.caption = text }
-        }
-        voice.onFinal = { [weak self] text, raw in
-            guard let self else { return }
-            self.lastTurnWasVoice = true
-            self.islandView.caption = ""
-            self.islandView.activity = .thinking
-            self.onPrompt?(text, true, raw)
-        }
-        voice.onListeningChanged = { [weak self] on in
-            guard let self else { return }
-            self.islandView.isListening = on
-            if on {
-                self.islandView.errorText = nil
-                self.islandView.activity = .listening
-            } else if self.islandView.activity == .listening {
-                self.islandView.activity = .none
-            }
-        }
-        voice.onSpeakingChanged = { [weak self] on in
-            self?.islandView.isSpeaking = on
-            // Anti-echo gate: while Neo speaks, the wake sidecar hears this
-            // TTS on the mic — Rust drops wake events for the duration.
-            emitEvent(["type": "tts_state", "source": "notch", "speaking": on])
-        }
-        voice.onLevel = { [weak self] level in
-            self?.islandView.micLevel = level
-        }
-        voice.onError = { [weak self] msg in
-            self?.islandView.errorText = msg
-        }
-    }
-
-    /// Voice-triggered interrupt ("pare") for the ISLAND surface (prompt/mic
-    /// turns): stop the spoken answer and/or cancel the in-flight turn.
-    /// Returns false when there was nothing to stop.
+    /// Interrupcao por voz ("pare") na superficie da ILHA: cancela o turno que
+    /// um prompt DIGITADO deixou em voo. Devolve false quando nao havia nada a
+    /// parar (ai quem trata e a sessao Live).
     func interruptTurn() -> Bool {
         var acted = false
-        if voice.speaking {
-            voice.cancelSpeak()
-            acted = true
-        }
         if islandView.activity == .thinking {
             emitEvent(["type": "live_abort"]) // cancels the in-flight agent turn
             islandView.activity = .none
@@ -1736,24 +1902,105 @@ final class NotchController {
         return acted
     }
 
-    // ----------------------------------------------------------------- IPC
-    func applyConfig(_ voiceCfg: VoiceConfig) {
-        voice.cfg = voiceCfg
+    // ------------------------------------------------------------- Modo Live
+    /// Liga/desliga a pilula de Modo Live. Duas fontes acendem a MESMA pilula --
+    /// a sessao nativa do chip e o Modo Live aberto dentro da janela -- porque o
+    /// usuario ve uma notch so.
+    func setLive(_ on: Bool, source: String, state liveState: String? = nil) {
+        if let liveState, !liveState.isEmpty, liveState != "idle" {
+            islandView.liveVoiceState = liveState
+        }
+        let wasLive = !liveSources.isEmpty
+        if on { liveSources.insert(source) } else { liveSources.remove(source) }
+        let isLive = !liveSources.isEmpty
+        guard wasLive != isLive, let screen = activeScreen() else { return }
+        if isLive {
+            enterLive(on: screen)
+        } else {
+            exitLive(on: screen)
+        }
     }
 
+    /// Nivel do microfone da sessao Live, para o medidor da asa esquerda.
+    func setLiveLevel(_ level: CGFloat) {
+        islandView.liveLevel = level
+    }
+
+    /// A pilula NASCE do tamanho do recorte -- invisivel, escondida atras da
+    /// camera -- e so entao estica para os lados. E isso que da a leitura de "a
+    /// notch cresceu", em vez de "uma janelinha apareceu no topo da tela".
+    private func enterLive(on screen: NSScreen) {
+        resetIntent()
+        let geometry = liveGeometry(on: screen)
+        state = .live
+        islandView.islandState = .live
+        islandView.activity = .none
+        islandView.caption = ""
+        islandView.errorText = nil
+        islandView.notchCoreWidth = geometry.core.width
+        islandView.liveHover = false
+        islandView.beginLiveReveal()
+        applyCorners(for: .live)
+        panel.setFrame(Self.frame(for: geometry.core, on: screen), display: true)
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = LiveMotion.enterDuration
+            // Passa um pouco do ponto e volta: e a mola que faz a abertura
+            // parecer material, e nao um corte de tamanho.
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.18, 1.5, 0.32, 1)
+            panel.animator().setFrame(Self.frame(for: geometry.full, on: screen), display: true)
+        }
+    }
+
+    /// Recolhe pela mesma porta: o conteudo apaga primeiro, a moldura encolhe ate
+    /// o recorte e so entao a ilha volta a ser a pilula ociosa.
+    private func exitLive(on screen: NSScreen) {
+        islandView.endLiveReveal()
+        islandView.liveHover = false
+        let core = liveGeometry(on: screen).core
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = LiveMotion.exitDuration
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.9, 0.4)
+            panel.animator().setFrame(Self.frame(for: core, on: screen), display: true)
+        }, completionHandler: { [weak self] in
+            guard let self, self.liveSources.isEmpty else { return }  // reabriu no meio
+            self.apply(.idle, on: self.activeScreen() ?? screen, animated: false)
+        })
+    }
+
+    /// (miolo, pilula inteira) do Modo Live nesta tela. O miolo tem a largura
+    /// EXATA do recorte, e por isso e o quadro zero da animacao.
+    private func liveGeometry(on screen: NSScreen) -> (core: NSSize, full: NSSize) {
+        if let notch = NotchGeometry.size(on: screen) {
+            let height = max(idleSize.height, notch.height)
+            return (NSSize(width: notch.width, height: height),
+                    NSSize(width: notch.width + liveWingWidth * 2, height: height))
+        }
+        // Sem notch nao ha o que abracar: a pilula nasce de um ponto no centro e
+        // as duas asas ficam lado a lado, com uma folga no meio.
+        let height = idleSize.height + 2
+        let gap: CGFloat = 26
+        return (NSSize(width: gap, height: height),
+                NSSize(width: gap + liveWingWidth * 2, height: height))
+    }
+
+    /// Hover do stop sem tracking area: a view e flipped, entao o y local conta do
+    /// topo do painel para baixo.
+    private func updateLiveHover(pointer: NSPoint) {
+        let frame = panel.frame
+        let local = NSPoint(x: pointer.x - frame.minX, y: frame.maxY - pointer.y)
+        islandView.liveHover = islandView.isOverLiveStop(local)
+    }
+
+    // ----------------------------------------------------------------- IPC
     func addNotification(_ n: NotchNotification) {
         islandView.addNotification(n)
     }
 
-    func agentComplete(text: String, voice voiceOverride: [String: Any]?) {
+    /// Resposta de um prompt digitado: a ilha MOSTRA, quem fala e o Modo Live.
+    func agentComplete(text: String) {
         islandView.caption = text
         islandView.activity = .answering
-        if lastTurnWasVoice {
-            let v = voiceOverride?["voice"] as? String
-            let lang = voiceOverride?["language"] as? String
-            let eng = voiceOverride?["engine"] as? String
-            voice.speak(text: text, voice: v, language: lang, backend: eng)
-        }
     }
 
     func agentError(_ message: String) {
@@ -1777,7 +2024,10 @@ final class NotchController {
 
         // Keep the island open while a voice/agent turn is alive even if the
         // pointer drifts away.
-        let busy = voice.listening || voice.speaking || islandView.activity == .thinking
+        // O Modo Live segura a ilha aberta: as asas sao o unico jeito de ver que o
+        // mic esta ligado e de desliga-lo. O turno digitado tambem segura, senao a
+        // resposta some do meio da tela.
+        let busy = islandView.activity == .thinking || !liveSources.isEmpty
 
         if now - lastFullscreenPoll >= fullscreenPollInterval {
             lastFullscreenPoll = now
@@ -1786,6 +2036,13 @@ final class NotchController {
         // Recolhida: nada de hover/expandir. O turno em voo continua vivo (o
         // audio nao para), so a apresentacao e que sai da frente.
         if hiddenForFullscreen { return }
+
+        // Modo Live: a pilula E o controle. Se ela expandisse por hover, o caminho
+        // do mouse ate o stop derrubaria o proprio botao debaixo do cursor.
+        if state == .live {
+            updateLiveHover(pointer: pointer)
+            return
+        }
 
         let interactiveFrame = panel.frame.insetBy(dx: state == .idle ? 8 : 14, dy: state == .idle ? 8 : 12)
         let isOverIsland = interactiveFrame.contains(pointer)
@@ -1842,8 +2099,14 @@ final class NotchController {
         } else {
             // Reposiciona antes de mostrar: enquanto recolhida o `tick` sai
             // cedo, entao o painel ficou parado na tela de onde ela sumiu.
-            apply(.idle, on: screen, animated: false)
             islandView.startPulse()
+            if liveSources.isEmpty {
+                apply(.idle, on: screen, animated: false)
+            } else {
+                // Voltar como pilula ociosa apagaria o mic e o stop de uma sessao
+                // Live que continua correndo: reabre pela mesma animacao.
+                enterLive(on: screen)
+            }
             panel.orderFrontRegardless()
         }
     }
@@ -1874,18 +2137,18 @@ final class NotchController {
         }
 
         let size: NSSize
-        let radius: CGFloat = CP.cardRadius   // angular HUD corners in every state
         switch next {
         case .idle:
             size = idleSize
+        case .live:
+            size = liveGeometry(on: screen).full
         case .peek:
             size = peekSize
         case .expanded:
             size = expandedSize
         }
 
-        container.layer?.cornerRadius = radius
-        blur.layer?.cornerRadius = radius
+        applyCorners(for: next)
 
         let nextFrame = Self.frame(for: size, on: screen)
 
@@ -1902,6 +2165,21 @@ final class NotchController {
         if next == .expanded {
             panel.makeKeyAndOrderFront(nil)
         }
+    }
+
+    /// Quinas: HUD angular (4 px) em todos os estados menos o Live, onde a ilha
+    /// imita o recorte -- topo reto (encosta na borda da tela) e as duas quinas
+    /// de baixo com a curva do hardware.
+    private func applyCorners(for state: IslandState) {
+        let radius = state == .live ? liveCornerRadius : CP.cardRadius
+        let bottomOnly: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        let all: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
+                                 .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        let mask = state == .live ? bottomOnly : all
+        container.layer?.cornerRadius = radius
+        container.layer?.maskedCorners = mask
+        blur.layer?.cornerRadius = radius
+        blur.layer?.maskedCorners = mask
     }
 
     private func activeScreen() -> NSScreen? {
@@ -1950,7 +2228,6 @@ final class LiveChipView: NSView {
     var onAbort: (() -> Void)?
 
     private var levelHistory = [CGFloat](repeating: 0, count: 22)
-    private var pulsePhase: CGFloat = 0
     private var progressPhase: CGFloat = 0
     /// 0...1 sweep position of the CRT scanline (speaking card only — the
     /// only state tall enough to read it).
@@ -1965,7 +2242,6 @@ final class LiveChipView: NSView {
         if timer != nil { return }
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.pulsePhase += 0.13
             self.progressPhase += 0.018
             if self.progressPhase > 1 { self.progressPhase -= 1 }
             self.scanPhase += 0.0037
@@ -2142,9 +2418,11 @@ final class LiveChipView: NSView {
     }
 
     private func drawMiniBars(x: CGFloat, y: CGFloat, active: Bool) {
+        let now = CACurrentMediaTime()
         for i in 0..<4 {
-            let phase = pulsePhase - CGFloat(i) * 0.6
-            let h = active ? 4 + (0.5 + 0.5 * sin(phase)) * 9 : 5
+            // Mesmo relogio e mesmos periodos do medidor da ilha logo acima: o
+            // chip fica colado nela, e fora de fase os dois brigavam na tela.
+            let h = active ? 4 + LiveMotion.wave(LiveMotion.barPeriods[i], at: now) * 9 : 5
             let rect = NSRect(x: x + CGFloat(i) * 5, y: y + (12 - h) / 2, width: 3, height: h)
             CP.red.withAlphaComponent(0.9).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
@@ -2152,10 +2430,9 @@ final class LiveChipView: NSView {
     }
 
     private func drawThinkingDots(at origin: NSPoint) {
+        let now = CACurrentMediaTime()
         for i in 0..<3 {
-            let phase = pulsePhase - CGFloat(i) * 0.5
-            let a = 0.35 + 0.55 * (0.5 + 0.5 * sin(phase))
-            CP.red.withAlphaComponent(a).setFill()
+            CP.red.withAlphaComponent(LiveMotion.blink(index: i, at: now)).setFill()
             NSBezierPath(ovalIn: NSRect(x: origin.x + CGFloat(i) * 13, y: origin.y, width: 7, height: 7)).fill()
         }
     }
@@ -2285,7 +2562,8 @@ final class LiveChipController {
         )
         if visible {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.26
+                // Mesma duracao da abertura da ilha e do HUD do webview.
+                context.duration = LiveMotion.enterDuration
                 context.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.4, 0.64, 1)
                 panel.animator().setFrame(frame, display: true)
             }
@@ -2323,6 +2601,11 @@ final class LiveSession {
     private let voice = VoiceController()
     /// (texto, transcricao crua) — a sessao Live SEMPRE vem do microfone.
     var onPrompt: ((String, String?) -> Void)?
+    /// Espelha a sessao na ILHA (as asas em volta do recorte): (ativa, estado).
+    /// O chip mostra a CONVERSA; a ilha mostra os CONTROLES.
+    var onStateChanged: ((Bool, String) -> Void)?
+    /// Nivel do microfone para o medidor das asas.
+    var onLevel: ((CGFloat) -> Void)?
 
     private var active = false
     /// The answer card lingers after TTS ends; it only collapses back to
@@ -2366,7 +2649,7 @@ final class LiveSession {
         active = true
         showingAnswer = false
         thinking = false
-        chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
+        present("listening")
         voice.toggleListening()
         armIdleTimer()
     }
@@ -2379,6 +2662,14 @@ final class LiveSession {
         cancelIdleTimer()
         voice.dispose()
         chip.hideChip()
+        onStateChanged?(false, "idle")
+    }
+
+    /// Toda transicao de estado passa por aqui: o chip conta a conversa, a ilha
+    /// acende os controles. Um lugar so para os dois nunca divergirem.
+    private func present(_ state: String, partial: String = "", spoken: String = "") {
+        chip.update(active: true, state: state, partial: partial, spoken: spoken, level: 0)
+        onStateChanged?(true, state)
     }
 
     /// (Re)arma o fecha-sozinho: dispara em `idleTimeout` se nada o rearmar.
@@ -2419,7 +2710,7 @@ final class LiveSession {
         voice.cancelSpeak()
         showingAnswer = false
         thinking = false
-        chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
+        present("listening")
         armIdleTimer() // voltou a escutar ocioso -> conta o tempo de novo
         emitEvent(["type": "live_abort"])
     }
@@ -2440,7 +2731,7 @@ final class LiveSession {
         showingAnswer = true
         thinking = false
         armStuckTimer() // vai falar: ociosidade nao vale, mas o teto de travamento sim
-        chip.update(active: true, state: "speaking", partial: "", spoken: text, level: 0)
+        present("speaking", spoken: text)
         let v = voiceOverride?["voice"] as? String
         let lang = voiceOverride?["language"] as? String
         let eng = voiceOverride?["engine"] as? String
@@ -2452,7 +2743,7 @@ final class LiveSession {
         showingAnswer = true
         thinking = false
         armIdleTimer() // erro mostrado, sem fala a caminho -> fecha se ficar ocioso
-        chip.update(active: true, state: "speaking", partial: "", spoken: "⚠ " + message, level: 0)
+        present("speaking", spoken: "⚠ " + message)
     }
 
     private func wire() {
@@ -2465,7 +2756,7 @@ final class LiveSession {
         voice.onListeningChanged = { [weak self] on in
             guard let self, self.active else { return }
             if on && !self.showingAnswer {
-                self.chip.update(active: true, state: "listening", partial: "", spoken: "", level: 0)
+                self.present("listening")
             }
         }
         voice.onPartial = { [weak self] text in
@@ -2476,14 +2767,14 @@ final class LiveSession {
             // neo-voice) chegando durante a fala trocaria o teto de travamento
             // pelo prazo curto de ociosidade e cortaria uma resposta longa.
             if !self.thinking && !self.voice.speaking { self.armIdleTimer() }
-            self.chip.update(active: true, state: "listening", partial: text, spoken: "", level: 0)
+            self.present("listening", partial: text)
         }
         voice.onFinal = { [weak self] text, raw in
             guard let self, self.active else { return }
             self.showingAnswer = false
             self.thinking = true
             self.armStuckTimer() // vai pensar: idem — agente mudo nao prende a sessao
-            self.chip.update(active: true, state: "thinking", partial: "", spoken: "", level: 0)
+            self.present("thinking")
             self.onPrompt?(text, raw)
         }
         voice.onSpeakingChanged = { [weak self] on in
@@ -2496,11 +2787,12 @@ final class LiveSession {
         voice.onLevel = { [weak self] level in
             guard let self, self.active, !self.showingAnswer else { return }
             self.chip.setLevel(level)
+            self.onLevel?(level)
         }
         voice.onError = { [weak self] msg in
             guard let self, self.active else { return }
             self.showingAnswer = true
-            self.chip.update(active: true, state: "speaking", partial: "", spoken: "⚠ " + msg, level: 0)
+            self.present("speaking", spoken: "⚠ " + msg)
         }
     }
 }
@@ -2521,8 +2813,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = NotchController(screen: screen)
         self.controller = controller
         controller.start()
-        controller.onPrompt = { [weak self] text, fromVoice, raw in
-            self?.submitPrompt(text, fromLive: false, fromVoice: fromVoice, asrRaw: raw)
+        controller.onPrompt = { [weak self] text in
+            // Prompt digitado na ilha: nunca e transcricao, entao nao leva `source`.
+            self?.submitPrompt(text, fromLive: false, fromVoice: false)
+        }
+        controller.onLiveStop = { [weak self] in
+            // Mesma saida do X do chip: encerra a sessao NATIVA e avisa o webview
+            // (o Rust reemite `live-close-requested`), porque o Modo Live pode ter
+            // sido aberto la dentro -- e ai a ilha e o unico controle na tela.
+            emitEvent(["type": "live_close"])
+            self?.liveSession?.stop()
+            self?.controller?.setLive(false, source: "app")
         }
 
         let chip = LiveChipController()
@@ -2531,6 +2832,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.onPrompt = { [weak self] text, raw in
             // sessao Live: sempre microfone
             self?.submitPrompt(text, fromLive: true, fromVoice: true, asrRaw: raw)
+        }
+        session.onStateChanged = { [weak self] active, state in
+            self?.controller?.setLive(active, source: "native", state: state)
+        }
+        session.onLevel = { [weak self] level in
+            self?.controller?.setLiveLevel(level)
         }
         liveSession = session
 
@@ -2579,7 +2886,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let t = v["idleTimeoutS"] as? Double { cfg.idleTimeoutS = max(0, t) }
                 cfg.inputDeviceName = (v["inputDeviceName"] as? String)
                     .flatMap { $0.isEmpty ? nil : $0 }
-                controller.applyConfig(cfg)
                 liveSession?.applyVoiceConfig(cfg)
             }
         case "notification":
@@ -2592,7 +2898,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if pendingFromLive {
                 liveSession?.agentComplete(text: text, voice: voice)
             } else {
-                controller.agentComplete(text: text, voice: voice)
+                controller.agentComplete(text: text)
             }
         case "agent_error":
             let message = (root["message"] as? String) ?? "Falha ao processar."
@@ -2605,6 +2911,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             liveSession?.start()
         case "live_stop":
             liveSession?.stop()
+        case "live_ui":
+            // Modo Live aberto DENTRO do app (overlay do webview). A sessao nao e
+            // nossa, mas a notch e a mesma: acende as asas para o mic e o stop
+            // existirem tambem quando a janela e que esta ouvindo.
+            controller.setLive((root["active"] as? Bool) ?? false,
+                               source: "app",
+                               state: root["state"] as? String)
+            // O nivel vem do MICROFONE DO WEBVIEW (a captura e dele nessa
+            // sessao). Sem isto o medidor da ilha ficava parado no piso
+            // enquanto o equalizador do app dancava com a voz.
+            if let level = root["level"] as? Double {
+                controller.setLiveLevel(CGFloat(max(0, min(1, level))))
+            }
         case "live_interrupt":
             // "pare": the Live chip has priority; when it has nothing to stop,
             // the island surface (typed/mic prompt being spoken or thought)

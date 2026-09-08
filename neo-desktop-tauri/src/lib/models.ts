@@ -83,7 +83,15 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, CatalogOption<ModelType>[]
     // O sufixo `@baidu` fixa o provedor de infra do gateway (o neo-core o
     // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
     // provedor, com outro preço e outro teto de saída.
-    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu)', description: '1M contexto, barato' },
+    //
+    // As DUAS entradas existem de propósito, e a escolha é preço x latência:
+    // o pin garante 1M de contexto pelo preço sondado do Baidu, mas o pool dele
+    // é compartilhado e satura (429 `rate-limited upstream`, medido na
+    // session-d94dc42f: 19 chamadas falhas e ~40s de backoff num turno só).
+    // Sem o pin o gateway roteia para qualquer endpoint livre — responde na
+    // hora, aceita `tool_choice=required` e cobra o que o endpoint da vez cobrar.
+    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu)', description: '1M contexto, barato — pool pode saturar' },
+    { value: 'deepseek/deepseek-v4-flash',       label: 'DeepSeek V4 Flash (auto)',  description: 'Sem pin: qualquer endpoint livre, preço varia' },
   ],
 };
 

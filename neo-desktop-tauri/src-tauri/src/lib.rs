@@ -306,6 +306,7 @@ pub fn run() {
             commands::remove_device,
             commands::pair_device,
             commands::wake_tts_state,
+            commands::notch_live_ui,
             commands::wake_set_test_mode,
             commands::get_conversation_history,
             commands::clear_conversation_history,

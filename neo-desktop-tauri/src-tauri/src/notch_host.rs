@@ -10,6 +10,10 @@
 //!   {"type":"notification","notification":{…}} a real notification to list
 //!   {"type":"agent_complete","text":…,"voice":…} final agent answer (+TTS voice)
 //!   {"type":"agent_error","message":…}         agent turn failed
+//!   {"type":"live_ui","active":…,"state":…,"level":…}
+//!                                             Modo Live aberto DENTRO do app: acende
+//!                                             as asas (mic + stop) da ilha e alimenta
+//!                                             o medidor com o VU do webview
 //!
 //! notch -> Rust (stdout):
 //!   {"type":"ready"}                            host booted; reply with config
@@ -17,6 +21,9 @@
 //!                                               run the full agent for this text
 //!                                               (`source` só vem quando o texto
 //!                                                saiu do microfone/STT)
+//!   {"type":"live_request"}                     o mic da ilha pediu Modo Live:
+//!                                               abre o modal na janela se ela estiver
+//!                                               na tela, senao sobe o chip nativo
 //!   {"type":"notification_action","notification_id":…,"action_type":…,"payload":…}
 //!   {"type":"notification_dismiss","notification_id":…}
 
@@ -148,6 +155,23 @@ mod imp {
         send_to_notch(&serde_json::json!({ "type": "live_interrupt" }));
     }
 
+    /// Espelha na ILHA do notch um Modo Live aberto DENTRO do app (overlay do
+    /// webview). A sessao NATIVA do chip nao passa por aqui -- ela acende as
+    /// asas do lado do Swift. Isto existe para o caso oposto: a wake word com a
+    /// janela em foco abre o Live no webview, e sem este aviso o mic e o stop
+    /// nao apareceriam na notch.
+    /// `level` e o VU do microfone DO WEBVIEW (0..1, ja normalizado pela mesma
+    /// curva das superficies nativas -- ver src/lib/liveMotion.ts): sem ele o
+    /// medidor da ilha ficaria parado enquanto o equalizador da janela dança.
+    pub fn live_ui(active: bool, state: Option<String>, level: Option<f64>) {
+        send_to_notch(&serde_json::json!({
+            "type": "live_ui",
+            "active": active,
+            "state": state.unwrap_or_else(|| "listening".to_string()),
+            "level": level.unwrap_or(0.0).clamp(0.0, 1.0),
+        }));
+    }
+
     /// Reenvia o config ao notch (ex.: o usuario trocou o microfone no painel).
     /// No-op se o host nao estiver rodando.
     pub fn resend_config() {
@@ -258,6 +282,31 @@ mod imp {
                             tauri::async_runtime::spawn(async move {
                                 let _ = commands::ack_notification(id).await;
                             });
+                        }
+                    }
+                    "live_request" => {
+                        // O microfone da ilha pede o Modo Live. Roteia como a wake
+                        // word (lib.rs, "wake-detected"), com UMA diferenca no
+                        // criterio: la a pergunta e "a janela esta FOCADA?", aqui
+                        // isso seria sempre "nao" -- clicar na ilha torna o painel
+                        // dela a janela chave e tira o foco da principal. Entao o
+                        // criterio e "esta NA TELA?", e se estiver, trazemos ela
+                        // pra frente: quem clicou no notch quer ver o modal.
+                        let window = app.get_webview_window("main");
+                        let on_screen = window
+                            .as_ref()
+                            .map(|w| {
+                                w.is_visible().unwrap_or(false)
+                                    && !w.is_minimized().unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if on_screen {
+                            if let Some(w) = window {
+                                let _ = w.set_focus();
+                            }
+                            let _ = app.emit("wake-live-inapp", ());
+                        } else {
+                            live_start();
                         }
                     }
                     "live_close" => {
@@ -388,11 +437,15 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    forward_agent_event, forward_notification, live_interrupt, live_start, resend_config,
-    start_notch_host, stop_notch_host,
+    forward_agent_event, forward_notification, live_interrupt, live_start, live_ui,
+    resend_config, start_notch_host, stop_notch_host,
 };
 
 /// Fora do macOS nao ha notch nativo: trocar o microfone no painel nao precisa
 /// avisar ninguem.
 #[cfg(not(target_os = "macos"))]
 pub fn resend_config() {}
+
+/// Idem para o Modo Live: sem notch nativa nao ha asas para acender.
+#[cfg(not(target_os = "macos"))]
+pub fn live_ui(_active: bool, _state: Option<String>, _level: Option<f64>) {}

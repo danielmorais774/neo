@@ -13,6 +13,7 @@
 
 import type { VoiceConfig, VoiceOverride, SpeechSegmentOverride } from './tauriApi';
 import { OutputRouter, getMicStream } from './audioDevices';
+import { levelFromRms } from './liveMotion';
 
 const TARGET_SR = 16000;
 const CHUNK = 1600; // 100ms @ 16kHz — frames PCM int16 enviados ao neo-voice
@@ -221,10 +222,13 @@ export class LiveVoiceSession {
   }
 
   private onFrame(f: Float32Array): void {
-    // VU meter
+    // VU meter — a curva mora em liveMotion.ts porque a ilha e o chip nativos
+    // usam a MESMA (LiveMotion.level no NeoNotchHost.swift). Com curvas
+    // diferentes, a mesma voz movia as barras de cada superfície numa altura
+    // diferente e o Modo Live parecia dois apps.
     let s = 0;
     for (let i = 0; i < f.length; i++) s += f[i] * f[i];
-    this.cb.onLevel?.(Math.min(1, Math.sqrt(s / f.length) * 3.2));
+    this.cb.onLevel?.(levelFromRms(Math.sqrt(s / f.length)));
 
     if (this.micPaused) return; // meio-duplex: descarta enquanto o Neo fala
 

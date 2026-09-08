@@ -1502,6 +1502,14 @@ pub fn wake_tts_state(speaking: bool) {
     crate::services::wake::set_tts_speaking("webview", speaking);
 }
 
+/// O webview avisa quando o Modo Live abre/fecha (ou muda de estado) DENTRO do
+/// app, para a ilha da notch acender as mesmas asas -- microfone de um lado do
+/// recorte, stop do outro -- que a sessao nativa do chip acende sozinha.
+#[tauri::command]
+pub fn notch_live_ui(active: bool, state: Option<String>, level: Option<f64>) {
+    crate::notch_host::live_ui(active, state, level);
+}
+
 /// Liga/desliga o modo teste do wake (tela "Teste de Wake"): enquanto ligado, o
 /// disparo NAO aciona o Live -- só reporta na tela (evento `wake-test-fire`).
 #[tauri::command]

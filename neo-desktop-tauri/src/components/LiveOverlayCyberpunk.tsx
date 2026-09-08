@@ -28,8 +28,11 @@ export default function LiveOverlayCyberpunk({
 }: LiveOverlayCyberpunkProps) {
   const stage = liveState === 'idle' ? 'listening' : liveState;
 
-  // o equalizador "respira" com o nível do microfone enquanto ouve
-  const eqScale = stage === 'listening' ? 1 + Math.min(0.9, micLevel * 1.3) : 1;
+  // O equalizador "respira" com o nível do microfone enquanto ouve. O 0.9 é o
+  // teto de escala; o nível já chega normalizado 0…1 por `levelFromRms`, então
+  // é multiplicação direta — é o que faz esta barra e o medidor da ilha
+  // subirem na mesma proporção para a mesma voz.
+  const eqScale = stage === 'listening' ? 1 + 0.9 * Math.min(1, micLevel) : 1;
 
   return (
     <div className={`cyber-live cyber-live-${stage}`}>

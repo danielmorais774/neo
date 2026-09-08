@@ -46,8 +46,9 @@ export default function LiveOverlay({
     );
   }
 
-  // o orbe "respira" com o nível do microfone enquanto ouve
-  const scale = liveState === 'listening' ? 1 + Math.min(0.45, micLevel * 0.6) : 1;
+  // o orbe "respira" com o nível do microfone (já normalizado 0…1 por
+  // `levelFromRms`, a mesma curva das superfícies nativas)
+  const scale = liveState === 'listening' ? 1 + 0.45 * Math.min(1, micLevel) : 1;
 
   const caption =
     liveState === 'speaking' ? spokenText : liveState === 'listening' ? partialText : '';

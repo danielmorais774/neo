@@ -80,6 +80,10 @@ export function useLiveMode({ onSendMessage }: UseLiveModeArgs): UseLiveModeResu
   const sessionRef = useRef<LiveVoiceSession | null>(null);
   const isLiveRef = useRef(false);
   const stateRef = useRef<LiveState>('idle');
+  // Último nível do mic sem passar por render: o worklet emite a cada frame de
+  // áudio (centenas de vezes por segundo) e quem espelha isso na notch lê daqui
+  // num ritmo fixo.
+  const micLevelRef = useRef(0);
 
   // Mantém o callback de envio sempre atual (o usuário pode trocar
   // modelo/provider durante o Live; a sessão captura este ref, não o valor).
@@ -311,7 +315,10 @@ export function useLiveMode({ onSendMessage }: UseLiveModeArgs): UseLiveModeResu
         if (stateRef.current === 'listening') armIdleTimer();
       },
       onFinal: (t, meta) => handleFinalTranscript(t, meta),
-      onLevel: (l) => setMicLevel(l),
+      onLevel: (l) => {
+        micLevelRef.current = l;
+        setMicLevel(l);
+      },
       onError: (m) => console.warn('[useLiveMode]', m),
     });
     sessionRef.current = session;
@@ -350,6 +357,25 @@ export function useLiveMode({ onSendMessage }: UseLiveModeArgs): UseLiveModeResu
       AgentService.stopExecution();
     }
   }, []);
+
+  // Espelha o Modo Live na ilha da notch (mic + stop em volta do recorte).
+  // O chip nativo acende as asas sozinho; este efeito cobre o caminho oposto —
+  // wake word com a janela em foco abre o Live AQUI, e sem o aviso a notch
+  // continuaria escondida. Falha de IPC é irrelevante: é só apresentação.
+  //
+  // O NÍVEL vai junto, a 20 Hz: nesta sessão quem captura é o webview, então
+  // sem ele o medidor da ilha ficava parado no piso enquanto o equalizador da
+  // janela dançava com a voz — as duas superfícies pareciam desligadas uma da
+  // outra. 20 Hz porque é o que um medidor de 3 barras consome; repassar os
+  // ~375 Hz do worklet seria um invoke por frame de áudio.
+  useEffect(() => {
+    const push = (level: number) =>
+      void window.electronAPI?.notchLiveUi(isLive, stateRef.current, level)?.catch(() => {});
+    push(isLive ? micLevelRef.current : 0);
+    if (!isLive) return;
+    const id = setInterval(() => push(micLevelRef.current), 50);
+    return () => clearInterval(id);
+  }, [isLive, liveState]);
 
   // Limpeza ao desmontar.
   useEffect(() => {
