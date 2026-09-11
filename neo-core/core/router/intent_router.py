@@ -865,6 +865,17 @@ class IntentRouter:
                 temperature=0.1,
                 max_tokens=_CLASSIFIER_MAX_TOKENS,
                 disable_thinking=True,
+                # Saída JSON nativa. O reparo abaixo existe porque o
+                # classificador escorrega para o modo conversa quando o
+                # histórico vem em turnos user/assistant — e responder ao
+                # USUÁRIO em vez de classificar custa uma segunda chamada
+                # inteira (medido: a classificação vai de ~2,5s para 8,4s, e
+                # ele já chegou a inventar destinatário de WhatsApp a partir do
+                # próprio texto do reparo). Com o formato imposto pela API, a
+                # prosa deixa de ser uma saída possível. O provider degrada
+                # sozinho no endpoint que não implementa o parâmetro, então o
+                # reparo continua de pé como rede.
+                response_format={"type": "json_object"},
             )
 
             raw_text = response.get_content() or ""

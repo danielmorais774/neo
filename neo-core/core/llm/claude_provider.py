@@ -68,6 +68,12 @@ class ClaudeProvider(LLMProvider):
             # do Claude é opt-in), então some antes de virar 400 no corpo.
             kwargs.pop("disable_thinking", None)
 
+            # Mesma história: `response_format` é da API da OpenAI (o
+            # classificador o usa para não ter como escorregar para prosa).
+            # A Anthropic não tem o parâmetro — indo no corpo, vira 400 e
+            # derruba a classificação inteira.
+            kwargs.pop("response_format", None)
+
             # Separa system message
             system_content: str | None = None
             claude_messages: list[dict[str, Any]] = []

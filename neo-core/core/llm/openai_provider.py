@@ -33,6 +33,12 @@ _RATE_LIMIT_BACKOFF = (2.0, 5.0, 10.0)
 #: o que já dá a re-sondagem de graça.
 _FORCED_TOOL_CHOICE_UNSUPPORTED: set[tuple[str, str]] = set()
 
+#: Mesmo cache, para o ``response_format``. Quem pede saída JSON (o classificador
+#: de intenção) prefere MUITO uma saída livre a um turno morto: sem isto, um
+#: endpoint que não implementa o parâmetro devolveria 400 e a classificação
+#: inteira cairia no fallback por palavra-chave, que é cego ao turno anterior.
+_RESPONSE_FORMAT_UNSUPPORTED: set[tuple[str, str]] = set()
+
 
 def _pinned_provider(params: dict[str, Any]) -> str:
     """Slug do provedor de infra fixado nesta chamada (ou "" quando livre).
@@ -125,6 +131,22 @@ def _rejects_forced_tool_choice(error: Exception) -> bool:
     # Mesma limitação de sempre, outro vocabulário; sem reconhecê-la aqui, todo
     # turno com tool forçada (force_tool_first, skill de finanças) morria.
     return (status == 404 or "404" in text) and "filter by tool compatibility" in text
+
+
+def _rejects_response_format(error: Exception) -> bool:
+    """A API recusou a REQUISIÇÃO por causa do ``response_format``?
+
+    Irmão do de cima, com o mesmo espírito: o parâmetro é uma OTIMIZAÇÃO (garante
+    JSON e economiza o round de reparo do classificador), então quando o endpoint
+    não o implementa o certo é seguir sem ele — nunca derrubar o turno.
+    """
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    text = str(error).lower()
+    if (status == 400 or "400" in text) and "response_format" in text:
+        return True
+    # Mesma história do 404 de roteamento do OpenRouter: com pin de provedor, o
+    # filtro por parâmetro pode zerar os endpoints em vez de responder 400.
+    return (status == 404 or "404" in text) and "no endpoints found" in text and "response_format" in text
 
 
 class OpenAICompletionResponse(CompletionResponse):
@@ -259,6 +281,16 @@ class OpenAIProvider(LLMProvider):
                 )
                 params["tool_choice"] = "auto"
 
+            # Idem para a saída JSON: se já sondamos e este endpoint não a
+            # implementa, não gaste a ida e volta — segue sem o parâmetro.
+            if params.get("response_format") and unsupported_key in _RESPONSE_FORMAT_UNSUPPORTED:
+                logger.debug(
+                    "[OpenAI] %r no provedor %r já recusou response_format antes — "
+                    "seguindo sem ele",
+                    unsupported_key[0], unsupported_key[1] or "livre",
+                )
+                params.pop("response_format", None)
+
             # Rate limit (429) é transitório: o TPM da org se renova em segundos. Sem
             # retry, o turno morria virando "Erro ao processar: 429" — que ainda por
             # cima entra no histórico e envenena os turnos seguintes.
@@ -272,12 +304,31 @@ class OpenAIProvider(LLMProvider):
             client = self._client_no_sdk_retry
             last_error: Exception | None = None
             downgraded_tool_choice = False
+            downgraded_response_format = False
             for attempt in range(_RATE_LIMIT_RETRIES + 1):
                 try:
                     response = await client.chat.completions.create(**params)
                     return OpenAICompletionResponse(response)
                 except Exception as e:  # noqa: BLE001 — só 429/5xx/tool_choice são retentáveis
                     last_error = e
+                    # Endpoint sem saída JSON nativa: tira o parâmetro e refaz.
+                    # Uma vez só, e sem consumir tentativa de rate limit — o
+                    # chamador perde a GARANTIA de JSON (que ele já sabia não ter
+                    # antes deste parâmetro existir), não o turno.
+                    if (
+                        not downgraded_response_format
+                        and params.get("response_format")
+                        and _rejects_response_format(e)
+                    ):
+                        downgraded_response_format = True
+                        _RESPONSE_FORMAT_UNSUPPORTED.add(unsupported_key)
+                        logger.warning(
+                            "[OpenAI] modelo %r no provedor %r recusou response_format — "
+                            "refazendo sem ele e memorizando para os próximos turnos",
+                            unsupported_key[0], unsupported_key[1] or "livre",
+                        )
+                        params.pop("response_format", None)
+                        continue
                     # Modelo que não aceita tool forçada: refaz com "auto" em vez
                     # de derrubar o turno. Uma vez só — se falhar de novo, o erro
                     # é outro. Não consome tentativa de rate limit.

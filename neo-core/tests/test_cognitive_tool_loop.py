@@ -54,6 +54,10 @@ def _svc(settings_overrides=None):
     class _S:
         cognitive_max_tool_rounds = 3
         default_max_tokens = 1024
+        # O loop lê estas duas em todo round: sem elas o dublê não é o
+        # Settings real e o teste passa a medir o AttributeError.
+        cognitive_stream_enabled = False
+        cognitive_reasoning_enabled = False
     svc.settings = _S()
     for k, v in (settings_overrides or {}).items():
         setattr(svc.settings, k, v)

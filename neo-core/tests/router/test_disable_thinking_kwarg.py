@@ -115,3 +115,64 @@ async def test_openrouter_absent_flag_changes_nothing():
     params = await _params_for(OpenRouterProvider(api_key="k"))
 
     assert "extra_body" not in params
+
+
+# ── response_format: mesma regra, outro parâmetro ───────────────────────────
+#
+# O classificador passou a pedir saída JSON nativa para não ter como responder
+# em prosa (o reparo custava uma chamada inteira). O parâmetro é da API da
+# OpenAI; nos providers que não o têm ele precisa sumir antes do corpo.
+
+
+@pytest.mark.asyncio
+async def test_response_format_nao_vaza_para_a_anthropic():
+    """A Anthropic fala `messages.create`, não `chat.completions` — dublê próprio."""
+    from core.llm.claude_provider import ClaudeProvider
+
+    class _Messages:
+        async def create(self, **params):
+            raise _CapturedCall(params)
+
+    class _Client:
+        messages = _Messages()
+
+    provider = ClaudeProvider(api_key="k")
+    provider.client = _Client()
+    try:
+        await provider.complete(
+            messages=[Message(role=MessageRole.USER, content="oi")],
+            tools=None,
+            model="m",
+            response_format={"type": "json_object"},
+            disable_thinking=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        seen = e
+        while seen is not None and not isinstance(seen, _CapturedCall):
+            seen = seen.__cause__ or seen.__context__
+        assert isinstance(seen, _CapturedCall), e
+        assert "response_format" not in seen.params, "iria no corpo e viraria 400"
+    else:
+        raise AssertionError("a chamada não chegou ao cliente")
+
+
+@pytest.mark.asyncio
+async def test_response_format_chega_na_openai():
+    from core.llm.openai_provider import OpenAIProvider
+
+    params = await _params_for(
+        OpenAIProvider(api_key="k"), response_format={"type": "json_object"}
+    )
+    assert params["response_format"] == {"type": "json_object"}
+
+
+def test_endpoint_que_recusa_response_format_e_reconhecido():
+    """A degradação só acontece se soubermos LER a recusa."""
+    from core.llm.openai_provider import _rejects_response_format
+
+    class _E(Exception):
+        status_code = 400
+
+    assert _rejects_response_format(_E("Invalid parameter: response_format"))
+    # 400 de outra coisa não pode virar degradação silenciosa do parâmetro.
+    assert not _rejects_response_format(_E("context length exceeded"))

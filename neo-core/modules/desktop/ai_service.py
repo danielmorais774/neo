@@ -57,6 +57,7 @@ from shared import (
     RoutingDecision,
     StreamChunk,
     StreamEventType,
+    ToolCall,
     get_settings,
 )
 
@@ -1281,6 +1282,98 @@ def _looks_like_promise(text: str | None) -> bool:
 # A marker rather than prose-sniffing on the client: the wording here changes freely.
 CYCLE_PROGRESS_MARKER = "[[CYCLE]]"
 
+# Rótulo humano de cada tool para a bolha de progresso. O nome cru da tool
+# (`file_stage`, `neo_bash`) é jargão do nosso registry, não informação para quem
+# está olhando a tela esperando.
+_TOOL_PROGRESS_LABEL: dict[str, str] = {
+    "file_info": "conferindo o arquivo",
+    "file_read": "lendo o arquivo",
+    "file_list": "olhando os arquivos",
+    "file_stage": "levando o arquivo pro sandbox",
+    "file_save": "publicando o arquivo",
+    "neo_bash": "rodando no sandbox",
+    "neo_write_file": "escrevendo no sandbox",
+    "neo_read_file": "lendo do sandbox",
+    "neo_list_files": "listando o sandbox",
+    "web_search": "pesquisando na web",
+    "web_fetch": "abrindo a página",
+    "search_pks": "consultando a memória",
+    "conversation_recall": "procurando na conversa antiga",
+    "wm_write": "anotando no caderno",
+    "wm_read": "relendo o caderno",
+    "skill_read": "abrindo a skill",
+    "email_inbox": "olhando a caixa de email",
+    "email_message": "lendo o email",
+    "email_send": "enviando o email",
+    "get_weather": "consultando o clima",
+    "device_control": "falando com o aparelho",
+    "browser_local_task": "dirigindo o seu navegador",
+    "browser_task": "abrindo o navegador do servidor",
+    "deep_research": "abrindo a pesquisa profunda",
+    "service_request": "chamando o serviço externo",
+}
+
+#: Eventos do stream que carregam pedaço de tool call (o resto é texto/controle).
+_TOOL_CALL_EVENTS = (
+    StreamEventType.TOOL_CALL_START,
+    StreamEventType.TOOL_CALL_ARGS,
+    StreamEventType.TOOL_CALL_END,
+)
+
+#: Campos que, quando existem nos argumentos, dizem em QUE a tool está mexendo.
+#: Ordem = prioridade; o primeiro que aparecer vira o complemento do rótulo.
+_PROGRESS_ARG_HINTS = ("name", "file_name", "path", "query", "task", "topic", "url")
+
+
+def _progress_label(name: str, arguments: dict[str, Any] | None) -> str:
+    """Uma linha curta dizendo o que está acontecendo agora.
+
+    Some com o argumento gigante de propósito: o `neo_bash` carrega um script
+    inteiro e a bolha tem uma linha. O que cabe é o VERBO e, quando existe, o
+    alvo curto (nome do arquivo, termo da busca).
+    """
+    base = _TOOL_PROGRESS_LABEL.get(name, f"chamando {name}")
+    for campo in _PROGRESS_ARG_HINTS:
+        valor = (arguments or {}).get(campo)
+        if isinstance(valor, str) and valor.strip():
+            alvo = " ".join(valor.split())
+            if len(alvo) > 60:
+                alvo = alvo[:57] + "…"
+            return f"{base}: {alvo}"
+    return base
+
+
+class _StreamedResponse:
+    """O que um round streamado devolve, na forma que o loop já sabia ler.
+
+    O loop foi escrito contra o `CompletionResponse` do provider (`get_content`
+    / `get_tool_calls`, e o `get_tool_calls` levantando quando os argumentos
+    vieram cortados pelo teto de tokens). Manter essa mesma superfície é o que
+    permite trocar a chamada bufferizada pela streamada sem reescrever as sete
+    guardas que dependem de `content`/`tool_calls`.
+    """
+
+    def __init__(self, content: str, raw_calls: list[dict[str, str]], finish: str | None) -> None:
+        self._content = content
+        self._raw_calls = raw_calls
+        self._finish = finish
+
+    def get_content(self) -> str:
+        return self._content
+
+    def get_tool_calls(self) -> list[ToolCall]:
+        # `json.loads` levanta JSONDecodeError com argumento truncado — é
+        # exatamente o que o loop espera e trata (round extra pedindo escrita
+        # em pedaços). Não engolir aqui.
+        return [
+            ToolCall(id=c["id"], name=c["name"], arguments=json.loads(c["arguments"] or "{}"))
+            for c in self._raw_calls
+            if c.get("name")
+        ]
+
+    def finish_reason(self) -> str | None:
+        return self._finish
+
 # Closing lines for a self-continuation cycle that stopped on a guard instead of
 # finishing. Each names the real reason: a generic "algo deu errado" here would be
 # the same opacity the cycle exists to remove.
@@ -1586,6 +1679,19 @@ _ALL_ACTUATION_TOOLS = _CLIENT_ACTUATION_TOOLS | _SHELL_ACTUATION_TOOLS
 # Teto de round-trips de atuação encadeados num mesmo pedido (pull→responde→push,
 # ou conflito→sobrescreve): evita um laço se o modelo insistir em atuar sem parar.
 _MAX_ACTUATION_DEPTH = 3
+
+
+class _LoopRun:
+    """Caixa para o texto final do loop cognitivo.
+
+    Async generator não tem valor de retorno: `_drive_cognitive_loop` emite as
+    bolhas de progresso pelo `yield` e deixa a resposta aqui.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self) -> None:
+        self.text: str = ""
 
 
 class ClientActuationRequested(Exception):
@@ -3361,7 +3467,12 @@ class AIService:
                     handoffs = control
                     work = (resp.metadata or {}).get("__pipeline_work__")
                     continue
-                if resp.message:
+                # Bolha de progresso não é fala: ela vale para a tela e morre no
+                # `complete`. Deixá-la virar `last_text` faria a nota de trabalho
+                # da autocontinuação registrar "[[CYCLE]]lendo o arquivo" como se
+                # fosse a resposta do passo — e é justamente essa nota que o passo
+                # seguinte lê para saber o que já foi feito.
+                if resp.message and not resp.message.startswith(CYCLE_PROGRESS_MARKER):
                     last_text = resp.message
                 if resp.is_final:
                     last_final = resp.message
@@ -4047,7 +4158,14 @@ class AIService:
                 )
                 _skill_tool_names = {t.name for t in _autoloaded_tools}
                 _used_tools: set[str] = set()
-                full_response = await self._run_cognitive_tool_loop(
+                # Progresso ao vivo: o loop empurra linhas numa fila e o drenador
+                # as converte em bolha "Executando" no desktop. Sem este seam o
+                # turno inteiro é mudo — a session-a82d344f passou 124s sem mandar
+                # um byte pro cliente.
+                _run = _LoopRun()
+                async for _bolha in self._drive_cognitive_loop(
+                    _run,
+                    session_id=session_id,
                     provider=provider,
                     messages=messages,
                     req_model=_req_model,
@@ -4063,7 +4181,9 @@ class AIService:
                     produced_files=produced_files,
                     tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
-                )
+                ):
+                    yield _bolha
+                full_response = _run.text
                 llm_ms = (time.monotonic() - t0) * 1000
                 # Usou a skill de verdade → o assunto está vivo: renova o prazo dela
                 # mesmo que a próxima mensagem seja um "sim" sem keyword nenhuma.
@@ -4159,7 +4279,13 @@ class AIService:
                         ),
                     )
                 )
-                full_response = await self._run_cognitive_tool_loop(
+                # Mesma bolha da primeira passada: esta corretiva também pode
+                # gastar rounds de tool, e ficar muda aqui seria devolver o
+                # silêncio justamente no turno que já estava dando errado.
+                _run2 = _LoopRun()
+                async for _bolha in self._drive_cognitive_loop(
+                    _run2,
+                    session_id=session_id,
                     provider=provider, messages=messages, req_model=_req_model,
                     model_name=model_name, provider_name=provider_name,
                     tools=cognitive_tools, tool_executor=cog_executor,
@@ -4167,7 +4293,9 @@ class AIService:
                     skill_tool_names=_skill_tool_names, used_tools=_used_tools,
                     produced_files=produced_files, tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
-                )
+                ):
+                    yield _bolha
+                full_response = _run2.text
                 if not full_response:
                     full_response = "Desculpe, não consegui gerar uma resposta."
 
@@ -4851,6 +4979,181 @@ class AIService:
 
         return [t for t in self.agent.tool_registry.get_all() if server_tool_can_run(t.name)]
 
+    async def _drive_cognitive_loop(
+        self,
+        saida: "_LoopRun",
+        *,
+        session_id: UUID,
+        **loop_kwargs: Any,
+    ) -> AsyncIterator["AIServiceResponse"]:
+        """Roda o loop cognitivo emitindo o progresso dele como resposta não-final.
+
+        O loop é uma corrotina que só volta no fim, e quem pode falar com o
+        cliente é o generator (`_handle_direct_response`). Este é o seam entre os
+        dois: o loop empurra linhas numa fila, isto aqui as converte em bolha.
+
+        A resposta final NÃO sai por aqui — ela vai em ``saida.text``, porque um
+        async generator não tem valor de retorno e o chamador precisa do texto
+        para todo o pós-processamento (handoff, segmentos de fala, guardas).
+        """
+        fila: asyncio.Queue[str] = asyncio.Queue()
+        task = asyncio.create_task(self._run_cognitive_tool_loop(progress=fila, **loop_kwargs))
+        try:
+            while True:
+                proxima = asyncio.ensure_future(fila.get())
+                done, _ = await asyncio.wait({proxima, task}, return_when=asyncio.FIRST_COMPLETED)
+                if proxima in done:
+                    yield AIServiceResponse(
+                        intent=IntentType.DIRECT_RESPONSE,
+                        session_id=session_id,
+                        message=f"{CYCLE_PROGRESS_MARKER}{proxima.result()}",
+                        is_final=False,
+                    )
+                    continue
+                # O loop terminou (ou explodiu). Escoa o que sobrou na fila antes
+                # de sair: a última linha costuma ser o fim do texto, e perdê-la
+                # faria a bolha "voltar" para um estado mais antigo.
+                proxima.cancel()
+                while not fila.empty():
+                    yield AIServiceResponse(
+                        intent=IntentType.DIRECT_RESPONSE,
+                        session_id=session_id,
+                        message=f"{CYCLE_PROGRESS_MARKER}{fila.get_nowait()}",
+                        is_final=False,
+                    )
+                break
+            saida.text = await task
+        finally:
+            # Cliente apertou Stop, ou o consumidor fechou o generator: sem isto a
+            # task seguiria viva, gastando LLM e chamando tool depois do turno morto.
+            if not task.done():
+                task.cancel()
+
+    @staticmethod
+    async def _emit_progress(progress: "asyncio.Queue[str] | None", text: str) -> None:
+        """Empurra uma linha de progresso para a bolha do desktop (best-effort).
+
+        Fila sem limite e `put_nowait`: progresso NUNCA pode segurar o turno. Se
+        o consumidor morreu (cliente desconectou), perder a linha é o certo.
+
+        Texto em branco é DESCARTADO e a borda é aparada: o modelo costuma abrir
+        a resposta com quebras de linha, e o throttle disparava nelas — a bolha
+        piscava vazia, e depois com duas linhas em branco em cima do texto
+        (visto no smoke test de 2026-09-11). Aqui é superfície de tela; o texto
+        que vira resposta de verdade não passa por este caminho.
+        """
+        if progress is None or not (text or "").strip():
+            return
+        try:
+            progress.put_nowait(text.strip())
+        except Exception:  # noqa: BLE001 — bolha nunca derruba o turno
+            pass
+
+    async def _cognitive_round(
+        self,
+        *,
+        provider: Any,
+        messages: list[Message],
+        tools: list[Any] | None,
+        req_model: str | None,
+        max_tokens: int,
+        extra: dict[str, Any],
+        progress: "asyncio.Queue[str] | None",
+    ) -> tuple[Any, float]:
+        """Um round do loop cognitivo, streamado quando dá — sempre com a rede.
+
+        **Por que streamar.** Sem isto o turno é mudo do começo ao fim: o loop é
+        `await`-ado inteiro antes do primeiro `yield` de `_handle_direct_response`,
+        então os 124s da session-a82d344f chegaram ao desktop como 124s de nada.
+        Streamando, o texto vai aparecendo na bolha de progresso enquanto é
+        gerado — medido em 2026-09-11, primeiro token em 2,3-3,4s com o
+        raciocínio desligado.
+
+        **Por que a queda para `complete()` não é detalhe.** O `complete()` tem
+        duas defesas que o caminho streamado não tem: a escada de 429 (2s/5s/10s
+        — e 162 de 965 chamadas ao OpenRouter voltaram 429 no log de produção) e
+        o rebaixamento de `tool_choice=required` para `auto` no provedor que o
+        recusa (o Baidu responde 404, não 400). Então:
+
+        * round que FORÇA tool vai bufferizado, sempre — é o único que precisa do
+          rebaixamento;
+        * stream que morre ANTES do primeiro chunk cai para o bufferizado, que
+          tem a escada;
+        * stream que já emitiu texto propaga o erro: refazer duplicaria na tela.
+
+        O pin de provedor já é relaxado dentro do `OpenRouterProvider.stream_complete`.
+        """
+        t0 = time.monotonic()
+        forca_tool = bool(extra.get("tool_choice"))
+        pode_streamar = bool(self.settings.cognitive_stream_enabled) and not forca_tool
+        comum: dict[str, Any] = {
+            "model": req_model or None,
+            "temperature": 0.9,
+            "max_tokens": max_tokens,
+            # O raciocínio do OpenRouter vem ligado sozinho, é gerado ANTES do
+            # primeiro token de texto e ignora o max_tokens. Ver a flag.
+            "disable_thinking": not self.settings.cognitive_reasoning_enabled,
+        }
+
+        if pode_streamar:
+            partes: list[str] = []
+            # Chaveado pelo id da tool call — o provider o repete em TODO chunk
+            # de argumento, justamente para dar conta de chamadas paralelas.
+            calls: dict[str, dict[str, str]] = {}
+            finish: str | None = None
+            ultimo_envio = 0.0
+            enviado = 0
+            try:
+                async for chunk in provider.stream_complete(
+                    messages=messages, tools=tools, **comum, **extra
+                ):
+                    if chunk.event == StreamEventType.TOKEN and chunk.content:
+                        partes.append(chunk.content)
+                        agora = time.monotonic()
+                        texto = "".join(partes)
+                        # Throttle: a bolha é substituída a cada evento, então
+                        # mandar token a token seria gRPC à toa. ~60 chars ou
+                        # 400ms é o bastante para parecer que está escrevendo.
+                        if len(texto) - enviado >= 60 or (agora - ultimo_envio) >= 0.4:
+                            enviado = len(texto)
+                            ultimo_envio = agora
+                            await self._emit_progress(progress, texto[-700:])
+                    elif chunk.event == StreamEventType.TOOL_CALL_START:
+                        # O nome chega ANTES dos argumentos: dá para anunciar
+                        # "rodando no sandbox" enquanto o modelo ainda escreve o
+                        # script de 1.500 chars que vai rodar lá.
+                        await self._emit_progress(
+                            progress, _progress_label(chunk.tool_name or "", None)
+                        )
+                    elif chunk.event == StreamEventType.DONE:
+                        finish = chunk.finish_reason
+
+                    if chunk.event in _TOOL_CALL_EVENTS:
+                        cid = chunk.tool_call_id or ""
+                        alvo = calls.setdefault(cid, {"id": cid, "name": "", "arguments": ""})
+                        if chunk.tool_name:
+                            alvo["name"] = chunk.tool_name
+                        if chunk.event == StreamEventType.TOOL_CALL_END:
+                            # O END traz os argumentos INTEIROS já remontados pelo
+                            # provider; os deltas viram ruído se somados por cima.
+                            alvo["arguments"] = chunk.tool_arguments_delta or alvo["arguments"]
+                        elif chunk.tool_arguments_delta:
+                            alvo["arguments"] += chunk.tool_arguments_delta
+                return (
+                    _StreamedResponse("".join(partes), list(calls.values()), finish),
+                    (time.monotonic() - t0) * 1000,
+                )
+            except Exception as e:  # noqa: BLE001 — a queda é o ponto do bloco
+                if partes:
+                    raise
+                logger.warning(
+                    "[Cognitive] stream falhou antes do primeiro chunk (%s) — "
+                    "refazendo bufferizado, que tem a escada de 429", e,
+                )
+
+        resp = await provider.complete(messages=messages, tools=tools, **comum, **extra)
+        return resp, (time.monotonic() - t0) * 1000
+
     async def _run_cognitive_tool_loop(
         self,
         *,
@@ -4869,6 +5172,7 @@ class AIService:
         produced_files: list[dict[str, Any]] | None = None,
         tool_trace: list[dict[str, Any]] | None = None,
         browser_actuation: list[str] | None = None,
+        progress: "asyncio.Queue[str] | None" = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -4930,20 +5234,19 @@ class AIService:
             round_tools = tools if (tools and round_idx < max_rounds) else None
             if slog:
                 slog.log_llm_request("COGNITIVE", messages, model=model_name, provider=provider_name, temperature=0.9)
-            t0 = time.monotonic()
             extra: dict[str, Any] = {}
             if round_tools and ((force_tool_first and round_idx == 0) or force_next):
                 extra["tool_choice"] = "required"
             force_next = False
-            resp = await provider.complete(
+            resp, llm_ms = await self._cognitive_round(
+                provider=provider,
                 messages=messages,
                 tools=round_tools,
-                model=req_model or None,
-                temperature=0.9,
+                req_model=req_model,
                 max_tokens=self.settings.default_max_tokens,
-                **extra,
+                extra=extra,
+                progress=progress,
             )
-            llm_ms = (time.monotonic() - t0) * 1000
             content = resp.get_content() or ""
             try:
                 tool_calls = resp.get_tool_calls() if round_tools else []
@@ -5010,15 +5313,16 @@ class AIService:
                         f"(raciocínio consumiu o teto) — retentando com "
                         f"max_tokens={bigger}.",
                     )
-                resp = await provider.complete(
+                resp, retry_ms = await self._cognitive_round(
+                    provider=provider,
                     messages=messages,
                     tools=round_tools,
-                    model=req_model or None,
-                    temperature=0.9,
+                    req_model=req_model,
                     max_tokens=bigger,
-                    **extra,
+                    extra=extra,
+                    progress=progress,
                 )
-                llm_ms = (time.monotonic() - t0) * 1000
+                llm_ms += retry_ms
                 content = resp.get_content() or ""
                 try:
                     tool_calls = resp.get_tool_calls() if round_tools else []
@@ -5296,6 +5600,10 @@ class AIService:
                 used.add(tc.name)
                 if slog:
                     slog.log_event("Cognitive Tool", f"→ `{tc.name}` {tc.arguments}")
+                # Agora com o argumento em mãos a bolha pode dizer em QUE ele
+                # está mexendo — e cobre a espera da tool, que num `neo_bash`
+                # pesado é o pedaço do turno que o stream não alcança.
+                await self._emit_progress(progress, _progress_label(tc.name, tc.arguments))
                 tr = await tool_executor.execute_tool_call(tc)
                 if tr.error:
                     result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")

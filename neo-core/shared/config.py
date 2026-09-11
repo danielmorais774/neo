@@ -140,6 +140,30 @@ class Settings(BaseSettings):
         "max_iterations (o teto que o AgentExecutor já usa) — uma rodada extra só "
         "custa latência quando o modelo REALMENTE chama tool.",
     )
+    cognitive_reasoning_enabled: bool = Field(
+        default=False,
+        description=(
+            "Deixar o modelo RACIOCINAR antes de cada round do loop cognitivo. "
+            "Desligado por padrão: no OpenRouter o reasoning vem ligado sozinho e "
+            "não respeita o max_tokens, e ele é gerado ANTES do primeiro token de "
+            "texto. Medido em 2026-09-11 replayando a session-a82d344f: um round "
+            "de tool custou 11,1s com raciocínio contra 3,5s sem, o turno inteiro "
+            "(6 rounds) 94,7s contra 74,0s, e o primeiro token VISÍVEL da resposta "
+            "final saiu em 13-40s contra 2,3-3,4s. É isso que tornava o streaming "
+            "inútil: o usuário esperava o raciocínio inteiro antes de ver letra."
+        ),
+    )
+    cognitive_stream_enabled: bool = Field(
+        default=True,
+        description=(
+            "Transmitir o round do loop cognitivo em streaming, para o texto ir "
+            "aparecendo na bolha de progresso do desktop em vez de o turno ficar "
+            "mudo até o fim. Cai para a chamada bufferizada sozinho quando o round "
+            "força tool (`tool_choice=required`, que alguns provedores do "
+            "OpenRouter recusam com 404) e quando o stream falha antes do primeiro "
+            "chunk — a escada de 429 do `complete()` continua sendo a rede."
+        ),
+    )
 
     # Workbench — o sandbox de execução do próprio Neo (docs/workbench-background-jobs-plan.md)
     workbench_enabled: bool = Field(

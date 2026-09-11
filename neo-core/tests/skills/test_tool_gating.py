@@ -31,7 +31,12 @@ class _ScriptedProvider:
         self._responses = list(responses)
         self.toolsets = []  # nomes das tools oferecidas em cada round
 
-    async def complete(self, *, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+    # `**kwargs` porque o loop passa a intenção `disable_thinking` (e pode
+    # passar `tool_choice`): o dublê ignora, o provider real traduz.
+    async def complete(
+        self, *, messages, tools=None, model=None, temperature=0.7,
+        max_tokens=4096, **kwargs,
+    ):
         self.toolsets.append([t.name for t in (tools or [])])
         return self._responses.pop(0)
 
@@ -64,7 +69,12 @@ class _FakeLibrary:
 
 def _svc(with_library=True):
     svc = object.__new__(AIService)
-    svc.settings = SimpleNamespace(cognitive_max_tool_rounds=3, default_max_tokens=1024)
+    svc.settings = SimpleNamespace(
+        cognitive_max_tool_rounds=3,
+        default_max_tokens=1024,
+        cognitive_stream_enabled=False,
+        cognitive_reasoning_enabled=False,
+    )
     if with_library:
         svc.skill_library = _FakeLibrary()
     return svc

@@ -46,7 +46,12 @@ class _ScriptedProvider:
         self._responses = list(responses)
         self.toolsets = []
 
-    async def complete(self, *, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+    # `**kwargs` porque o loop passa a intenção `disable_thinking` (e pode
+    # passar `tool_choice`): o dublê ignora, o provider real traduz.
+    async def complete(
+        self, *, messages, tools=None, model=None, temperature=0.7,
+        max_tokens=4096, **kwargs,
+    ):
         self.toolsets.append({t.name for t in (tools or [])})
         return self._responses.pop(0)
 
@@ -88,7 +93,12 @@ async def test_full_flow_skill_read_unlocks_real_sql_tool():
     settings, registry, tool_executor, library = _wire()
 
     svc = object.__new__(AIService)
-    svc.settings = SimpleNamespace(cognitive_max_tool_rounds=3, default_max_tokens=1024)
+    svc.settings = SimpleNamespace(
+        cognitive_max_tool_rounds=3,
+        default_max_tokens=1024,
+        cognitive_stream_enabled=False,
+        cognitive_reasoning_enabled=False,
+    )
     svc.skill_library = library
 
     provider = _ScriptedProvider([
