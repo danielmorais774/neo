@@ -728,6 +728,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 broker=_notification_broker,
                 llm_router=_llm_router,
                 default_model=settings.default_model,
+                # O resultado de um job só existe aqui: ele não passa por turno
+                # cognitivo nenhum, então é o dispatcher que anota no caderno.
+                # `None` com a flag desligada (o store nem é construído).
+                working_memory=_working_memory,
             )
         )
         await _job_manager.start()

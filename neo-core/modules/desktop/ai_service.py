@@ -949,6 +949,10 @@ _MAX_TRUNCATED_TOOL_ROUNDS = 2
 # Tools cujo resultado custa caro para reproduzir — é o gatilho do backstop da
 # memória de trabalho (docs/working-memory-plan.md §7). Uma consulta de tempo ou
 # de dispositivo não entra: refazer é barato e a nota só viraria ruído.
+#: Tools que devolvem um job enfileirado em vez do resultado. O que elas
+#: produzem chega minutos depois, por fora do turno — ver `_summarize_tool_call`.
+_ASYNC_JOB_TOOLS = frozenset({"browser_task", "browser_local_task", "agent_job", "deep_research"})
+
 _WM_HEAVY_TOOLS = frozenset({
     "neo_bash", "neo_write_file", "file_read", "file_stage", "file_save",
     "deep_research", "web_fetch", "run_command", "browser_task",
@@ -998,33 +1002,159 @@ def _autonote_entry(
     return render_auto_entry(heavy, produced_files) or None
 
 
+#: Teto do `note_detail` — o campo que existe SÓ para o caderno. Duas ordens de
+#: grandeza acima dos 200 caracteres do resumo porque os custos são opostos: o
+#: resumo entra no prompt de todo turno, o `note_detail` só no corpo da nota, que
+#: ninguém lê sem pedir (`wm_read`, e mesmo assim com orçamento — TAIL_MAX_CHARS).
+_NOTE_DETAIL_CHARS = 4000
+
+
+#: Chaves cujo valor é PAYLOAD relegível, não resultado. Copiá-las para o
+#: caderno é errado por dois motivos, e o segundo é o grave:
+#:
+#: 1. custo — o conteúdo de um arquivo grande vira uma bolha de tokens;
+#: 2. **validade** — a cópia ENVELHECE. O caderno existe para o modelo não
+#:    refazer trabalho; um retrato velho do arquivo faz ele AFIRMAR o que já não
+#:    é verdade, que é pior do que reler. O ponteiro (id, nome, caminho) não
+#:    envelhece; o conteúdo, sim.
+#:
+#: A regra geral da casa passa a ser: **efêmero se guarda, relegível se aponta.**
+#: `stdout` de comando some para sempre se não for guardado — vai inteiro.
+#: Conteúdo de arquivo se lê de novo quando precisar — vai só o endereço.
+_PAYLOAD_KEYS = ("content", "text", "body", "conteudo", "conteúdo", "raw", "html", "markdown")
+
+#: Acima disto o valor deixa de ser "um campo" e passa a ser um despejo.
+_PAYLOAD_INLINE_MAX = 400
+
+
+def _strip_payload(value: Any) -> Any:
+    """Troca payload relegível por uma marca do tamanho, recursivamente."""
+    if isinstance(value, dict):
+        podado: dict[str, Any] = {}
+        for chave, valor in value.items():
+            if (
+                chave in _PAYLOAD_KEYS
+                and isinstance(valor, str)
+                and len(valor) > _PAYLOAD_INLINE_MAX
+            ):
+                podado[chave] = f"<{len(valor)} caracteres — não copiados para o caderno>"
+            else:
+                podado[chave] = _strip_payload(valor)
+        return podado
+    if isinstance(value, list):
+        return [_strip_payload(v) for v in value[:20]]
+    return value
+
+
+def _note_detail(value: Any) -> str:
+    """Conteúdo generoso de um resultado de tool, para o caderno.
+
+    Generoso, mas não ingênuo: `_strip_payload` tira o que é relegível antes.
+    """
+    podado = _strip_payload(value)
+    texto = podado if isinstance(podado, str) else str(podado)
+    texto = texto.strip()
+    if len(texto) <= _NOTE_DETAIL_CHARS:
+        return texto
+    return texto[:_NOTE_DETAIL_CHARS].rstrip() + "\n[…truncado]"
+
+
+def _strip_note_detail(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cópia do trace sem o campo farto, para tudo que paga contexto."""
+    return [{k: v for k, v in (e or {}).items() if k != "note_detail"} for e in trace]
+
+
 def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[str, Any]:
     """Resumo compacto de uma tool call pro ``tool_trace`` (nunca o payload cru).
 
     Guardado em ``conversation_message.extra_metadata`` e reinjetado no contexto
     do PRÓXIMO turno (session_manager.get_history) — precisa caber em poucas
     linhas, nunca o conteúdo de um arquivo inteiro ou um stdout gigante.
+
+    **Exceção: a chave ``note_detail``.** Ela carrega o resultado FARTO e existe
+    só para o caderno de trabalho, que é barato (corpo em Postgres, lido sob
+    demanda). É removida antes de o trace ir para o `extra_metadata` e ignorada
+    pelo registro de passo — ver `_strip_note_detail`. Sem essa separação o
+    caderno herdava o teto de 200 caracteres de quem paga prompt todo turno, e
+    era por isso que ele "não anotava nada de útil": a informação era cortada
+    antes de chegar lá.
     """
     if tr.error:
         return {"tool": name, "ok": False, "error": str(tr.error)[:200]}
     result = tr.result
     if name == "neo_write_file":
         content = arguments.get("content") or ""
-        return {"tool": name, "ok": True, "path": arguments.get("path"), "bytes": len(content.encode("utf-8"))}
+        return {
+            "tool": name, "ok": True, "path": arguments.get("path"),
+            "bytes": len(content.encode("utf-8")),
+            "note_detail": _note_detail(content),
+        }
     if name == "neo_bash":
         stdout = ""
         exit_code = None
         if isinstance(result, dict):
             stdout = str(result.get("stdout", ""))[:300]
             exit_code = result.get("exit_code")
-        return {"tool": name, "ok": True, "command": arguments.get("command"), "exit_code": exit_code, "stdout_preview": stdout}
+        # `stdout_preview` continua com 300 chars (vai para o prompt); o stdout
+        # INTEIRO — e o stderr, que o preview nunca teve — vai para a nota.
+        bruto = result if isinstance(result, dict) else {}
+        completo = "\n".join(
+            parte for parte in (
+                str(bruto.get("stdout") or "").strip(),
+                (f"[stderr] {str(bruto.get('stderr') or '').strip()}"
+                 if str(bruto.get("stderr") or "").strip() else ""),
+            ) if parte
+        )
+        return {
+            "tool": name, "ok": True, "command": arguments.get("command"),
+            "exit_code": exit_code, "stdout_preview": stdout,
+            "note_detail": _note_detail(completo),
+        }
+    # Tools que ABREM um job e voltam na hora: o `result` é o comprovante de
+    # enfileiramento, não o trabalho. Guardar `str(result)[:200]` fazia o caderno
+    # afirmar `status: 'queued'` sobre um job que podia já ter falhado — foi o
+    # que aconteceu na sessão 4a75a655. Quem anota o RESULTADO é o
+    # ProactiveDispatcher, quando o job termina (`_note_result`).
+    # `job_id` presente é a condição, não só o nome da tool: estas mesmas tools
+    # devolvem `{"ok": False, "error": ...}` quando recusam o pedido (flag off,
+    # topic vazio), e aí NÃO há job nenhum — tratar isso como enfileiramento
+    # jogaria fora justamente o motivo da recusa.
+    if name in _ASYNC_JOB_TOOLS and isinstance(result, dict) and result.get("job_id"):
+        return {
+            "tool": name, "ok": True, "async_job": True,
+            "job_id": result.get("job_id"), "job_title": result.get("title"),
+        }
+    # ── família de arquivo: ENDEREÇO, nunca o conteúdo ──────────────────────
+    if name == "file_read" and isinstance(result, dict):
+        conteudo = str(result.get("content") or "")
+        inicio, fim = result.get("start_line"), result.get("end_line")
+        return {
+            "tool": name, "ok": True,
+            "name": result.get("name"), "file_id": result.get("file_id"),
+            "linhas": f"{inicio}-{fim}" if inicio and fim else None,
+            "chars": len(conteudo),
+            "tem_mais": bool(result.get("has_more")),
+            # Sem `note_detail` de propósito: é exatamente aqui que o caderno
+            # engordava com o arquivo inteiro. O que fica é como chegar nele.
+        }
+    if name == "file_stage" and isinstance(result, dict):
+        # O bom exemplo que já existia: o caminho no sandbox é o dado, e o
+        # conteúdo nunca passou pelo contexto. Vira cidadão de primeira classe.
+        return {
+            "tool": name, "ok": True,
+            "path": result.get("path"), "target": result.get("target"),
+            "file_id": result.get("file_id"),
+        }
     if name == "file_save" and isinstance(result, dict):
         return {
             "tool": name, "ok": True,
             "name": result.get("name"), "file_id": result.get("file_id"),
             "size_bytes": result.get("size_bytes"),
         }
-    return {"tool": name, "ok": True, "summary": str(result)[:200]}
+    return {
+        "tool": name, "ok": True, "summary": str(result)[:200],
+        "note_detail": _note_detail(result),
+    }
 
 
 _HANDOFF_INSTRUCTION_RULES = (
@@ -1193,7 +1323,7 @@ def _format_work_note(
             detail = ", ".join(
                 f"{k}={v}"
                 for k, v in entry.items()
-                if k not in ("tool", "ok") and v not in (None, "")
+                if k not in ("tool", "ok", "note_detail") and v not in (None, "")
             )
             lines.append(f"  - `{name}` OK{f' ({detail})' if detail else ''}")
         else:
@@ -4253,7 +4383,9 @@ class AIService:
         if produced_files:
             _msg_metadata["files"] = produced_files
         if tool_trace:
-            _msg_metadata["tool_trace"] = tool_trace
+            # Sem o `note_detail`: este trace é reinjetado no contexto de TODO
+            # turno seguinte. O campo farto é do caderno, não do prompt.
+            _msg_metadata["tool_trace"] = _strip_note_detail(tool_trace)
         await self.sessions.add_message(
             session_id=session_id,
             role="assistant",
@@ -4692,6 +4824,32 @@ class AIService:
             device_id=(metadata or {}).get("device_id"),
         )
         return _CognitiveAgentExecutor(base_executor, job_executor, JOB_TOOL_NAMES)
+
+    def _server_tool_toolset(self) -> list[Any]:
+        """As tools que o agente do SERVER_TOOL pode VER.
+
+        Ele recebia ``tool_registry.get_all()`` — o registry inteiro. O
+        ``_SKILL_OWNED_TOOL_PREFIXES`` esconde as tools gated do CLASSIFICADOR, mas
+        não do agente que roda depois, e as duas coisas juntas produziram o pior
+        desfecho possível: em 2026-09-09 o classificador mandou
+        SERVER_TOOL/``list_connected_devices`` para "tem uma fila de musica criada
+        né, me mostra o que tem nela", o agente ignorou a escolha dele, viu
+        ``data_list`` no catálogo e chamou — mas nesse trilho as executoras
+        user-scoped (datasets/events/finance) são as GLOBAIS, que nascem sem
+        usuário. O turno respondeu "A ferramenta falhou — data_list precisa de um
+        usuário identificado", depois de 4 iterações e 19s.
+
+        Oferecer uma tool que este trilho não sabe executar é prometer o que não se
+        cumpre. Quem destrava as gated é o ``skill_read`` do cognitivo, com o
+        usuário do turno em mãos.
+
+        As job tools são a exceção e ficam: elas casam o prefixo (``neo_``,
+        ``deep_``, ``job_``), mas aqui existe executor por request para elas
+        (``_with_job_tools``) — foi o conserto do mesmo defeito, uma camada antes.
+        """
+        from core.router.intent_router import server_tool_can_run
+
+        return [t for t in self.agent.tool_registry.get_all() if server_tool_can_run(t.name)]
 
     async def _run_cognitive_tool_loop(
         self,
@@ -5867,6 +6025,9 @@ class AIService:
                 session_id=session_id,
                 memory=memory,
                 tool_executor=ctx_executor,
+                # Sem isto o agente enxerga o registry INTEIRO, gated incluso —
+                # ver `_server_tool_toolset`.
+                available_tools=self._server_tool_toolset(),
             )
 
             final_text = result.get("final_response", "Tarefa concluída.")

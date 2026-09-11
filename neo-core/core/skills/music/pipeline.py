@@ -28,12 +28,13 @@ from core.skills.music.adapter_spotify import (
     SpotifyAdapter,
     SpotifyNotConnectedError,
 )
-from core.skills.music.adapter_youtube import YouTubeAdapter
+from core.skills.music.adapter_youtube import YouTubeAdapter, YouTubeVideo
 from core.skills.music.service import (
     clean_query,
     detect_action,
     detect_service,
     find_music_tab,
+    parse_direct_link,
     parse_media_context,
     pick_reuse_tab,
     neo_played_ids,
@@ -101,6 +102,25 @@ class MusicPipeline(SkillPipeline):
                 )
 
         query = clean_query(order)
+
+        # Ordem que JÁ traz o LINK do vídeo: toca ELE, não procura pelo texto
+        # dele. A skill `playlists` manda o cérebro despachar a fila "com o
+        # link" — justamente para a faixa tocada ser a que a inscrição espera —
+        # e o cérebro obedecia; mas aqui o link ia inteiro para o `search.list`
+        # do YouTube, que devolvia OUTRO vídeo. Medido em 2026-09-09: a fila
+        # pediu `watch?v=YdQ5NKjbd2U`, o play abriu `USELWXVcQUQ`, o `observar`
+        # viu faixa diferente da esperada, concluiu "o usuário pediu outra
+        # música", PAUSOU a inscrição — e o turno caiu em `open_url`, sem
+        # extensão, sem vigia e com o autoplay do YouTube solto no fim da faixa.
+        direto = parse_direct_link(order)
+        if direto is not None and direto.service == "youtube" and direto.kind == "video":
+            return await self._play_youtube(
+                query,
+                media_context,
+                youtube_available,
+                session_id=session_id,
+                video_id=direto.id,
+            )
 
         if service == "spotify":
             return await self._play_spotify(query, user_id, spotify_connected)
@@ -238,19 +258,32 @@ class MusicPipeline(SkillPipeline):
         media_context: dict[str, Any],
         available: bool,
         session_id: UUID | None = None,
+        video_id: str = "",
     ) -> SkillResult:
-        if not available:
-            return SkillResult(
-                ok=False,
-                message="A busca do YouTube ainda não está configurada (falta a YOUTUBE_API_KEY).",
-            )
-        try:
-            video = await self.youtube.search_video(query)
-        except Exception as e:
-            logger.warning("YouTube search failed: %s", e)
-            return SkillResult(ok=False, message=f"Não consegui buscar no YouTube: {e}")
-        if not video or not video.id:
-            return SkillResult(ok=False, message=f'Não achei "{query}" no YouTube.')
+        """Toca no YouTube. Com `video_id`, toca ESSE vídeo; sem, busca pelo texto.
+
+        Com o id em mãos a busca não é só desnecessária — ela é ERRADA (devolve
+        outro vídeo) — e a chave da API vira opcional: sem ela ainda dá para
+        tocar, só não dá para enfeitar o título.
+        """
+        if video_id:
+            video = await self.youtube.video_by_id(video_id)
+            if video is None:
+                # Sem título bonito, mas o que importa é o id certo.
+                video = YouTubeVideo(id=video_id, title=query or video_id, channel="")
+        else:
+            if not available:
+                return SkillResult(
+                    ok=False,
+                    message="A busca do YouTube ainda não está configurada (falta a YOUTUBE_API_KEY).",
+                )
+            try:
+                video = await self.youtube.search_video(query)
+            except Exception as e:
+                logger.warning("YouTube search failed: %s", e)
+                return SkillResult(ok=False, message=f"Não consegui buscar no YouTube: {e}")
+            if not video or not video.id:
+                return SkillResult(ok=False, message=f'Não achei "{query}" no YouTube.')
 
         # Reusar aba só onde há POSSE: a que o próprio Neo colocou música nesta
         # conversa, ou uma sem nada carregado. Aba de vídeo do usuário — tocando

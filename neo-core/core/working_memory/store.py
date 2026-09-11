@@ -215,6 +215,7 @@ class WorkingMemoryStore:
         entry: str,
         slug: str | None = None,
         title: str = "Trabalho desta sessão",
+        summary: str | None = None,
     ) -> WorkingNote | None:
         """Backstop determinístico do turno (§7) — sem LLM, best-effort.
 
@@ -234,7 +235,11 @@ class WorkingMemoryStore:
                 slug=auto_slug,
                 content=entry,
                 title=title,
-                summary="registro automático do que foi executado nesta sessão",
+                # O padrão é fixo porque a entrada do backstop é sempre a mesma
+                # coisa (o tool_trace do turno). Quem TEM um achado — o resultado
+                # de um job — manda o seu, e aí a linha do índice passa a dizer
+                # algo que o modelo pode usar para decidir abrir a nota.
+                summary=summary or "registro automático do que foi executado nesta sessão",
                 origin="auto",
             )
         except Exception as exc:  # noqa: BLE001 — caderno nunca derruba o turno

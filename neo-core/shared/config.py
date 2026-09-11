@@ -542,8 +542,15 @@ class Settings(BaseSettings):
         "recência e expulsa as notas que o modelo escreveu de propósito. 0 desliga o enchimento.",
     )
     working_memory_note_max_bytes: int = Field(
-        default=32768, ge=1024,
-        description="Teto do corpo de uma nota; ao estourar, as entradas MAIS ANTIGAS caem",
+        default=262144, ge=1024,
+        description=(
+            "Teto do corpo de uma nota; ao estourar, as entradas MAIS ANTIGAS caem. "
+            "256 KB e não 32 KB: as entradas passaram a carregar o resultado farto "
+            "(stdout inteiro, resumo de job, links) e com o teto antigo escrever mais "
+            "significava EXPULSAR o histórico mais rápido. O corpo é texto no Postgres "
+            "e não entra em prompt nenhum — quem paga contexto é o índice (240 chars "
+            "por nota) e o wm_read, que tem orçamento próprio (TAIL_MAX_CHARS)."
+        ),
     )
     working_memory_ttl_days: int = Field(
         default=30, ge=1,

@@ -18,6 +18,8 @@ from core.working_memory.render import (
     format_when,
     render_auto_entry,
     render_index,
+    render_job_entry,
+    render_job_summary,
     render_tail,
     stamp,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "render_summary",
     "render_auto_entry",
     "render_index",
+    "render_job_entry",
+    "render_job_summary",
     "render_tail",
     "slugify",
     "stamp",

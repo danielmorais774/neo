@@ -318,7 +318,11 @@ async def test_loop_populates_tool_trace_with_compact_summaries():
     """session-7b0956de: 3x neo_write_file sem persistir rastro nenhum foi o
     motivo do follow-up ("cade os arquivos?") ter refeito tudo do zero. Aqui
     garantimos que o resumo compacto (path+bytes, nunca o conteúdo do arquivo)
-    fica disponível pro chamador persistir em extra_metadata."""
+    fica disponível pro chamador persistir em extra_metadata.
+
+    O trace ganhou depois um campo `note_detail` com o conteúdo FARTO, que serve
+    só ao caderno de trabalho — o contrato original continua valendo para o que
+    é persistido, e é `_strip_note_detail` que o garante (asserção no fim)."""
     svc = _svc()
     provider = _ScriptedProvider([
         _Resp(tool_calls=[ToolCall(id="1", name="neo_write_file", arguments={"path": "/workspace/index.html", "content": "<html></html>"})]),
@@ -332,8 +336,16 @@ async def test_loop_populates_tool_trace_with_compact_summaries():
         tools=cognitive_tools_for(uuid4()), tool_executor=execu, slog=None, trace=None,
         tool_trace=trace,
     )
+    from modules.desktop.ai_service import _strip_note_detail
+
     assert out == "Arquivo pronto."
-    assert trace == [{"tool": "neo_write_file", "ok": True, "path": "/workspace/index.html", "bytes": 13}]
+    # O que vai para o extra_metadata (reinjetado no contexto de todo turno
+    # seguinte) continua sendo exatamente o resumo compacto de antes.
+    assert _strip_note_detail(trace) == [
+        {"tool": "neo_write_file", "ok": True, "path": "/workspace/index.html", "bytes": 13}
+    ]
+    # E o conteúdo do arquivo existe, mas só no campo que o caderno consome.
+    assert trace[0]["note_detail"] == "<html></html>"
 
 
 @pytest.mark.asyncio

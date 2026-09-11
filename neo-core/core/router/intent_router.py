@@ -377,6 +377,36 @@ _SKILL_OWNED_TOOL_PREFIXES = (
 # cognitivo (via ClientActuationRequested). Fica fora da visão do classificador
 # pra não roubar do DIRECT_RESPONSE os pedidos de arquivo (start conservador). O
 # save_generated_file, esse sim, segue roteável ("salva aí" → CLIENT_TOOL).
+# Mesmo conjunto, com nome público: o trilho SERVER_TOOL usa isto para NÃO
+# oferecer ao agente uma tool gated que ele não sabe executar (ver
+# `ai_service._server_tool_toolset`). Esconder do classificador nunca bastou —
+# quem chamou a `data_list` sem usuário foi o agente, não o classificador.
+SKILL_OWNED_TOOL_PREFIXES = _SKILL_OWNED_TOOL_PREFIXES
+
+
+def server_tool_can_run(tool_name: str) -> bool:
+    """O trilho SERVER_TOOL sabe EXECUTAR esta tool?
+
+    Uma definição só, usada nos dois lugares que dependem dela: o toolset que o
+    agente enxerga (`ai_service._server_tool_toolset`) e a decisão de devolver o
+    turno ao cognitivo (`_brain_skill_for`). Separadas, elas divergiriam no
+    primeiro prefixo novo — e a divergência é silenciosa: ou o agente vê uma tool
+    que não roda, ou o turno é desviado de um caminho que funcionava.
+
+    Gated (`data_`, `fin_`, `sql_`, `skill_`, …) = destravada pelo `skill_read` do
+    cognitivo, com o usuário do turno. As job tools são a exceção: casam o prefixo,
+    mas este trilho tem executor por request para elas (`_with_job_tools`).
+    """
+    if not tool_name:
+        return False
+    try:
+        from core.jobs import JOB_TOOL_NAMES
+    except Exception:  # noqa: BLE001 — sem jobs, sobra o filtro por prefixo
+        JOB_TOOL_NAMES = frozenset()
+    if tool_name in JOB_TOOL_NAMES:
+        return True
+    return not tool_name.startswith(SKILL_OWNED_TOOL_PREFIXES)
+
 _BRAIN_ONLY_CLIENT_TOOLS = frozenset({"request_user_file"})
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
@@ -1242,6 +1272,38 @@ class IntentRouter:
             )
             return self._music_decision(user_message)
 
+        # Assunto de skill do cérebro despachado como SERVER_TOOL: devolve ao
+        # cognitivo. O `router_note()` já MANDA o classificador fazer isso ("Pedidos
+        # sobre esses assuntos NÃO são CLIENT_TOOL nem SERVER_TOOL"), mas ele lista
+        # só uma AMOSTRA de keywords por grupo — em 2026-09-09 o grupo `cadastros`
+        # apareceu como "(anexa na playlist, camiseta, caneca, catalogo)", sem
+        # nenhuma palavra de fila/música, e "tem uma fila de musica criada né, me
+        # mostra o que tem nela" saiu como SERVER_TOOL/`list_connected_devices`
+        # ("preciso identificar quais dispositivos estão conectados para verificar a
+        # fila", disse o classificador). O agente do SERVER_TOOL então viu `data_list`
+        # no registry, chamou, e o turno morreu em "A ferramenta falhou — data_list
+        # precisa de um usuário identificado": naquele trilho as executoras
+        # user-scoped rodam pelo executor GLOBAL, que nasce sem usuário.
+        #
+        # Aqui a política vira CÓDIGO em vez de pedido no prompt: se a mensagem casa
+        # a keyword de uma skill `tool_backed`, o dono do turno é o cognitivo — que é
+        # quem carrega a skill (autoload) e tem o usuário do turno. Sem skill_hint de
+        # propósito: o autoload já acha a skill sozinho, e o hint só mexeria no
+        # registro de tom.
+        if intent == IntentType.SERVER_TOOL:
+            casada = self._brain_skill_for(user_message)
+            if casada:
+                logger.warning(
+                    "Router: SERVER_TOOL(%s) para assunto da skill '%s' — devolvendo "
+                    "ao cognitivo (é quem carrega a skill e tem o usuário)",
+                    tool_name or "agent",
+                    casada,
+                )
+                intent = IntentType.DIRECT_RESPONSE
+                tool_name = None
+                tool_arguments = None
+                raw_command = None
+
         # Rede do áudio do navegador (ver _BROWSER_AUDIO_COMMAND): qualquer
         # comando improvisado para mexer no som/player de um navegador vira
         # pedido de música — o cognitivo decide e o bloco atua pela extensão.
@@ -1845,6 +1907,37 @@ class IntentRouter:
         if palavras[0] in _MUSIC_PLAY_AMBIGUOUS:
             return any(cue in compact for cue in _MUSIC_PLAY_CUES)
         return False
+
+    def _brain_skill_for(self, message: str) -> str | None:
+        """Nome da skill `tool_backed` cuja keyword casa com a mensagem (ou None).
+
+        Mesmo casamento que o autoload do cognitivo usa — de propósito: o que
+        decide aqui tem que ser o MESMO critério que lá na frente carrega a skill,
+        senão o turno é desviado para um caminho que não vai ativá-la. Nunca
+        levanta: sem library, com library vazia ou com erro, o roteamento segue
+        como estava (fail-open).
+        """
+        library = getattr(self, "skill_library", None)
+        if library is None or not message:
+            return None
+        try:
+            casada = library.autoload_for(message)
+        except Exception as e:  # noqa: BLE001 — classificação nunca quebra por isso
+            logger.warning("[SkillLibrary] autoload_for no router falhou: %s", e)
+            return None
+        if not casada:
+            return None
+        entry = casada[0]
+        # Só desvia quando este trilho não sabe executar NENHUMA tool da skill.
+        # `compras` (meli_search, browser_task) e `imitacao-vozes` (voice_list)
+        # têm tool servível aqui — e o browser_task pelo SERVER_TOOL foi conserto
+        # anterior (docs: jobs no registry global sem executor). Desviar essas
+        # seria desfazer trabalho feito. Já `playlists`/`financas`/`produtos` só
+        # têm tool gated: o trilho não tem o que oferecer, e insistir é o bug.
+        tools = [str(t) for t in (getattr(entry, "tools", None) or [])]
+        if any(server_tool_can_run(t) for t in tools):
+            return None
+        return getattr(entry, "name", None) or None
 
     def _music_decision(self, message: str) -> RoutingDecision:
         """Route a music request to the cognitive core with a music handoff hint."""

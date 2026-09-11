@@ -777,3 +777,203 @@ async def list_sessions(
     """Lista todas as sessões ativas."""
     sessions = service.list_active_sessions()
     return {"sessions": sessions, "count": len(sessions)}
+
+
+# ============ MEMÓRIA DE TRABALHO (leitura) ============
+#
+# O caderno do Neo (docs/working-memory-plan.md) nasceu SEM janela: até aqui a
+# única forma de ver o que ele anota era `psql` na VPS ou pedir `wm_read` no
+# chat — e pedir ao modelo o que ele escreveu é a pior fonte possível, porque a
+# resposta passa pelo próprio componente sob suspeita. Estes dois endpoints são
+# o visor read-only do desktop.
+#
+# Por que consultar a TABELA e não `WorkingMemoryStore.index()`:
+#
+# * `index()` devolve o que cabe no PROMPT — com a quota de notas automáticas
+#   (§ docstring de `index`). Quem abre o visor quer a verdade do banco,
+#   inclusive as notas que a quota deixou de fora. Foi olhando justamente essa
+#   diferença que se mediu o desequilíbrio 36 auto × 3 model;
+# * o store só existe quando `WORKING_MEMORY_ENABLED=true`. Nota escrita antes
+#   de a flag cair continua no banco, e um visor que some com a flag esconde
+#   exatamente o histórico que se quer auditar.
+#
+# Read-only de propósito: nada aqui escreve. `pinned`/`status` mudam o que entra
+# no contexto do Neo, então mexer neles é decisão de outro turno, não efeito
+# colateral de abrir uma tela.
+
+
+class WorkingNoteSummary(BaseModel):
+    """Uma linha da lista. Sem `body` — o corpo é caro e vem sob demanda."""
+
+    slug: str
+    title: str
+    summary: str
+    status: str
+    origin: str
+    pinned: bool
+    entry_count: int
+    links: list[str]
+    #: ISO-8601 SEM timezone — o core grava `datetime.utcnow()`. O front humaniza
+    #: tratando como UTC, igual ao seletor de sessões (ver SessionInfo no Rust).
+    created_at: str | None
+    updated_at: str | None
+    expires_at: str | None
+    session_id: str | None
+
+
+class WorkingNoteDetail(WorkingNoteSummary):
+    """A nota inteira. `body` é markdown pronto para render."""
+
+    body: str
+
+
+def _serialize_working_note(note: Any) -> dict[str, Any]:
+    def stamp(value: Any) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    return {
+        "slug": note.slug,
+        "title": note.title,
+        "summary": note.summary or "",
+        "status": note.status,
+        "origin": note.origin,
+        "pinned": bool(note.pinned),
+        "entry_count": note.entry_count,
+        # `links` é JSONB: já volta como lista, mas nota antiga pode ter NULL.
+        "links": [str(item) for item in (note.links or [])],
+        "created_at": stamp(note.created_at),
+        "updated_at": stamp(note.updated_at),
+        "expires_at": stamp(note.expires_at),
+        "session_id": str(note.session_id) if note.session_id else None,
+        "body": note.body or "",
+    }
+
+
+async def _resolve_working_memory_user(
+    db: AsyncPostgresClient, user_id: str | None
+) -> UUID | None:
+    """Explícito ganha; senão, o dono do CADERNO — não "o único usuário".
+
+    A política de `events.py`/`datasets.py` ("se houver exatamente um usuário,
+    é ele") não serve aqui: a base de produção tem 5 linhas em `user`, das
+    quais 4 são resíduo de seed/teste (nenhuma sessão, nenhuma nota). Aquela
+    regra devolvia 400 e o visor nascia inútil no único ambiente que importa.
+
+    Aqui a pergunta é mais simples e não depende de faxina no cadastro: de quem
+    é o caderno? Quem tem nota é o dono; havendo empate improvável, ganha quem
+    escreveu por último. Sem nota nenhuma, devolve ``None`` e a tela diz
+    "caderno vazio" — que é a verdade — em vez de um erro que o usuário leria
+    como desktop quebrado.
+    """
+    if user_id:
+        try:
+            return UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="user_id inválido")
+
+    from sqlalchemy import func
+    from db.models.working_note import WorkingNote
+    from sqlmodel import select
+
+    statement = (
+        select(WorkingNote.user_id)
+        .where(WorkingNote.user_id.is_not(None))
+        .group_by(WorkingNote.user_id)
+        .order_by(func.count().desc(), func.max(WorkingNote.updated_at).desc())
+        .limit(1)
+    )
+    async with db.get_session() as session:
+        owner = (await session.execute(statement)).scalars().first()
+    if owner is not None:
+        return owner
+
+    # Caderno vazio: cai para o cadastro só quando ele é inequívoco.
+    user_ids = await db.list_user_ids()
+    return user_ids[0] if len(user_ids) == 1 else None
+
+
+@router.get("/working-memory/notes")
+async def list_working_notes(
+    user_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    """Todas as notas do caderno, ativas primeiro e mais recentes no topo.
+
+    Arquivadas (`status='done'`) vêm no mesmo pacote, marcadas — sumir com elas
+    esconderia o caderno de ontem, que é metade do valor de ter um visor.
+    """
+    from db.models.working_note import WorkingNote
+    from sqlmodel import select
+
+    user = await _resolve_working_memory_user(db, user_id)
+    if user is None:
+        return {"notes": [], "count": 0, "counts": {}, "user_id": None}
+
+    statement = (
+        select(WorkingNote)
+        .where(WorkingNote.user_id == user)
+        # Ativas antes das arquivadas; fixadas no topo de cada grupo; depois a
+        # mais recentemente TOCADA (`updated_at`), que é a ordem em que o
+        # trabalho de fato aconteceu.
+        .order_by(
+            (WorkingNote.status != "active"),
+            WorkingNote.pinned.desc(),
+            WorkingNote.updated_at.desc(),
+        )
+        .limit(limit)
+    )
+
+    async with db.get_session() as session:
+        notes = list((await session.execute(statement)).scalars().all())
+
+    serialized = []
+    counts: dict[str, int] = {}
+    for note in notes:
+        payload = _serialize_working_note(note)
+        # A lista não carrega corpo: com 36 notas isso seria centenas de KB por
+        # abertura de tela, e o corpo só é lido quando se clica em uma.
+        payload.pop("body", None)
+        serialized.append(payload)
+        key = f"{note.origin}/{note.status}"
+        counts[key] = counts.get(key, 0) + 1
+
+    return {
+        "notes": serialized,
+        "count": len(serialized),
+        # `origin/status` agregado: é o número que revela o backstop escrevendo
+        # no lugar do modelo (auto × model) sem precisar contar na mão.
+        "counts": counts,
+        "user_id": str(user),
+    }
+
+
+@router.get("/working-memory/notes/{slug}")
+async def read_working_note(
+    slug: str,
+    user_id: str | None = Query(default=None),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    """O markdown inteiro de uma nota.
+
+    Sem a truncagem do `wm_read` (`render_tail` corta as entradas antigas para
+    caber no contexto do modelo): aqui quem lê é uma pessoa numa tela com
+    scroll, e ver só a cauda é justamente o que impede de auditar o caderno.
+    """
+    from db.models.working_note import WorkingNote
+    from sqlmodel import select
+
+    user = await _resolve_working_memory_user(db, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"Nota '{slug}' não encontrada")
+
+    statement = select(WorkingNote).where(
+        WorkingNote.user_id == user, WorkingNote.slug == slug
+    )
+    async with db.get_session() as session:
+        note = (await session.execute(statement)).scalars().first()
+
+    if note is None:
+        raise HTTPException(status_code=404, detail=f"Nota '{slug}' não encontrada")
+
+    return _serialize_working_note(note)

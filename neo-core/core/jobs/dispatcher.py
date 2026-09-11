@@ -44,16 +44,26 @@ class ProactiveDispatcher:
         broker: Any,
         llm_router: Any = None,
         default_model: str | None = None,
+        working_memory: Any = None,
     ) -> None:
         self.db = db
         self.broker = broker
         self.llm = llm_router
         self.default_model = default_model
+        #: Caderno de trabalho. ``None`` com a flag desligada — e aí o passo 3
+        #: do dispatch simplesmente não acontece.
+        self.working_memory = working_memory
 
     async def dispatch(self, job: AgentJob) -> None:
         """Entrega o resultado do ``job`` (idempotente: só entrega uma vez)."""
         if job.notified_at is not None:
             return
+
+        # 0. Caderno de trabalho, ACIMA do corte de `silent`: anotar não é avisar.
+        #    Job silencioso não fala com o usuário, mas o trabalho aconteceu — e o
+        #    caderno é memória do servidor, não notificação. Ver `_note_result`.
+        await self._note_result(job)
+
         if job.notify_policy == "silent":
             await self._mark_notified(job)
             return
@@ -82,6 +92,97 @@ class ProactiveDispatcher:
         await self._mark_notified(job)
 
     # ------------------------------------------------------------------
+
+    async def _note_result(self, job: AgentJob) -> None:
+        """Grava o resultado do job no caderno de trabalho do usuário.
+
+        **Por que aqui, e não no cérebro.** O caderno tem uma tool (`wm_write`) e
+        uma regra no prompt mandando anotar toda conclusão — e mesmo assim o
+        achado de um job nunca chegava lá. Não é desobediência do modelo: o
+        `browser_local_task` responde `status: queued` em milissegundos, e o
+        resultado real só existe minutos depois, quando este dispatcher o
+        entrega com uma chamada de LLM PRÓPRIA (`_compose`). Entre um e outro
+        não existe turno cognitivo — o cérebro nunca vê o resultado, então nunca
+        teve como anotá-lo.
+
+        Medido na sessão 09cfa763: o job 7c127b3b apurou o número da reclamação
+        (258599465), o título, o status "Em réplica", o modelo do monitor
+        (Alienware Fast IPS 280 Hz) e a URL exata da página — e o caderno ficou
+        com ``{'ok': True, 'job_id': ..., 'status': 'queued'}``. O turno
+        seguinte precisou reabrir tudo no navegador para recuperar o que já
+        estava apurado.
+
+        Este é, portanto, o ponto onde TODO job (navegador local, headless,
+        research, workbench) passa a anotar por si. Best-effort e nunca levanta:
+        um caderno que falha não pode impedir a entrega da resposta.
+        """
+        if self.working_memory is None or job.user_id is None:
+            return
+        summary = (job.result_summary or "").strip()
+        # Nada apurado e nada a explicar: só o `completed` mudo é dispensável —
+        # um `failed` sem resumo ainda avisa o próximo turno que não adianta
+        # esperar por aquele resultado.
+        if not summary and job.status == "completed":
+            return
+        try:
+            from core.working_memory import render_job_entry, render_job_summary
+
+            spec = job.spec_json or {}
+            duracao = None
+            if job.started_at and job.finished_at:
+                duracao = (job.finished_at - job.started_at).total_seconds()
+            entry = render_job_entry(
+                title=job.title or "(sem título)",
+                kind=job.kind or "job",
+                status=job.status or "?",
+                job_id=str(job.id),
+                summary=summary,
+                # O que foi PEDIDO ao subagente. Só existe no spec — o
+                # `result_summary` conta o que voltou, nunca o que se tentou.
+                pedido=str(
+                    spec.get("task") or spec.get("goal") or spec.get("command")
+                    or spec.get("topic") or ""
+                ),
+                urls=[u for u in (spec.get("start_url"),) if u],
+                arquivos=self._arquivos_do_job(job),
+                duracao_s=duracao,
+                diario=f"logs/browser_local/{job.id}" if job.kind == "browser_local" else "",
+            )
+            await self.working_memory.append_auto(
+                user_id=job.user_id,
+                # Mesma nota do backstop do turno (`sessao-<8>`): a linha "abri o
+                # job X" e o resultado dele ficam juntos, na ordem em que
+                # aconteceram. Sem session_id o append_auto cai em
+                # `trabalho-recente` sozinho.
+                session_id=job.session_id,
+                entry=entry,
+                summary=render_job_summary(
+                    title=job.title or "(sem título)",
+                    status=job.status or "?",
+                    summary=summary,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — caderno nunca derruba a entrega
+            logger.warning("[Dispatch] caderno não registrou o job %s: %s", job.id, e)
+
+    @staticmethod
+    def _arquivos_do_job(job: AgentJob) -> list[str]:
+        """Arquivos que o job pôs no disco, com caminho real.
+
+        Vem do mesmo lugar que alimenta o registro de artefatos; aqui entra na
+        nota do job para que o caminho fique ao lado do achado que o produziu, e
+        não só numa lista solta de downloads recentes.
+        """
+        spec = job.spec_json or {}
+        saida: list[str] = []
+        for item in (spec.get("downloaded") or [])[:20]:
+            if isinstance(item, dict):
+                nome = item.get("name") or "(sem nome)"
+                caminho = item.get("path") or item.get("file_id") or ""
+                saida.append(f"{nome} · {caminho}".strip(" ·"))
+            elif item:
+                saida.append(str(item))
+        return saida
 
     async def _compose(self, job: AgentJob) -> str:
         """Redige a mensagem do usuário a partir do resultado do job."""
