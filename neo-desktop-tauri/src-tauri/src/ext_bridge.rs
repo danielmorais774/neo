@@ -53,6 +53,9 @@ pub struct MusicTab {
 struct CmdResult {
     success: bool,
     error: String,
+    /// Aba em que a extensão REALMENTE executou (ela pode ter aberto uma nova).
+    /// É a única fonte desse id: aqui ninguém mais sabe onde a música caiu.
+    tab_id: Option<i64>,
 }
 
 /// Uma vigia armada: "esta aba está tocando ESTA faixa por conta de uma fila".
@@ -143,12 +146,15 @@ impl ExtBridge {
     /// `tab_id` is the tab the core picked when it decided to reuse (from the
     /// snapshot this bridge reported). It is a pin, not an order: the extension
     /// falls back to its own lookup when that tab is gone. `None` = no pin.
+    /// `nova_aba` = o core decidiu NÃO reusar nada (não havia aba sem dono):
+    /// a extensão abre a sua em vez de tomar a primeira que achar.
     pub async fn send_command(
         &self,
         action: &str,
         target: &str,
         video_id: &str,
         tab_id: Option<i64>,
+        nova_aba: bool,
     ) -> Result<(), String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (resp_tx, resp_rx) = oneshot::channel::<CmdResult>();
@@ -172,6 +178,7 @@ impl ExtBridge {
             "target": target,
             "videoId": video_id,
             "tabId": tab_id,
+            "novaAba": nova_aba,
         })
         .to_string();
 
@@ -183,7 +190,15 @@ impl ExtBridge {
         }
 
         match tokio::time::timeout(Duration::from_secs(8), resp_rx).await {
-            Ok(Ok(r)) if r.success => Ok(()),
+            Ok(Ok(r)) if r.success => {
+                // A extensão diz em que aba caiu. Guardar isso é o que mantém a
+                // fila na MESMA guia: a vigia passa a olhar essa aba e o id
+                // viaja no próximo evento até a inscrição no neo-core.
+                if let Some(id) = r.tab_id {
+                    self.note_watch_tab(id, video_id);
+                }
+                Ok(())
+            }
             Ok(Ok(r)) => Err(if r.error.is_empty() {
                 "a extensão não conseguiu tocar".to_string()
             } else {
@@ -238,6 +253,63 @@ impl ExtBridge {
             "videoId": video_id,
             "codigo": codigo,
         }));
+    }
+
+    /// A aba em que a fila está tocando DE VERDADE, dita por quem a viu.
+    ///
+    /// Três informantes, todos a jusante da decisão do servidor: o `result` do
+    /// play (a extensão pode ter aberto aba nova), o `media_event` do vigia (ele
+    /// mora na página) e o snapshot de abas. Sem isto o alvo da vigia continuava
+    /// sendo o que o neo-core adivinhou ANTES de a fila começar, o evento saía
+    /// com `tab_id: null` e a inscrição nunca aprendia a aba — então a faixa
+    /// seguinte era despachada para a guia velha (medido em 12/09, 15:39:58:
+    /// `watch armado: aba None` e, no avanço, `aba Some(1976602762)`).
+    fn note_watch_tab(&self, tab_id: i64, for_video: &str) {
+        if tab_id <= 0 {
+            return;
+        }
+        if let Ok(mut g) = self.inner.lock() {
+            let Some(w) = g.watch.as_mut() else { return };
+            // Evento de outra faixa quando já sabemos a aba: não mexe (é o
+            // "trocaram o vídeo na minha aba", que o servidor trata pausando).
+            if w.tab_id.is_some() && !for_video.is_empty() && w.video_id != for_video {
+                return;
+            }
+            if w.tab_id != Some(tab_id) {
+                info!(
+                    "[ExtBridge] aba da fila: {} (era {:?}, faixa {})",
+                    tab_id, w.tab_id, w.video_id
+                );
+                w.tab_id = Some(tab_id);
+            }
+        }
+    }
+
+    /// Vigia sem aba (o play caiu numa guia que o servidor não escolheu): o
+    /// snapshot diz qual delas está com a nossa faixa. Terceiro informante, atrás
+    /// do `result` do play e do `media_event` — e o único que funciona quando o
+    /// worker da extensão foi reciclado no meio da faixa.
+    fn learn_watch_tab_from_snapshot(&self) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        let faixa = match g.watch.as_ref() {
+            Some(w) if w.tab_id.is_none() && !w.video_id.is_empty() => w.video_id.clone(),
+            _ => return,
+        };
+        let achada = g
+            .tabs
+            .iter()
+            .find(|t| t.extra.get("videoId").and_then(|v| v.as_str()) == Some(faixa.as_str()))
+            .map(|t| t.tab_id)
+            .filter(|id| *id > 0);
+        if let (Some(id), Some(w)) = (achada, g.watch.as_mut()) {
+            info!("[ExtBridge] aba da fila: {} (pelo snapshot, faixa {})", id, faixa);
+            w.tab_id = Some(id);
+        }
+    }
+
+    /// Aba da vigia armada (None quando não há vigia). Usado nos testes e no log.
+    pub fn watch_tab_id(&self) -> Option<i64> {
+        self.inner.lock().ok().and_then(|g| g.watch.as_ref().and_then(|w| w.tab_id))
     }
 
     /// Desarma. Chamado quando o neo-core responde `desarmar` ou quando o usuário
@@ -394,6 +466,7 @@ impl ExtBridge {
                 if let Ok(mut g) = self.inner.lock() {
                     g.tabs = tabs;
                 }
+                self.learn_watch_tab_from_snapshot();
                 // Só faz alguma coisa se houver watch armado — o filtro na BORDA
                 // (§7.4): sem fila rodando, nenhum evento de mídia vira requisição.
                 if let Some((watch, event, video_id)) = self.evaluate_watch() {
@@ -422,6 +495,12 @@ impl ExtBridge {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // O vigia mora na PÁGINA: o `tabId` que ele manda é a aba onde a
+                // música está tocando de verdade. Aprender aqui é o que faz o
+                // POST seguinte levar a aba certa ao neo-core.
+                if let Some(id) = parsed.get("tabId").and_then(|v| v.as_i64()) {
+                    self.note_watch_tab(id, &video_id);
+                }
                 let watch = match self.inner.lock() {
                     Ok(mut g) => {
                         if let Some(w) = g.watch.as_mut() {
@@ -464,9 +543,10 @@ impl ExtBridge {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let tab_id = parsed.get("tabId").and_then(|v| v.as_i64());
                 if let Ok(mut g) = self.inner.lock() {
                     if let Some(tx) = g.pending.remove(&id) {
-                        let _ = tx.send(CmdResult { success, error });
+                        let _ = tx.send(CmdResult { success, error, tab_id });
                     }
                 }
             }
@@ -567,7 +647,12 @@ async fn report_media_event(
                 &next_video,
                 &next_codigo,
             );
-            if let Err(e) = bridge.send_command("play", "youtube", &next_video, tab_id).await {
+            // `nova_aba: false` — no avanço a fila NUNCA abre guia: ou é a aba
+            // dela (a extensão sabe qual, mesmo sem pin), ou nada.
+            if let Err(e) = bridge
+                .send_command("play", "youtube", &next_video, tab_id, false)
+                .await
+            {
                 warn!("[ExtBridge] não consegui tocar a próxima da fila: {}", e);
             }
             bridge.end_reporting();
@@ -713,6 +798,61 @@ mod tests {
         assert_eq!(de_volta["track"], "No Matter What");
         assert_eq!(de_volta["adShowing"], false);
         assert_eq!(de_volta["tabId"], 42);
+    }
+
+    // A FILA NÃO PODE TROCAR DE GUIA. O alvo que o neo-core manda ao armar a
+    // vigia é um chute feito antes de a fila começar (às vezes `None`, como no
+    // log de 12/09 15:39:38). Quem sabe a aba de verdade é a extensão, e ela diz
+    // — no `result` do play, no `media_event` do vigia e no snapshot. Se a ponte
+    // joga isso fora, o POST sai com `tab_id: null`, a inscrição nunca aprende e
+    // a faixa seguinte é despachada para a guia velha.
+    #[test]
+    fn aba_da_fila_aprendida_pelo_snapshot() {
+        let bridge = ExtBridge::new();
+        bridge.arm_watch("sub-1", "mac-daniel", None, "AAAAAAAAAAA", "ab12");
+        assert_eq!(bridge.watch_tab_id(), None, "o core não sabia a aba");
+
+        // `duration: 0` de propósito: assim o snapshot não vira evento (e o
+        // teste não precisa de runtime tokio) — só o aprendizado da aba importa.
+        bridge.on_message(
+            r#"{"type":"tabs","tabs":[
+                {"site":"youtube","tabId":9,"url":"u","title":"outra","playing":false,
+                 "videoId":"ZZZZZZZZZZZ","duration":0},
+                {"site":"youtube","tabId":77,"url":"u","title":"a da fila","playing":true,
+                 "videoId":"AAAAAAAAAAA","duration":0}
+            ]}"#,
+        );
+        assert_eq!(bridge.watch_tab_id(), Some(77), "aprendeu a aba da faixa");
+    }
+
+    #[test]
+    fn result_do_play_carrega_a_aba_usada() {
+        let bridge = ExtBridge::new();
+        let (tx, rx) = oneshot::channel::<CmdResult>();
+        bridge
+            .inner
+            .lock()
+            .unwrap()
+            .pending
+            .insert("cmd-1".to_string(), tx);
+        bridge.on_message(r#"{"type":"result","id":"cmd-1","success":true,"tabId":123}"#);
+        let r = rx.blocking_recv().expect("resultado");
+        assert!(r.success);
+        assert_eq!(r.tab_id, Some(123), "a aba em que o play caiu volta no result");
+    }
+
+    // Vídeo trocado na aba (o usuário assumiu o player) NÃO é aba nova: o
+    // servidor trata pausando a fila, e mexer no alvo aqui só confundiria.
+    #[test]
+    fn evento_de_outra_faixa_nao_move_a_aba_conhecida() {
+        let bridge = ExtBridge::new();
+        bridge.arm_watch("sub-1", "mac-daniel", Some(77), "AAAAAAAAAAA", "ab12");
+        bridge.note_watch_tab(88, "OUTROVIDEO1");
+        assert_eq!(bridge.watch_tab_id(), Some(77));
+        // Já a mesma faixa reportada de outra aba é a verdade nova (a fila abriu
+        // a aba dela): aí seguimos o player.
+        bridge.note_watch_tab(88, "AAAAAAAAAAA");
+        assert_eq!(bridge.watch_tab_id(), Some(88));
     }
 
     // Extensão velha (só os cinco campos originais) não pode quebrar a ponte —

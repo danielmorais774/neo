@@ -294,6 +294,12 @@ export interface ElectronAPI {
   listSessions: (limit?: number) => Promise<SessionInfo[]>;
   /** Sessão ativa agora (para destacar a linha atual na lista). */
   getSessionId: () => Promise<string>;
+  // Caderno de trabalho do Neo (tabela `working_note` no core). Read-only: o
+  // visor não mexe em `pinned`/`status`, que mudam o contexto do próprio Neo.
+  listWorkingNotes: (limit?: number) => Promise<WorkingNotesPage>;
+  readWorkingNote: (slug: string) => Promise<WorkingNoteDetail>;
+  /** Abre (ou foca, se já aberta) a janela separada do caderno. */
+  openWorkingMemoryWindow: () => Promise<void>;
 }
 
 export interface SessionInfo {
@@ -302,6 +308,37 @@ export interface SessionInfo {
   message_count: number;
   /** ISO-8601 SEM timezone, gravado pelo core como UTC. */
   last_activity_at: string | null;
+}
+
+/** Uma linha da lista do caderno. Sem `body` — o corpo vem por `readWorkingNote`. */
+export interface WorkingNoteSummary {
+  slug: string;
+  title: string;
+  summary: string;
+  /** `active` ocupa o índice do prompt; `done` é arquivada. */
+  status: 'active' | 'done' | string;
+  /** `model` = o Neo anotou por conta; `auto` = backstop do turno. */
+  origin: 'model' | 'auto' | string;
+  pinned: boolean;
+  entry_count: number;
+  links: string[];
+  /** ISO-8601 SEM timezone, gravado pelo core como UTC (igual ao SessionInfo). */
+  created_at: string | null;
+  updated_at: string | null;
+  expires_at: string | null;
+  session_id: string | null;
+}
+
+export interface WorkingNoteDetail extends WorkingNoteSummary {
+  /** Markdown inteiro, sem a truncagem que o `wm_read` aplica para o modelo. */
+  body: string;
+}
+
+export interface WorkingNotesPage {
+  notes: WorkingNoteSummary[];
+  count: number;
+  /** `origin/status` → quantidade (ex.: `auto/active`: 36, `model/active`: 3). */
+  counts: Record<string, number>;
 }
 
 let passwordRequestUnlisten: UnlistenFn | null = null;
@@ -750,4 +787,10 @@ export const electronAPI: ElectronAPI = {
   // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
   listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),
   getSessionId: () => invoke<string>('get_session_id'),
+
+  // Caderno de trabalho (proxy pro neo-core, ver commands/mod.rs).
+  listWorkingNotes: (limit?: number) =>
+    invoke<WorkingNotesPage>('list_working_notes', { limit }),
+  readWorkingNote: (slug: string) => invoke<WorkingNoteDetail>('read_working_note', { slug }),
+  openWorkingMemoryWindow: () => invoke<void>('open_working_memory_window'),
 };

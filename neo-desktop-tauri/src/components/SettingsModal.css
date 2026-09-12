@@ -271,3 +271,64 @@
   font-size: 11px;
   line-height: 1.25;
 }
+
+/* Botão "abre uma tela" — mesma linguagem do .theme-option (ícone, cópia em
+   duas linhas), mas com chevron: sinaliza que leva a outro lugar em vez de
+   alternar um ajuste aqui dentro. */
+.settings-open-screen {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  text-align: left;
+  color: var(--text-primary);
+  background: var(--control-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.settings-open-screen:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--accent-border);
+}
+
+.settings-open-screen-icon {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: var(--selected-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 9px;
+}
+
+.settings-open-screen-copy {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-open-screen-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-open-screen-copy small {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.settings-open-screen-chevron {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--text-secondary);
+}

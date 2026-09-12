@@ -1001,7 +1001,18 @@ async fn run_media_command(bridge: &ExtBridge, arguments: &str) -> (bool, String
     // re-resolvia sozinha, pela primeira aba do YouTube que achasse — que nem
     // sempre é a aba sobre a qual a decisão foi tomada.
     let tab_id = args.get("tabId").and_then(|v| v.as_i64());
-    match bridge.send_command(action, target, video_id, tab_id).await {
+    // `novaAba`: o core não achou aba sem dono (o `pick_reuse_tab` se recusa a
+    // tomar vídeo do usuário) e converteu o `open_url` em `media_command` para a
+    // fila. Sem este sinal a extensão re-escolhia sozinha e pegava a primeira
+    // aba do YouTube que achasse — justamente a que o core tinha recusado.
+    let nova_aba = args
+        .get("novaAba")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    match bridge
+        .send_command(action, target, video_id, tab_id, nova_aba)
+        .await
+    {
         Ok(()) => (true, "comando enviado à extensão".to_string(), String::new()),
         Err(e) => {
             // Plano B da fila: o neo-core converte `open_url` em `media_command`

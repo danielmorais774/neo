@@ -2058,6 +2058,166 @@ pub fn set_notification_context(
     Ok(())
 }
 
+// ============ MEMÓRIA DE TRABALHO (visor read-only) ============
+//
+// O caderno mora no neo-core (tabela `working_note`), igual às sessões: aqui é
+// só proxy. Nada nesta seção escreve — `pinned`/`status` mudam o que entra no
+// contexto do Neo, e isso não pode ser efeito colateral de abrir uma tela.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkingNoteSummary {
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    /// `active` ocupa o índice do prompt; `done` é arquivada.
+    pub status: String,
+    /// `model` = o Neo chamou `wm_write`; `auto` = backstop determinístico.
+    pub origin: String,
+    pub pinned: bool,
+    pub entry_count: i64,
+    pub links: Vec<String>,
+    /// ISO-8601 SEM timezone (o core grava `datetime.utcnow()`), ou seja: UTC.
+    /// O front humaniza tratando como UTC — mesma pegadinha do SessionInfo.
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkingNoteDetail {
+    #[serde(flatten)]
+    pub note: WorkingNoteSummary,
+    /// Markdown pronto para render, INTEIRO (sem a truncagem do `wm_read`).
+    pub body: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkingNotesPage {
+    pub notes: Vec<WorkingNoteSummary>,
+    pub count: i64,
+    /// Agregado `origin/status` → quantidade. É o número que mostra o backstop
+    /// escrevendo no lugar do modelo sem ninguém ter de contar na mão.
+    #[serde(default)]
+    pub counts: std::collections::HashMap<String, i64>,
+}
+
+/// Label da janela do caderno. Precisa estar em `capabilities/default.json`:
+/// sem isso a janela abre, mas todo `invoke` dela é NEGADO pelo ACL — a tela
+/// subiria em branco, sem erro visível no console do Rust.
+const WORKING_MEMORY_WINDOW: &str = "working-memory";
+
+/// Abre (ou traz para a frente) a janela do caderno.
+///
+/// Janela criada SOB DEMANDA em vez de declarada em `tauri.conf.json` como a de
+/// notificação: aquela precisa existir antes do evento chegar, esta só existe
+/// quando alguém quer ler. Declarada, seria um webview carregado no boot e
+/// mantido em memória para uma tela que se abre de vez em quando.
+///
+/// Chamar de novo com a janela aberta não cria uma segunda: mostra, restaura e
+/// foca a que já existe. Duas cópias do mesmo caderno lado a lado só produziriam
+/// a dúvida de qual das duas está desatualizada.
+#[tauri::command]
+pub async fn open_working_memory_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(WORKING_MEMORY_WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        window
+            .set_focus()
+            .map_err(|e| format!("Não consegui focar a janela do caderno: {}", e))?;
+        return Ok(());
+    }
+
+    // `?mode=working-memory` no index.html: mesmo mecanismo do `quick-help` que
+    // já existe no App.tsx. Evita uma entrada nova de HTML no vite.config e
+    // mantém o ThemeProvider do main.tsx valendo aqui também — a janela nasce no
+    // mesmo tema da principal (o tema mora no localStorage, mesma origem).
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        WORKING_MEMORY_WINDOW,
+        tauri::WebviewUrl::App("index.html?mode=working-memory".into()),
+    )
+    .title("Caderno do Neo")
+    .inner_size(1020.0, 720.0)
+    .min_inner_size(680.0, 420.0)
+    .resizable(true)
+    // Com decoração nativa, ao contrário da janela principal: é uma janela de
+    // documento, e o usuário ganha mover/redimensionar/fullscreen/Cmd-W de graça
+    // em vez de uma reimplementação da barra de título só para esta tela.
+    .decorations(true)
+    .transparent(false)
+    .build()
+    .map_err(|e| format!("Não consegui abrir a janela do caderno: {}", e))?;
+
+    info!("[Neo] janela do caderno de trabalho aberta");
+    Ok(())
+}
+
+fn working_memory_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))
+}
+
+/// Todas as notas do caderno. Erro de rede vira `Err` para a UI poder dizer
+/// "não deu pra carregar" em vez de mostrar lista vazia — que o usuário leria
+/// como "o Neo não anota nada", exatamente a dúvida que a tela existe para tirar.
+#[tauri::command]
+pub async fn list_working_notes(limit: Option<u32>) -> Result<WorkingNotesPage, String> {
+    let url = format!(
+        "{}/api/v1/desktop/working-memory/notes?limit={}",
+        neo_core_http_url(),
+        limit.unwrap_or(200)
+    );
+
+    let resp = working_memory_client()?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("neo-core respondeu {}", resp.status()));
+    }
+
+    resp.json::<WorkingNotesPage>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
+}
+
+/// O markdown inteiro de uma nota. 404 vira mensagem própria: nota expirada
+/// pelo GC entre a listagem e o clique é o caso normal, não uma falha.
+#[tauri::command]
+pub async fn read_working_note(slug: String) -> Result<WorkingNoteDetail, String> {
+    let url = format!(
+        "{}/api/v1/desktop/working-memory/notes/{}",
+        neo_core_http_url(),
+        urlencoding::encode(&slug)
+    );
+
+    let resp = working_memory_client()?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "A nota '{}' não existe mais no caderno (pode ter expirado).",
+            slug
+        ));
+    }
+    if !resp.status().is_success() {
+        return Err(format!("neo-core respondeu {}", resp.status()));
+    }
+
+    resp.json::<WorkingNoteDetail>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
+}
+
+
 #[cfg(test)]
 mod inline_image_tests {
     use super::*;
@@ -2314,4 +2474,74 @@ pub async fn remove_device(
         info!("[Neo] este dispositivo foi removido — token local apagado");
     }
     Ok(is_self)
+}
+
+#[cfg(test)]
+mod working_memory_tests {
+    use super::*;
+
+    /// Resposta REAL de produção (`GET /api/v1/desktop/working-memory/notes/…`),
+    /// com o corpo encurtado. O que se testa aqui é o contrato entre o Python e
+    /// estas structs: `#[serde(flatten)]` no `WorkingNoteDetail` significa que um
+    /// campo renomeado de um lado só apareceria como "Resposta inválida do
+    /// neo-core" na tela, e não em tempo de compilação.
+    // `r##"…"##` e não `r#"…"#`: o corpo da nota começa com `"# Mix musical`, e a
+    // sequência `"#` fecharia o raw string ali no meio do JSON.
+    const DETAIL_JSON: &str = r##"{
+        "slug": "playlist-mix-youtube",
+        "title": "Mix musical do Daniel (YouTube)",
+        "summary": "08/09 12:46",
+        "status": "active",
+        "origin": "model",
+        "pinned": false,
+        "entry_count": 2,
+        "links": [],
+        "created_at": "2026-09-05T01:28:53.104476",
+        "updated_at": "2026-09-08T12:46:26.464158",
+        "expires_at": "2026-10-08T12:46:26.464158",
+        "session_id": "8bf5ceab-5f92-4383-8f54-be7edae6069c",
+        "body": "# Mix musical do Daniel (YouTube)\n> caderno de trabalho"
+    }"##;
+
+    #[test]
+    fn detail_deserializa_a_resposta_do_core() {
+        let detail: WorkingNoteDetail = serde_json::from_str(DETAIL_JSON).unwrap();
+        assert_eq!(detail.note.slug, "playlist-mix-youtube");
+        assert_eq!(detail.note.origin, "model");
+        assert_eq!(detail.note.entry_count, 2);
+        assert!(!detail.note.pinned);
+        assert!(detail.body.starts_with("# Mix musical"));
+    }
+
+    #[test]
+    fn detail_volta_para_o_front_achatado() {
+        // O TypeScript declara `WorkingNoteDetail extends WorkingNoteSummary`,
+        // ou seja, espera `slug` e `body` no MESMO nível. Se o flatten sumisse,
+        // o front receberia `{ note: {...}, body }` e todo campo viraria
+        // undefined — sem erro nenhum, só uma tela vazia.
+        let detail: WorkingNoteDetail = serde_json::from_str(DETAIL_JSON).unwrap();
+        let out = serde_json::to_value(&detail).unwrap();
+        assert_eq!(out["slug"], "playlist-mix-youtube");
+        assert!(out.get("note").is_none(), "o flatten sumiu: {out}");
+    }
+
+    #[test]
+    fn lista_aceita_pagina_sem_counts() {
+        // `counts` é `#[serde(default)]`: um core mais antigo (ou a resposta de
+        // caderno vazio) não pode derrubar a tela inteira.
+        let page: WorkingNotesPage =
+            serde_json::from_str(r#"{"notes": [], "count": 0}"#).unwrap();
+        assert!(page.notes.is_empty());
+        assert!(page.counts.is_empty());
+    }
+
+    #[test]
+    fn lista_le_o_agregado_de_origem() {
+        let page: WorkingNotesPage = serde_json::from_str(
+            r#"{"notes": [], "count": 0, "counts": {"auto/active": 36, "model/active": 3}}"#,
+        )
+        .unwrap();
+        assert_eq!(page.counts.get("auto/active"), Some(&36));
+        assert_eq!(page.counts.get("model/active"), Some(&3));
+    }
 }

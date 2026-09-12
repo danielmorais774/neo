@@ -16,6 +16,16 @@ interface SettingsModalProps {
 
 export default function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalProps) {
   const [wakeEnabled, setWakeEnabled] = useWakeEnabled();
+
+  // O caderno abre em JANELA PRÓPRIA (comando `open_working_memory_window`), e
+  // não como overlay: ler as notas é trabalho lado a lado com o chat — como
+  // overlay, conferir o que o Neo anotou obrigava a fechar a tela para voltar à
+  // conversa. Chamar com a janela já aberta apenas a traz para a frente.
+  const openNotebook = () => {
+    window.electronAPI?.openWorkingMemoryWindow().catch((err) => {
+      console.error('[Neo] Falha ao abrir a janela do caderno:', err);
+    });
+  };
   // Portal para document.body: escapa do `.app`, que tem `overflow:hidden` e uma
   // -webkit-mask radial (desbota as bordas) e, no WebKit, vira containing block
   // do position:fixed — o que recortava/esmaecia o topo e o rodapé do modal.
@@ -114,6 +124,32 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
               </span>
             </button>
             <WakeWordPanel />
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <span>Memória de trabalho</span>
+              <small>O caderno da tarefa — o que o Neo anota entre um turno e o outro</small>
+            </div>
+            <button type="button" className="settings-open-screen" onClick={openNotebook}>
+              <span className="settings-open-screen-icon" aria-hidden="true">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 19.5V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v14H6a2 2 0 0 0-2 2z" />
+                  <line x1="8" y1="7" x2="15" y2="7" />
+                  <line x1="8" y1="11" x2="15" y2="11" />
+                  <line x1="8" y1="15" x2="12" y2="15" />
+                </svg>
+              </span>
+              <span className="settings-open-screen-copy">
+                <strong>Abrir o caderno</strong>
+                <small>Preview do markdown de cada nota, direto do neo-core</small>
+              </span>
+              <span className="settings-open-screen-chevron" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </span>
+            </button>
           </div>
 
           <div className="settings-section">
