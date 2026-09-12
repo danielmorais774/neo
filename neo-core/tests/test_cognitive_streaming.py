@@ -363,3 +363,56 @@ async def test_consumidor_que_desiste_nao_deixa_o_loop_rodando():
     await gen.aclose()
     await asyncio.sleep(0.05)
     assert rodou_ate_o_fim is False
+
+
+# ── pin de provedor: o painel valia para todo mundo menos para o desktop ─────
+
+
+class _FakeCfg:
+    def __init__(self, model):
+        self.model = model
+
+    async def __call__(self, db, role, **kw):
+        assert role == "cognitive"
+        return {"provider": "openrouter", "model": self.model}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pedido,painel,esperado",
+    [
+        # O caso que motivou tudo: cliente sem pin, painel com pin, mesmo modelo.
+        ("deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash@baidu",
+         "deepseek/deepseek-v4-flash@baidu"),
+        # Cliente pediu OUTRO modelo: escolha dele, não se mexe.
+        ("qwen/qwen3.7-flash", "deepseek/deepseek-v4-flash@baidu", "qwen/qwen3.7-flash"),
+        # Cliente já mandou pin explícito: ganha.
+        ("deepseek/deepseek-v4-flash@streamlake", "deepseek/deepseek-v4-flash@baidu",
+         "deepseek/deepseek-v4-flash@streamlake"),
+        # Painel sem pin: nada a colar.
+        ("deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash",
+         "deepseek/deepseek-v4-flash"),
+    ],
+)
+async def test_pin_do_painel_so_cola_quando_e_o_mesmo_modelo(
+    monkeypatch, pedido, painel, esperado
+):
+    import modules.model_config as mc
+
+    monkeypatch.setattr(mc, "get_model_config", _FakeCfg(painel))
+    svc = _svc()
+    svc.db = object()
+    assert await svc._pin_from_panel(pedido) == esperado
+
+
+@pytest.mark.asyncio
+async def test_preferencia_ilegivel_nao_derruba_o_turno(monkeypatch):
+    import modules.model_config as mc
+
+    async def _explode(*a, **k):
+        raise RuntimeError("banco fora")
+
+    monkeypatch.setattr(mc, "get_model_config", _explode)
+    svc = _svc()
+    svc.db = object()
+    assert await svc._pin_from_panel("deepseek/deepseek-v4-flash") == "deepseek/deepseek-v4-flash"

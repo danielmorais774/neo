@@ -4076,7 +4076,7 @@ class AIService:
         # embaixo — ver `_drop_music_handoff_after_browser`.
         browser_actuation: list[str] = []
         try:
-            _req_model = (metadata or {}).get("model")
+            _req_model = await self._pin_from_panel((metadata or {}).get("model"))
             _req_provider = (metadata or {}).get("provider")
             if _req_provider:
                 provider = self.llm.get_provider(_req_provider)
@@ -4978,6 +4978,48 @@ class AIService:
         from core.router.intent_router import server_tool_can_run
 
         return [t for t in self.agent.tool_registry.get_all() if server_tool_can_run(t.name)]
+
+    async def _pin_from_panel(self, req_model: str | None) -> str | None:
+        """Devolve o modelo do cliente com o PIN DE PROVEDOR do painel, se houver.
+
+        O sufixo ``@slug`` (``deepseek/deepseek-v4-flash@baidu``) escolhe o
+        ENDPOINT de infra no OpenRouter — não é outro modelo. O desktop escolhe
+        modelo; ele não sabe de endpoint, e mandava o id pelado, que vence a
+        preferência do painel em `_handle_direct_response`. Resultado: o pin que o
+        operador configurou no slot `cognitive` valia para todo mundo MENOS para
+        o caminho mais quente do sistema.
+
+        E o pin não é detalhe de preço. Medido em 2026-09-11, mesmo prompt, 4
+        chamadas cada:
+
+        * sem pin (o que o desktop manda hoje): caiu em Parasail a **21,7 tok/s**,
+          Baidu a 75 e StreamLake a 57 — 10,1s no pior caso contra 2,8s;
+        * ``@baidu``: 4/4, 74-80 tok/s;
+        * ``@streamlake``: 4/4, 47-60 tok/s.
+
+        Sortear o endpoint a cada round também joga fora o cache de prefixo: com
+        provedor estável, 24.576 dos 24.723 tokens de entrada voltam cacheados;
+        trocando de provedor, zero.
+
+        Conservador de propósito: só cola o pin quando o modelo é o MESMO (o
+        cliente pediu outro modelo → é escolha dele, não se mexe) e quando ele
+        veio sem pin (pin explícito do cliente ganha). Nunca levanta — uma
+        preferência ilegível não pode derrubar o turno.
+        """
+        if not req_model or "@" in req_model:
+            return req_model
+        try:
+            from modules.model_config import get_model_config
+
+            cfg = await get_model_config(self.db, "cognitive")
+        except Exception as e:  # noqa: BLE001 — preferência nunca derruba turno
+            logger.warning("[Cognitive] não deu para ler o pin do painel: %s", e)
+            return req_model
+        painel = str((cfg or {}).get("model") or "")
+        if "@" not in painel or painel.split("@", 1)[0] != req_model:
+            return req_model
+        logger.debug("[Cognitive] adotando o pin do painel: %s → %s", req_model, painel)
+        return painel
 
     async def _drive_cognitive_loop(
         self,
