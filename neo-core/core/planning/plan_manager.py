@@ -814,7 +814,8 @@ class PlanManager:
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
             parsed = json.loads(raw)
-            logger.info(f"[PLAN] advance_and_refine: decision={parsed.get('decision', '?')}, reason={parsed.get('reason', '?')[:80]}")
+            parsed = self._flatten_decision(parsed, next_step)
+            logger.info(f"[PLAN] advance_and_refine: decision={parsed.get('decision', '?')}, reason={str(parsed.get('reason', '?'))[:80]}")
 
             validation = parsed.get("validation", {})
             return {
@@ -841,6 +842,43 @@ class PlanManager:
                 "subplan_steps": None,
                 "retry_classification": None,
             }
+
+    @staticmethod
+    def _flatten_decision(parsed: dict, next_step: "PlanStep | None") -> dict:
+        """Aceita o JSON do validador aninhado — e nunca devolve um `decision` inválido.
+
+        O prompt pede os campos no TOPO (`decision`, `reason`, `refined_step`…),
+        mas o modelo às vezes embrulha tudo num objeto `decision`:
+
+            {"validation": {...},
+             "decision": {"decision": "continue", "refined_step": {...}, ...}}
+
+        Medido na sessão 3733f3ae (2026-09-12): `parsed["decision"]` virou um
+        **dict**, nenhum `elif` do despachante casou (`== "finish"`,
+        `in ("continue", …)`), e o turno caiu no fallthrough "plano completo"
+        com o passo 2 de 2 **nunca executado** — e o `refined_step` correto, que
+        o modelo tinha produzido, foi jogado fora. O usuário recebeu um `ls`
+        truncado no meio da linha como resposta a "ler o corpo do email".
+
+        Achatar é mais barato e mais confiável que brigar com o prompt. E um
+        `decision` que ainda assim não seja um dos quatro verbos vira
+        ``continue`` enquanto houver passo pendente: a falha segura de um
+        validador é seguir o plano, nunca declarar vitória.
+        """
+        bloco = parsed.get("decision")
+        if isinstance(bloco, dict):
+            logger.info("[PLAN] decision veio aninhado — achatando")
+            parsed = {**parsed, **bloco}
+
+        decision = parsed.get("decision")
+        if decision not in ("continue", "retry", "subplan", "finish"):
+            seguro = "continue" if next_step else "finish"
+            logger.warning(
+                "[PLAN] decision inválido (%r) — assumindo %r para não abandonar passo pendente",
+                decision, seguro,
+            )
+            parsed = {**parsed, "decision": seguro}
+        return parsed
 
     @staticmethod
     def should_skip_llm(
@@ -916,7 +954,14 @@ class PlanManager:
         user_message: str,
     ) -> str:
         """Build a final response using a template. LLM only if output is complex/technical."""
-        lines = [f"✅ **{plan.goal}**\n"]
+        # Passo que nunca rodou não pode virar ✅. Na sessão 3733f3ae o plano
+        # "listar + ler" parou no passo 1 (decision veio aninhado, ver
+        # `_flatten_decision`) e a resposta abriu com um check verde por cima de
+        # um `ls` truncado — o usuário tinha pedido pra LER o e-mail.
+        pendentes = [s for s in plan.steps if s.status in ("pending", "running")]
+        falhos = [s for s in plan.steps if s.status == "failed"]
+        icone = "✅" if not pendentes and not falhos else "⚠️"
+        lines = [f"{icone} **{plan.goal}**\n"]
 
         for step in plan.steps:
             if step.status == "completed":
@@ -924,6 +969,13 @@ class PlanManager:
                 lines.append(f"- {step.description}: {summary}")
             elif step.status == "failed":
                 lines.append(f"- ⚠️ {step.description}: falhou ({step.error or 'erro desconhecido'})")
+            else:
+                lines.append(f"- ⏳ {step.description}: NÃO executado")
+        if pendentes:
+            logger.warning(
+                "[PLAN] resposta final com %d passo(s) pendente(s) — plano encerrado cedo demais",
+                len(pendentes),
+            )
 
         combined_output = "\n".join(s.result or "" for s in plan.steps if s.status == "completed")
 

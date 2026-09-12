@@ -1605,6 +1605,48 @@ def _video_id_of(url: str) -> str:
     return ""
 
 
+def _fila_pela_extensao(
+    tool_name: str, args: dict[str, Any], observar: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Fila SEMPRE pela extensão: converte `open_url` em `media_command`.
+
+    `open_url` entrega a URL ao sistema operacional: abre uma aba que a ponte não
+    escolheu, e é a ponte que precisa registrar o listener de fim de faixa e
+    travar o autoplay. Com `media_command` a extensão navega a aba (criando uma
+    se não houver) e passa a mandar no player. A `url` viaja junto como plano B,
+    para o desktop abrir sozinho se a ponte estiver fora.
+
+    Duas saídas, e a diferença é a ABA:
+
+    - `tabId` — o reuso já foi decidido (a aba é do Neo, ou estava sem nada
+      carregado): a extensão toca nela;
+    - `novaAba` — não havia aba reusável. `pick_reuse_tab` se recusa a tomar
+      vídeo do usuário, e sem este sinal a extensão re-escolhia sozinha pela
+      PRIMEIRA aba do YouTube que achasse — justamente a que a decisão tinha
+      recusado. Com ele a fila abre a aba dela, que passa a ser A aba da fila.
+    """
+    video_id = str(observar.get("video_id") or "")
+    if tool_name != "open_url" or not video_id:
+        return tool_name, args
+    novos: dict[str, Any] = {
+        "action": "play",
+        "target": "youtube",
+        "videoId": video_id,
+        "url": str(args.get("url") or ""),
+        "observar": observar,
+    }
+    if observar.get("tab_id") not in (None, ""):
+        novos["tabId"] = observar["tab_id"]
+    else:
+        novos["novaAba"] = True
+    logger.info(
+        "[music] fila: open_url → media_command (a extensão precisa dirigir a "
+        "aba para travar o autoplay)%s",
+        "" if novos.get("tabId") else " — em aba nova, que passa a ser a da fila",
+    )
+    return "media_command", novos
+
+
 def _media_context_of(metadata: dict[str, Any] | None) -> dict[str, Any]:
     """`media_context` do turno ({} em qualquer problema).
 
@@ -1679,6 +1721,150 @@ _ALL_ACTUATION_TOOLS = _CLIENT_ACTUATION_TOOLS | _SHELL_ACTUATION_TOOLS
 # Teto de round-trips de atuação encadeados num mesmo pedido (pull→responde→push,
 # ou conflito→sobrescreve): evita um laço se o modelo insistir em atuar sem parar.
 _MAX_ACTUATION_DEPTH = 3
+
+#: Evidência de disco guardada por sessão (quantas saídas, e quanto de cada).
+_DISK_EVIDENCE_KEPT, _DISK_EVIDENCE_CHARS = 12, 20000
+_DISK_EVIDENCE_SESSIONS = 64
+
+#: Trocas da conversa que o formatador do CLIENT_TOOL enxerga para resolver um
+#: pedido de continuação. Poucas de propósito: é desambiguação, não o turno todo.
+_FORMAT_HISTORY_MSGS = 6
+
+
+_RE_BARRAS = re.compile(r"/{2,}")
+
+#: String entre aspas que começa com "/" — é assim que um caminho absoluto que
+#: JÁ funcionou aparece num comando anterior da sessão.
+_RE_CAMINHO_CITADO = re.compile(r"""(['"])(/[^'"\n]*)\1""")
+
+
+def _dentro_de_aspas(texto: str, pos: int) -> bool:
+    """A posição ``pos`` está dentro de um par de aspas ainda aberto?"""
+    return (texto.count('"', 0, pos) % 2 == 1) or (texto.count("'", 0, pos) % 2 == 1)
+
+
+def _quote_known_paths(command: str, conhecidos: list[str]) -> str:
+    """Põe aspas nos caminhos COM ESPAÇO que já provaram existir nesta sessão.
+
+    O classificador escreve o comando como texto e, com pasta que tem espaço, o
+    shell parte no meio. Medido na sessão 3733f3ae (2026-09-12), duas vezes:
+
+        find /Users/.../Conversa do WhatsApp com Dell Support - WA/00-… -iname …
+        → find: -: unknown primary or operator
+        cat /Users/.../Conversa do WhatsApp com Dell Support - WA/00-…/CORPO-DO-EMAIL.txt
+        → cat: /Users/daniel/Downloads/Conversa: No such file or directory (×7)
+
+    Não dá pra resolver por sintaxe: a pasta contém " - ", então "pare no
+    primeiro token que começa com hífen" corta no lugar errado. O que resolve é
+    EVIDÊNCIA — só mexemos num caminho que esta sessão já viu entre aspas num
+    comando que rodou, ou que veio no campo ``working_dir``. Depois de casar o
+    prefixo conhecido, estende até o próximo espaço, porque o resto do caminho
+    (``/00-ENVIAR-AO-PROCON/CORPO-DO-EMAIL.txt``) não tem espaço nenhum.
+
+    Conservador de propósito: caminho já citado é pulado, e o que não está na
+    lista de conhecidos não é tocado — errar aqui seria quebrar um comando que
+    dependia do corte por espaço.
+    """
+    if not command:
+        return command
+    for alvo in conhecidos:
+        busca = 0
+        while True:
+            i = command.find(alvo, busca)
+            if i < 0:
+                break
+            if _dentro_de_aspas(command, i):
+                busca = i + 1
+                continue
+            j = i + len(alvo)
+            while j < len(command) and not command[j].isspace():
+                j += 1
+            trecho = command[i:j]
+            command = f'{command[:i]}"{trecho}"{command[j:]}'
+            busca = i + len(trecho) + 2
+    return command
+
+
+def _norm_path(texto: str) -> str:
+    """Casefold + colapso de barras, para comparar caminho com texto solto.
+
+    O `ls -R` imprime o cabeçalho da pasta com barra dobrada
+    (``.../WA//00-ENVIAR-AO-PROCON:``); sem colapsar, a pasta impressa nunca casa
+    com a pasta do caminho. E a comparação sem casefold já custou um seletor de
+    arquivo: o usuário escreveu "corpo-do-email", o arquivo é "CORPO-DO-EMAIL.txt".
+    """
+    return _RE_BARRAS.sub("/", (texto or "").casefold())
+
+#: Quantos passos do turno o cérebro relê na retomada. O teto existe só para o
+#: prompt não crescer sem fim; o cap de profundidade (_MAX_ACTUATION_DEPTH) já
+#: limita quantos podem existir.
+_ACTUATION_STEPS_KEPT = 6
+#: Orçamento de saída por passo: o ÚLTIMO é o dado fresco que motivou a retomada
+#: e recebe o teto cheio; os anteriores viram lembrete de "já rodei isso".
+_STEP_LINES_LAST, _STEP_CHARS_LAST = 200, 12000
+_STEP_LINES_PREV, _STEP_CHARS_PREV = 40, 2000
+
+
+def _render_actuation_steps(steps: list[dict[str, Any]]) -> str:
+    """Transcript dos comandos que JÁ rodaram neste turno, para a retomada.
+
+    **Por que isto existe.** A retomada (`_reenter_cognitive`) reconstrói o prompt
+    a partir do histórico do BANCO, e o histórico só ganha linha quando o turno
+    termina. O transcript do turno em curso — a tool call que o cérebro fez e a
+    saída que voltou — não existia em lugar nenhum: cada rodada recebia a saída do
+    ÚLTIMO comando colada no meio do system prompt e mais nada. Ou seja, o array
+    de mensagens da rodada N+1 era idêntico ao da rodada N.
+
+    O preço, medido na sessão ea040f16 (interação 6): o cérebro rodou
+    `wc -l <arquivo>`, recebeu 535, e na rodada seguinte rodou **exatamente o
+    mesmo `wc -l`** — não por burrice, mas porque não havia como saber. Depois
+    `cat | wc -l`, depois `cat`; estourou o teto de profundidade e o turno morreu
+    sem responder "analisa o arquivo". O loop do SANDBOX (`neo_bash`) nunca teve
+    esse problema: lá as tool calls ficam no mesmo array de mensagens.
+
+    Vai como mensagem no FIM do array, nunca dentro do system prompt: a saída de
+    comando é a coisa mais volátil do turno e, colada no meio dos ~20k chars de
+    persona, invalidava o cache de prefixo a cada rodada — o mesmo cache que o pin
+    de provedor foi comprar (ver `_pin_from_panel`).
+    """
+    if not steps:
+        return ""
+    recentes = steps[-_ACTUATION_STEPS_KEPT:]
+    partes = [
+        "## O que você JÁ FEZ neste turno (na máquina do usuário)",
+        "Você está CONTINUANDO o mesmo turno — isto não é uma mensagem nova do "
+        "usuário. Os comandos abaixo já rodaram e estas são as saídas REAIS.",
+        "",
+        "**Não repita um comando que já está nesta lista.** Se o que você precisa "
+        "já apareceu, use e responda. Se não apareceu, rode um comando DIFERENTE — "
+        "repetir o mesmo vai devolver o mesmo.",
+        "",
+    ]
+    for i, step in enumerate(recentes, 1):
+        ultimo = i == len(recentes)
+        linhas, chars = (
+            (_STEP_LINES_LAST, _STEP_CHARS_LAST) if ultimo
+            else (_STEP_LINES_PREV, _STEP_CHARS_PREV)
+        )
+        cmd = str(step.get("command") or "(sem comando)")
+        partes.append(f"### Passo {i}: `{cmd}`")
+        if step.get("ok", True):
+            saida = AIService._truncate_output(
+                str(step.get("output") or ""), max_lines=linhas, max_chars=chars
+            )
+            partes.append(f"Saída real:\n```\n{saida or '(vazia)'}\n```")
+        else:
+            partes.append(f"FALHOU: {step.get('error') or 'erro desconhecido'}")
+        partes.append("")
+    partes.append(
+        "Responda AGORA o pedido original com base nestas saídas — direto, sem "
+        "recontar o que você fez. Só os fatos que estão aí: não invente linha que "
+        "não apareceu. Se as saídas ainda não respondem o que foi pedido (veio "
+        "vazia, veio agregada demais, faltou um campo), rode um comando NOVO em "
+        "vez de entregar meia resposta ou de pedir pro usuário rodar."
+    )
+    return "\n".join(partes)
+
 
 
 class _LoopRun:
@@ -2006,6 +2192,10 @@ class AIService:
         # Mesmo motivo do set acima: a resposta de um client tool
         # (process_tool_result → _format_tool_result) perde o metadata do turno.
         self._image_capable_sessions: set[str] = set()
+        # Saídas REAIS de comandos que rodaram na máquina do usuário nesta sessão.
+        # É o que prova que um caminho existe no disco dele — ver
+        # `_file_path_is_grounded`, que antes só aceitava o que o USUÁRIO digitou.
+        self._session_disk_evidence: dict[str, list[str]] = {}
         # Sessões cujo último turno veio de VOZ (metadata["input_source"]=="voice").
         # Independente do set Live acima: `mode` descreve a SAÍDA (falar sem
         # markdown), `input_source` descreve a ENTRADA (texto transcrito por ASR,
@@ -3662,6 +3852,8 @@ class AIService:
         enable_handoff: bool = False,
         register: "Register | None" = None,
         _actuation_depth: int = 0,
+        _actuation_steps: list[dict[str, Any]] | None = None,
+        _resume_note: str | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Handle direct conversational response using LLM.
 
@@ -4060,6 +4252,27 @@ class AIService:
         if not last_in_history or last_in_history.get("content") != user_message or last_in_history.get("role") != "user":
             messages.append(Message(role=MessageRole.USER, content=user_message))
 
+        # Transcript do turno em curso (retomada de client-actuation). Vai por
+        # ÚLTIMO, depois da mensagem do usuário: é o dado mais fresco e o mais
+        # volátil — no topo ele invalidaria o cache de prefixo a cada rodada.
+        _steps_note = _render_actuation_steps(_actuation_steps or [])
+        if _steps_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_steps_note))
+            if slog:
+                slog.log_event(
+                    "Transcrição do turno (passos já executados)",
+                    "\n".join(
+                        f"{i}. `{s.get('command')}` → "
+                        + ("ok" if s.get("ok", True) else f"ERRO: {s.get('error')}")
+                        for i, s in enumerate(_actuation_steps or [], 1)
+                    ),
+                )
+
+        # Evento que motivou a retomada (arquivo chegou, colisão de nome…).
+        # Mesmo motivo do transcript acima: volátil, então vai no fim.
+        if _resume_note:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_resume_note))
+
         # Log the exact conversation payload being sent to the LLM
         history_count = len(messages) - 1  # subtract system message
         logger.info(f"[HISTORY-DEBUG] Total messages in LLM payload: {len(messages)} (1 system + {history_count} conversation)")
@@ -4313,6 +4526,7 @@ class AIService:
                 trace=trace,
                 slog=slog,
                 depth=_actuation_depth,
+                steps=_actuation_steps,
             ):
                 yield resp
             return
@@ -5020,6 +5234,39 @@ class AIService:
             return req_model
         logger.debug("[Cognitive] adotando o pin do painel: %s → %s", req_model, painel)
         return painel
+
+    async def _utility_llm(self) -> tuple[Any, str | None]:
+        """Provider + modelo das chamadas UTILITÁRIAS (formatar saída, follow-up, erro).
+
+        Estas três chamadas nasceram com ``self.llm.get_provider()`` pelado, que
+        resolve no ``DEFAULT_PROVIDER`` do env — ``deepseek``, a carteira que
+        zerou em 2026-09-03 (ver neo-llm-slots-and-wallets). O crédito da
+        OpenRouter não cobre quem bate em ``api.deepseek.com`` direto, então em
+        produção as três respondiam **402 Insufficient Balance** e caíam no
+        ``except``, silenciosamente:
+
+        * ``_format_tool_result`` → despejava a saída CRUA do comando no chat (e
+          no histórico). Foi o que aconteceu na sessão ea040f16 às 02:37:02 UTC:
+          535 linhas de uma reclamação do PROCON coladas na tela, truncadas, sem
+          o cérebro nunca ter lido o arquivo;
+        * ``_check_followup_needed`` → nunca encadeava o 2º passo;
+        * o analisador de erro → nenhum diagnóstico de comando que falhou.
+
+        Resolver pelo slot ``cognitive`` do painel conserta os três de uma vez e
+        mantém a coerência: o texto que sai daqui é a fala do Neo no chat, então
+        é o modelo do Neo que deve escrevê-la — hoje ``deepseek`` pela OpenRouter,
+        com o pin de endpoint que o operador escolheu. Nunca levanta: painel
+        ilegível volta ao default de antes.
+        """
+        try:
+            from modules.model_config import get_model_config
+
+            cfg = await get_model_config(getattr(self, "db", None), "cognitive")
+            provider = self.llm.get_provider(cfg["provider"])
+            return provider, (cfg.get("model") or None)
+        except Exception as e:  # noqa: BLE001 — preferência nunca derruba a chamada
+            logger.warning("[utility-llm] slot 'cognitive' indisponível (%s) — usando o default do env", e)
+            return self.llm.get_provider(), None
 
     async def _drive_cognitive_loop(
         self,
@@ -6796,29 +7043,7 @@ class AIService:
         observar = await self._watch_for_actuation(user_id, metadata, args)
         if observar:
             args["observar"] = observar
-            # Fila SEMPRE pela extensão. `open_url` entrega a URL ao sistema
-            # operacional: abre uma aba que a ponte não escolheu, e é a ponte
-            # que precisa registrar o listener de fim de faixa e travar o
-            # autoplay. Com `media_command` a extensão navega a aba (criando uma
-            # se não houver) e passa a mandar no player. A `url` viaja junto
-            # como plano B, para o desktop abrir sozinho se a ponte estiver fora.
-            video_id = str(observar.get("video_id") or "")
-            if tool_name == "open_url" and video_id:
-                url_original = str(args.get("url") or "")
-                tool_name = "media_command"
-                args = {
-                    "action": "play",
-                    "target": "youtube",
-                    "videoId": video_id,
-                    "url": url_original,
-                    "observar": observar,
-                }
-                if observar.get("tab_id") not in (None, ""):
-                    args["tabId"] = observar["tab_id"]
-                logger.info(
-                    "[music] fila: open_url → media_command (a extensão precisa "
-                    "dirigir a aba para travar o autoplay)"
-                )
+            tool_name, args = _fila_pela_extensao(tool_name, args, observar)
 
         # desktop/browser → dispatch a client tool; the final confirmation comes from
         # process_tool_result (flow="music_actuation"), truthful to the real outcome.
@@ -7210,6 +7435,10 @@ class AIService:
         """
         arguments = step.tool_arguments or {}
         command = step.raw_command or arguments.get("command") or step.tool_name
+        # Idem para o passo refinado pelo validador do plano: ele monta o comando
+        # a partir do resultado do passo anterior e erra a citação do mesmo jeito.
+        if step.raw_command or arguments.get("command"):
+            command = self._fix_command_quoting(command, session_id, arguments) or command
         common_meta = {
             "user_message": user_message,
             "tool_arguments": arguments,
@@ -7295,6 +7524,18 @@ class AIService:
         """
         command_id = str(uuid4())
         tool_call_id = str(uuid4())
+
+        # Caminho com espaço que o classificador escreveu sem aspas: o shell parte
+        # no meio e o turno morre num erro cru. Determinístico e só sobre caminho
+        # que a sessão já viu funcionar — ver `_quote_known_paths`.
+        if decision.raw_command:
+            decision.raw_command = self._fix_command_quoting(
+                decision.raw_command, session_id, decision.tool_arguments
+            )
+        if isinstance(decision.tool_arguments, dict) and decision.tool_arguments.get("command"):
+            decision.tool_arguments["command"] = self._fix_command_quoting(
+                decision.tool_arguments["command"], session_id, decision.tool_arguments
+            )
 
         # ── PLAN CHECK: use classifier's needs_plan (no extra LLM call) ──
         sys_context = self._build_system_context(metadata)
@@ -7601,6 +7842,86 @@ class AIService:
     # Arquivos sob iniciativa do cérebro (client-actuating: pull/push)
     # ---------------------------------------------------------------
 
+    def _known_paths(self, session_id: "UUID | str", tool_arguments: dict | None = None) -> list[str]:
+        """Caminhos absolutos COM ESPAÇO que esta sessão já provou existirem.
+
+        Duas fontes, ambas inequívocas (nada de adivinhar onde o caminho acaba):
+
+        * ``working_dir`` do próprio pedido — é um campo, não texto solto;
+        * trechos entre aspas dos comandos que RODARAM nesta sessão
+          (``_session_disk_evidence`` guarda a linha ``$ <comando>``).
+
+        Mais longos primeiro: assim o caminho mais específico é citado antes do
+        seu prefixo, e o prefixo já não casa de novo (fica dentro de aspas).
+        """
+        achados: list[str] = []
+        wd = str((tool_arguments or {}).get("working_dir") or "").strip()
+        if wd.startswith("/"):
+            achados.append(wd)
+        for blob in (getattr(self, "_session_disk_evidence", None) or {}).get(str(session_id), ()):
+            primeira = blob.split("\n", 1)[0]
+            achados += [m.group(2) for m in _RE_CAMINHO_CITADO.finditer(primeira)]
+        return sorted(
+            {p.rstrip("/") for p in achados if " " in p and p.startswith("/")},
+            key=len, reverse=True,
+        )
+
+    def _fix_command_quoting(
+        self, command: str | None, session_id: "UUID | str", tool_arguments: dict | None = None
+    ) -> str | None:
+        """`_quote_known_paths` com as fontes da sessão, e sem nunca levantar."""
+        if not command:
+            return command
+        try:
+            conhecidos = self._known_paths(session_id, tool_arguments)
+            if not conhecidos:
+                return command
+            corrigido = _quote_known_paths(command, conhecidos)
+        except Exception as exc:  # noqa: BLE001 — normalizar nunca pode derrubar o turno
+            logger.warning("[shell] normalização de aspas falhou: %s", exc)
+            return command
+        if corrigido != command:
+            logger.info("[shell] caminho com espaço citado: %r → %r", command, corrigido)
+        return corrigido
+
+    def _pode_escalar_ao_cerebro(self, tool_name: str | None, ja_escalou: bool) -> bool:
+        """Uma falha de SHELL pode virar turno cognitivo em vez de erro cru?
+
+        Só para comando de shell: uma tool nomeada (`save_generated_file`,
+        `request_user_file`) que falha tem tratamento próprio, e mandar o cérebro
+        "consertar" um 404 de catálogo só gastaria um round. E só uma vez por
+        turno — o cérebro que falhar de novo cai no limite de profundidade, não
+        num pingue-pongue com o classificador.
+        """
+        if ja_escalou or not getattr(self.settings, "neo_brain_shell_enabled", False):
+            return False
+        return (tool_name or "") in ("run_command", "execute_command")
+
+    def _record_disk_evidence(self, session_id: "UUID | str", command: str, output: str) -> None:
+        """Guarda a saída de um comando que REALMENTE rodou na máquina do usuário.
+
+        É a fonte de verdade que faltava para a guarda de fundamentação: um
+        caminho impresso por um `ls`/`find` que o usuário aprovou não é chute do
+        modelo, é o disco dele respondendo. Ring buffer curto — isto vive em RAM
+        e só serve pra decidir "o Neo viu isso ou inventou?".
+        """
+        if not output:
+            return
+        sid = str(session_id)
+        # getattr: há caminhos (e testes) que constroem o serviço sem __init__;
+        # perder a evidência é aceitável, derrubar o turno não é.
+        if getattr(self, "_session_disk_evidence", None) is None:
+            self._session_disk_evidence = {}
+        buf = self._session_disk_evidence.setdefault(sid, [])
+        buf.append(f"$ {command}\n{output[:_DISK_EVIDENCE_CHARS]}")
+        del buf[:-_DISK_EVIDENCE_KEPT]
+        # Teto de sessões: o dict vive enquanto o processo viver e ninguém o
+        # esvazia no fim do turno. Sessão mais antiga (ordem de inserção) sai.
+        while len(self._session_disk_evidence) > _DISK_EVIDENCE_SESSIONS:
+            self._session_disk_evidence.pop(
+                next(iter(self._session_disk_evidence)), None
+            )
+
     async def _file_path_is_grounded(
         self, path: str, session_id: UUID, user_message: str, user_id: UUID | None = None
     ) -> bool:
@@ -7625,17 +7946,41 @@ class AIService:
         needle = (path or "").strip()
         if not needle:
             return False
-        base = needle.rsplit("/", 1)[-1]
+        alvo = _norm_path(needle)
+        base = alvo.rsplit("/", 1)[-1]
+        pai = alvo.rsplit("/", 1)[0] if "/" in alvo else ""
+        # O usuário escreve "corpo-do-email"; o arquivo é "CORPO-DO-EMAIL.txt".
+        # Sem o radical (e sem casefold) a citação dele não casava com o próprio
+        # arquivo que ele estava pedindo — foi assim que a sessão ea040f16 abriu
+        # um seletor para um arquivo nomeado na mensagem anterior.
+        radical = base.rsplit(".", 1)[0] if "." in base else base
+
         haystacks = [user_message or ""]
         try:
             history = await self.sessions.get_history(session_id, limit=12, max_tokens_budget=1500)
             haystacks += [m.get("content", "") for m in history if m.get("role") == "user"]
         except Exception as exc:  # noqa: BLE001 — sem histórico ⇒ só o turno atual
             logger.warning("[files] grounding: histórico indisponível: %s", exc)
-        blob = "\n".join(haystacks)
+        blob = _norm_path("\n".join(haystacks))
         # Caminho inteiro citado, ou o nome-base (o usuário costuma dizer só o nome).
-        if needle in blob or (len(base) >= 3 and base in blob):
+        if alvo in blob or (len(base) >= 3 and base in blob) or (len(radical) >= 4 and radical in blob):
             return True
+
+        # Evidência de DISCO: o caminho apareceu na saída de um comando que rodou
+        # (e foi aprovado) nesta sessão. Isto não é o modelo se auto-fundamentando
+        # na própria prosa — é a máquina do usuário tendo impresso o nome. Para o
+        # nome-base sozinho exigimos também a pasta: um `ls` de outra pasta que por
+        # acaso tem um arquivo homônimo não fundamenta ESTE caminho.
+        evidencia = _norm_path(
+            "\n".join((getattr(self, "_session_disk_evidence", None) or {}).get(str(session_id), ()))
+        )
+        if evidencia:
+            if alvo in evidencia:
+                logger.info("[files] caminho fundamentado por saída de comando: %r", needle)
+                return True
+            if len(base) >= 3 and base in evidencia and (not pai or pai in evidencia):
+                logger.info("[files] nome+pasta fundamentados por saída de comando: %r", needle)
+                return True
 
         # Registro de artefatos: arquivo que o Neo mesmo pôs lá. Best-effort —
         # registro indisponível só faz a guarda voltar a ser o que era.
@@ -7663,6 +8008,7 @@ class AIService:
         trace: "MessageTrace | None",
         slog: "SessionFileLogger | None",
         depth: int = 0,
+        steps: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Emite o ``tool_request`` de uma tool de arquivo client-actuating.
 
@@ -7695,6 +8041,7 @@ class AIService:
         # _resume_after_command retoma o turno cognitivo com a saída real).
         if tool_name in _SHELL_ACTUATION_TOOLS:
             command = str(args.get("command") or "").strip()
+            command = self._fix_command_quoting(command, session_id, args) or command
             if not command:
                 final_text = (
                     "Ia rodar um comando aqui pra te responder, mas montei ele vazio. "
@@ -7735,6 +8082,9 @@ class AIService:
                 "user_id": str(user_id) if user_id else None,
                 "metadata": metadata or {},
                 "depth": depth,
+                # Transcript acumulado do turno: sem isto cada retomada recomeça
+                # do zero e o cérebro repete o comando que acabou de rodar.
+                "steps": list(steps or []),
             }
             if trace is not None:
                 self._pending_traces[sid] = trace
@@ -7852,6 +8202,7 @@ class AIService:
             "destination": args.get("destination"),
             "depth": depth,
             "downgraded_path": caminho_rebaixado,
+            "steps": list(steps or []),
         }
         if trace is not None:
             self._pending_traces[sid] = trace
@@ -7899,13 +8250,21 @@ class AIService:
         extra_note: str | None,
         slog: "SessionFileLogger | None",
         trace: "MessageTrace | None",
+        steps: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
-        """Roda de novo o turno DIRECT_RESPONSE com o arquivo já disponível.
+        """Roda de novo o turno DIRECT_RESPONSE com o resultado da ação do cliente.
 
-        Reconstrói decisão/histórico/contexto (agora com o manifesto do anexo
-        recém-chegado + ``extra_note``) e delega ao ``_handle_direct_response`` —
-        assim o cérebro lê/entrega o arquivo e responde o pedido original. A
-        profundidade (``depth``) sobe pra cortar um eventual laço de atuação.
+        Reconstrói decisão/histórico/contexto e delega ao ``_handle_direct_response``.
+        A profundidade (``depth``) sobe pra cortar um eventual laço de atuação.
+
+        ``steps`` é o transcript do que JÁ rodou neste turno (ver
+        `_render_actuation_steps`): sem ele cada retomada era um começo do zero —
+        o histórico do banco ainda não tem o turno em curso, então o cérebro
+        reexecutava o comando que acabou de rodar. ``extra_note`` (o evento que
+        motivou a retomada) também deixou de ser concatenada no system prompt:
+        junto da persona ela invalidava o cache de prefixo a cada rodada, e no
+        MEIO de 20k chars de instrução ela competia com tudo. As duas agora vão
+        como mensagens no fim do array, onde são recentes e baratas.
         """
         sid = session_id
         metadata = (pend or {}).get("metadata") or {}
@@ -7919,7 +8278,7 @@ class AIService:
         history = await self.sessions.get_history(sid, limit=20, max_tokens_budget=3000)
         base_ctx = self._build_system_context(metadata)
         manifest = await self._build_attachments_manifest(None, session_id=sid)
-        sys_context = "\n\n".join(p for p in (base_ctx, manifest, extra_note) if p)
+        sys_context = "\n\n".join(p for p in (base_ctx, manifest) if p)
         decision = RoutingDecision(
             intent=IntentType.DIRECT_RESPONSE,
             confidence=1.0,
@@ -7936,6 +8295,8 @@ class AIService:
             slog=slog, user_id=user_id, metadata=metadata,
             enable_handoff=False,
             _actuation_depth=depth,
+            _actuation_steps=steps if steps is not None else (pend or {}).get("steps"),
+            _resume_note=extra_note,
         ):
             yield resp
 
@@ -8050,26 +8411,27 @@ class AIService:
         errada pode ser corrigido no MESMO turno, sem o usuário ter que pedir de novo.
         """
         command = (pend or {}).get("command") or "o comando"
+        # O passo entra no transcript do turno; a instrução de "responda agora"
+        # já vem do `_render_actuation_steps`, que enxerga TODOS os passos — e é
+        # ele quem diz "não repita um comando que já está aqui".
+        steps: list[dict[str, Any]] = list((pend or {}).get("steps") or [])
+        steps.append(
+            {"command": command, "ok": bool(success),
+             "output": (result or "") if success else "",
+             "error": None if success else (error or "desconhecido")}
+        )
+        extra_note = None
+        if not success:
+            extra_note = (
+                "O último comando FALHOU. Diagnostique e, se der pra corrigir "
+                "(binário/flag/caminho errado), rode outro `run_command` já "
+                "corrigido — diferente do que falhou. Se não der, diga em uma frase "
+                "o que falhou, sem pedir pro usuário rodar nada por você."
+            )
+        # Evidência de disco: o que um comando aprovado IMPRIMIU existe de verdade,
+        # e é o que fundamenta um caminho no turno seguinte (ver _file_path_is_grounded).
         if success:
-            output = self._truncate_output(result or "", max_lines=200)
-            extra_note = (
-                "## SAÍDA DO COMANDO QUE VOCÊ RODOU\n"
-                f"Você executou na máquina do usuário: `{command}`\n"
-                f"Saída real:\n```\n{output or '(vazia)'}\n```\n"
-                "Responda AGORA o pedido original com base nesta saída — direto, sem "
-                "recontar o que você fez. Só os fatos que estão aí: não invente linha "
-                "que não apareceu, e se a saída não responde o que foi pedido (veio "
-                "vazia, veio agregada demais, faltou um campo), rode outro `run_command` "
-                "em vez de entregar meia resposta ou de pedir pro usuário rodar."
-            )
-        else:
-            extra_note = (
-                "## O COMANDO QUE VOCÊ RODOU FALHOU\n"
-                f"Comando: `{command}`\nErro: {error or 'desconhecido'}\n"
-                "Diagnostique e, se der pra corrigir (binário/flag/caminho errado), rode "
-                "outro `run_command` já corrigido. Se não der, diga em uma frase o que "
-                "falhou — sem pedir pro usuário rodar nada por você."
-            )
+            self._record_disk_evidence(session_id, command, result or "")
         if slog:
             slog.log_event(
                 "Retomada cognitiva (shell do cérebro)",
@@ -8077,7 +8439,7 @@ class AIService:
             )
         async for resp in self._reenter_cognitive(
             session_id, user_message=user_message, pend=pend,
-            extra_note=extra_note, slog=slog, trace=trace,
+            extra_note=extra_note, slog=slog, trace=trace, steps=steps,
         ):
             yield resp
 
@@ -8186,8 +8548,15 @@ class AIService:
         _is_diagnostic: bool = False,
         _followup_count: int = 0,
         _has_plan: bool = False,
+        _escalated: bool = False,
     ) -> AsyncIterator[AIServiceResponse]:
-        """Process tool execution result from desktop and format response."""
+        """Process tool execution result from desktop and format response.
+
+        ``_escalated`` marca que esta falha já virou turno cognitivo uma vez —
+        ver `_pode_escalar_ao_cerebro`. Na prática o cérebro segue por
+        `_pending_actuations`/`_resume_after_command` e não volta por aqui; a
+        trava existe para o caso de um chamador reentrar por este caminho.
+        """
         MAX_TOOL_RETRIES = 4
         MAX_FOLLOWUP_STEPS = 3
 
@@ -8431,8 +8800,18 @@ class AIService:
                 duration_ms=tool_ms,
             )
 
-            # Truncate very long output for LLM formatting
-            raw_output = self._truncate_output(raw_output)
+            # Evidência de disco: o que este comando imprimiu existe de verdade
+            # na máquina do usuário — é o que fundamenta um caminho nos turnos
+            # seguintes sem abrir seletor. Antes da truncagem, de propósito.
+            self._record_disk_evidence(session_id, command or tool_name, raw_output)
+
+            # Teto para o formatador. Eram 60 linhas fixas, e esse corte não era
+            # só do prompt: o texto truncado é o que vai pro CHAT e pro HISTÓRICO,
+            # ou seja, vira a única memória que o Neo tem do que leu. Na sessão
+            # ea040f16 um `cat` de 535 linhas virou 60 + "475 linhas omitidas", e
+            # nos turnos seguintes o cérebro tentou analisar um arquivo do qual só
+            # restava o coto. O teto de caracteres é o que segura o custo real.
+            raw_output = self._truncate_output(raw_output, max_lines=400, max_chars=24000)
 
             yield AIServiceResponse(
                 intent=IntentType.CLIENT_TOOL,
@@ -8615,11 +8994,23 @@ class AIService:
 
             else:
                 # Format with AI (trace is passed so the LLM call gets logged)
+                # Histórico: esta é uma CONTINUAÇÃO (o metadata do turno já se
+                # perdeu no round-trip), e sem as trocas anteriores um "tenta de
+                # outra forma" é respondido ao pé da letra. Best-effort — falhar
+                # aqui só devolve o comportamento antigo.
+                try:
+                    _fmt_hist = await self.sessions.get_history(
+                        session_id, limit=_FORMAT_HISTORY_MSGS, max_tokens_budget=1500
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[format] histórico indisponível: %s", exc)
+                    _fmt_hist = None
                 final_text = await self._format_tool_result(
                     user_message, command or tool_name, raw_output, trace=trace,
                     live=str(session_id) in self._live_sessions,
                     register=self._session_registers.get(str(session_id)),
                     can_show_images=str(session_id) in self._image_capable_sessions,
+                    history=_fmt_hist,
                 )
 
             # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
@@ -8894,6 +9285,44 @@ class AIService:
 
                 elif recovery and recovery.get("action") == "respond":
                     final_text = recovery.get("message", f"Não consegui executar `{command or tool_name}`. Erro: {error or 'desconhecido'}")
+                elif self._pode_escalar_ao_cerebro(tool_name, _escalated):
+                    # A recuperação determinística desistiu (ela é um playbook de
+                    # "achar app instalado" — flatpak/snap/dpkg — e `path_not_found`
+                    # sequer chega ao LLM). O que sobrava era despejar o erro cru e
+                    # encerrar: na sessão 3733f3ae o usuário levou duas vezes um
+                    # "Não consegui executar `cat …`. Erro: No such file or directory"
+                    # por um caminho que existia e só faltava aspas.
+                    #
+                    # O cérebro já sabe fazer isso: é o mesmo caminho do shell dele
+                    # (`_resume_after_command`), que agora carrega o transcript do
+                    # turno e pode reescrever o comando. Profundidade limitada por
+                    # _MAX_ACTUATION_DEPTH, e o `_escalated` impede o pingue-pongue.
+                    logger.info("[client_tool] recuperação sem ação — escalando ao cérebro: %s", error)
+                    if slog:
+                        slog.log_event(
+                            "Escalando ao cérebro",
+                            f"`{command or tool_name}` falhou e a recuperação determinística "
+                            f"não tinha ação. Erro: {error or 'desconhecido'}",
+                        )
+                    async for _resp in self._resume_after_command(
+                        session_id,
+                        success=False,
+                        result=None,
+                        error=error,
+                        user_message=user_message,
+                        pend={
+                            "command": command or tool_name,
+                            "metadata": (tool_arguments or {}),
+                            "user_id": None,
+                            "depth": 0,
+                            "steps": [],
+                            "_escalated": True,
+                        },
+                        slog=slog,
+                        trace=trace,
+                    ):
+                        yield _resp
+                    return
                 else:
                     final_text = f"Não consegui executar `{command or tool_name}`. Erro: {error or 'desconhecido'}"
             else:
@@ -9454,15 +9883,20 @@ class AIService:
         ]
 
         try:
-            provider = self.llm.get_provider()
+            provider, util_model = await self._utility_llm()
             provider_name = type(provider).__name__.replace("Provider", "").lower()
-            model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+            model_name = util_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
             t0 = time.monotonic()
 
             response = await provider.complete(
                 messages=messages,
+                model=util_model,
                 temperature=0.2,
                 max_tokens=500,
+                # 500 tokens não sobrevivem ao raciocínio do OpenRouter: ele é
+                # cobrado do MESMO orçamento e sai antes do texto, então a
+                # resposta voltaria vazia.
+                disable_thinking=True,
             )
 
             llm_ms = (time.monotonic() - t0) * 1000
@@ -9817,8 +10251,19 @@ class AIService:
         live: bool = False,
         register: "Register | None" = None,
         can_show_images: bool = False,
+        history: list[dict[str, str]] | None = None,
     ) -> str:
         """Use LLM to format tool output into a user-friendly response.
+
+        ``history`` é o que faz um pedido de CONTINUAÇÃO ser respondido. Esta
+        chamada nasceu vendo só a ÚLTIMA mensagem, e uma mensagem sem conteúdo
+        próprio ("tenta de outra forma", "e agora?", "iai o que deu?") não diz o
+        que o usuário quer. Medido na sessão 3733f3ae: o pedido real era "ler os
+        .txt e me diz o que acha do texto que fiz"; o comando falhou, o usuário
+        respondeu "tenta de outra froma", o comando novo trouxe o texto INTEIRO —
+        e a resposta foi "o comando já fez exatamente o que foi solicitado; se
+        você esperava outro resultado, especifique". A opinião pedida nunca veio
+        porque a pergunta nunca chegou aqui.
 
         ``live=True`` (turno do modo voz) pede texto corrido sem markdown, já que a
         resposta será falada por TTS. ``register`` anexa a diretiva de tom da
@@ -9845,13 +10290,35 @@ class AIService:
             if can_show_images
             else ""
         )
+        # Só as últimas trocas, e cortadas: isto é contexto para desambiguar um
+        # pedido curto, não o turno cognitivo inteiro.
+        historico_bloco = ""
+        if history:
+            linhas = [
+                f"{'Usuário' if m.get('role') == 'user' else 'Neo'}: "
+                f"{(m.get('content') or '')[:600]}"
+                for m in history[-_FORMAT_HISTORY_MSGS:]
+            ]
+            if linhas:
+                historico_bloco = (
+                    "Conversa até aqui (para você entender o que ele quer, "
+                    "principalmente se a última mensagem for curta ou uma "
+                    "continuação):\n" + "\n".join(linhas) + "\n\n"
+                )
+
         prompt = (
-            f'O usuário perguntou: "{user_message}"\n'
+            f"{historico_bloco}"
+            f'A última mensagem do usuário foi: "{user_message}"\n'
             f"Foi executado o comando: `{command}`\n"
             f"Saída do comando:\n```\n{output}\n```\n\n"
-            "Responda o que ele perguntou usando esta saída. Responda a PERGUNTA, não "
-            "a saída: se ele perguntou 'quantas chaves' e a saída lista arquivos, dê o "
-            "número certo (e os nomes) — não descreva o comando nem narre o que você fez. "
+            "Responda o que ele quer usando esta saída. Se a última mensagem for só "
+            "uma continuação ('tenta de outra forma', 'e agora?', 'iai o que deu?'), "
+            "o pedido que vale é o ORIGINAL da conversa acima — responda AQUELE, não "
+            "a continuação ao pé da letra. Responda a PERGUNTA, não a saída: se ele "
+            "perguntou 'quantas chaves' e a saída lista arquivos, dê o número certo (e "
+            "os nomes) — não descreva o comando nem narre o que você fez. Se ele pediu "
+            "uma ANÁLISE ou OPINIÃO sobre o conteúdo, dê a análise; dizer que o comando "
+            "rodou não é resposta. "
             f"{format_rule} Não invente dados — use apenas o que está na saída."
             f"{image_rule}"
         )
@@ -9875,9 +10342,9 @@ class AIService:
         ]
 
         try:
-            provider = self.llm.get_provider()
+            provider, util_model = await self._utility_llm()
             provider_name = type(provider).__name__.replace("Provider", "").lower()
-            model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+            model_name = util_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
             t0 = time.monotonic()
             # 600 tokens era um teto de era pré-raciocínio: os DeepSeek pensam ANTES de
             # escrever e cobram isso do MESMO orçamento, então a resposta saía cortada
@@ -9886,8 +10353,14 @@ class AIService:
             base_max_tokens = max(int(getattr(self.settings, "default_max_tokens", 8192)), 2000)
             response = await provider.complete(
                 messages=messages,
+                model=util_model,
                 temperature=0.3,
                 max_tokens=base_max_tokens,
+                # Formatar saída de comando não precisa de raciocínio, e no
+                # OpenRouter ele vem ligado sozinho, ignora o max_tokens e é
+                # gerado ANTES do primeiro token de texto — era a outra metade
+                # das respostas vazias que caíam no despejo cru.
+                disable_thinking=True,
             )
             llm_ms = (time.monotonic() - t0) * 1000
             response_text = response.get_content() or ""
@@ -9901,7 +10374,8 @@ class AIService:
                     "— retentando com max_tokens=%d", bigger,
                 )
                 retry = await provider.complete(
-                    messages=messages, temperature=0.3, max_tokens=bigger,
+                    messages=messages, model=util_model, temperature=0.3,
+                    max_tokens=bigger, disable_thinking=True,
                 )
                 response_text = retry.get_content() or ""
             if not response_text.strip():
@@ -9985,14 +10459,17 @@ class AIService:
         ]
 
         try:
-            provider = self.llm.get_provider()
+            provider, util_model = await self._utility_llm()
             provider_name = type(provider).__name__.replace("Provider", "").lower()
-            model_name = getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
+            model_name = util_model or getattr(provider, 'model', None) or getattr(self.settings, 'default_model', 'gpt-4o')
             t0 = time.monotonic()
             response = await provider.complete(
                 messages=messages,
+                model=util_model,
                 temperature=0.1,
                 max_tokens=200,
+                # Idem: 200 tokens com raciocínio ligado = JSON vazio.
+                disable_thinking=True,
             )
             llm_ms = (time.monotonic() - t0) * 1000
             raw = response.get_content() or ""
@@ -10051,9 +10528,23 @@ class AIService:
         return False
 
     @staticmethod
-    def _truncate_output(value: str, max_lines: int = 60) -> str:
-        """Truncate long output to max_lines."""
-        lines = (value or "").splitlines()
-        if len(lines) <= max_lines:
-            return value or "(sem saída)"
-        return "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} linhas omitidas)"
+    def _truncate_output(value: str, max_lines: int = 60, max_chars: int | None = None) -> str:
+        """Corta a saída por LINHAS e, opcionalmente, por caracteres.
+
+        O teto de caracteres existe porque linha não é unidade de custo: um CSV de
+        40 linhas com 2 mil colunas estoura o mesmo prompt que 4 mil linhas de
+        `ls`. Quando corta, diz o que cortou — um coto silencioso é pior que um
+        coto anunciado, porque o modelo trata o pedaço como o todo.
+        """
+        texto = value or ""
+        lines = texto.splitlines()
+        cortes: list[str] = []
+        if len(lines) > max_lines:
+            cortes.append(f"{len(lines) - max_lines} linhas omitidas")
+            texto = "\n".join(lines[:max_lines])
+        if max_chars is not None and len(texto) > max_chars:
+            cortes.append(f"cortado em {max_chars} caracteres")
+            texto = texto[:max_chars]
+        if not texto:
+            return "(sem saída)"
+        return texto + (f"\n... ({', '.join(cortes)})" if cortes else "")

@@ -730,12 +730,117 @@ async def test_fila_troca_open_url_por_media_command():
 
 
 def test_conversao_de_open_url_esta_no_handler():
-    """Guarda de regressão do trecho que faz a troca — ele mora no _handle_music
-    e é fácil de perder num refactor."""
+    """Guarda de regressão do trecho que faz a troca — é fácil de perder num
+    refactor, e sem ele a fila não anda (quem trava o autoplay é a extensão)."""
     import inspect
 
     from modules.desktop.ai_service import AIService
 
     fonte = inspect.getsource(AIService._handle_music)
-    assert 'tool_name == "open_url"' in fonte
-    assert 'tool_name = "media_command"' in fonte
+    assert "_fila_pela_extensao" in fonte
+
+
+def test_fila_sem_aba_reusavel_pede_aba_nova():
+    """A fila não pode tomar aba que ninguém escolheu.
+
+    Sem aba para reusar, `pick_reuse_tab` manda `open_url` justamente por se
+    recusar a tomar vídeo do usuário. Ao converter para `media_command` esse
+    "não reuse nada" tem que viajar: sem o sinal a extensão re-escolhia pela
+    PRIMEIRA aba do YouTube que achasse — a que a decisão tinha recusado.
+    """
+    from modules.desktop.ai_service import _fila_pela_extensao
+
+    observar = {"inscricao_id": "i1", "video_id": "AAAAAAAAAAA", "tab_id": None, "codigo": "ab12"}
+    tool, args = _fila_pela_extensao(
+        "open_url", {"url": "https://www.youtube.com/watch?v=AAAAAAAAAAA"}, observar
+    )
+    assert tool == "media_command"
+    assert args["novaAba"] is True
+    assert "tabId" not in args
+    assert args["videoId"] == "AAAAAAAAAAA"
+    # A URL continua junto: é o plano B de quando a ponte está fora.
+    assert args["url"].endswith("AAAAAAAAAAA")
+
+
+def test_fila_com_aba_decidida_toca_nela():
+    """Com reuso decidido, a aba viaja como pin e não se pede aba nova."""
+    from modules.desktop.ai_service import _fila_pela_extensao
+
+    observar = {"inscricao_id": "i1", "video_id": "AAAAAAAAAAA", "tab_id": 77, "codigo": "ab12"}
+    tool, args = _fila_pela_extensao(
+        "open_url", {"url": "https://www.youtube.com/watch?v=AAAAAAAAAAA"}, observar
+    )
+    assert tool == "media_command"
+    assert args["tabId"] == 77
+    assert "novaAba" not in args
+
+
+def test_conversao_nao_mexe_em_outra_tool():
+    """`launch_uri` (Spotify) e um `media_command` já pronto passam intactos."""
+    from modules.desktop.ai_service import _fila_pela_extensao
+
+    observar = {"video_id": "AAAAAAAAAAA"}
+    original = {"uri": "spotify:track:123"}
+    tool, args = _fila_pela_extensao("launch_uri", original, observar)
+    assert (tool, args) == ("launch_uri", original)
+
+
+# ---------------------------------------------------------------------------
+# Em QUE ABA a próxima faixa toca
+# ---------------------------------------------------------------------------
+
+
+def _trigger():
+    return parse_triggers([TRIGGER_RAW], skill="playlists")[0]
+
+
+def _fila_de_duas():
+    tocando, proxima = uuid.uuid4(), uuid.uuid4()
+    return FakeDatasetService([
+        {"id": tocando, "musica_titulo": "Um", "link": "https://youtu.be/AAAAAAAAAAA",
+         "estado": "tocada", "posicao": 1, "codigo": "ab12"},
+        {"id": proxima, "musica_titulo": "Dois", "link": "https://youtu.be/BBBBBBBBBBB",
+         "estado": "pendente", "posicao": 2, "codigo": ""},
+    ])
+
+
+@pytest.mark.asyncio
+async def test_avanco_da_fila_segue_a_aba_do_evento():
+    """A ABA VEM DO APARELHO, não do alvo gravado na inscrição.
+
+    O alvo da inscrição é um chute do `event_subscribe`: ele o adivinha pelo
+    snapshot de ANTES de a fila começar (aqui, a aba 42 — um vídeo do usuário).
+    Quem acabou de ver a faixa tocando é o aparelho, e ele reporta a aba no
+    evento. Foi essa inversão que jogou a segunda faixa em outra guia e deixou a
+    primeira pausada onde o usuário estava ouvindo (medido em 12/09).
+    """
+    service = _fila_de_duas()
+    ctx = RunnerContext(
+        trigger=_trigger(),
+        subscription=Subscription(_Row(target={"site": "youtube", "tab_id": 42})),
+        event={"evento": "faixa_terminando", "codigo": "ab12", "tab_id": 77},
+        user_id=USER,
+        db=None,
+        dataset_registry=FakeRegistry(),
+        dataset_service=service,
+    )
+    r = await proxima_da_fila(ctx)
+    assert r.action["video_id"] == "BBBBBBBBBBB"
+    assert r.action["tab_id"] == 77
+
+
+@pytest.mark.asyncio
+async def test_avanco_sem_aba_no_evento_cai_no_alvo_da_inscricao():
+    """Extensão velha (evento sem `tabId`): o alvo gravado ainda é o que há."""
+    service = _fila_de_duas()
+    ctx = RunnerContext(
+        trigger=_trigger(),
+        subscription=Subscription(_Row(target={"site": "youtube", "tab_id": 42})),
+        event={"evento": "faixa_terminando", "codigo": "ab12"},
+        user_id=USER,
+        db=None,
+        dataset_registry=FakeRegistry(),
+        dataset_service=service,
+    )
+    r = await proxima_da_fila(ctx)
+    assert r.action["tab_id"] == 42

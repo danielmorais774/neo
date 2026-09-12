@@ -548,6 +548,59 @@ o desktop abre sozinho e avisa que a fila não vai andar.
 
 ---
 
+### 7.12 A fila trocava de GUIA no meio (2026-09-12)
+
+Sintoma do Daniel: a fila pausa a faixa e põe a próxima para tocar **em outra
+guia**, deixando a anterior parada na guia em que ele estava ouvindo. Medido no
+log do desktop (`~/Library/Logs/com.neo.desktop/Neo Desktop.log`):
+
+```
+15:39:38  watch armado: aba None             faixa YdQ5NKjbd2U
+15:39:44  evento faixa_iniciou → nada
+15:39:58  evento faixa_terminando → tocar
+15:39:58  watch armado: aba Some(1976602762) faixa 09y8THtoqJc
+```
+
+`aba None` na primeira faixa e uma aba concreta no avanço — e ela não veio do
+player: veio do `target.tab_id` da inscrição, que o `event_subscribe` adivinhou
+pelo snapshot de ANTES de a fila começar (§7.3). A correção do §7.10.2 ("o alvo
+é atualizado para a aba nova") existia e **nunca podia rodar**: quem mandaria a
+aba nova é o evento, e o `tab_id` dele saía do `Watch` do desktop — que continuava
+`None`, porque a ponte **jogava fora** o `tabId` que a extensão já reportava no
+`media_event`. Quatro elos, um por vez:
+
+1. **A ponte aprende a aba** (`ext_bridge.rs`, `note_watch_tab`). Três
+   informantes, todos a jusante do chute do servidor: o `result` do play (a
+   extensão pode ter aberto a aba), o `tabId` do `media_event` (o vigia mora na
+   página) e o snapshot. O log agora diz `[ExtBridge] aba da fila: 77 (era None…)`.
+2. **A extensão devolve a aba** no `result` do comando. Era a única peça que sabia
+   onde a música caiu, e ela respondia só `success`.
+3. **O runner segue o evento** (`_play_action`): a aba sai do evento primeiro, do
+   alvo gravado só depois. Quem acabou de ver a faixa tocando é o aparelho.
+4. **A extensão fica na aba da fila** (`abaDaFila`, em `background.js`): enquanto
+   a fila viver, toda faixa vai para a MESMA guia, e um `watch` apontando outra é
+   recusado com aviso no console. É a trava final — ela vale mesmo com o servidor
+   mandando um id velho.
+
+E um quinto, que é o outro lado da mesma moeda: quando não há aba reusável, o
+`open_url` convertido em `media_command` passa a levar `novaAba: true`
+(`_fila_pela_extensao`). Sem esse sinal a extensão re-escolhia sozinha pela
+PRIMEIRA aba do YouTube que achasse — **justamente a aba de vídeo do usuário que
+o `pick_reuse_tab` tinha se recusado a tomar**. Agora a fila abre a guia dela, e
+é essa que ela usa até o fim.
+
+Testes: `neo-music-ext/scripts/testar-aba-da-fila.mjs` (várias abas abertas, que é
+a condição em que escolher errado é possível), `ext_bridge.rs` (3 casos de
+aprendizado da aba) e `tests/skills/test_events.py` (a aba do evento vence o alvo;
+sem aba reusável a fila pede guia nova).
+
+**Lição**: o alvo que o servidor grava numa inscrição é uma HIPÓTESE; quem
+executa é que sabe onde a coisa caiu. Todo elo entre os dois tem que carregar o
+id de volta — um só que o descarte em silêncio (aqui, um `tabId` não lido no
+`match` do JSON) apaga a correção que existe do outro lado.
+
+---
+
 ### 7.9 Fases dessa parte
 
 | Fase | Entrega | Como se prova |

@@ -1,7 +1,7 @@
 ---
 name: playlists
 description: 'Playlists, músicas salvas e fila de reprodução: guardar, anexar música numa playlist, enfileirar e consultar. Use quando falarem em salvar, guardar, anexar ou enfileirar música/playlist.'
-keywords: [playlist, playlists, salvar musica, salva essa musica, guarda essa musica, anexa na playlist, minhas playlists, o que tem na playlist, fila de musica, enfileira, repertorio]
+keywords: [playlist, fila de reproducao, playlists, minha fila, fila, fila de musica, enfileira, proximas musicas, salvar musica, salva essa musica, guarda essa musica, anexa na playlist, minhas playlists, o que tem na playlist, repertorio]
 kind: tool_backed
 group: cadastros
 discovery: keyword

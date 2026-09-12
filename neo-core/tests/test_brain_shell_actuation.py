@@ -26,7 +26,12 @@ from uuid import uuid4
 
 import pytest
 
-from modules.desktop.ai_service import AIService, ClientActuationRequested, IntentType
+from modules.desktop.ai_service import (
+    AIService,
+    ClientActuationRequested,
+    IntentType,
+    _render_actuation_steps,
+)
 
 
 class _FakeSessions:
@@ -54,10 +59,18 @@ def _svc() -> AIService:
 
 
 def _spy_reenter(svc, recorder):
-    """_reenter_cognitive real puxa LLM+DB; aqui só grava a nota de retomada."""
+    """_reenter_cognitive real puxa LLM+DB; aqui só grava o que chega ao cérebro.
 
-    async def _reenter(session_id, *, user_message, pend, extra_note, slog, trace):
-        recorder.append({"extra_note": extra_note, "user_message": user_message, "pend": pend})
+    `steps` é o transcript do turno (o que o cérebro RELÊ na retomada); `extra_note`
+    ficou só com o evento que motivou a reentrada. Antes os dois eram a mesma
+    string colada no system prompt — ver `_render_actuation_steps`.
+    """
+
+    async def _reenter(session_id, *, user_message, pend, extra_note, slog, trace, steps=None):
+        recorder.append({
+            "extra_note": extra_note, "user_message": user_message,
+            "pend": pend, "steps": steps or [],
+        })
         from modules.desktop.ai_service import AIServiceResponse
 
         yield AIServiceResponse(
@@ -177,8 +190,10 @@ async def test_saida_do_comando_volta_pro_cerebro_nao_pro_formatador():
     ))
 
     assert len(seen) == 1
-    note = seen[0]["extra_note"]
-    assert "SAÍDA DO COMANDO" in note
+    # A saída viaja no transcript do turno, não mais colada no system prompt.
+    passos = seen[0]["steps"]
+    assert len(passos) == 1 and passos[0]["ok"] is True
+    note = _render_actuation_steps(passos)
     assert "id_ed25519_github" in note, "a saída REAL tem que chegar no cérebro"
     assert "ls -la ~/.ssh" in note
     assert out[-1].is_final
@@ -198,10 +213,14 @@ async def test_erro_do_comando_tambem_volta_pro_cerebro():
         user_message="quanta memória livre?", pend=pend, slog=None, trace=None,
     ))
 
-    note = seen[0]["extra_note"]
+    passos = seen[0]["steps"]
+    assert len(passos) == 1 and passos[0]["ok"] is False
+    note = _render_actuation_steps(passos)
     assert "FALHOU" in note
     assert "command not found: free" in note
-    assert "run_command" in note, "o cérebro deve ser instruído a tentar de novo, não a desistir"
+    assert "run_command" in seen[0]["extra_note"], (
+        "o cérebro deve ser instruído a tentar de novo, não a desistir"
+    )
 
 
 @pytest.mark.asyncio

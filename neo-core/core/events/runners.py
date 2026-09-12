@@ -63,25 +63,38 @@ async def _resolve_dataset(ctx: RunnerContext, slug: str) -> Any:
 
 
 def _play_action(
-    link: str, target: dict[str, Any], titulo: str, codigo: str = ""
+    link: str,
+    target: dict[str, Any],
+    titulo: str,
+    codigo: str = "",
+    event: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Traduz o link salvo na ação concreta que o aparelho sabe executar.
 
     YouTube com aba conhecida vira `media_command` (reusa a aba, sem piscar);
     o resto vira `open_url`/`launch_uri`, o mesmo par que a MusicPipeline já usa.
+
+    A aba sai do EVENTO primeiro, e só depois do alvo gravado na inscrição: quem
+    acabou de ver a faixa tocando é o aparelho. O alvo da inscrição foi um chute
+    feito no `event_subscribe`, sobre o snapshot de ANTES de a fila começar — e
+    era ele que mandava a faixa seguinte para outra guia, deixando a anterior
+    pausada onde o usuário estava ouvindo (medido em 12/09).
     """
     from core.skills.music.service import parse_direct_link
 
     parsed = parse_direct_link(link or "")
     if parsed is None:
         return None
+    aba = (event or {}).get("tab_id")
+    if aba in (None, ""):
+        aba = target.get("tab_id")
     if parsed.service == "youtube" and parsed.kind == "video":
         return {
             "acao": "tocar",
             "servico": "youtube",
             "video_id": parsed.id,
             "url": parsed.url,
-            "tab_id": target.get("tab_id"),
+            "tab_id": aba,
             "titulo": titulo,
             "codigo": codigo,
         }
@@ -214,7 +227,11 @@ async def proxima_da_fila(ctx: RunnerContext) -> RunnerResult:
         # deixa o "começou"/"terminou" casarem com a linha certa.
         codigo = secrets.token_hex(4) if trigger.campo_codigo else ""
         action = _play_action(
-            str(row.get(trigger.campo_link) or ""), ctx.subscription.target, titulo, codigo
+            str(row.get(trigger.campo_link) or ""),
+            ctx.subscription.target,
+            titulo,
+            codigo,
+            event=ctx.event,
         )
         if action is None:
             skipped.append(titulo or str(row_id))

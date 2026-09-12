@@ -1161,6 +1161,42 @@ class SkillLibrary:
 
     _ROUTER_NOTE_MAX_SKILLS = 12
     _ROUTER_NOTE_MAX_KEYWORDS = 4
+    #: Teto de keywords de um GRUPO. Maior que o de uma skill sozinha porque o
+    #: grupo representa várias: com 4 (o valor antigo) um grupo de 3 skills
+    #: deixava duas delas mudas no prompt do classificador.
+    _ROUTER_NOTE_MAX_GROUP_KEYWORDS = 8
+
+    @staticmethod
+    def _round_robin_keywords(skills: list["SkillEntry"], teto: int) -> list[str]:
+        """Keywords de várias skills, uma de cada por vez, em ORDEM DE AUTORIA.
+
+        Substitui um ``sorted(<união>)[:4]`` que ordenava por ALFABETO — critério
+        que não tem relação nenhuma com o quanto a palavra identifica o assunto.
+        O preço, medido na sessão b54c4f36 (2026-09-12): o grupo `cadastros`
+        (clientes + playlists + produtos, 25 keywords) chegava ao classificador
+        como ``cadastros (anexa na playlist, camiseta, caneca, catalogo)`` — três
+        das quatro sobre caneca e camiseta, e nenhuma sobre música. Perguntar
+        "como tá a minha fila?" não se parecia com nada disso, então o
+        classificador mandava para `list_connected_devices` e a skill `playlists`
+        (que TEM um dataset `fila`) nunca era alcançada. Em 09-08 o mesmo pedido
+        já falhava igual — a skill só engatava quando o usuário escrevia
+        "playlist", uma das poucas palavras que sobreviviam ao corte.
+
+        Rodízio + ordem de autoria garante que **toda skill do grupo contribui**
+        antes de qualquer uma contribuir duas vezes. A ordem em que o autor
+        escreveu `keywords:` no SKILL.md passa a ser a declaração de prioridade
+        dele — é o contrato que o `_ROUTER_NOTE_MAX_KEYWORDS` das skills soltas
+        já usava.
+        """
+        listas = [list(dict.fromkeys(s.keywords or [])) for s in skills]
+        saida: list[str] = []
+        for i in range(max((len(x) for x in listas), default=0)):
+            for lista in listas:
+                if i < len(lista) and lista[i] not in saida:
+                    saida.append(lista[i])
+                    if len(saida) >= teto:
+                        return saida
+        return saida
 
     def router_note(self) -> str | None:
         """Seção compacta para o prompt do classificador de intenção.
@@ -1168,6 +1204,11 @@ class SkillLibrary:
         Diz ao router que assuntos cobertos por skills .md são resolvidos pelo
         CÉREBRO (DIRECT_RESPONSE) — para "consulta o banco X" nunca cair em
         run_command/CLIENT_TOOL. Só nomes+keywords (barato); nunca o corpo.
+
+        O grupo também lista os NOMES das skills que o compõem: sem isso a
+        palavra "playlists" não aparecia em lugar nenhum do prompt (o nome do
+        grupo a substituía), e um pedido que cita a skill pelo nome — "é na tua
+        skill de fila de reprodução" — não tinha como casar com nada.
         """
         self.maybe_reload()
         # O SEGUNDO vazamento de tokens (§8.1): esta nota é paga em TODA mensagem
@@ -1177,21 +1218,29 @@ class SkillLibrary:
         entries = [e for e in self.all() if (e.discovery or "always") != "oculta"]
         if not entries:
             return None
-        parts, seen_groups = [], set()
-        for e in entries[: self._ROUTER_NOTE_MAX_SKILLS]:
-            if e.group:
-                if e.group in seen_groups:
-                    continue
-                seen_groups.add(e.group)
-                group_keywords = sorted(
-                    {k for m in entries if m.group == e.group for k in m.keywords}
-                )[: self._ROUTER_NOTE_MAX_KEYWORDS]
-                parts.append(
-                    f"{e.group} ({', '.join(group_keywords)})" if group_keywords else e.group
-                )
+        # Dedupe de grupo ANTES do teto: o corte é por ASSUNTO, não por arquivo.
+        # Antes, um grupo com 5 skills comia 5 das 12 vagas e depois colapsava
+        # numa linha só — as skills seguintes sumiam do prompt sem motivo.
+        assuntos: list[tuple[str, list[SkillEntry]]] = []
+        indice: dict[str, int] = {}
+        for e in entries:
+            chave = e.group or f"\x00{e.name}"
+            if chave in indice:
+                assuntos[indice[chave]][1].append(e)
                 continue
-            kws = ", ".join(e.keywords[: self._ROUTER_NOTE_MAX_KEYWORDS])
-            parts.append(f"{e.name} ({kws})" if kws else e.name)
+            indice[chave] = len(assuntos)
+            assuntos.append((chave, [e]))
+
+        parts = []
+        for chave, membros in assuntos[: self._ROUTER_NOTE_MAX_SKILLS]:
+            if chave.startswith("\x00"):  # skill sem grupo
+                e = membros[0]
+                kws = ", ".join((e.keywords or [])[: self._ROUTER_NOTE_MAX_KEYWORDS])
+                parts.append(f"{e.name} ({kws})" if kws else e.name)
+                continue
+            kws = self._round_robin_keywords(membros, self._ROUTER_NOTE_MAX_GROUP_KEYWORDS)
+            nomes = ", ".join(m.name for m in membros)
+            parts.append(f"{chave} — {nomes} ({', '.join(kws)})" if kws else f"{chave} — {nomes}")
         return (
             "## Assuntos com skill interna do cérebro (→ DIRECT_RESPONSE)\n"
             "O núcleo cognitivo tem skills próprias para: "

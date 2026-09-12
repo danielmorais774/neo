@@ -27,7 +27,8 @@ class _CaptureProvider:
     def __init__(self) -> None:
         self.messages = None
 
-    async def complete(self, messages, temperature=0.0, max_tokens=0):
+    async def complete(self, messages, model=None, temperature=0.0,
+                       max_tokens=0, **kwargs):
         self.messages = messages
         return _FakeResp()
 

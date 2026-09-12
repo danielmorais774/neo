@@ -1,5 +1,6 @@
 """Router para seleção e gestão de LLM providers."""
 
+import logging
 from typing import Literal
 
 from core.llm.claude_provider import ClaudeProvider
@@ -12,6 +13,8 @@ from core.llm.openai_provider import OpenAIProvider
 from core.llm.openrouter_provider import OpenRouterProvider
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, get_settings
+
+logger = logging.getLogger(__name__)
 
 ProviderType = Literal[
     "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter"
@@ -268,6 +271,37 @@ class LLMRouter:
         self._providers["ollama"] = OllamaProvider(
             base_url=self.settings.ollama_base_url,
         )
+
+        self._apply_default_model()
+
+    def _apply_default_model(self) -> None:
+        """Faz o provider DEFAULT honrar o ``DEFAULT_MODEL`` do env.
+
+        Sem isto o ``DEFAULT_MODEL`` não valia para ninguém: cada provider nasce
+        com o modelo de fábrica DELE (``OpenRouterProvider`` → gemini-flash-lite),
+        e quem chama ``get_provider()`` sem nome — o `PlanManager`, o extrator de
+        preferências, o compactador de contexto — não passa modelo. O operador
+        escrevia ``DEFAULT_MODEL=…`` no ``.env`` e o sistema usava outra coisa
+        (ver neo-llm-slots-and-wallets: o modelo real do cérebro nunca foi este).
+
+        Só mexe no provider default, e só quando o catálogo não desmente o par:
+        modelo declaradamente de OUTRO provider é engano de configuração, e
+        aplicá-lo trocaria um 402 por um 404. Modelo fora do catálogo passa — o
+        OpenRouter tem muito mais ids do que a lista conhece, inclusive com o
+        sufixo ``@slug`` de pin de endpoint, que não é outro modelo.
+        """
+        padrao = self._providers.get(self.settings.default_provider)
+        modelo = (self.settings.default_model or "").strip()
+        if padrao is None or not modelo:
+            return
+        dono = provider_for_model(modelo.split("@", 1)[0])
+        if dono is not None and dono != self.settings.default_provider:
+            logger.warning(
+                "DEFAULT_MODEL=%r é do provider '%s', não de '%s' — ignorando o par.",
+                modelo, dono, self.settings.default_provider,
+            )
+            return
+        padrao.model = modelo
 
     def get_provider(self, provider_name: ProviderType | None = None) -> LLMProvider:
         """

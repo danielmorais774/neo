@@ -176,3 +176,77 @@ def test_router_brain_note_none_without_library():
     router = object.__new__(IntentRouter)
     router.skill_library = None
     assert router._skills_brain_note() is None
+
+
+# ── grupo: a nota do router não pode diluir as skills que o compõem ──────────
+#
+# Sessão b54c4f36 (2026-09-12): o grupo `cadastros` (clientes + playlists +
+# produtos, 25 keywords) chegava ao classificador como
+# `cadastros (anexa na playlist, camiseta, caneca, catalogo)` — resultado de um
+# `sorted(<união>)[:4]`, ou seja ordem ALFABÉTICA. Três das quatro palavras eram
+# de caneca/camiseta e nenhuma de música, então "como tá a minha fila?" não se
+# parecia com nenhum assunto de skill e o classificador mandava para
+# `list_connected_devices`. A skill `playlists` — que tem um dataset `fila` —
+# nunca era alcançada.
+
+def _library_with_group(tmp_path):
+    skills = {
+        "clientes": "[cliente, clientes, comprador, contato]",
+        "playlists": "[playlist, fila de reproducao, playlists, minha fila]",
+        "produtos": "[produto, produtos, caneca, camiseta, catalogo]",
+    }
+    for nome, kws in skills.items():
+        d = tmp_path / nome
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {nome}\ndescription: Cadastro de {nome}.\n"
+            f"keywords: {kws}\ngroup: cadastros\n---\ncorpo",
+            encoding="utf-8",
+        )
+    settings = SimpleNamespace(
+        workbench_enabled=True, skills_library_enabled=True,
+        skill_read_max_bytes=16_384, skills_catalog_max_entries=30,
+        skills_router_note_enabled=True,
+    )
+    lib = SkillLibrary(root=tmp_path, settings=settings)
+    lib.load()
+    return lib
+
+
+def test_router_note_grupo_da_voz_a_todas_as_skills(tmp_path):
+    """Toda skill do grupo contribui antes de qualquer uma contribuir 2x."""
+    note = _library_with_group(tmp_path).router_note()
+    assert "cliente" in note
+    assert "playlist" in note
+    assert "produto" in note
+
+
+def test_router_note_grupo_nao_ordena_por_alfabeto(tmp_path):
+    """O defeito original: 'caneca'/'camiseta' venciam 'playlist' por serem antes no alfabeto."""
+    note = _library_with_group(tmp_path).router_note()
+    assert "fila de reproducao" in note, "a palavra que o usuário usa tem que chegar ao classificador"
+    assert "caneca" not in note and "camiseta" not in note, (
+        "keyword do fim da lista do autor não pode roubar a vaga da primeira de outra skill"
+    )
+
+
+def test_router_note_grupo_cita_os_nomes_das_skills(tmp_path):
+    """Sem isso a palavra 'playlists' não existia no prompt — o grupo a substituía."""
+    note = _library_with_group(tmp_path).router_note()
+    assert "playlists" in note and "clientes" in note and "produtos" in note
+
+
+def test_router_note_grupo_respeita_o_teto(tmp_path):
+    lib = _library_with_group(tmp_path)
+    kws = lib._round_robin_keywords(list(lib.all()), lib._ROUTER_NOTE_MAX_GROUP_KEYWORDS)
+    assert len(kws) == lib._ROUTER_NOTE_MAX_GROUP_KEYWORDS
+    assert len(kws) == len(set(kws)), "sem repetir keyword"
+
+
+def test_round_robin_alterna_entre_as_skills(tmp_path):
+    """Primeira de cada uma, depois a segunda de cada uma — ordem de autoria."""
+    lib = _library_with_group(tmp_path)
+    ordem = [e.name for e in lib.all()]
+    kws = lib._round_robin_keywords(list(lib.all()), 3)
+    esperado = [lib.get(n).keywords[0] for n in ordem][:3]
+    assert kws == esperado
