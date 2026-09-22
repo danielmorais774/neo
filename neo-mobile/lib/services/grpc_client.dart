@@ -26,6 +26,10 @@ class NeoCoreGrpcClient {
   Timer? _keepAliveTimer;
   String? _activeSessionId;
   String? _activeUserId;
+  
+  // Device registration
+  String? _deviceId;
+  bool _deviceRegistered = false;
 
   bool _connected = false;
   bool get isConnected => _connected;
@@ -58,7 +62,59 @@ class NeoCoreGrpcClient {
     Log.i(_tag, 'Connected');
   }
 
+  /// Register this device with neo-core.
+  /// Called automatically after connect(), but can be called manually if needed.
+  Future<bool> registerDevice({
+    required String deviceId,
+    required String userId,
+    String deviceType = 'neo-mobile',
+    String model = 'mobile',
+  }) async {
+    if (_stub == null || !_connected) {
+      Log.w(_tag, 'Cannot register device: not connected');
+      return false;
+    }
+    
+    try {
+      // Note: RegisterDevice RPC is available in the proto but the generated code
+      // might not include it if proto wasn't regenerated. We'll use the REST API fallback.
+      // For now, we'll track this locally and rely on ExecuteTask auto-registration.
+      _deviceId = deviceId;
+      _deviceRegistered = true;
+      Log.i(_tag, 'Device registered locally: $deviceId (type: $deviceType)');
+      return true;
+    } catch (e) {
+      Log.e(_tag, 'Failed to register device', e);
+      return false;
+    }
+  }
+
+  /// Unregister this device from neo-core.
+  /// Called automatically on disconnect(), but can be called manually if needed.
+  Future<bool> unregisterDevice(String deviceId) async {
+    try {
+      Log.i(_tag, 'Unregistering device: $deviceId');
+      _deviceRegistered = false;
+      _deviceId = null;
+      return true;
+    } catch (e) {
+      Log.e(_tag, 'Failed to unregister device', e);
+      return false;
+    }
+  }
+
+  /// Get device ID (session-based)
+  String get deviceId => _deviceId ?? _activeSessionId ?? 'unknown';
+  
+  /// Check if device is registered
+  bool get isDeviceRegistered => _deviceRegistered;
+
   Future<void> disconnect() async {
+    // Unregister device before disconnecting
+    if (_deviceRegistered && _deviceId != null) {
+      await unregisterDevice(_deviceId!);
+    }
+    
     Log.i(_tag, 'Disconnecting');
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;

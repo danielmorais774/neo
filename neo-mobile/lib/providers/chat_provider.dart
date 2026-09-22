@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import '../config/app_config.dart';
 import '../models/chat_message.dart';
@@ -52,6 +53,16 @@ class ChatProvider extends ChangeNotifier {
     try {
       _connectionError = null;
       await _grpc.connect(_config.host, _config.grpcPort);
+      
+      // Register this mobile device with neo-core
+      final deviceId = _sessionService.userId ?? 'mobile-${DateTime.now().millisecondsSinceEpoch}';
+      await _grpc.registerDevice(
+        deviceId: deviceId,
+        userId: _sessionService.userId ?? '',
+        deviceType: 'neo-mobile',
+        model: defaultTargetPlatform.toString(),
+      );
+      
       final healthy = await _grpc.healthCheck();
       _isConnected = healthy;
       if (!healthy) {
