@@ -147,6 +147,10 @@ class ToolParameter(BaseModel):
     description: str
     enum: list[str] | None = None
     required: bool = False
+    #: Schema dos elementos quando ``type="array"``. Sem ele, provedor estrito
+    #: recusa a tool inteira com 400 — e uma tool que vai em todo turno cognitivo
+    #: derrubaria todo turno (edit_user_file.edits).
+    items: dict | None = None
 
 
 class ToolSchema(BaseModel):
@@ -373,3 +377,5 @@ class ContextCandidate:
     final_score: float = 0.0  # após ponderação
     included: bool = False
     skip_reason: str = ""
+    #: Diagnóstico da camada (ex.: o "explain" do ranking do PKS) para o session log.
+    detail: dict | None = None

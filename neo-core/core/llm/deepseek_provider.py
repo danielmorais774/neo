@@ -31,17 +31,22 @@ _THINKING_DISABLED = {"thinking": {"type": "disabled"}}
 
 
 class DeepSeekProvider(OpenAIProvider):
-    """Provider para DeepSeek (deepseek-v4-flash, deepseek-v4-pro).
+    """Provider para DeepSeek (deepseek-flash, deepseek-v4-pro).
 
     A API do DeepSeek é 100% compatível com a OpenAI — apenas muda o base_url
     e os nomes de modelos:
-      - deepseek-v4-flash  → rápido, bom custo-benefício (default)
-      - deepseek-v4-pro    → forte, raciocínio mais profundo
+      - deepseek-flash   → rápido, bom custo-benefício (default)
+      - deepseek-v4-pro  → forte, raciocínio mais profundo
     NOTA: os nomes antigos "deepseek-chat"/"deepseek-reasoner" foram aposentados
     pela API (400 invalid_request) — não usar como default.
+    NOTA 2 (sondado em 2026-09-20 em ``GET /models``): a flash perdeu a versão no
+    id. A listagem devolve hoje ``deepseek-flash`` e ``deepseek-v4-pro`` — o
+    ``deepseek-v4-flash`` sumiu dela. Ou seja, o id não fixa mais a geração: quem
+    quiser a V4.1 com endpoint e preço fixos usa o gateway
+    (``deepseek/deepseek-v4.1-flash@fireworks``, ver core/llm/router.py).
     """
 
-    DEFAULT_MODEL = "deepseek-v4-flash"
+    DEFAULT_MODEL = "deepseek-flash"
     BASE_URL = "https://api.deepseek.com"
 
     def __init__(self, api_key: str | None = None, **kwargs: Any) -> None:

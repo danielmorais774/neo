@@ -55,9 +55,16 @@ class Settings(BaseSettings):
     # Agent Settings
     max_iterations: int = Field(default=32, ge=1, le=100, description="Max agent iterations")
     tool_timeout: int = Field(default=30, ge=1, description="Tool execution timeout (seconds)")
-    agent_global_timeout: int = Field(
-        default=300, ge=30,
-        description="Global agent timeout in seconds",
+    agent_stall_timeout: int = Field(
+        default=180, ge=30,
+        description=(
+            "Segundos SEM AVANÇO até o agente desistir — não é prazo desde o início. "
+            "Avanço = resposta do LLM, resultado de tool ou progresso do sandbox. Era "
+            "um relógio de 300s (agent_global_timeout) e na session-d35696d4 matou um "
+            "agente que já tinha rodado 5 consultas e estava na 6ª ida ao modelo. "
+            "Fica abaixo dos 240s de _STALL_WINDOW_S do gRPC: quem desiste primeiro "
+            "é o agente, que ainda consegue dizer o que já apurou."
+        ),
     )
 
     # Pipeline orchestrator (chaining of feature pipelines — cascade/handoff)
@@ -125,10 +132,12 @@ class Settings(BaseSettings):
         "subagente de memória). Off → a tool some do read set do cognitivo.",
     )
     pks_planner_model: str = Field(
-        default="deepseek-v4-flash",
+        default="deepseek-flash",
         description="Modelo do PKSMemoryPlanner (subagente que estrutura a "
         "escrita no PKS). Explícito porque o default do provider já foi "
-        "'deepseek-chat' (aposentado, dava 400 e quebrava TODA gravação).",
+        "'deepseek-chat' (aposentado, dava 400 e quebrava TODA gravação). "
+        "'deepseek-flash' é o id que api.deepseek.com serve hoje para a flash "
+        "atual (V4.1); o 'deepseek-v4-flash' saiu da listagem em 2026-09-20.",
     )
     cognitive_max_tool_rounds: int = Field(
         default=32, ge=1, le=100,
@@ -241,7 +250,7 @@ class Settings(BaseSettings):
         "via agent_job kind=research). Requer jobs_enabled e web_search_enabled.",
     )
     research_model: str = Field(
-        default="deepseek-v4-flash",
+        default="deepseek-flash",
         description="Modelo do VOLUME do ResearchAgent (intake/plan/triage/"
         "evidência/reflect/organize). Barato por design — são muitas chamadas "
         "sobre texto de web.",
@@ -251,6 +260,38 @@ class Settings(BaseSettings):
         description="Modelo FORTE do ResearchAgent (escrita por seção, resumo "
         "executivo/conclusão, crítica e revisão). São poucas chamadas e é onde a "
         "qualidade do relatório é decidida — ver docs/deep-research-v2-plan.md.",
+    )
+
+    # Leitura delegada de documentos (docs/deep-read-plan.md)
+    deep_read_enabled: bool = Field(
+        default=True,
+        description="Liga a tool deep_read: subagentes leem documentos grandes/vários "
+        "documentos por inteiro no sandbox e escrevem notas/<doc>.md + sintese.md, "
+        "fora do contexto do cérebro. Requer jobs_enabled e workbench.",
+    )
+    deep_read_timeout: int = Field(
+        default=3600, ge=120, le=21600,
+        description="Teto (s) de um job de leitura; estourou, o que foi lido fica e a síntese diz o que faltou.",
+    )
+    deep_read_doc_concurrency: int = Field(
+        default=3, ge=1, le=8,
+        description="Documentos extraídos/lidos ao mesmo tempo num job.",
+    )
+    deep_read_llm_concurrency: int = Field(
+        default=6, ge=1, le=16,
+        description="Chamadas de LLM simultâneas num job (todas as partes de todos os documentos).",
+    )
+    deep_read_chunk_chars: int = Field(
+        default=16_000, ge=4_000, le=40_000,
+        description="Tamanho alvo de cada parte lida por um subagente (respeita a página).",
+    )
+    deep_read_max_parts_per_doc: int = Field(
+        default=150, ge=1, le=1000,
+        description="Partes lidas por documento; acima disto a cobertura fica parcial e é dita.",
+    )
+    deep_read_max_files: int = Field(
+        default=30, ge=1, le=200,
+        description="Documentos aceitos numa chamada de deep_read.",
     )
 
     # Browser Agent — subagente browser-use no backend (docs/browser-agent-plan.md)
@@ -306,7 +347,7 @@ class Settings(BaseSettings):
         "/ws/devices/control + extensão neo-browser-local). Requer jobs_enabled.",
     )
     browser_local_model: str = Field(
-        default="deepseek-v4-flash",
+        default="deepseek-flash",
         description="Modelo que decide o passo do navegador local. Saída curta e "
         "estruturada (um JSON por passo) — não precisa do caro.",
     )
@@ -389,6 +430,25 @@ class Settings(BaseSettings):
         "neo_data, tools data_*, instalador de skills e tela /dados do painel. "
         "Default OFF — rollback é desligar a flag.",
     )
+    # ── Agenda / cron (docs/scheduler-plan.md) ─────────────────────────
+    neo_scheduler_enabled: bool = Field(
+        default=False,
+        description="Liga a agenda: tabela scheduled_task, loop SchedulerTick, "
+        "tools schedule_* e a tela /agenda do painel. Default OFF — com a flag "
+        "desligada nada é disparado e nenhuma tarefa é criada.",
+    )
+    scheduler_tick_interval: int = Field(
+        default=30, ge=5, le=300,
+        description="Intervalo (s) do loop que procura tarefas vencidas. Não "
+        "precisa ser curto: o disparo é materializado como job e quem corre "
+        "atrás dele é o JobManager.",
+    )
+    scheduler_timezone: str = Field(
+        default="America/Fortaleza",
+        description="Fuso padrão das tarefas agendadas (o mesmo do módulo de "
+        "finanças). Cada tarefa pode ter o seu.",
+    )
+
     # ── Barramento de eventos (docs/playlists-skill-plan.md §7) ────────
     neo_events_enabled: bool = Field(
         default=False,
@@ -513,6 +573,51 @@ class Settings(BaseSettings):
         default=5, ge=1, description="Max previous sessions to search for context recovery",
     )
 
+    # ── Janela de histórico da sessão (docs/context-recall-fixes.md §2) ──
+    #: Quanto da conversa ATUAL volta para o classificador e para o cérebro a
+    #: cada turno. Era `limit=20, max_tokens_budget=3000` cravado no código, e
+    #: 3000 é MENOS que uma resposta longa do próprio Neo: na sessão 7330e40c a
+    #: "Reanálise Completa" tinha 3.982 tokens — não cabia nem sozinha. A partir
+    #: do turno seguinte ela era matematicamente inalcançável, e o Neo passou 13
+    #: turnos jurando que aquela análise não existia, até começar a ler arquivos
+    #: do disco e apresentá-los como "a mensagem que eu postei no chat". A
+    #: sessão INTEIRA tinha 14.498 tokens — cabia folgada em qualquer modelo que
+    #: usamos. O teto nunca foi do LLM; era este número.
+    #: Custo: o histórico vai em DOIS prompts por turno (classificador +
+    #: cognitivo), então subir isto sobe token de entrada nos dois. Com cache de
+    #: prompt o prefixo estável é barato; ainda assim, é o botão a girar se a
+    #: latência ou a conta subirem.
+    history_limit_messages: int = Field(
+        default=40, ge=2,
+        description="Max messages pulled from the current session for LLM context",
+    )
+    history_max_tokens_budget: int = Field(
+        default=24000, ge=500,
+        description="Token budget for the current-session history window",
+    )
+    #: Quantas mensagens grandes demais podem virar um marcador de omissão antes
+    #: de a varredura parar de vez. O marcador existe para o modelo SABER que
+    #: algo foi cortado — silêncio é o que o fazia inventar.
+    history_max_elisions: int = Field(
+        default=3, ge=0,
+        description="Max oversized messages replaced by an elision marker before truncating",
+    )
+    #: Resgate semântico DENTRO da sessão: quando a conversa passa deste
+    #: tamanho, as mensagens que não couberam na janela ainda podem voltar por
+    #: similaridade com o que o usuário acabou de perguntar.
+    history_semantic_merge_min_messages: int = Field(
+        default=12, ge=2,
+        description="Session size above which the in-session semantic merge runs",
+    )
+    history_semantic_merge_limit: int = Field(
+        default=4, ge=0,
+        description="Max older in-session messages re-injected by similarity",
+    )
+    history_semantic_merge_min_similarity: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description="Minimum cosine similarity for the in-session semantic merge",
+    )
+
     # ── Context Selector budgets (tokens por camada) ──────────────
     context_budget_neo_core_ctx: int = Field(
         default=600, ge=0,
@@ -538,6 +643,39 @@ class Settings(BaseSettings):
         default=700, ge=0,
         description="Token budget for the working-memory index (docs/working-memory-plan.md)",
     )
+
+    # ── Ranking do PKS (docs/pks-ranking-plan.md) ─────────────────
+    pks_ranker_v2_enabled: bool = Field(
+        default=False,
+        description=(
+            "Bloco 'Conhecimento do Usuário' e search_pks pela nota de prioridade "
+            "(core/pks/ranking.py) em vez do teto de 10 por ordem de chegada. Ligar "
+            "só depois do gabarito revisado (§6 do plano)."
+        ),
+    )
+    pks_ranker_v2_shadow: bool = Field(
+        default=True,
+        description=(
+            "Com o v2 desligado: calcula o v2 junto, injeta o antigo e registra no "
+            "session log o que entraria/sairia. Nunca muda o prompt."
+        ),
+    )
+    pks_rank_weights: dict[str, float] = Field(
+        default_factory=dict,
+        description="Sobrescreve pesos do ranking (nome/lex/conv/grafo/tipo/prior/sem). Vazio = os do plano.",
+    )
+    pks_rank_min_score: float = Field(default=0.12, ge=0.0, le=1.0)
+    pks_rank_relative_cutoff: float = Field(default=0.45, ge=0.0, le=1.0)
+    pks_rank_kappa: float = Field(default=6.0, gt=0.0)
+    pks_rank_history_turns: int = Field(default=3, ge=0, le=10)
+    pks_rank_list_cap: int = Field(default=20, ge=1)
+    # Orçamento ELÁSTICO do bloco (tokens). Medido em 2150 turnos reais + gabarito
+    # (docs/pks-ranking-plan.md §12): todo grupo cabe na BASE; só grupo forte
+    # (nota ≥ strong_ratio × a melhor) usa a extensão até o TETO. Fixo em 880,
+    # 14 grupos fortes eram cortados; fixo em 1600, entravam 101 grupos de cauda.
+    pks_rank_budget_base: int = Field(default=600, ge=100)
+    pks_rank_budget_max: int = Field(default=1600, ge=100)
+    pks_rank_strong_ratio: float = Field(default=0.7, ge=0.0, le=1.0)
 
     # ── Memória de trabalho — o caderno da tarefa (docs/working-memory-plan.md) ──
     # Terceiro tipo de memória, entre a sessão (volátil) e o PKS (permanente): o
@@ -794,7 +932,7 @@ class Settings(BaseSettings):
         description="Validade de um arquivo 'temp' (o GC expira depois disso)",
     )
     neo_files_max_file_mb: int = Field(
-        default=50, ge=1,
+        default=500, ge=1,
         description="Tamanho máximo por arquivo no upload/ingestão",
     )
     neo_files_quota_gb: float = Field(
@@ -901,6 +1039,75 @@ class Settings(BaseSettings):
     conversation_recall_excerpts_per_session: int = Field(
         default=4, ge=1, le=10,
         description="Trechos mostrados por conversa recuperada",
+    )
+    #: Quantos trechos abrir quando o modelo foca numa conversa específica
+    #: (`conversa="7330e40c"`). Tem que ser bem maior que o teto normal: focar
+    #: existe justamente porque o que ele procura ficou FORA dos 4 primeiros.
+    conversation_recall_excerpts_focused: int = Field(
+        default=12, ge=2, le=40,
+        description="Trechos por conversa quando o recall foca numa conversa só",
+    )
+    #: Tamanho do trecho de cada mensagem no bloco "Arquivo de conversas".
+    #: 240 chars respondem "a gente já falou disso?" — mas NÃO respondem "me
+    #: mostra aquela análise de novo", que foi o pedido da sessão 7330e40c. Com
+    #: o texto cortado, a única saída do modelo é parafrasear de cabeça, que é
+    #: exatamente a confabulação que se quer evitar. Daí o segundo teto: quando
+    #: o modelo pede `completo=true`, as mensagens que CASARAM vêm inteiras (as
+    #: vizinhas continuam curtas, que é só contexto).
+    conversation_recall_excerpt_chars: int = Field(
+        default=240, ge=40, le=4000,
+        description="Chars por trecho no bloco de recall",
+    )
+    conversation_recall_full_excerpt_chars: int = Field(
+        default=20000, ge=500, le=60000,
+        description="Chars por trecho quando o recall é pedido com completo=true",
+    )
+    #: Teto SOMADO dos trechos longos num mesmo recall. O teto por mensagem
+    #: sozinho não limita nada (3 sessões × 4 trechos × 20k = 240k chars); é
+    #: este que garante que `completo=true` não estoure o prompt. Gasto do mais
+    #: recente para o mais antigo — o que não couber volta ao trecho curto.
+    conversation_recall_full_total_chars: int = Field(
+        default=40000, ge=1000, le=200000,
+        description="Orçamento somado dos trechos longos de um recall completo",
+    )
+    #: A sessão ATUAL voltou a ser pesquisável pelo recall, com corte no turno de
+    #: agora. Excluí-la inteira (como era) matava o caso mais comum: pedir de
+    #: volta algo que o Neo escreveu nesta mesma conversa, longe demais para
+    #: caber na janela de histórico. Ver docs/context-recall-fixes.md §3.
+    conversation_recall_include_current_session: bool = Field(
+        default=True,
+        description="Deixa o recall buscar também na conversa atual (até o turno anterior)",
+    )
+    #: Fatiar mensagens longas em pedaços com vetor próprio. O embedder local
+    #: (all-MiniLM-L6-v2) trunca em 256 tokens SEM AVISAR — o vetor de uma
+    #: mensagem de 12.811 chars representava só os ~1.000 primeiros, e a busca
+    #: pela tabela que estava no offset 9.399 devolvia 83º de 2.304.
+    embedding_chunk_enabled: bool = Field(
+        default=True,
+        description="Indexa mensagens longas em pedaços (contorna o corte de 256 tokens)",
+    )
+    #: 500/250 MEDIDO contra 5 pedidos reais de recall da mesma mensagem (rank
+    #: do alvo entre 2.303 candidatas, menor é melhor):
+    #:
+    #:     sem chunk  583   |  1200/300  281   |  900/450  266
+    #:     650/325    177   |  600/300   149   |  500/250   70   ← escolhido
+    #:
+    #: O tokenizer gasta ~2,9 chars/token em pt-BR, então 1.200 chars viram
+    #: ~416 tokens e TODO pedaço era truncado de novo pelo modelo — o mesmo
+    #: defeito, um nível abaixo. 500 chars ≈ 169 tokens, com folga.
+    #: Calibrar num caso só engana: 900/450 ganhava no exemplo isolado (0,7334)
+    #: por alinhamento sortudo da fatia com a tabela, e é medíocre na média.
+    embedding_chunk_chars: int = Field(
+        default=500, ge=200, le=4000,
+        description="Tamanho de cada pedaço, em chars (tem que caber em 256 tokens)",
+    )
+    embedding_chunk_overlap: int = Field(
+        default=250, ge=0, le=1000,
+        description="Sobreposição entre pedaços (evita cortar a resposta no meio)",
+    )
+    embedding_chunk_min_chars: int = Field(
+        default=1000, ge=300, le=8000,
+        description="Só fatia mensagens acima disso (2,9% do corpus)",
     )
     assistant_embeddings_enabled: bool = Field(
         default=True,

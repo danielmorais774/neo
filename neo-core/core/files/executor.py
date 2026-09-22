@@ -76,6 +76,26 @@ class FilesExecutor:
                     "para citar: nunca escreva um link de download você mesmo."
                 ),
             }
+        if tool_name == "file_offer":
+            # "Me mostra o botão de download" de algo que JÁ está no catálogo: sem
+            # isto o único jeito era file_save de novo (outra linha, outro id) — e na
+            # sessão f33632b4 a frase virou um plano de run_command que falhou inteiro.
+            entry = await self._store.get(str(arguments.get("file_id") or ""))
+            if entry is None or entry.status != "available":
+                return {
+                    "error": "not_found",
+                    "message": "esse file_id não está disponível no catálogo — confira no registro de arquivos da conversa.",
+                }
+            return {
+                "file_id": str(entry.id),
+                "name": entry.name,
+                "size_bytes": entry.size_bytes,
+                "offered": True,
+                "message": (
+                    f"O botão de download de '{entry.name}' vai junto da sua resposta. Diga em uma "
+                    "frase que ele está aí; não escreva link nenhum."
+                ),
+            }
         if tool_name == "file_set_retention":
             entry = await self._store.set_retention(
                 str(arguments.get("file_id") or ""),

@@ -28,7 +28,7 @@ def _router(monkeypatch, *, provider: str, model: str) -> LLMRouter:
 
     r._providers = {
         "openrouter": _P("google/gemini-3.1-flash-lite"),
-        "deepseek": _P("deepseek-v4-flash"),
+        "deepseek": _P("deepseek-flash"),
     }
     r._apply_default_model()
     return r
@@ -37,7 +37,7 @@ def _router(monkeypatch, *, provider: str, model: str) -> LLMRouter:
 def test_default_model_chega_no_provider_default(monkeypatch):
     r = _router(monkeypatch, provider="openrouter", model="deepseek/deepseek-v4-flash@baidu")
     assert r._providers["openrouter"].model == "deepseek/deepseek-v4-flash@baidu"
-    assert r._providers["deepseek"].model == "deepseek-v4-flash", "só o default muda"
+    assert r._providers["deepseek"].model == "deepseek-flash", "só o default muda"
 
 
 def test_pin_de_endpoint_nao_e_outro_modelo(monkeypatch):

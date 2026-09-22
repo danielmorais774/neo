@@ -54,7 +54,8 @@ class WorkbenchStager:
         dest_dir = f"{self._sandbox.workspace_root}/{self._dest_subdir}"
         dest = f"{dest_dir}/{name}"
         command = f"mkdir -p {shlex.quote(dest_dir)} && cp {shlex.quote(src)} {shlex.quote(dest)}"
-        result = await self._sandbox.run(command, timeout=60)
+        # 300s: um blob de até 500 MB (NEO_FILES_MAX_FILE_MB) em disco lento da VPS.
+        result = await self._sandbox.run(command, timeout=300)
         if result.exit_code != 0:
             stderr = (result.stderr or "").strip()[:300]
             raise RuntimeError(

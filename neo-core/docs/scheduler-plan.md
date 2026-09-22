@@ -1,6 +1,9 @@
 # Plano: Agenda do Neo — cron de tarefas, prompts e tools disparados sozinhos
 
-> **Status:** desenho para revisão. Nada implementado.
+> **Status: F1–F4 IMPLEMENTADOS** (2026-09-12). Ver §14 (o que ficou de pé).
+> Migration `y8z9a0b1c2d3` aplicada em prod; a feature nasce atrás de
+> `NEO_SCHEDULER_ENABLED` (default OFF).
+> **Status original:** desenho para revisão, nada implementado.
 > **Motivação:** hoje o Neo só age quando alguém fala com ele. Falta o eixo do
 > **tempo**: "todo dia 7h me faz o resumo", "dia 5 me lembra da fatura", "a cada
 > 15 min confere se o TTS do PC gamer caiu", "amanhã 15h me pergunta se resolvi
@@ -469,3 +472,76 @@ POST   /pausar-tudo             kill switch global
 26. Relatório semanal da própria agenda: o que disparou, o que foi ignorado, o que falhou — e sugestão de desligar as que ninguém lê.
 27. Tarefa que cria tarefa: o Neo propõe um cron quando percebe repetição ("você me pede isso toda segunda; quer que eu passe a fazer sozinho?") — com aprovação.
 28. Modo férias: pausa tudo que não for crítico até uma data.
+
+
+---
+
+## 14. O que ficou de pé (2026-09-12)
+
+Implementado em uma leva, com a suíte inteira verde (2220 testes existentes + 58
+novos, `tests/scheduler/`).
+
+### Arquivos novos
+
+| Arquivo | Papel |
+|---------|-------|
+| `db/models/scheduled_task.py` + `alembic/versions/y8z9a0b1c2d3_*` | A regra. Migration aditiva, já aplicada |
+| `core/scheduler/timing.py` | Cron de 5 campos **escrito à mão** (com `L`), intervalo, uma vez, fuso, janela, quiet hours, descrição em português |
+| `core/scheduler/nlp.py` | "todo dia útil às 8h" → `0 8 * * 1,2,3,4,5`, com o horário resolvido de volta |
+| `core/scheduler/conditions.py` | Guardas (`tool`/`device`/`http`) + fingerprint do "só se mudou" |
+| `core/scheduler/tick.py` | O relógio: claim, misfire, sobreposição, condição, materialização, disjuntor |
+| `core/scheduler/runners.py` | Os quatro disparos (`notify`/`tool`/`job`/`prompt`) + contadores da tarefa |
+| `core/scheduler/service.py` | CRUD e validação compartilhados por painel e tools |
+| `core/scheduler/tools.py` + `executor.py` | As 7 tools `schedule_*`, por-request, com usuário |
+| `api/routes/schedules.py` | `/api/v1/agenda` — CRUD, preview, simular, disparos, kill switch |
+| `neo-panel/src/AgendaPanel.tsx` | A tela `/agenda`, com preview de horário ao vivo |
+
+### Decisões que mudaram em relação ao plano
+
+1. **Sem `croniter`.** Dependência nova derruba prod no reload (memória
+   `neo-dev-topology-prod-tunnel`), e o cron que a agenda precisa coube em 150
+   linhas testadas. Zero dependência nova, zero rebuild.
+2. **`build_request_executor` extraído de verdade** (`ai_service.py:5121`), e o
+   `_handle_server_tool` passou a chamá-lo. Era pré-requisito de §6.5 e agora é
+   um ponto só — a agenda dispara tool com exatamente o mesmo escopo de usuário
+   que um turno normal.
+3. **`texto_literal`.** O `ProactiveDispatcher` reescrevia tudo com um LLM. Um
+   alerta de texto fixo virava paráfrase e a resposta de um turno agendado (que
+   já sai com a persona certa) era reescrita por um modelo menor. Quem sabe o
+   texto final agora manda em `extra_metadata.texto_literal` e o dispatcher
+   entrega como está.
+4. **Ação `job` reusa a tool** (`deep_research`, `browser_local_task`…) em vez
+   de montar o `agent_job` na mão — do contrário uma pesquisa agendada nasceria
+   sem a `research_task` e o job rodaria sem ter o que executar.
+5. **Guardas do turno agendado** ficaram nos três pontos que o plano previu:
+   `source=schedule` tira o turno do afeto e da birra (`ai_service.py`, dois
+   sítios), `unattended` tira as tools client-side do toolset e **devolve um
+   CLIENT_TOOL ao cognitivo** em vez de deixá-lo pendurado até o timeout.
+6. **A cópia no claim.** `claim_due_scheduled_tasks` grava a sentinela mas
+   devolve o objeto com o `next_run_at` **original** — é dele que sai a decisão
+   de misfire. O primeiro teste do tick pegou exatamente isso (o fake devolvia a
+   sentinela e todo disparo parecia adiantado).
+
+### O que NÃO entrou (e por quê)
+
+- **F5 `dataset` schedules** (§7.5) — a ideia grande, mas depende de decidir
+  como a linha do cadastro vira disparo idempotente (não pode avisar duas vezes
+  da mesma conta). Merece desenho próprio.
+- **Escalonamento de entrega e snooze/ack** (§8.3/§8.4) — o `quiet_hours` com
+  `adiar`/`silenciar`/`forcar` está de pé; a escada notch→chat→WhatsApp→email e
+  os botões de adiar/já-fiz pedem mexer no cliente.
+- **`requires_approval`** (§F6) — a coluna não existe ainda; hoje a proteção é a
+  `tool_policy` (client-side proibido por padrão) e o teto de tempo.
+- **Ação `pipeline`** — `tool → guard → prompt → notify` numa tarefa só. Hoje se
+  faz com duas tarefas ou com uma condição + prompt.
+
+### Como ligar
+
+```bash
+# .env da RAIZ (o container não lê o neo-core/.env)
+NEO_SCHEDULER_ENABLED=true
+docker compose up -d --no-deps neo-core
+```
+
+Com a flag off: sem tabela consultada, sem laço, sem tools no toolset, e a API
+responde 503. Rollback é desligar a flag.

@@ -324,9 +324,9 @@ async def test_loop_populates_tool_trace_with_compact_summaries():
     garantimos que o resumo compacto (path+bytes, nunca o conteúdo do arquivo)
     fica disponível pro chamador persistir em extra_metadata.
 
-    O trace ganhou depois um campo `note_detail` com o conteúdo FARTO, que serve
-    só ao caderno de trabalho — o contrato original continua valendo para o que
-    é persistido, e é `_strip_note_detail` que o garante (asserção no fim)."""
+    O trace ganha campos que servem só ao caderno de trabalho (aqui,
+    `primeira_linha`) — o contrato original continua valendo para o que é
+    persistido, e é `_strip_note_detail` que o garante (asserção no fim)."""
     svc = _svc()
     provider = _ScriptedProvider([
         _Resp(tool_calls=[ToolCall(id="1", name="neo_write_file", arguments={"path": "/workspace/index.html", "content": "<html></html>"})]),
@@ -348,8 +348,10 @@ async def test_loop_populates_tool_trace_with_compact_summaries():
     assert _strip_note_detail(trace) == [
         {"tool": "neo_write_file", "ok": True, "path": "/workspace/index.html", "bytes": 13}
     ]
-    # E o conteúdo do arquivo existe, mas só no campo que o caderno consome.
-    assert trace[0]["note_detail"] == "<html></html>"
+    # O caderno aponta para o arquivo (que continua no /workspace) em vez de
+    # copiá-lo — docs/deep-read-plan.md §6. Só a primeira linha, para reconhecer.
+    assert "note_detail" not in trace[0]
+    assert trace[0]["primeira_linha"] == "<html></html>"
 
 
 @pytest.mark.asyncio

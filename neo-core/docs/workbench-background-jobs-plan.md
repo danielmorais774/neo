@@ -353,3 +353,88 @@ docker exec neo-workbench sh -lc 'curl -s -m6 -o /dev/null -w "%{http_code}\n" h
 Rollback: `workbench_enabled=false` no .env desliga o subsistema sem tocar no resto;
 a tabela `agent_job` pode ficar (inerte). A migração é um merge — `downgrade -1`
 recria as 2 heads (evitar salvo necessidade).
+
+## 15. Comando longo vira job, continuação e janela de tarefas (2026-09-13)
+
+**O problema medido (sessões c4f3f7de e 45bd5ad0).** Primeiro, o teto de parede de
+120s matava um ffmpeg com 89% feito. Trocado por detecção de travamento (vigia de
+CPU/IO/saída no `WorkbenchSandbox`), o mesmo tipo de trabalho passou a prender o
+turno: um OCR de 127 quadros segurou a conversa 8 min — e o Stop não matava o
+processo no container.
+
+**O que mudou:**
+- `neo_bash` passa pelo `JobToolExecutor` (por request, conhece usuário e sessão).
+  Até `_FOREGROUND_BUDGET` (120s) roda em primeiro plano como sempre; passado isso,
+  ainda trabalhando, `JobManager.adopt_running` o transforma num `sandbox_task`
+  `running` SEM interromper o processo, e a tool devolve `backgrounded: true` +
+  `job_id`. O resultado sai pelo `_settle` comum (caderno, continuação, aviso). O
+  comando adotável já nasce com o teto do job (`job_default_timeout`): o `timeout`
+  do coreutils não muda depois da largada.
+- Cancelar (tool ou tela) cancela a task, e cancelar a task mata a árvore no
+  container (`WorkbenchSandbox.run` trata `CancelledError`). Um callback de término
+  cobre o cancelamento que chega antes de a task começar a rodar.
+- `neo_bash_background` ganhou `then`: ao terminar `completed`, o JobManager
+  enfileira um `scheduled_prompt` sem tarefa de agenda, na MESMA sessão, com o
+  resultado e a ordem — o turno em que o Neo termina a entrega sozinho. O job
+  original fica `silent` para não avisar duas vezes; se a continuação não
+  enfileira, ele avisa normalmente.
+- Log de job do sandbox é lido pelo FIM (`read_tail`). Leitura e cancelamento
+  viraram `read_job_logs` / `cancel_job` (`core/jobs/executor.py`), usados pela
+  tool e pelas rotas.
+- Rotas do desktop (router `desktop`, sem JWT, dono resolvido como no caderno):
+  `GET /desktop/jobs[?status=active]`, `GET /desktop/jobs/{id}`,
+  `GET /desktop/jobs/{id}/logs?tail=`, `POST /desktop/jobs/{id}/cancel`.
+- Desktop: janela própria "Tarefas do Neo" (Configurações → Tarefas em
+  background): ativas primeiro, detalhe com pedido, `then`, resultado e o fim do
+  log, atualizando a cada 4s com tarefa ativa (20s sem).
+
+**Validado em prod:** um `neo_bash` de 14s com orçamento de 5s voltou em 5,4s como
+job, terminou `completed`, gravou o log e apareceu pela rota; a linha de teste foi
+apagada.
+
+## 16. Skill ocr-video v2 — conversa lida por balão (2026-09-14)
+
+**Por que a v1 não bastava (session-1fcaa440).** OCR da tela inteira + junção de
+linhas deu 14 entradas contra 188 linhas de uma leitura por modelo de visão. O OCR
+não era o gargalo (28/31 frases de referência estavam nas linhas brutas); a perda
+veio de o remetente não estar no texto (é o LADO/COR do balão), do horário do canto
+ilegível na tela reduzida e da junção por semelhança, que duplica e engole.
+
+**Como ficou** (`skills/ocr-video/scripts/chat_ocr.py`, chamado pelo `ocr_video.py`
+com `--modo auto`; sem balões cai no caminho de texto antigo):
+1. Reconhecimento em quadros pequenos a 4/s, um por vez (empilhar 2 min passaria de
+   1 GB): área que muda = painel; perfil das linhas = rolagem; quadro-chave a cada
+   45% de painel rolado ou 3 s de tela mudando.
+2. Quadros-chave nativos, só o painel.
+3. Balões: cor por balde de frequência e lado → rótulo pela cor MAIS PRÓXIMA da
+   paleta (tolerância fixa fragmentava ou engolia o fundo) → abertura →
+   componentes (RLE + union-find, sem scipy) → corte pelo recuo dos cantos.
+   Alinhamento dá o remetente. Mais: miniatura de mídia (bloco claro sem moldura),
+   citação (caixa de outra cor no topo), data/aviso (texto CENTRALIZADO sobre o
+   fundo — a pílula não sai na máscara de cor) e área tapada por sobreposição
+   (Central de Controle: vários blocos que não encostam em lado nenhum).
+4. Posição global de cada quadro-chave → o mesmo balão entre quadros vira um grupo,
+   lido uma vez no melhor exemplar. Horário por VOTAÇÃO (até 4 exemplares × 2
+   limiares + o fim do texto), recortado só no grupo de colunas mais à direita da
+   última linha. Reparo: dentro de cada dia (a data separa), âncora = 2+ votos em
+   ordem crescente; o resto escolhe a troca de dígito que cabe entre as âncoras.
+5. Saída: `mensagens.txt` (`[HORA] REMETENTE: mensagem`, `== dia ==`, `[aviso]`,
+   citação, botões, `[vídeo 1:13]`, `[cortada em "Ler mais"]`), `mensagens.jsonl`
+   e `descartadas.txt`. OCR com cache em disco (retomável).
+
+Limiares em px medidos no WhatsApp macOS em tela Retina; escalam por `u` = altura
+mediana das faixas de texto ÷ 26. Tema claro e outros apps não foram medidos.
+
+**Gotchas do vídeo real:** a caixa da citação fica a ~10 do verde do balão e o
+botão de resposta rápida a ~14 do cinza — nenhum limiar da máscara de cor serve
+aos dois (20 esconde a citação, 10 apaga o botão), então a máscara fica em 20 e a
+citação sai da cor mediana de cada linha; pilha de balões de larguras diferentes tem caixa pouco
+preenchida e virava "mídia" engolindo as mensagens (anexo com moldura exige os 4
+lados cheios); o botão fixo "rolar para baixo" fatiava balão de uma linha (pedaço
+< 50px volta ao vizinho) e escondia os tiques; o rótulo de data flutuante no topo
+punha data errada (fora o topo, e data sem mensagem até a próxima some); sem data,
+"horário só cresce" empurrava 20:06 para 08:xx; "[vídeo 1:13]" e "Dá até pra ver…
+vídeo" viravam a mesma mensagem pela palavra "vídeo".
+
+Testes: `tests/skills/test_ocr_video_chat.py` (quadros sintéticos; pula sem numpy,
+que o `.venv` local não tem — rodam no sandbox).

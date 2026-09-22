@@ -29,6 +29,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _int_setting(settings: object, nome: str, default: int) -> int:
+    """Lê um setting numérico tolerando mock, None e versão antiga sem o campo.
+
+    O chunking roda no caminho de `add_message`, que é o turno do usuário: um
+    `getattr` que devolva algo não-comparável (um MagicMock nos testes, um
+    Settings em cache sem o campo novo) não pode virar TypeError e derrubar o
+    salvamento da mensagem.
+    """
+    valor = getattr(settings, nome, default)
+    # `int(MagicMock())` devolve 1 (o mock implementa __int__), o que ligava o
+    # chunking para qualquer texto acima de 1 char. Checar o tipo de verdade é
+    # o que distingue "campo ausente" de "campo com valor".
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return default
+    return int(valor)
+
+
+def _flag(settings: object, nome: str, default: bool) -> bool:
+    """Idem para flags booleanas."""
+    valor = getattr(settings, nome, default)
+    return default if not isinstance(valor, bool) else valor
+
+#: Superfícies em que a conversa é DO USUÁRIO: ele abre, ele troca (Novo chat,
+#: seletor de sessões) e nada mais mexe nisso. Prefixos porque o mesmo cliente
+#: aparece com sufixo (`neo-desktop`, `neo-desktop-tauri`). Ver
+#: ``PersistentSessionManager._is_user_owned_chat``.
+_CHAT_SERVICE_PREFIXES = ("neo-desktop", "desktop-chat", "neo-panel")
+
 # Quantas mensagens do assistente (as mais recentes) ganham a nota técnica —
 # só o turno imediatamente anterior importa pra continuidade de curto prazo
 # ("cade os arquivos?"); memória de longo prazo é papel do PKS, não daqui.
@@ -71,6 +100,14 @@ def _render_tool_trace_note(extra_metadata: dict[str, Any] | None) -> str | None
     return "\n".join(lines)[:_TOOL_TRACE_NOTE_MAX_CHARS]
 
 
+#: Texto já sem acento e em minúsculas (``_normalize_context_text``).
+_DEICTIC_FOLLOWUP_RE = re.compile(
+    r"\b(la|ali|de novo|novamente|outra vez|o mesmo|a mesma|"
+    r"(esse|este|aquele|o) arquivo|(essa|esta|aquela|nessa|naquela|a) pasta|"
+    r"tent[ae] (de novo|novamente|salvar|abrir|mandar|colocar|enviar|baixar|rodar|gravar|editar))\b"
+)
+
+
 class PersistentSessionManager:
     """Gerencia sessões com rotação automática e recuperação de contexto."""
 
@@ -103,15 +140,35 @@ class PersistentSessionManager:
     ) -> ConversationSession:
         """Obtém sessão ativa existente ou cria uma nova.
 
-        ``mode`` é o canal do turno (``"live"``, ``"agent"``, ...) e decide só o
-        relógio de inatividade — ver ``_is_expired``.
+        ``mode`` é o canal do turno (``"live"``, ``"agent"``, ...) e decide o que
+        acontece com uma sessão parada há tempo.
+
+        **No chat a sessão que o desktop pediu é a sessão que ele recebe.** Ela só
+        muda quando o USUÁRIO muda (Novo chat, seletor de sessões) — nem relógio
+        nem status fecham a porta. Antes de 2026-09-18 não era assim: o backstop de
+        inatividade (12h) forkava uma sessão nova, e pior, ``_is_expired`` devolve
+        ``True`` para QUALQUER sessão com ``status != "active"``, então uma sessão
+        fechada por outro caminho (o relógio de 30min do live num desvio por voz,
+        uma rotação de tópico) nunca chegava no ramo de reativação logo abaixo —
+        voltar a escrever nela sempre criava outra. Era isto que o usuário via como
+        "ele rotacionou a sessão sozinha depois de um tempo parado".
+
+        O resumo/embedding de tópico, que é o que o backstop existia para produzir
+        (alimenta a busca entre sessões), continua saindo: ``_refresh_topic_summary``
+        faz a parte útil do ``close_session`` sem encerrar nada.
+
+        No **live** o relógio curto continua valendo: lá uma pausa longa quer mesmo
+        dizer que a conversa acabou (e mantém ruído de teste de microfone fora das
+        sessões boas).
         """
         session: ConversationSession | None = None
 
         if session_id:
             session = await self.db.get_conversation_session(session_id)
             if session:
-                if self._is_expired(session, mode=mode):
+                if not self._is_user_owned_chat(service, mode) and self._is_expired(
+                    session, mode=mode
+                ):
                     logger.info(f"Sessão {session.id} expirada por inatividade")
                     await self.close_session(session.id, reason="inactivity")
                     session = await self.db.create_conversation_session(
@@ -128,12 +185,21 @@ class PersistentSessionManager:
                         session_id,
                     )
                     return session
-                # Found session — reactivate if it was closed
+
+                mudou = False
+                # Passou do backstop: arquiva o TÓPICO (resumo + embedding), não a
+                # conversa. É o que o `close_session` tinha de útil aqui.
+                if self._chat_backstop_due(session):
+                    mudou = await self._refresh_topic_summary(session)
+                # Sessão fechada por qualquer motivo volta a viver: o desktop pediu
+                # por ela nominalmente, então é nela que a conversa continua.
                 if session.status != "active":
                     logger.info(f"Reativando sessão {session.id} (status={session.status})")
                     session.status = "active"
                     session.ended_at = None
                     session.last_activity_at = datetime.utcnow()
+                    mudou = True
+                if mudou:
                     await self.db.update_session(session)
                 return session
             else:
@@ -183,6 +249,57 @@ class PersistentSessionManager:
         session.extra_metadata = {**(session.extra_metadata or {}), "close_reason": reason}
         await self.db.update_session(session)
         logger.info(f"Sessão {session_id} fechada (motivo={reason})")
+
+    @staticmethod
+    def _is_user_owned_chat(service: str | None, mode: str | None) -> bool:
+        """A sessão é do USUÁRIO neste canal — ele abre, ele troca, ninguém mais?
+
+        Vale para as superfícies de conversa (desktop, painel). NÃO vale para o
+        live, onde a pausa longa encerra mesmo, nem para canais automáticos como
+        a agenda/cron: um job diário que reusasse a MESMA sessão para sempre
+        acumularia meses de histórico dentro de um turno só.
+
+        Canal desconhecido cai no comportamento antigo (expira) de propósito.
+        """
+        if mode == "live":
+            return False
+        canal = (service or "").lower()
+        return canal.startswith(_CHAT_SERVICE_PREFIXES)
+
+    def _chat_backstop_due(self, session: ConversationSession) -> bool:
+        """A sessão está parada há mais que o backstop longo do chat?
+
+        Não decide mais se ela ACABA (no chat ela não acaba sozinha) — decide só
+        se vale regerar o resumo do tópico. ``0`` desliga.
+        """
+        minutes = self.settings.session_inactivity_chat_minutes
+        if minutes <= 0 or not session.last_activity_at:
+            return False
+        return session.last_activity_at < datetime.utcnow() - timedelta(minutes=minutes)
+
+    async def _refresh_topic_summary(self, session: ConversationSession) -> bool:
+        """Gera `topic_summary`/`topic_embedding` SEM encerrar a sessão.
+
+        É a metade do ``close_session`` que a memória entre sessões precisa. A
+        outra metade — fechar — é justamente o que o chat não quer: o usuário
+        volta horas depois e continua o mesmo assunto.
+
+        Devolve se algo mudou (o chamador é quem grava).
+        """
+        messages = await self.db.fetch_session_messages(session.id, limit=50)
+        if not messages or not self.embeddings.available:
+            return False
+        session.topic_summary = self._build_topic_summary(messages)
+        try:
+            session.topic_embedding = await self.embeddings.embed(session.topic_summary)
+        except Exception as e:
+            logger.warning(f"Falha ao gerar embedding do tópico: {e}")
+        session.extra_metadata = {
+            **(session.extra_metadata or {}),
+            "topic_summary_at": datetime.utcnow().isoformat(),
+        }
+        logger.info("Resumo de tópico regerado para a sessão %s (sem encerrá-la)", session.id)
+        return True
 
     # ---------------------------------------------------------------
     # Message management
@@ -240,6 +357,31 @@ class PersistentSessionManager:
         ):
             self._spawn_embedding_backfill(msg.id, content)
 
+        # Mensagem longa: indexar os pedaços também, sempre em background (o
+        # embedding de N pedaços custa CPU e não pode entrar no caminho da
+        # resposta). Vale para user e assistant: a pergunta longa também some
+        # da busca quando só os 256 primeiros tokens viram vetor.
+        #
+        # Tudo aqui é best-effort e envolto em try: indexação não pode derrubar
+        # o salvamento da mensagem, que é o caminho crítico do turno.
+        try:
+            if role in ("user", "assistant") and _flag(
+                self.settings, "embedding_chunk_enabled", True
+            ):
+                minimo = _int_setting(
+                    self.settings, "embedding_chunk_min_chars", 1000
+                )
+                if len(content or "") > minimo:
+                    task = asyncio.create_task(
+                        self.index_message_chunks(
+                            msg.id, session_id, user_id, content
+                        )
+                    )
+                    self._embedding_tasks.add(task)
+                    task.add_done_callback(self._embedding_tasks.discard)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Agendamento do chunking falhou: %s", e)
+
         return msg
 
     def _spawn_embedding_backfill(self, message_id: UUID, content: str) -> None:
@@ -257,81 +399,237 @@ class PersistentSessionManager:
         except Exception as e:  # noqa: BLE001 — embedding tardio nunca afeta o turno
             logger.warning("Embedding em background falhou (%s): %s", message_id, e)
 
+    async def index_message_chunks(
+        self,
+        message_id: UUID,
+        session_id: UUID,
+        user_id: UUID | None,
+        content: str,
+    ) -> int:
+        """Indexa os PEDAÇOS de uma mensagem longa.
+
+        O embedder local trunca em 256 tokens sem avisar, então o vetor da
+        linha só cobre a abertura de um texto longo. Cada pedaço cabe na
+        janela e ganha vetor próprio; `find_similar_messages` faz UNION dos
+        dois e devolve a mensagem. Best-effort: falhar aqui nunca afeta o
+        turno — no pior caso a busca fica como era antes.
+        """
+        st = self.settings
+        if not _flag(st, "embedding_chunk_enabled", True):
+            return 0
+        if not self.embeddings.available:
+            return 0
+        minimo = _int_setting(st, "embedding_chunk_min_chars", 1000)
+        if len(content or "") <= minimo:
+            return 0
+        try:
+            from core.memory.chunking import chunk_text
+
+            pedacos = chunk_text(
+                content,
+                size=_int_setting(st, "embedding_chunk_chars", 500),
+                overlap=_int_setting(st, "embedding_chunk_overlap", 250),
+            )
+            if len(pedacos) < 2:
+                return 0
+            vetores = await self.embeddings.embed_batch(pedacos)
+            pares = [
+                (p, v) for p, v in zip(pedacos, vetores) if v is not None
+            ]
+            gravados = await self.db.replace_message_chunks(
+                message_id, session_id, user_id, pares
+            )
+            logger.info(
+                "[EMBEDDING] %s pedaços indexados para a mensagem %s (%s chars)",
+                gravados, message_id, len(content),
+            )
+            return gravados
+        except Exception as e:  # noqa: BLE001 — nunca derruba o turno
+            logger.warning("Chunking falhou (%s): %s", message_id, e)
+            return 0
+
     async def get_history(
         self,
         session_id: UUID,
-        limit: int = 20,
-        max_tokens_budget: int = 3000,
+        limit: int | None = None,
+        max_tokens_budget: int | None = None,
         current_embedding: list[float] | None = None,
     ) -> list[dict[str, str]]:
         """Obtém histórico filtrado e com orçamento de tokens para o LLM.
 
         1. Busca as últimas `limit` mensagens (user/assistant, sem tool calls, >5 chars).
         2. Aplica orçamento de tokens: mantém mensagens mais recentes até atingir o limite.
-        3. Se a sessão tem >30 mensagens e um embedding está disponível,
-           busca top-K mensagens similares e mescla para dar contexto relevante.
+        3. Mensagem grande demais para o que sobrou do orçamento não corta mais a
+           conversa inteira: ela vira um MARCADOR de omissão e a varredura segue
+           para trás (ver `_apply_token_budget`).
+        4. Se um embedding da mensagem atual chegar, mescla por similaridade as
+           mensagens da própria sessão que não couberam na janela.
 
         Retorna lista de {role, content} (sem token_count — limpo para o LLM).
         """
+        limit = limit if limit is not None else self.settings.history_limit_messages
+        if max_tokens_budget is None:
+            max_tokens_budget = self.settings.history_max_tokens_budget
+
         raw_history = await self.db.fetch_session_history(session_id, limit=limit)
 
         if not raw_history:
             return []
 
-        # --- Token budget: keep most recent messages within budget ---
-        budgeted: list[dict[str, str]] = []
+        budgeted = self._apply_token_budget(raw_history, max_tokens_budget)
+
+        # --- Resgate semântico DENTRO da sessão ---
+        if current_embedding is not None:
+            budgeted = await self._merge_relevant_session_messages(
+                session_id=session_id,
+                budgeted=budgeted,
+                current_embedding=current_embedding,
+            )
+
+        return self._render_history(budgeted)
+
+    # ── Janela de histórico — orçamento e resgate ─────────────────────
+
+    def _count_tokens(self, msg: dict[str, Any]) -> int:
+        tc = msg.get("token_count", 0) or 0
+        if tc == 0 and self.token_counter:
+            tc = self.token_counter.count(msg.get("content") or "")
+        return tc
+
+    def _apply_token_budget(
+        self,
+        raw_history: list[dict[str, Any]],
+        max_tokens_budget: int,
+    ) -> list[dict[str, Any]]:
+        """Mantém as mensagens mais recentes que cabem no orçamento.
+
+        O `break` que existia aqui era o defeito central da sessão 7330e40c: ao
+        topar com uma mensagem maior que o orçamento restante, a varredura
+        PARAVA, e com ela ia embora todo o resto da conversa — não só a mensagem
+        grande. Com orçamento de 3.000 tokens e uma resposta de 3.982, isso
+        significava que o próprio texto que o usuário estava pedindo era
+        inalcançável para sempre, e o modelo, sem saber que havia um buraco,
+        concluía que a mensagem nunca existiu e improvisava.
+
+        Agora a mensagem que não cabe vira um marcador explícito e a varredura
+        continua para trás. O marcador custa ~40 tokens e faz duas coisas que o
+        silêncio não fazia: preserva o contexto mais antigo e AVISA o modelo de
+        que falta algo ali, com a instrução de buscar em vez de deduzir.
+        """
+        budgeted: list[dict[str, Any]] = []
         remaining = max_tokens_budget
-        # Walk backwards (most recent first) and accumulate
+        elisions = 0
+        max_elisions = self.settings.history_max_elisions
+
         for msg in reversed(raw_history):
-            tc = msg.get("token_count", 0) or 0
-            # Estimate if no token_count was saved
-            if tc == 0 and self.token_counter:
-                tc = self.token_counter.count(msg["content"])
-            if remaining - tc < 0 and budgeted:
-                # Budget exhausted — stop adding older messages
+            tc = self._count_tokens(msg)
+
+            if tc <= remaining:
+                remaining -= tc
+                budgeted.append(msg)
+                continue
+
+            if not budgeted:
+                # A mais recente entra mesmo estourando: um turno sem histórico
+                # nenhum é pior que um turno acima do orçamento.
+                budgeted.append(msg)
+                remaining = 0
+                continue
+
+            if elisions >= max_elisions:
                 break
-            remaining -= tc
-            budgeted.append(msg)
-        # Restore chronological order
+
+            elisions += 1
+            marker = self._elision_marker(msg, tc)
+            marker_cost = self._count_tokens(marker)
+            if marker_cost > remaining:
+                break
+            remaining -= marker_cost
+            budgeted.append(marker)
+
         budgeted.reverse()
+        return budgeted
 
-        # --- Embedding relevance: merge top-K similar for long sessions ---
-        if current_embedding is not None and self.embeddings.available:
-            try:
-                session = await self.db.get_conversation_session(session_id)
-                msg_count = session.message_count if session else 0
-            except Exception:
-                msg_count = 0
+    @staticmethod
+    def _elision_marker(msg: dict[str, Any], tokens: int) -> dict[str, Any]:
+        """Placeholder de uma mensagem que não coube — ver `_apply_token_budget`."""
+        quem = "sua" if msg.get("role") == "assistant" else "do usuário"
+        primeira_linha = (msg.get("content") or "").strip().splitlines()
+        titulo = primeira_linha[0][:80] if primeira_linha else ""
+        content = (
+            f"[mensagem {quem} de ~{tokens} tokens OMITIDA desta janela por tamanho"
+            + (f" — começava com “{titulo}…”" if titulo else "")
+            + ". O texto continua salvo na conversa. Se o usuário se referir a "
+            "ela, BUSQUE com `conversation_recall` — não deduza o conteúdo nem "
+            "substitua por um arquivo do disco.]"
+        )
+        return {"role": msg.get("role", "assistant"), "content": content, "token_count": 0}
 
-            if msg_count > 30:
-                try:
-                    similar = await self.db.fetch_similar_session_messages(
-                        session_id=session_id,
-                        embedding=current_embedding,
-                        limit=5,
-                        min_similarity=0.55,
-                    )
-                    # Deduplicate: don't add messages already in budgeted
-                    existing_contents = {m["content"] for m in budgeted}
-                    new_relevant = [
-                        s for s in similar if s["content"] not in existing_contents
-                    ]
-                    if new_relevant:
-                        # Prepend relevant old context before the recent history
-                        logger.info(
-                            f"[HISTORY] Merged {len(new_relevant)} relevant older messages "
-                            f"into context for session {session_id}"
-                        )
-                        budgeted = new_relevant + budgeted
-                except Exception as e:
-                    logger.warning(f"[HISTORY] Embedding relevance merge failed: {e}")
+    async def _merge_relevant_session_messages(
+        self,
+        session_id: UUID,
+        budgeted: list[dict[str, Any]],
+        current_embedding: list[float],
+    ) -> list[dict[str, Any]]:
+        """Traz de volta, por similaridade, o que não coube na janela.
 
-        # Strip token_count/extra_metadata before returning — LLM só recebe
-        # {role, content}. Antes de cortar, os últimos turnos do assistente
-        # ganham uma nota técnica (tools executadas, arquivos criados) anexada
-        # SÓ no content mandado pro LLM — o texto salvo no banco (o que o chat
-        # mostra) nunca é tocado, porque essa enriquização acontece aqui, não
-        # em add_message.
+        Este bloco existia e era CÓDIGO MORTO: ficava atrás de
+        ``if current_embedding is not None`` e o único chamador de produção
+        passava ``None`` cravado, porque o embedding da mensagem só nasce depois
+        do `add_message` que roda em paralelo com o `get_history`. Nunca rodou
+        uma vez em produção. Agora o `ai_service` faz um segundo passe depois
+        que o embedding existe, e o piso de tamanho da sessão caiu de >30 para
+        `history_semantic_merge_min_messages` — 30 mensagens é mais do que a
+        maioria das conversas tem quando já começou a perder contexto.
+        """
+        if not self.embeddings.available:
+            return budgeted
+
+        try:
+            session = await self.db.get_conversation_session(session_id)
+            msg_count = session.message_count if session else 0
+        except Exception:  # noqa: BLE001 — sem contagem, não arrisca o turno
+            return budgeted
+
+        if msg_count < self.settings.history_semantic_merge_min_messages:
+            return budgeted
+
+        limite = self.settings.history_semantic_merge_limit
+        if limite <= 0:
+            return budgeted
+
+        try:
+            similar = await self.db.fetch_similar_session_messages(
+                session_id=session_id,
+                embedding=current_embedding,
+                limit=limite,
+                min_similarity=self.settings.history_semantic_merge_min_similarity,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[HISTORY] Embedding relevance merge failed: {e}")
+            return budgeted
+
+        existing_contents = {m.get("content") for m in budgeted}
+        new_relevant = [
+            s for s in similar if s.get("content") not in existing_contents
+        ]
+        if not new_relevant:
+            return budgeted
+
+        logger.info(
+            "[HISTORY] Resgatadas %d mensagens antigas da sessão %s por similaridade",
+            len(new_relevant),
+            session_id,
+        )
+        return new_relevant + budgeted
+
+    def _render_history(self, budgeted: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Corta para {role, content} e anexa a nota técnica de tools.
+
+        A nota (tools executadas, arquivos criados) vai SÓ no content mandado
+        pro LLM — o texto salvo no banco, que é o que o chat mostra, nunca é
+        tocado, porque a enriquização acontece aqui e não em `add_message`.
+        """
         result: list[dict[str, str]] = []
         enriched = 0
         for m in reversed(budgeted):
@@ -353,11 +651,21 @@ class PersistentSessionManager:
         self,
         session: ConversationSession,
         new_message: str,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         """Detecta mudança de tópico via similaridade de embeddings.
 
-        Conservative approach: only rotate on extreme topic changes after a
-        significant number of messages AND a cooldown period.
+        **Só vale no live.** No chat a sessão é do usuário: ela troca quando ele
+        troca (Novo chat, seletor), e não quando um cosseno passa de 0,45. O
+        gatilho real era "parado há mais que o cooldown + mensagem que o
+        embedding achou diferente" — ou seja, exatamente voltar de uma pausa e
+        mudar de assunto, que num chat é o comportamento NORMAL, não o fim da
+        conversa. Rotacionar ali custava o histórico inteiro do follow-up
+        seguinte (f33632b4 → 9b0b10cc) e ainda arrastava junto o pendente do
+        gRPC. Ver [[neo-topic-rotation-hijack]].
+
+        Conservative approach (live): only rotate on extreme topic changes after
+        a significant number of messages AND a cooldown period.
 
         Returns a dict with rotation details:
             should_rotate (bool), similarity (float|None), threshold (float),
@@ -381,6 +689,13 @@ class PersistentSessionManager:
             "new_message": new_message,
             "duration_ms": 0,
         }
+
+        if self._is_user_owned_chat(session.service, mode):
+            base["reason"] = (
+                f"canal {session.service or 'chat'} — a sessão só muda quando o usuário muda"
+            )
+            base["duration_ms"] = (_time.monotonic() - t0) * 1000
+            return base
 
         if not self.embeddings.available:
             base["reason"] = "embeddings indisponíveis"
@@ -464,6 +779,7 @@ class PersistentSessionManager:
         message: str,
         user_id: UUID | None = None,
         service: str | None = None,
+        exclude_session_id: UUID | None = None,
     ) -> list[MemorySearchResult]:
         """Recupera contexto de sessões e mensagens anteriores.
 
@@ -474,6 +790,11 @@ class PersistentSessionManager:
         antigo era ``"neo-desktop"`` e nenhum chamador passava outro, enquanto o
         desktop grava as sessões como ``"neo-desktop-tauri"``: a memória entre
         sessões via 1,8% do corpus. Ver docs/conversation-recall-plan.md §2a.
+
+        ``exclude_session_id`` tira a conversa de AGORA do resultado — esta é a
+        camada de memória ENTRE conversas, e a de agora já vai inteira pelo
+        histórico. Sem isso a própria pergunta recém-salva casa consigo mesma e
+        ganha o primeiro lugar.
         """
         # Busca híbrida
         if self.hybrid_search:
@@ -483,18 +804,22 @@ class PersistentSessionManager:
                     user_id=user_id,
                     service=service,
                     limit=self.settings.session_history_recovery_limit,
+                    exclude_session_id=exclude_session_id,
                 )
             except Exception as e:
                 logger.warning(f"Busca híbrida falhou, usando fallback: {e}")
 
         # Fallback: busca vetorial pura
-        return await self._vector_only_recovery(message, user_id, service)
+        return await self._vector_only_recovery(
+            message, user_id, service, exclude_session_id,
+        )
 
     async def _vector_only_recovery(
         self,
         message: str,
         user_id: UUID | None,
         service: str | None,
+        exclude_session_id: UUID | None = None,
     ) -> list[MemorySearchResult]:
         """Fallback: recuperação por vetor puro (comportamento original)."""
         if not self.embeddings.available:
@@ -515,6 +840,8 @@ class PersistentSessionManager:
 
         results: list[MemorySearchResult] = []
         for session, similarity in similar_sessions:
+            if exclude_session_id is not None and session.id == exclude_session_id:
+                continue
             results.append(
                 MemorySearchResult(
                     content=session.topic_summary or "",
@@ -764,6 +1091,19 @@ class PersistentSessionManager:
                     "reason": "numeric_back_reference",
                 }
 
+        # Retomada que aponta para um LUGAR ou OBJETO da conversa, ou repete uma
+        # tentativa. Sessão f33632b4: "tenta salvar o arquivo lá agora", depois de 26
+        # min parado, deu similaridade 0,398 com a conversa sobre o arquivo — o
+        # embedding não enxerga "lá" nem "o arquivo" — e o pedido foi parar numa
+        # conversa sobre o clima. Custo de errar aqui é só não rotacionar.
+        if len(compact) <= 180 and _DEICTIC_FOLLOWUP_RE.search(compact):
+            return {
+                "is_context_dependent": True,
+                "kind": "deictic_followup",
+                "confidence": 0.8,
+                "reason": "deictic_or_retry_marker",
+            }
+
         return {
             "is_context_dependent": False,
             "kind": "standalone",
@@ -821,12 +1161,13 @@ class PersistentSessionManager:
     def _is_expired(self, session: ConversationSession, mode: str | None = None) -> bool:
         """Verifica se sessão expirou por inatividade.
 
-        O relógio depende do canal. No **live** (voz) uma pausa longa realmente
-        encerra a conversa, e cortar ali mantém o ruído de teste de microfone
-        fora das sessões boas. No **chat** a pausa não significa nada: você sai,
-        volta e continua o mesmo assunto — cortar ali decapita o follow-up, que
-        chega numa sessão em branco (foi o que engoliu "converte o preço da
-        ponte que eu tinha pedido", 3h27 depois da resposta que tinha o preço).
+        Depois de 2026-09-18 isto NÃO decide mais o destino de uma sessão pedida
+        por id no chat (ver ``get_or_create_session``): sobrou para o **live**,
+        onde uma pausa longa realmente encerra a conversa e cortar ali mantém o
+        ruído de teste de microfone fora das sessões boas, e para o ramo de
+        FALLBACK sem id — ali expirar é o que impede `get_active_session` de
+        ressuscitar uma conversa de dias atrás (foi assim que "tenta salvar o
+        arquivo lá agora" caiu dentro de uma conversa sobre o clima).
 
         ``mode=None`` (default) é tratado como chat de propósito: os caminhos de
         retomada de turno — tool_result, aprovação de comando — não carregam o

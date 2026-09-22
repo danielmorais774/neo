@@ -250,7 +250,7 @@ class PKSMemoryPlanner:
         """
         from shared.config import get_settings
 
-        fallback = getattr(get_settings(), "pks_planner_model", "deepseek-v4-flash")
+        fallback = getattr(get_settings(), "pks_planner_model", "deepseek-flash")
         try:
             from modules.model_config import get_model_config
 

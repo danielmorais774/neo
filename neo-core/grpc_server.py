@@ -25,6 +25,7 @@ from grpc import aio
 
 import neo_desktop_pb2
 import neo_desktop_pb2_grpc
+from core.liveness import TurnLiveness, bind_liveness
 from modules.desktop.ai_service import (
     AIService,
     AIServiceResponse,
@@ -33,6 +34,78 @@ from modules.desktop.ai_service import (
 from shared import IntentType
 
 logger = logging.getLogger(__name__)
+
+
+# Keepalive do turno. Enquanto um turno está em curso o desktop só recebe algo
+# quando há bolha nova, e um ffmpeg de 3 min ou um script longo não gera bolha
+# nenhuma — na sessão c4f3f7de o desktop desistiu aos 300s com o turno produzindo.
+# O keepalive é um CoreMessage VAZIO (sem `content`): o desktop o usa só como sinal
+# de vida, e o conversor de eventos dele (inclusive o de builds antigos) ignora
+# mensagem sem conteúdo. Só sai enquanto o turno teve progresso real
+# (core.liveness) nos últimos _STALL_WINDOW_S: turno travado fica mudo e o desktop
+# desiste pelo timeout de inatividade dele.
+_KEEPALIVE_INTERVAL_S = 15.0
+_STALL_WINDOW_S = 240.0
+_KEEPALIVE = neo_desktop_pb2.CoreMessage()
+_TURN_END = object()
+
+
+class _TurnFailure:
+    """Exceção do turno atravessando a fila até o handler."""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+async def with_keepalive(
+    responses: AsyncIterator[AIServiceResponse],
+    liveness: TurnLiveness,
+    *,
+    interval: float = _KEEPALIVE_INTERVAL_S,
+    stall_window: float = _STALL_WINDOW_S,
+) -> AsyncIterator[AIServiceResponse | None]:
+    """Repassa as respostas do turno, intercalando ``None`` = "mande um keepalive".
+
+    O turno roda numa task própria para o handler acordar a cada ``interval``
+    mesmo com o turno parado dentro de um await longo (tool no sandbox, LLM). Um
+    ``None`` só sai se o turno avançou nos últimos ``stall_window`` segundos. Se o
+    consumidor sair (cliente caiu, handler cancelado), a task do turno é cancelada
+    junto — como acontecia quando o gerador rodava no próprio handler.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _produce() -> None:
+        try:
+            async for item in responses:
+                queue.put_nowait(item)
+        except asyncio.CancelledError as exc:
+            queue.put_nowait(_TurnFailure(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001 — relançada no handler, que fecha o turno
+            queue.put_nowait(_TurnFailure(exc))
+        else:
+            queue.put_nowait(_TURN_END)
+
+    liveness.touch()
+    producer = asyncio.create_task(_produce())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                if liveness.idle_seconds() < stall_window:
+                    yield None
+                continue
+            if item is _TURN_END:
+                return
+            if isinstance(item, _TurnFailure):
+                raise item.exc
+            liveness.touch()
+            yield item
+    finally:
+        producer.cancel()
 
 
 class ConnectedDevicesRegistry:
@@ -183,6 +256,11 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         device_info: dict = {}
         stream_user_id: UUID | None = None  # last known user on this stream (for voice stamping)
         _connected_devices_local = _connected_devices  # local ref for finally block
+        # Sinal de vida deste stream: o sandbox e o stream do LLM tocam nele (via
+        # ContextVar, herdado pela task do turno) e o keepalive só sai enquanto ele
+        # estiver fresco. Ver with_keepalive.
+        liveness = TurnLiveness()
+        bind_liveness(liveness)
 
         try:
             async for desktop_msg in request_iterator:
@@ -245,27 +323,31 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                                     )
                                 )
 
-                    async for resp in self.ai_service.process_user_input(
+                    turn = self.ai_service.process_user_input(
                         user_message=msg,
                         session_id=sid_uuid,
                         user_id=uid_uuid,
                         service=metadata.get("client", "neo-desktop"),
                         metadata=metadata,
-                    ):
+                    )
+                    async for resp in with_keepalive(turn, liveness):
+                        if resp is None:
+                            yield _KEEPALIVE
+                            continue
                         await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
                         # Track pending flows
                         if self._is_pending_flow(resp):
-                            self._pending[session_id] = {**resp.metadata, "session_id": session_id}
+                            self._track_pending(session_id, resp, {**resp.metadata, "session_id": session_id})
 
                 elif desktop_msg.HasField("tool_result"):
                     tr = desktop_msg.tool_result
                     logger.info(f"[gRPC] TOOL_RESULT session={session_id}: {tr.tool_name} success={tr.success}")
-                    pending = self._pending.pop(session_id, {})
+                    pending = self._take_pending(session_id)
 
-                    async for resp in self.ai_service.process_tool_result(
+                    turn = self.ai_service.process_tool_result(
                         session_id=sid_uuid,
                         tool_name=tr.tool_name,
                         tool_call_id=tr.tool_call_id,
@@ -279,34 +361,42 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         _is_diagnostic=pending.get("_is_diagnostic", False),
                         _followup_count=pending.get("_followup_count", 0),
                         _has_plan=pending.get("_has_plan", False),
-                    ):
+                    )
+                    async for resp in with_keepalive(turn, liveness):
+                        if resp is None:
+                            yield _KEEPALIVE
+                            continue
                         await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
                         # Re-track pending metadata for retry flows (new tool_request/command_request)
                         if self._is_pending_flow(resp):
-                            self._pending[session_id] = {**resp.metadata, "session_id": session_id}
+                            self._track_pending(session_id, resp, {**resp.metadata, "session_id": session_id})
 
                 elif desktop_msg.HasField("command_approval"):
                     ca = desktop_msg.command_approval
                     logger.info(f"[gRPC] COMMAND_APPROVAL session={session_id}: approved={ca.approved}")
                     pending = self._pending.get(session_id, {})
 
-                    async for resp in self.ai_service.process_command_approval(
+                    turn = self.ai_service.process_command_approval(
                         session_id=sid_uuid,
                         command_id=ca.command_id,
                         approved=ca.approved,
                         command=pending.get("command", ""),
                         user_message=pending.get("user_message", ""),
-                    ):
+                    )
+                    async for resp in with_keepalive(turn, liveness):
+                        if resp is None:
+                            yield _KEEPALIVE
+                            continue
                         await self._stamp_voice(resp, stream_user_id)
                         core_msg = self._to_core_message(session_id, resp)
                         if core_msg:
                             yield core_msg
                         # Track tool_call_id for subsequent tool_result
                         if resp.metadata and resp.tool_request:
-                            self._pending[session_id] = {**pending, **resp.metadata}
+                            self._track_pending(session_id, resp, {**pending, **resp.metadata})
 
                 
         except asyncio.CancelledError:
@@ -334,7 +424,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
             # If a client-tool flow was still awaiting the desktop when the stream
             # ended (disconnect/crash), close the turn gracefully so it does not
             # dangle as "Executando" — event-driven, no time limit.
-            pending = self._pending.pop(session_id, None) if session_id else None
+            pending = self._take_pending(session_id) if session_id else None
             if pending and pending.get("flow") in ("client_tool", "client_command"):
                 self._close_incomplete_tool_turn(pending)
             # Mark device offline when stream ends — this fires on graceful disconnect
@@ -346,6 +436,28 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         self.ai_service.db.mark_device_offline(device_id)
                     )
                 logger.info(f"[Devices] Stream ended, marked offline: {device_id}")
+
+    def _track_pending(self, desktop_sid: str | None, resp: AIServiceResponse, data: dict) -> None:
+        """Guarda o fluxo pendente pelo id que o desktop mandou E pelo da sessão real.
+
+        Na rotação de tópico a resposta sai com o id da sessão NOVA, o desktop adota
+        esse id e manda a aprovação/o resultado com ele — enquanto o pendente estava
+        guardado pelo antigo. Sessão f33632b4→9b0b10cc: a aprovação do `ls` chegou
+        sem comando, o desktop respondeu "comando ausente" e o cérebro concluiu que
+        a pasta não existia. O mesmo dicionário fica nas duas chaves.
+        """
+        chaves = {desktop_sid, str(resp.session_id) if resp.session_id else None} - {None, ""}
+        for chave in chaves:
+            self._pending[chave] = data
+
+    def _take_pending(self, sid: str | None) -> dict:
+        """Tira o pendente de ``sid`` e das outras chaves que apontam para ele."""
+        dado = self._pending.pop(sid, None) if sid else None
+        if dado is None:
+            return {}
+        for chave in [k for k, v in self._pending.items() if v is dado]:
+            self._pending.pop(chave, None)
+        return dado
 
     @staticmethod
     def _is_pending_flow(resp: AIServiceResponse) -> bool:

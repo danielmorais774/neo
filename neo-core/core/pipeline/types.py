@@ -108,3 +108,9 @@ class StepOutcome:
     # the next self-continuation so the cycle builds on real results instead of
     # retrying blind. Built from execution facts, never from the model's promises.
     work_note: str | None = None
+    # O step ESTACIONOU no cliente: emitiu um tool_request/command_request e o
+    # trabalho de verdade só acontece quando o desktop devolver o resultado, por
+    # outra entrada (`process_tool_result`). O step "terminou" do ponto de vista
+    # do gerador, mas não fez nada ainda — quem tratar isso como passo concluído
+    # despacha o próximo em cima de um resultado que não existe.
+    parked: bool = False

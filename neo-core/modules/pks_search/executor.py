@@ -55,6 +55,9 @@ class PKSSearchExecutor:
                 "name": r.get("name"),
                 "entity_type": r.get("entity_type"),
                 "properties": r.get("properties"),
+                # As ligações (os exercícios de um treino, os membros de um plano).
+                # Sem elas a ferramenta negava o que estava no prompt.
+                "relations": r.get("relations") or [],
                 "score": r.get("score"),
                 "matched_by": r.get("matched_by"),
             }

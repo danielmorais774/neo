@@ -222,6 +222,8 @@ class ClaudeProvider(LLMProvider):
                 }
                 if param.enum:
                     properties[param_name]["enum"] = param.enum
+                if param.items:
+                    properties[param_name]["items"] = param.items
 
                 if param.required:
                     required.append(param_name)

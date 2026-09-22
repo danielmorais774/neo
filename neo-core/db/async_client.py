@@ -294,10 +294,13 @@ class AsyncPostgresClient:
                         UPDATE conversation_session
                         SET status = :status,
                             topic_summary = :topic_summary,
-                            topic_embedding = CASE
-                                WHEN :topic_embedding IS NULL THEN NULL
-                                ELSE CAST(:topic_embedding AS vector)
-                            END,
+                            -- O CAST para text tipa o parâmetro: o antigo
+                            -- `CASE WHEN <param> IS NULL` deixava $3 sem tipo e o
+                            -- asyncpg recusava preparar (AmbiguousParameterError).
+                            -- Esse ramo só roda desde que a coluna virou vector
+                            -- (migration a0b1c2d3e4f5, 2026-09-19). CAST(NULL)
+                            -- continua NULL, então o CASE nem é preciso.
+                            topic_embedding = CAST(CAST(:topic_embedding AS text) AS vector),
                             last_activity_at = :last_activity_at,
                             ended_at = :ended_at,
                             session_metadata = CAST(:session_metadata AS jsonb)
@@ -344,6 +347,22 @@ class AsyncPostgresClient:
                     params,
                 )
             await db.commit()
+
+    async def _topic_embedding_vector_expr(self, db: AsyncSession) -> str | None:
+        """Expressão SQL que entrega `topic_embedding` como `vector`.
+
+        `None` quando a coluna tem um tipo do qual não dá para extrair um vetor
+        — aí a busca por sessão é desligada em voz alta, em vez de devolver
+        vazio como se o arquivo estivesse limpo.
+        """
+        tipo = await self._get_topic_embedding_column_type(db)
+        if tipo == "vector":
+            return "topic_embedding"
+        if tipo == "bytea":
+            # O caminho de escrita grava `json.dumps(vetor).encode("utf-8")`,
+            # que é o literal textual que o pgvector aceita.
+            return "convert_from(topic_embedding, 'UTF8')::vector"
+        return None
 
     async def _get_topic_embedding_column_type(self, db: AsyncSession) -> str:
         if self._topic_embedding_column_type:
@@ -402,10 +421,25 @@ class AsyncPostgresClient:
         """
         async with self.get_session() as db:
             try:
-                from pgvector.sqlalchemy import Vector
                 from sqlalchemy import text
 
-                # Use pgvector cosine similarity operator
+                # A coluna nem sempre é `vector`: em produção ela nasceu `bytea`
+                # (tabela criada fora do alembic). Esta query cravava
+                # `topic_embedding <=> CAST(... AS vector)` e morria com
+                # "operator does not exist: bytea <=> vector" — sempre, em
+                # silêncio, por causa do `except` lá embaixo. O mesmo detector
+                # que o `update_session` usa para ESCREVER agora decide como LER.
+                # A migration a0b1c2d3e4f5 converte a coluna; este ramo existe
+                # para o código ficar certo antes e depois dela.
+                coluna = await self._topic_embedding_vector_expr(db)
+                if coluna is None:
+                    logger.error(
+                        "[DB] conversation_session.topic_embedding tem tipo '%s': "
+                        "busca por sessão desabilitada (rode `alembic upgrade head`)",
+                        self._topic_embedding_column_type,
+                    )
+                    return []
+
                 params = {
                     "embedding": str(embedding),
                     "limit": limit,
@@ -422,14 +456,14 @@ class AsyncPostgresClient:
 
                 query = text(f"""
                     SELECT id, topic_summary,
-                           1 - (topic_embedding <=> CAST(:embedding AS vector)) as similarity
+                           1 - ({coluna} <=> CAST(:embedding AS vector)) as similarity
                     FROM conversation_session
                     WHERE status = 'closed'
                       AND topic_embedding IS NOT NULL
                       {service_filter}
                       {user_filter}
-                      AND 1 - (topic_embedding <=> CAST(:embedding AS vector)) > :min_sim
-                    ORDER BY topic_embedding <=> CAST(:embedding AS vector)
+                      AND 1 - ({coluna} <=> CAST(:embedding AS vector)) > :min_sim
+                    ORDER BY {coluna} <=> CAST(:embedding AS vector)
                     LIMIT :limit
                 """)
                 result = await db.execute(query, params)
@@ -443,7 +477,19 @@ class AsyncPostgresClient:
                         sessions.append((sess, float(row[2])))
                 return sessions
             except Exception as e:
-                logger.warning(f"pgvector search failed (extension may not be installed): {e}")
+                # O tipo da coluna fica em cache no processo. Se a migration
+                # a0b1c2d3e4f5 rodar com o neo-core de pé, o cache aponta para o
+                # tipo ANTIGO e a query quebra — invalidar aqui faz a próxima
+                # chamada se curar sozinha, sem depender de restart.
+                self._topic_embedding_column_type = None
+                # ERROR, não warning: por meses isto devolveu [] com um warning
+                # que parecia "pgvector não instalado" e ninguém olhou. Busca de
+                # memória que falha calada vira "não temos nada registrado".
+                logger.error(
+                    "[DB] find_similar_sessions falhou (%s) — busca por sessão "
+                    "devolvendo vazio; tipo da coluna será redetectado", e,
+                    exc_info=True,
+                )
                 return []
 
     async def fetch_recent_sessions(
@@ -505,16 +551,36 @@ class AsyncPostgresClient:
                     user_filter = "AND cm.user_id = :user_id"
                     params["user_id"] = str(user_id)
 
+                # UNION com os PEDAÇOS: o embedder local trunca em 256
+                # tokens, então o vetor da linha só representa a abertura de
+                # uma mensagem longa. O pedaço casa e a MENSAGEM é devolvida —
+                # assinatura e retorno seguem idênticos, nada a jusante muda.
+                chunk_user_filter = user_filter.replace("cm.", "cmc.")
                 query = text(f"""
-                    SELECT cm.id,
-                           1 - (cm.embedding <=> CAST(:embedding AS vector)) AS similarity
-                    FROM conversation_message cm
-                    JOIN conversation_session cs ON cs.id = cm.session_id
-                    WHERE cm.embedding IS NOT NULL
-                      {service_filter}
-                      {user_filter}
-                      AND 1 - (cm.embedding <=> CAST(:embedding AS vector)) > :min_sim
-                    ORDER BY cm.embedding <=> CAST(:embedding AS vector)
+                    WITH ranked AS (
+                        SELECT cm.id AS id,
+                               1 - (cm.embedding <=> CAST(:embedding AS vector))
+                                   AS similarity
+                        FROM conversation_message cm
+                        JOIN conversation_session cs ON cs.id = cm.session_id
+                        WHERE cm.embedding IS NOT NULL
+                          {service_filter}
+                          {user_filter}
+                        UNION ALL
+                        SELECT cmc.message_id AS id,
+                               1 - (cmc.embedding <=> CAST(:embedding AS vector))
+                                   AS similarity
+                        FROM conversation_message_chunk cmc
+                        JOIN conversation_session cs ON cs.id = cmc.session_id
+                        WHERE cmc.embedding IS NOT NULL
+                          {service_filter}
+                          {chunk_user_filter}
+                    )
+                    SELECT id, max(similarity) AS similarity
+                    FROM ranked
+                    GROUP BY id
+                    HAVING max(similarity) > :min_sim
+                    ORDER BY similarity DESC
                     LIMIT :limit
                 """)
                 result = await db.execute(query, params)
@@ -625,6 +691,50 @@ class AsyncPostgresClient:
                 {"emb": str(embedding), "id": str(message_id)},
             )
             await db.commit()
+
+    async def replace_message_chunks(
+        self,
+        message_id: UUID,
+        session_id: UUID,
+        user_id: UUID | None,
+        chunks: list[tuple[str, list[float]]],
+    ) -> int:
+        """Regrava os pedaços embeddados de uma mensagem (idempotente).
+
+        Apaga e reinsere: reindexar a mesma mensagem duas vezes não pode
+        duplicar pedaço nem deixar sobra de uma fatiagem anterior com outro
+        tamanho. Ver ConversationMessageChunk.
+        """
+        if not chunks:
+            return 0
+        from uuid import uuid4
+
+        async with self.get_session() as db:
+            await db.execute(
+                text("DELETE FROM conversation_message_chunk WHERE message_id = :mid"),
+                {"mid": str(message_id)},
+            )
+            for idx, (conteudo, emb) in enumerate(chunks):
+                await db.execute(
+                    text("""
+                        INSERT INTO conversation_message_chunk
+                            (id, message_id, session_id, user_id, chunk_index,
+                             content, embedding, created_at)
+                        VALUES (:id, :mid, :sid, :uid, :idx, :content,
+                                CAST(:emb AS vector), now() AT TIME ZONE 'utc')
+                    """),
+                    {
+                        "id": str(uuid4()),
+                        "mid": str(message_id),
+                        "sid": str(session_id),
+                        "uid": str(user_id) if user_id else None,
+                        "idx": idx,
+                        "content": conteudo,
+                        "emb": str(emb),
+                    },
+                )
+            await db.commit()
+        return len(chunks)
 
     async def save_message(
         self,
@@ -1878,6 +1988,144 @@ class AsyncPostgresClient:
                 .order_by(AgentJob.finished_at.asc())
             )
             return list((await db.execute(stmt)).scalars().all())
+
+    # ---------------------------------------------------------------
+    # ScheduledTask CRUD (agenda — docs/scheduler-plan.md §4)
+    # ---------------------------------------------------------------
+
+    async def create_scheduled_task(self, task: "ScheduledTask") -> "ScheduledTask":
+        from db.models.scheduled_task import ScheduledTask  # noqa: F401
+
+        async with self.get_session() as db:
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+        return task
+
+    async def get_scheduled_task(self, task_id: UUID) -> "ScheduledTask | None":
+        from db.models.scheduled_task import ScheduledTask
+
+        async with self.get_session() as db:
+            return await db.get(ScheduledTask, task_id)
+
+    async def list_scheduled_tasks(
+        self,
+        user_id: UUID | None = None,
+        *,
+        enabled_only: bool = False,
+        limit: int = 200,
+    ) -> list["ScheduledTask"]:
+        from db.models.scheduled_task import ScheduledTask
+
+        async with self.get_session() as db:
+            stmt = select(ScheduledTask)
+            if user_id is not None:
+                stmt = stmt.where(ScheduledTask.user_id == user_id)
+            if enabled_only:
+                stmt = stmt.where(ScheduledTask.enabled.is_(True))
+            stmt = stmt.order_by(ScheduledTask.created_at.desc()).limit(limit)
+            return list((await db.execute(stmt)).scalars().all())
+
+    async def update_scheduled_task(self, task_id: UUID, **fields) -> "ScheduledTask | None":
+        """Patch de colunas. Campos JSON são SUBSTITUÍDOS (nunca mesclados)."""
+        from datetime import datetime
+
+        from db.models.scheduled_task import ScheduledTask
+
+        async with self.get_session() as db:
+            task = await db.get(ScheduledTask, task_id)
+            if task is None:
+                return None
+            for key, value in fields.items():
+                setattr(task, key, value)
+            task.updated_at = datetime.utcnow()
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+    async def delete_scheduled_task(self, task_id: UUID) -> bool:
+        from db.models.scheduled_task import ScheduledTask
+
+        async with self.get_session() as db:
+            task = await db.get(ScheduledTask, task_id)
+            if task is None:
+                return False
+            await db.delete(task)
+            await db.commit()
+            return True
+
+    async def claim_due_scheduled_tasks(self, limit: int = 20) -> list["ScheduledTask"]:
+        """Reivindica tarefas vencidas — o claim é o MESMO truque do agent_job.
+
+        Empurrar ``next_run_at`` para longe (sentinela) dentro de um UPDATE
+        guardado no valor antigo é o que torna o claim atômico: duas voltas do
+        tick (ou dois processos) nunca disparam a mesma tarefa duas vezes. Quem
+        recalcula o próximo horário de verdade é o tick, logo depois — e o
+        valor devolvido aqui ainda carrega o ``next_run_at`` ORIGINAL, porque é
+        dele que sai a decisão de misfire (§7.3).
+        """
+        from datetime import datetime, timedelta
+
+        from db.models.scheduled_task import ScheduledTask
+
+        if limit <= 0:
+            return []
+        now = datetime.utcnow()
+        # Sentinela: longe o bastante para não disparar de novo, perto o
+        # bastante para um bug ficar visível em vez de sumir para 2099.
+        sentinel = now + timedelta(days=3650)
+
+        async with self.get_session() as db:
+            stmt = (
+                select(ScheduledTask.id, ScheduledTask.next_run_at)
+                .where(ScheduledTask.enabled.is_(True))
+                .where(ScheduledTask.next_run_at.is_not(None))
+                .where(ScheduledTask.next_run_at <= now)
+                .order_by(ScheduledTask.next_run_at.asc())
+                .limit(limit)
+            )
+            candidates = list((await db.execute(stmt)).all())
+
+        claimed: list["ScheduledTask"] = []
+        for task_id, due_at in candidates:
+            async with self.get_session() as db:
+                upd = (
+                    update(ScheduledTask)
+                    .where(ScheduledTask.id == task_id)
+                    .where(ScheduledTask.next_run_at == due_at)
+                    .values(next_run_at=sentinel)
+                )
+                result = await db.execute(upd)
+                await db.commit()
+                if not result.rowcount:
+                    continue
+                task = await db.get(ScheduledTask, task_id)
+                if task is not None:
+                    # O chamador precisa do horário que VENCEU, não da sentinela.
+                    task.next_run_at = due_at
+                    claimed.append(task)
+        return claimed
+
+    async def list_jobs_of_scheduled_task(
+        self, task_id: UUID, *, limit: int = 30
+    ) -> list["AgentJob"]:
+        """Histórico de disparos de uma tarefa.
+
+        O filtro é em Python de propósito: ``agent_job.extra_metadata`` é ``JSON``
+        (não ``JSONB``), e um ``->>`` portátil aqui custaria um cast frágil por
+        dialeto. O recorte por ``kind`` já deixa o conjunto pequeno.
+        """
+        async with self.get_session() as db:
+            stmt = (
+                select(AgentJob)
+                .where(AgentJob.kind.in_(["scheduled_prompt", "scheduled_tool", "scheduled_notify", "scheduled_job"]))
+                .order_by(AgentJob.created_at.desc())
+                .limit(400)
+            )
+            rows = list((await db.execute(stmt)).scalars().all())
+        alvo = str(task_id)
+        return [j for j in rows if str((j.extra_metadata or {}).get("scheduled_task_id")) == alvo][:limit]
 
     # ---------------------------------------------------------------
     # ResearchTask CRUD (deep_research — docs/web-search-deep-research-plan.md)

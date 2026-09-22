@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, spotify, skills, research, files, connections, datasets, events
+from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -252,6 +252,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # neo_bash_background/job_* dispatch through a per-request JobToolExecutor,
         # not the global one. The manager loop is started later (after the dispatcher
         # is wired), so boot-reconcile notifications can be delivered.
+        if settings.neo_scheduler_enabled:
+            # Agenda (docs/scheduler-plan.md): as tools entram no registry para
+            # aparecerem no catálogo, mas quem as EXECUTA é o seam por-request
+            # (_with_schedule_tools) — igual às job tools. O prefixo `schedule_`
+            # já está na lista gated do intent_router: só o cognitivo aciona.
+            from core.scheduler import SCHEDULE_TOOLS
+
+            _tool_registry.register_many(SCHEDULE_TOOLS)
+            print(f"✅ Agenda: {len(SCHEDULE_TOOLS)} tools schedule_* registradas")
+
         if settings.jobs_enabled:
             from core.jobs import JOB_TOOLS, JobManager, build_research_runner
 
@@ -339,6 +349,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
                 _download_watch_runner = build_download_watch_runner(db=_db)
                 print("✅ Download watch runner wired")
+            # Leitura delegada (docs/deep-read-plan.md): subagentes leem documentos
+            # no sandbox e escrevem notas + síntese fora do contexto do cérebro.
+            _deep_read_runner = None
+            if settings.deep_read_enabled and _workbench_sandbox is not None:
+                from core.jobs import build_deep_read_runner
+
+                _deep_read_runner = build_deep_read_runner(
+                    db=_db,
+                    llm_router=_llm_router,
+                    sandbox=_workbench_sandbox,
+                    # Getters: File Store e caderno nascem mais abaixo neste boot.
+                    get_file_store=lambda: getattr(app.state, "file_store", None),
+                    get_working_memory=lambda: getattr(app.state, "working_memory", None),
+                    timeout_s=settings.deep_read_timeout,
+                    doc_concurrency=settings.deep_read_doc_concurrency,
+                    llm_concurrency=settings.deep_read_llm_concurrency,
+                    chunk_chars=settings.deep_read_chunk_chars,
+                    max_parts_per_doc=settings.deep_read_max_parts_per_doc,
+                )
+                print("✅ Deep read runner wired (leitura delegada de documentos)")
             _job_manager = JobManager(
                 db=_db,
                 sandbox=_workbench_sandbox,
@@ -350,6 +380,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 browser_runner=_browser_runner,
                 browser_local_runner=_browser_local_runner,
                 download_watch_runner=_download_watch_runner,
+                deep_read_runner=_deep_read_runner,
             )
             app.state.job_manager = _job_manager
             print("✅ JobManager created (background jobs)")
@@ -681,6 +712,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             _event_router = None
     events.set_dependencies(_event_registry, _event_router, db=_db)
 
+    # ── Agenda (docs/scheduler-plan.md) ────────────────────────────
+    # O serviço nasce antes do AIService porque é ele quem entra no toolset do
+    # cognitivo; o tick e o runner vêm depois, quando o AIService já existe (o
+    # turno agendado precisa dele).
+    _schedule_service = None
+    _scheduler_tick = None
+    if settings.neo_scheduler_enabled:
+        from core.scheduler import ScheduleService
+
+        _schedule_service = ScheduleService(db=_db, job_manager=_job_manager)
+        print("✅ Agenda: ScheduleService criado")
+
     _ai_service = AIService(
         llm_router=_llm_router,
         intent_router=intent_router,
@@ -702,6 +745,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Identidade: com uma caixa cadastrada, o Neo sabe o próprio email sem
         # precisar chamar tool para descobrir (ver _neo_identity_block).
         credential_store=_cred_store,
+        # Agenda: None com a flag off — as tools schedule_* nem entram no toolset.
+        schedule_service=_schedule_service,
     )
     # Panel /context/prompt-preview reproduces the real turn's prompt assembly
     # (classify → recover_context → register → build_prompt) read-only.
@@ -737,6 +782,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _job_manager.start()
         print("✅ JobManager started (dispatcher wired)")
 
+    # ── Agenda: runner dos disparos + o relógio ────────────────────
+    # O runner precisa do AIService (turno agendado) e o JobManager precisa do
+    # runner — por isso a injeção é aqui, e não na construção.
+    if _schedule_service is not None:
+        from core.scheduler import SchedulerTick, build_scheduled_runner
+
+        if _job_manager is not None:
+            _job_manager.set_scheduled_runner(
+                build_scheduled_runner(db=_db, service=_schedule_service, ai_service=_ai_service)
+            )
+            _schedule_service.job_manager = _job_manager
+        else:
+            print("⚠️ Agenda ligada sem JobManager: os disparos ficam na fila sem rodar")
+        _scheduler_tick = SchedulerTick(
+            db=_db,
+            service=_schedule_service,
+            ai_service=_ai_service,
+            tick_interval=settings.scheduler_tick_interval,
+            enabled=True,
+        )
+        await _scheduler_tick.start()
+        schedules.set_dependencies(
+            _schedule_service, _scheduler_tick, db=_db, registry=_tool_registry
+        )
+        app.state.scheduler_tick = _scheduler_tick
+        print("✅ Agenda pronta (SchedulerTick rodando)")
+
     # Wire skill executor into webhook route
     from api.routes.whatsapp import set_dependencies as set_whatsapp_deps
     set_whatsapp_deps(_db, _skill_executor)
@@ -765,6 +837,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Wire voice (TTS) config route (neo-panel → Settings page)
     voice_config.set_dependencies(_db)
+    file_edit_config.set_dependencies(_db)
 
     # Wire Spotify OAuth route (neo-panel → Music page)
     spotify.set_dependencies(_db)
@@ -819,6 +892,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ──────────────────────────────────────────────────
     print("🛑 Shutting down Neo Core 2...")
+
+    if _scheduler_tick is not None:
+        try:
+            await _scheduler_tick.stop()
+            print("✅ SchedulerTick stopped")
+        except Exception as e:
+            print(f"⚠️ SchedulerTick stop error: {e}")
 
     if _job_manager is not None:
         try:
@@ -910,9 +990,11 @@ app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(requ
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(file_edit_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(datasets.install_router)
 app.include_router(datasets.router)
 app.include_router(events.router)
+app.include_router(schedules.router)
 app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
 # identity is bound via a signed `state`. See api/routes/spotify.py.

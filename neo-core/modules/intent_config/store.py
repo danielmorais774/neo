@@ -24,7 +24,7 @@ PREF_KEY = "classifier"
 # What the router used before this was configurable — also the safe fallback.
 DEFAULT_CLASSIFIER: dict[str, str] = {
     "provider": "deepseek",
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-flash",
 }
 
 # Every provider the LLMRouter knows how to build (see ProviderType in router.py).
@@ -35,7 +35,7 @@ KNOWN_PROVIDERS: tuple[str, ...] = (
 # A sensible fast/cheap model per provider for classification, used to prefill the
 # UI and to repair a provider switch that didn't specify a model.
 SUGGESTED_MODEL: dict[str, str] = {
-    "deepseek": "deepseek-v4-flash",
+    "deepseek": "deepseek-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.1-8b-instant",
     "gemini": "gemini-2.0-flash-lite",

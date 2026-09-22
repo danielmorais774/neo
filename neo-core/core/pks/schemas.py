@@ -30,6 +30,8 @@ class EntityRecord(BaseModel):
     confidence: float = 1.0
     sensitivity: str = "private"
     last_used_at: datetime | None = None
+    #: Desempate fraco do ranking (core/pks/ranking.py) — nunca ordem principal.
+    updated_at: datetime | None = None
 
 
 class FieldRecord(BaseModel):

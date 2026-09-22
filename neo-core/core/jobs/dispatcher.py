@@ -31,6 +31,17 @@ _COMPOSE_SYSTEM = (
     "tom de sempre, dizendo o que aconteceu e o resultado essencial. Não use "
     "markdown pesado nem cole saídas cruas gigantes; resuma. Se falhou, diga de "
     "forma direta e, se der, o motivo. Não invente dados que não estão no resultado."
+    # Sem o nome do usuário no contexto, o modelo preenche o vocativo com o
+    # genérico: "Fala, usuário." (job 36a81dd6). Vocativo aqui não serve para
+    # nada — é aviso de tarefa, não início de conversa —, então é mais barato
+    # proibir do que plumbar o nome até aqui.
+    "\nComece pelo fato, sem vocativo e sem cumprimento: nada de "
+    "\"Fala\", \"Oi\", \"E aí\" nem de chamar o usuário de \"usuário\"."
+    # O resumo do job pode trazer uma instrução do runner sobre o próximo passo
+    # (ex.: bloqueio por origem → perguntar sobre o navegador local). Ela é
+    # dirigida ao Neo e precisa CHEGAR ao usuário como pergunta.
+    "\nSe o resultado disser para perguntar algo ao usuário, faça essa pergunta "
+    "na mensagem, em uma frase, junto do motivo."
 )
 
 
@@ -73,12 +84,16 @@ class ProactiveDispatcher:
         # 1. Persiste na história da sessão de origem (se houver).
         if job.session_id is not None:
             try:
+                metadados = {"source": "agent_job", "job_id": str(job.id), "kind": job.kind}
+                if (job.extra_metadata or {}).get("files"):
+                    # Mesmo formato do turno normal (`_msg_metadata["files"]`).
+                    metadados["files"] = job.extra_metadata["files"]
                 await self.db.save_message(
                     session_id=job.session_id,
                     role="assistant",
                     content=text,
                     user_id=job.user_id,
-                    metadata={"source": "agent_job", "job_id": str(job.id), "kind": job.kind},
+                    metadata=metadados,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("[Dispatch] persist failed for job %s: %s", job.id, e)
@@ -186,6 +201,13 @@ class ProactiveDispatcher:
 
     async def _compose(self, job: AgentJob) -> str:
         """Redige a mensagem do usuário a partir do resultado do job."""
+        # Texto já pronto (agenda): entrega como está. Um alerta de texto fixo
+        # reescrito pelo redator vira paráfrase — e a resposta de um turno
+        # cognitivo agendado JÁ saiu com a persona certa; passá-la de novo por um
+        # modelo menor só a encurta e a piora. Ver docs/scheduler-plan.md §5.
+        literal = str((job.extra_metadata or {}).get("texto_literal") or "").strip()
+        if literal:
+            return literal
         summary = (job.result_summary or "").strip()
         fallback = self._fallback_text(job, summary)
         if self.llm is None:
@@ -221,7 +243,19 @@ class ProactiveDispatcher:
                 messages=messages,
                 model=self.default_model,
                 temperature=0.6,
-                max_tokens=400,
+                # O reasoning vem LIGADO por padrão no OpenRouter e consome o
+                # orçamento antes de sobrar conteúdo. Este era o único caminho
+                # de LLM do sistema sem `disable_thinking` — e o efeito não é
+                # resposta vazia, é resposta CORTADA no meio da palavra, que
+                # chega ao usuário parecendo bug de outra coisa. Job 36a81dd6:
+                # "Fala, usuário. A tarefa ... falhou — o navegador est".
+                # Medido em 8 chamadas iguais: 1 truncou com finish=length e
+                # 382 dos 400 tokens gastos em reasoning; com o reasoning
+                # desligado, 8/8 limpas e 0 tokens de reasoning.
+                # A folga de tokens é a segunda linha de defesa, para o caso de
+                # algum provider ignorar a intenção.
+                max_tokens=700,
+                disable_thinking=True,
             )
             text = (resp.get_content() or "").strip()
             return text or fallback
@@ -291,6 +325,15 @@ class ProactiveDispatcher:
             "kind_detail": job.kind,
             "status": job.status,
         }
+        arquivos = [
+            {"id": str(f.get("file_id") or f.get("id")), "name": f.get("name"), "sizeBytes": f.get("size_bytes") or 0}
+            for f in ((job.extra_metadata or {}).get("files") or [])
+            if isinstance(f, dict) and (f.get("file_id") or f.get("id"))
+        ]
+        if arquivos:
+            # A bolha do desktop desenha o botão a partir disto (mesma forma
+            # {id, name, sizeBytes} das respostas normais).
+            payload["files"] = arquivos
         created_unix = int(datetime.utcnow().timestamp())
         db_notif = None
         if job.user_id is not None:

@@ -1,7 +1,11 @@
 """Package exports for DB models."""
 from .user import User
 from .user_message import UserMessage
-from .conversation import ConversationSession, ConversationMessage
+from .conversation import (
+    ConversationSession,
+    ConversationMessage,
+    ConversationMessageChunk,
+)
 from .user_preference import UserPreference
 from .pks import (
     PKSAuditLog,
@@ -35,12 +39,15 @@ from .birra_act import BirraAct
 from .working_note import WorkingNote
 from .dataset import DatasetAudit, DatasetDefinition, SkillInstall
 from .event import EventDelivery, EventSubscription
+from .scheduled_task import ScheduledTask
+from .file_link import FileLink
 
 __all__ = [
     "User",
     "UserMessage",
     "ConversationSession",
     "ConversationMessage",
+    "ConversationMessageChunk",
     "UserPreference",
     "PKSAuditLog",
     "PKSCollection",
@@ -55,6 +62,7 @@ __all__ = [
     "UserNotification",
     "ConnectedDevice",
     "AgentJob",
+    "ScheduledTask",
     "ResearchTask",
     "FinAccount",
     "FinBudget",
@@ -74,4 +82,5 @@ __all__ = [
     "EventDelivery",
     "EventSubscription",
     "SkillInstall",
+    "FileLink",
 ]

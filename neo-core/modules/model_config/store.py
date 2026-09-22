@@ -93,7 +93,7 @@ def _brain_env_default() -> tuple[str, str]:
         provider = get_settings().default_provider
     except Exception:  # pragma: no cover - defensive; import-time só depende do env
         provider = "deepseek"
-    return provider, DEFAULT_MODEL_BY_PROVIDER.get(provider, "deepseek-v4-flash")
+    return provider, DEFAULT_MODEL_BY_PROVIDER.get(provider, "deepseek-flash")
 
 
 _BRAIN_PROVIDER, _BRAIN_MODEL = _brain_env_default()
@@ -128,7 +128,7 @@ ROLES: dict[str, RoleSpec] = {
             "relações). Muitas chamadas de JSON; um modelo barato dá conta."
         ),
         default_provider="deepseek",
-        default_model="deepseek-v4-flash",
+        default_model="deepseek-flash",
     ),
     "research_volume": RoleSpec(
         key="research_volume",
@@ -138,7 +138,7 @@ ROLES: dict[str, RoleSpec] = {
             "evidência/reflect/organize. São muitas chamadas sobre texto de web."
         ),
         default_provider="deepseek",
-        default_model="deepseek-v4-flash",
+        default_model="deepseek-flash",
     ),
     "research_writer": RoleSpec(
         key="research_writer",
@@ -150,6 +150,21 @@ ROLES: dict[str, RoleSpec] = {
         default_provider="deepseek",
         default_model="deepseek-v4-pro",
     ),
+    "document_reader": RoleSpec(
+        key="document_reader",
+        label="Leitura de documentos — subagentes (deep_read)",
+        description=(
+            "Lê cada parte de um documento procurando o que o cérebro pediu "
+            "(citação literal + página) e consolida a análise por documento. "
+            "Volume alto de texto de entrada e JSON na saída: use um modelo "
+            "barato com boa leitura de português."
+        ),
+        # Não a DeepSeek direta como os outros defaults: aquela carteira está
+        # zerada (neo-llm-slots-and-wallets), e um slot novo sem linha no banco
+        # nasceria morto.
+        default_provider="openrouter",
+        default_model="deepseek/deepseek-v4.1-flash@fireworks",
+    ),
     "browser_local": RoleSpec(
         key="browser_local",
         label="Navegador local — passo a passo",
@@ -158,7 +173,7 @@ ROLES: dict[str, RoleSpec] = {
             "passo, 25 chamadas por tarefa). É volume puro: use o barato."
         ),
         default_provider="deepseek",
-        default_model="deepseek-v4-flash",
+        default_model="deepseek-flash",
     ),
     "browser_agent": RoleSpec(
         key="browser_agent",

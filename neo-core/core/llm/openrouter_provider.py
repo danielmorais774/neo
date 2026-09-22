@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 from openai import AsyncOpenAI
 
-from core.llm.openai_provider import OpenAIProvider
+from core.llm.openai_provider import OpenAIProvider, is_upstream_failure
 from core.llm.provider import LLMProvider
 from shared import LLMProviderError, Message, StreamChunk, StreamEventType, ToolSchema
 
@@ -59,7 +59,7 @@ class OpenRouterProvider(OpenAIProvider):
       - google/gemini-2.0-flash       → bom custo-benefício
       - anthropic/claude-3.5-sonnet   → tarefas complexas
       - meta-llama/llama-3.3-70b-instruct → open-weights
-      - deepseek/deepseek-v4-flash@baidu → 1M de contexto, barato (pin de provedor)
+      - deepseek/deepseek-v4.1-flash@fireworks → 1M de contexto (pin de provedor)
 
     Os headers opcionais ``HTTP-Referer``/``X-Title`` identificam o app no
     leaderboard do OpenRouter (não são obrigatórios).
@@ -136,9 +136,10 @@ class OpenRouterProvider(OpenAIProvider):
         `order` SEM `allow_fallbacks=False`: o gateway continua tentando o
         provedor escolhido PRIMEIRO e só sai dele quando ele não atende.
 
-        Vale só para "está ocupado" (429/502/503), nunca para erro de conteúdo
-        — 404 de compatibilidade de tool, por exemplo, tem tratamento próprio em
-        `_rejects_forced_tool_choice` e afrouxar ali esconderia a causa.
+        Vale só para "está ocupado" (429/502/503) ou "caiu no meio" (erro dentro
+        de uma resposta 200 — ver `is_upstream_failure`), nunca para erro de
+        conteúdo — 404 de compatibilidade de tool, por exemplo, tem tratamento
+        próprio em `_rejects_forced_tool_choice` e afrouxar ali esconderia a causa.
 
         Existe porque um laço de passos é a carga que estoura RPM: medido em
         2026-09-03 com `deepseek/deepseek-v4-flash@baidu`, o pool compartilhado
@@ -162,6 +163,11 @@ class OpenRouterProvider(OpenAIProvider):
             or "rate-limited" in text
             or "temporarily" in text
             or "overloaded" in text
+            # A causa real mora no `__cause__`: o LLMProviderError só carrega o
+            # texto, e o do Baidu caído ("JSON error injected into SSE stream")
+            # não tem palavra nenhuma de lotação.
+            or is_upstream_failure(exc)
+            or is_upstream_failure(exc.__cause__)
         )
         if not busy:
             return False
@@ -259,6 +265,12 @@ class OpenRouterProvider(OpenAIProvider):
                     max_tokens=max_tokens,
                     **kwargs,
                 ):
+                    # O ERROR que o provider base emite antes de levantar NÃO é
+                    # saída: contá-lo marcava `emitiu` em toda falha e a segunda
+                    # tentativa nunca rodava — nem num 429 de livro. A exceção
+                    # chega logo atrás e o `except` emite o ERROR se for desistir.
+                    if chunk.event == StreamEventType.ERROR:
+                        continue
                     emitiu = True
                     yield chunk
                 return

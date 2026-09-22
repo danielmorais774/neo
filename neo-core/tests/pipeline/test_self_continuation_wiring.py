@@ -233,7 +233,9 @@ async def test_anti_loop_stop_also_terminates_and_names_the_reason():
 
     finals = [r for r in out if r.is_final]
     assert len(finals) == 1
-    assert "mesma tentativa" in finals[0].message
+    assert "repetir um que já rodou" in finals[0].message
+    # A ordem repetida não quer dizer que algo falhou (session-30b1e484).
+    assert "falhou" not in finals[0].message
 
 
 @pytest.mark.asyncio

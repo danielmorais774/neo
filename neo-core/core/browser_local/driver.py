@@ -673,8 +673,21 @@ class BrowserLocalDriver:
         trace: Any = None,
         follow_download: bool | None = None,
         on_download: Callable[[list[dict]], Awaitable[None]] | None = None,
+        headless: bool = False,
     ) -> None:
         self._act = act
+        # Headless: mesma máquina, mesmo IP residencial, SEM janela.
+        #
+        # É o degrau que resolve bloqueio por origem sem o custo de tomar a tela
+        # do usuário — o navegador do servidor sai por IP de datacenter na
+        # França e a web BR recusa (medido 2026-09-20: CDN do portal de dados devolve 403
+        # para o ASN inteiro, Google e DuckDuckGo servem CAPTCHA).
+        #
+        # Tudo daqui para baixo é idêntico nos dois modos: o vocabulário de
+        # ações, o JS de página e a visão por passo falam CDP, e CDP é o mesmo
+        # dos dois lados. Só o `claim` muda — e é ele que decide, pelo sinal do
+        # `tab_ref`, para qual backend o resto das ações vai.
+        self.headless = bool(headless)
         self.llm = llm
         self.model = model
         # Modelo COM visão. Vira None na primeira falha (print ou chamada) e a
@@ -914,7 +927,9 @@ class BrowserLocalDriver:
         uma nova. Aqui o `não` é barato — cai para aba nova e a tarefa segue.
         """
         try:
-            resposta = await self._call("browser.tabs", {})
+            resposta = await self._call(
+                "browser.tabs", {"mode": "headless"} if self.headless else {}
+            )
         except Exception as exc:  # noqa: BLE001 — sem lista, o seguro é aba nova
             self._log("note", "não consegui listar as abas", f"{exc} — abro uma nova")
             return False
@@ -1804,7 +1819,9 @@ class BrowserLocalDriver:
 
         files: list[dict] = []
         while True:
-            listing = await self._call("browser.downloads", {})
+            listing = await self._call(
+                "browser.downloads", {"mode": "headless"} if self.headless else {}
+            )
             files = self._absorb_listing(listing)
             novos = [f for f in files if f.get("name") not in antes]
             for item in novos:
@@ -1924,7 +1941,10 @@ class BrowserLocalDriver:
     async def _downloads_snapshot(self, label: str) -> list[dict]:
         """Fotografa a pasta de downloads. Device antigo simplesmente não tem."""
         try:
-            listing = await self._call("browser.downloads", {"since_s": 900})
+            pedido_dl: dict = {"since_s": 900}
+            if self.headless:
+                pedido_dl["mode"] = "headless"
+            listing = await self._call("browser.downloads", pedido_dl)
         except Exception as exc:  # noqa: BLE001
             self._log("downloads", label, None, str(exc))
             return []
@@ -2720,6 +2740,8 @@ class BrowserLocalDriver:
         self._allowed_hosts.update(_hosts_citados(task))
 
         pedido: dict = {}
+        if self.headless:
+            pedido["mode"] = "headless"
         if start_url:
             pedido["url"] = start_url
         reaproveitou = False
@@ -2734,7 +2756,8 @@ class BrowserLocalDriver:
         self._navegou = bool(start_url) or reaproveitou
         self._tab_ref = claim.get("tab_ref")
         if self._tab_ref is None:
-            return DriverResult(status="failed", summary="Não consegui abrir uma aba no seu navegador.")
+            onde = "no navegador headless desta máquina" if self.headless else "no seu navegador"
+            return DriverResult(status="failed", summary=f"Não consegui abrir uma aba {onde}.")
 
         last_url = start_url
         if self.follow_download is None:

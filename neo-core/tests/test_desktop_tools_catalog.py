@@ -45,4 +45,8 @@ def test_desktop_tools_catalog_only_has_working_tools():
         "save_generated_file",
         "request_user_file",
         "write_file",
+        # services/file_ops.rs — só oferecidas a cliente que anuncia `client_tools`.
+        "read_user_file",
+        "edit_user_file",
+        "delegate_file_edit",
     }

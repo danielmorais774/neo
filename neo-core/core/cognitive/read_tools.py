@@ -282,9 +282,10 @@ class CognitiveReadExecutor:
             from modules.pks_search import PKSSearchExecutor
 
             # Recall de conversas: só precisa do banco (a busca é SQL). O
-            # session_id serve para EXCLUIR a conversa atual do resultado —
-            # sem isso a própria pergunta casa com a busca — e para guardar o
-            # cursor do "foi antes ainda".
+            # session_id serve para CORTAR a busca no turno de agora (senão a
+            # própria pergunta casa com a busca) e para guardar o cursor do
+            # "foi antes ainda". Os turnos anteriores desta mesma sessão FICAM
+            # pesquisáveis — ver docs/context-recall-fixes.md §3.
             self._recall = ConversationRecallExecutor(db=db, embeddings=embeddings)
             self._recall.set_context(user_id, session_id)
 

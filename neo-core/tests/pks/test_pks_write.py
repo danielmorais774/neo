@@ -74,7 +74,7 @@ def test_planner_confirmed_mode_injects_override_and_structures():
     assert "MODO CONFIRMADO" in (provider.last_system or "")
     # Modelo explícito e válido (não o 'deepseek-chat' aposentado) — regressão
     # do bug que fazia toda gravação falhar com 400 (session-77a77b00).
-    assert provider.last_model == "deepseek-v4-flash"
+    assert provider.last_model == "deepseek-flash"
     assert len(ops) == 1
     assert ops[0].entity["type"] == "preference"
 

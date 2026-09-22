@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 
 from core.jobs.executor import JobToolExecutor
+from shared import ToolCall
 
 
 class _FakeDB:
@@ -65,10 +66,30 @@ async def test_pediu_local_e_escolheu_local_segue():
 
 
 @pytest.mark.asyncio
-async def test_nao_pediu_e_escolheu_local_rebaixa():
-    """A falha grave: tomar conta do Chrome do usuário sem ele pedir."""
+async def test_nao_pediu_fica_local_mas_sem_janela():
+    """A falha grave continua sendo tomar conta do Chrome dele sem pedir — mas
+    quem evita isso agora é o modo HEADLESS, não o rebaixamento.
+
+    Rebaixar para o servidor mandava o trabalho para a origem PIOR de propósito:
+    a VPS sai por IP de datacenter na França e leva 403/CAPTCHA na web
+    brasileira (job 36a81dd6, 2026-09-20: 22 passos, 51 CAPTCHAs, nada
+    entregue). Headless na máquina dele tem o IP certo E não toca a tela.
+    """
     ex = _executor("procura o preço do teclado")
-    assert await ex._gate_browser("browser_local_task") == "browser_task"
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
+    result = await ex._browser_local_task({"task": "preço do teclado", "title": "t"})
+    assert result["ok"] is True
+    spec = ex.db.criados[-1].spec_json
+    assert spec["headless"] is True, "sem pedido explícito, nunca com janela"
+
+
+@pytest.mark.asyncio
+async def test_pediu_para_ver_abre_com_janela():
+    """O erro simétrico: pediu para VER e o Neo ia fazer escondido."""
+    ex = _executor("abre o github no meu navegador e me diz o título")
+    result = await ex._browser_local_task({"task": "abre o github", "title": "t"})
+    assert result["ok"] is True
+    assert ex.db.criados[-1].spec_json["headless"] is False
 
 
 @pytest.mark.asyncio
@@ -106,7 +127,9 @@ async def test_continuacao_velha_nao_herda():
         created_at=datetime.utcnow() - timedelta(minutes=45),
     )
     ex = _executor("agora ordena por preço", jobs=[antigo], session_id=session_id)
-    assert await ex._gate_browser("browser_local_task") == "browser_task"
+    # Continua na máquina dele — é a origem certa — só que sem herdar a JANELA.
+    # Que o modo vire headless está fixado em `test_nao_pediu_fica_local_mas_sem_janela`.
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
 
 
 @pytest.mark.asyncio
@@ -117,7 +140,7 @@ async def test_job_de_outra_sessao_nao_herda():
         created_at=datetime.utcnow() - timedelta(minutes=1),
     )
     ex = _executor("agora ordena por preço", jobs=[recente])
-    assert await ex._gate_browser("browser_local_task") == "browser_task"
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
 
 
 @pytest.mark.asyncio
@@ -138,8 +161,11 @@ async def test_flag_desligada_rebaixa_tudo(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sem_device_a_tool_recusa_em_vez_de_enfileirar():
-    """Canal que não identifica a máquina (WhatsApp, painel) não pode virar job."""
+async def test_sem_device_cai_para_o_servidor_em_vez_de_desistir():
+    """Canal que não identifica a máquina (WhatsApp, neo-panel) não tem navegador
+    local — mas DESISTIR era pior que o problema: o trabalho simplesmente não
+    acontecia. O servidor faz a mesma coisa de uma origem que parte da web
+    recusa; tentar lá e dizer a verdade se apanhar é melhor que não tentar."""
     ex = JobToolExecutor(
         db=_FakeDB(),
         job_manager=SimpleNamespace(poke=lambda: None),
@@ -149,8 +175,11 @@ async def test_sem_device_a_tool_recusa_em_vez_de_enfileirar():
         device_id=None,
     )
     result = await ex._browser_local_task({"task": "abre o github", "title": "t"})
-    assert result["ok"] is False
-    assert "máquina" in result["error"]
+    # Virou job DE SERVIDOR, não local — e o cérebro é avisado do porquê.
+    assert result["ok"] is True
+    assert ex.db.criados[-1].kind == "browser"
+    assert "SERVIDOR" in result["note"]
+    assert "desktop" in result["note"]
 
 
 # ── uma tarefa por navegador (job 698446b8: "Debugger unattached") ────────
@@ -329,3 +358,176 @@ async def test_tarefa_normal_nao_vira_retomada():
     assert result["ok"] is True
     assert "resumed_from" not in result
     assert "resume_pending" not in ex.db.criados[0].spec_json
+
+
+# ── pedido recente vale para a mensagem seguinte (session-30b1e484) ────────
+#
+# "vamos fazer pelo meu navegador local - ou seja - caminho A" e, um minuto
+# depois, "nao foi, acessa o meu portifolio ai". O cérebro chamou
+# `browser_local_task`, a segunda frase não tinha âncora, não havia job local
+# anterior para herdar — e o portão rebaixou para o servidor. Duas vezes.
+
+
+def _com_historico(message, falas, *, minutos=1):
+    ex = _executor(message)
+    msgs = [
+        SimpleNamespace(
+            role="user", content=fala, created_at=datetime.utcnow() - timedelta(minutes=minutos)
+        )
+        for fala in falas
+    ]
+
+    async def _fetch(session_id, limit=50, roles=None, **kw):
+        return msgs[-limit:]
+
+    ex.db.fetch_session_messages = _fetch
+    return ex
+
+
+@pytest.mark.asyncio
+async def test_pedido_de_navegador_local_na_mensagem_anterior_mantem_o_local():
+    ex = _com_historico(
+        "nao foi, acessa o meu portifolio ai",
+        [
+            "vamos fazer pelo meu navegador local - ou seja - caminho A",
+            "nao foi, acessa o meu portifolio ai",
+        ],
+    )
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
+
+
+@pytest.mark.asyncio
+async def test_passo_de_continuacao_le_a_frase_do_usuario_no_banco():
+    """No ciclo, `user_message` é a ordem que o Neo sintetizou, não a do usuário."""
+    ex = _com_historico(
+        "avertir o usuário quando a tarefa do browser terminar",
+        ["entao acessa pelo meu navegador local"],
+    )
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
+
+
+@pytest.mark.asyncio
+async def test_pedido_velho_nao_segura_a_janela():
+    """Pedido de 30 min atrás não vale mais como "quero ver".
+
+    O destino continua sendo a máquina dele (origem certa); o que caduca é a
+    JANELA — e sem pedido vivo o modo é headless.
+    """
+    ex = _com_historico("acessa o site", ["no meu navegador local"], minutos=30)
+    assert await ex._gate_browser("browser_local_task") == "browser_local_task"
+
+
+@pytest.mark.asyncio
+async def test_historico_so_mantem_nunca_promove():
+    """Quem escolheu o servidor fica no servidor: o histórico não toma o Chrome dele."""
+    ex = _com_historico("B", ["entao acessa pelo meu navegador local"])
+    assert await ex._gate_browser("browser_task") == "browser_task"
+
+
+@pytest.mark.asyncio
+async def test_rebaixado_avisa_o_cerebro_que_nao_foi_na_tela_dele(monkeypatch):
+    """O resultado voltava igual nos dois casos e o Neo disse "abri no seu navegador"."""
+    from shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "browser_agent_enabled", True, raising=False)
+    # Só há rebaixamento de verdade quando NÃO existe máquina do usuário neste
+    # canal — com device, o local headless vence (ver o teste acima).
+    ex = _executor("acessa o meu portifolio")
+    ex.device_id = None
+    tr = await ex.execute_tool_call(
+        ToolCall(id="1", name="browser_local_task", arguments={"task": "abre https://x.dev", "title": "t"})
+    )
+    assert tr.name == "browser_task"
+    assert tr.result["onde_rodou"] == "servidor"
+    assert "NÃO para a tela do usuário" in tr.result["aviso"]
+
+
+@pytest.mark.asyncio
+async def test_sem_troca_o_resultado_fica_como_era(monkeypatch):
+    from shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "browser_agent_enabled", True, raising=False)
+    ex = _executor("procura o preço do teclado")
+    tr = await ex.execute_tool_call(
+        ToolCall(id="1", name="browser_task", arguments={"task": "preço do teclado", "title": "t"})
+    )
+    assert "aviso" not in tr.result and "onde_rodou" not in tr.result
+
+
+# ── mesma tarefa de browser não vira dois jobs (session-30b1e484) ──────────
+
+
+def _browser_vivo(session_id, task, *, status="running", minutos=2):
+    return SimpleNamespace(
+        id=uuid4(),
+        kind="browser",
+        status=status,
+        title="Análise de Portfólio Antigo",
+        session_id=session_id,
+        spec_json={"task": task, "session": "user-default"},
+        created_at=datetime.utcnow() - timedelta(minutes=minutos),
+    )
+
+
+@pytest.fixture
+def _browser_do_servidor_ligado(monkeypatch):
+    from shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "browser_agent_enabled", True, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_mesmo_site_na_mesma_conversa_reusa_o_job(_browser_do_servidor_ligado):
+    sid = uuid4()
+    vivo = _browser_vivo(sid, "Acesse https://danielmorais.vercel.app/ e analise o conteúdo")
+    ex = _executor("acessa o site e faz uma analise", jobs=[vivo], session_id=sid)
+
+    result = await ex._browser_task(
+        {"task": "Acesse https://danielmorais.vercel.app e verifique o conteúdo atual. Tire screenshot."}
+    )
+
+    assert result["reused"] is True
+    assert result["job_id"] == str(vivo.id)
+    assert ex.db.criados == []
+
+
+@pytest.mark.asyncio
+async def test_site_diferente_cria_job_novo(_browser_do_servidor_ligado):
+    sid = uuid4()
+    vivo = _browser_vivo(sid, "Acesse https://danielmorais.vercel.app/")
+    ex = _executor("agora olha o github", jobs=[vivo], session_id=sid)
+    result = await ex._browser_task({"task": "Acesse https://github.com/danielmorais"})
+    assert result.get("reused") is None
+    assert len(ex.db.criados) == 1
+
+
+@pytest.mark.asyncio
+async def test_job_terminado_ou_de_outra_conversa_nao_conta(_browser_do_servidor_ligado):
+    sid = uuid4()
+    tarefa = "Acesse https://danielmorais.vercel.app/"
+    ex = _executor(
+        "analisa de novo",
+        jobs=[
+            _browser_vivo(sid, tarefa, status="timeout"),
+            _browser_vivo(uuid4(), tarefa),
+            _browser_vivo(sid, tarefa, minutos=45),
+        ],
+        session_id=sid,
+    )
+    result = await ex._browser_task({"task": tarefa})
+    assert result.get("reused") is None
+    assert len(ex.db.criados) == 1
+
+
+@pytest.mark.asyncio
+async def test_sem_endereco_so_a_tarefa_identica_conta(_browser_do_servidor_ligado):
+    sid = uuid4()
+    ex = _executor(
+        "pesquisa",
+        jobs=[_browser_vivo(sid, "Pesquise passagens para São Paulo")],
+        session_id=sid,
+    )
+    diferente = await ex._browser_task({"task": "Pesquise hotéis em São Paulo"})
+    igual = await ex._browser_task({"task": "pesquise  passagens para são paulo"})
+    assert diferente.get("reused") is None
+    assert igual["reused"] is True

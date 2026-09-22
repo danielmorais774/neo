@@ -27,9 +27,10 @@ def _field(entity_id: UUID, key: str, value, value_type: str = "text") -> FieldR
 
 
 class _FakeRepo:
-    def __init__(self, rows, fields):
+    def __init__(self, rows, fields, relations=None):
         self._rows = rows
         self._fields = fields
+        self._relations = relations or {}
         self.batch_calls = 0
 
     async def search_entities(self, session, workspace_id, query):
@@ -38,6 +39,9 @@ class _FakeRepo:
     async def get_fields_for_entities(self, session, entity_ids):
         self.batch_calls += 1
         return {eid: self._fields.get(eid, []) for eid in entity_ids}
+
+    async def get_relations(self, session, entity_id):
+        return self._relations.get(entity_id, [])
 
 
 class _FakeDB:
@@ -51,9 +55,9 @@ class _FakeBootstrap:
         return _WORKSPACE
 
 
-def _service(rows, fields) -> tuple[PKSService, _FakeRepo]:
+def _service(rows, fields, relations=None) -> tuple[PKSService, _FakeRepo]:
     svc = object.__new__(PKSService)
-    repo = _FakeRepo(rows, fields)
+    repo = _FakeRepo(rows, fields, relations)
     svc.repository = repo
     svc.db = _FakeDB()
     svc.bootstrap = _FakeBootstrap()
@@ -115,3 +119,31 @@ async def test_no_rows_skips_the_field_query():
     svc, repo = _service([], {})
     assert await svc.search_entities(user_id=uuid4(), query="nada") == []
     assert repo.batch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_devolve_as_relacoes_da_entidade():
+    """session-098211a8: o treino de quinta estava no prompt com os 6
+    exercícios, e a ferramenta devolvia só nome/fields — "o treino existe, os
+    exercícios não". Agora as ligações vêm junto, nos dois sentidos."""
+    from core.pks.schemas import RelationRecord
+
+    treino = _entity("Treino de quinta-feira", "workout")
+    plano_id, ex_id = uuid4(), uuid4()
+    rels = {treino.id: [
+        RelationRecord(id=uuid4(), workspace_id=_WORKSPACE, from_entity_id=treino.id,
+                       relation_type="has_exercise", to_entity_id=ex_id, to_name="Elevação Lateral"),
+        RelationRecord(id=uuid4(), workspace_id=_WORKSPACE, from_entity_id=plano_id,
+                       relation_type="has_member", to_entity_id=treino.id, from_name="Plano de treino"),
+        RelationRecord(id=uuid4(), workspace_id=_WORKSPACE, from_entity_id=treino.id,
+                       relation_type="has_exercise", to_entity_id=uuid4(), to_name="Segredo",
+                       sensitivity="secret"),
+    ]}
+    svc, _ = _service([(treino, 1.0, "name")], {}, rels)
+
+    out = await svc.search_entities(user_id=uuid4(), query="treino de quinta")
+
+    assert out[0]["relations"] == [
+        "has_exercise -> Elevação Lateral",
+        "has_member <- Plano de treino",
+    ]

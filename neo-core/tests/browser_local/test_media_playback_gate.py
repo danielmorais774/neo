@@ -153,12 +153,14 @@ async def test_a_recusa_vira_resultado_que_ensina_o_caminho_certo():
 
 
 @pytest.mark.asyncio
-async def test_pesquisa_comum_continua_rebaixando():
-    """A regra de duas partes segue valendo para tudo que não é play — errar
-    para o lado do local é tomar conta do Chrome dele sem pedir."""
+async def test_pesquisa_comum_fica_local_sem_janela():
+    """A regra de duas partes segue valendo para tudo que não é play — mas o que
+    protege a tela dele agora é o modo headless, não o rebaixamento. Play
+    continua sendo o caso especial: sem tela e sem as caixas dele, ninguém ouve.
+    """
     ex = _executor("acessa a amazon e acha uma promoção de iphone")
     tarefa = {"task": "Buscar promoção de iPhone na Amazon", "title": "Amazon 9.9"}
-    assert await ex._gate_browser("browser_local_task", tarefa) == "browser_task"
+    assert await ex._gate_browser("browser_local_task", tarefa) == "browser_local_task"
 
 
 @pytest.mark.asyncio

@@ -162,7 +162,7 @@ def build_research_runner(
     llm_router: Any,
     web_search: Any,
     sandbox: Any = None,
-    research_model: str = "deepseek-v4-flash",
+    research_model: str = "deepseek-flash",
     research_model_writer: str | None = None,
 ) -> Callable[[AgentJob], Awaitable[dict]]:
     """Fecha as dependências e devolve ``run_research_job(job) -> dict`` p/ o JobManager.

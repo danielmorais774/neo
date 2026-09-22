@@ -22,11 +22,65 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from modules.web_search.blocking import classify
+
 logger = logging.getLogger(__name__)
 
 # Formato exigido pela política de UA da Wikimedia (nome/versão + contato +
 # lib); sem o contato, wikipedia.org responde 403.
 USER_AGENT = "NeoAssistant/1.0 (personal assistant; contact: daniel.morais@acme.com.br) python-httpx"
+
+# ── Perfil de headers ────────────────────────────────────────────────────────
+#
+# O UA acima se identifica como robô, e era o ÚNICO que saía daqui. Isso não é
+# neutro: WAF de CDN bloqueia na hora, e o custo não fica no fetch — ele
+# cascateia, porque toda página recusada vira tentativa de navegador, que é o
+# caminho caro (na sessão 8c449cb8 virou um job de 570s que terminou em nada).
+#
+# Medido em 2026-09-20, da VPS, contra a página de dados abertos do portal de dados:
+#
+#     UA de bot            → 403 (0 KB)
+#     headers coerentes    → 200 (230 KB)
+#
+# O que destrava não é o User-Agent sozinho — é o CONJUNTO. Testei header a
+# header contra o CDN do portal de dados e nenhum isolado passa; só o conjunto completo.
+# WAF pontua coerência: um Chrome que não manda `Sec-Fetch-*` nem
+# `Accept-Language` não é um Chrome.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+)
+_BROWSER_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+_BOT_HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.6"}
+
+# Hosts cuja política de uso EXIGE identificação. Medido: os dois perfis dão 200
+# na Wikipédia, então isto não é necessidade técnica — é cumprir a regra deles
+# onde ela existe. Em todo o resto, o perfil de navegador.
+_POLICY_UA_SUFFIXES = (
+    "wikipedia.org", "wikimedia.org", "wikidata.org", "wiktionary.org",
+    "wikisource.org", "wikibooks.org", "wikiquote.org", "wikinews.org",
+    "wikiversity.org", "wikivoyage.org", "mediawiki.org",
+)
+
+
+def headers_for(host: str) -> dict[str, str]:
+    """Perfil de headers do host: identificado onde a política pede, navegador no resto."""
+    h = (host or "").lower().rstrip(".")
+    if any(h == suf or h.endswith("." + suf) for suf in _POLICY_UA_SUFFIXES):
+        return dict(_BOT_HEADERS)
+    return dict(_BROWSER_HEADERS)
 _MAX_REDIRECTS = 3
 _MIN_EXTRACTED_CHARS = 200
 _FETCH_TIMEOUT = 15.0
@@ -45,7 +99,23 @@ class FetchedPage:
 
 @dataclass
 class FetchError:
-    error: str  # js_required | blocked_private | fetch_failed
+    """Falha de fetch, classificada pelo que ela PEDE como próximo passo.
+
+    - ``blocked_origin``  o site recusou esta origem (anti-bot) → trocar de
+                          origem (navegador do usuário) muda o resultado.
+    - ``js_required``     veio HTML, mas o conteúdo depende de JS → navegador
+                          resolve, a origem não é o problema.
+    - ``not_found``       a URL está errada → NÃO escalar, procurar a certa.
+    - ``transient``       5xx/timeout → retry, e só.
+    - ``blocked_private`` guard de SSRF.
+    - ``fetch_failed``    o resto.
+
+    Só ``blocked_origin`` e ``js_required`` sobem a escada de navegador. Essa
+    distinção é o ponto: escalar num 404 queima minutos por uma página que não
+    existe.
+    """
+
+    error: str
     message: str
 
 
@@ -152,9 +222,13 @@ async def fetch_readable(url: str, *, max_chars: int = 8000) -> FetchedPage | Fe
             async with httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=_FETCH_TIMEOUT,
-                headers={"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.6"},
+                headers=headers_for(host),
             ) as client:
                 resp = await client.get(current)
+        except httpx.TimeoutException as e:
+            # Timeout é transitório, não bloqueio: trocar de navegador não
+            # acelera um servidor lento.
+            return FetchError("transient", f"Tempo esgotado ao buscar {current}: {e}")
         except httpx.HTTPError as e:
             return FetchError("fetch_failed", f"Falha no GET: {e}")
 
@@ -165,11 +239,19 @@ async def fetch_readable(url: str, *, max_chars: int = 8000) -> FetchedPage | Fe
             current = urljoin(current, location)
             continue
 
-        if resp.status_code >= 400:
-            return FetchError("fetch_failed", f"HTTP {resp.status_code} em {current}")
-
         content_type = (resp.headers.get("content-type") or "").lower()
         raw_body = resp.content
+
+        # Classifica ANTES de tentar extrair: um 403 do WAF e um 200 com
+        # interstitial do Cloudflare são a mesma coisa para quem decide o
+        # próximo passo, e nenhum dos dois tem conteúdo para extrair.
+        problema = classify(
+            status=resp.status_code, headers=dict(resp.headers), body=raw_body
+        )
+        if problema is not None:
+            codigo, mensagem = problema
+            logger.info("[web_fetch] %s em %s — %s", codigo, current, mensagem[:120])
+            return FetchError(codigo, f"{mensagem} (url: {current})")
 
         if _looks_like_pdf(content_type, current, raw_body):
             try:
@@ -201,8 +283,21 @@ async def fetch_readable(url: str, *, max_chars: int = 8000) -> FetchedPage | Fe
                 title=parsed.hostname or "", text=text[:max_chars], truncated=truncated, url=current
             )
         if "html" not in content_type and "xml" not in content_type:
+            # Não é página: é ARQUIVO. Distinguir importa porque a saída é
+            # outra — o `web_fetch` extrai texto, e o que se faz com um .zip é
+            # baixar. Enquanto isso era `fetch_failed`, o modelo lia "falhou" e
+            # ia tentar navegador, que é o pior jeito de pegar um binário (cai
+            # na pasta de downloads, sem bytes na mão, com nome imprevisível).
+            tamanho = resp.headers.get("content-length")
+            quanto = f" (~{int(tamanho) // 1024} KB)" if (tamanho or "").isdigit() else ""
             return FetchError(
-                "fetch_failed", f"Content-type não suportado: {content_type or '(desconhecido)'}"
+                "download",
+                f"Esta URL não é uma página: é um arquivo {content_type or '(tipo desconhecido)'}"
+                f"{quanto}, e ele está ACESSÍVEL (HTTP {resp.status_code}) — não há bloqueio "
+                "aqui. `web_fetch` só extrai texto de página. Para pegar o arquivo, baixe-o no "
+                "sandbox com `neo_bash` (curl) e trate de lá; se o usuário quiser o arquivo no "
+                "disco dele, publique com `file_save` e entregue com `save_generated_file`. "
+                "NÃO use navegador para isto.",
             )
 
         html = body.decode(resp.encoding or "utf-8", errors="replace")

@@ -129,3 +129,63 @@ class ConversationMessage(SQLModel, table=True):
         Index("ix_conv_msg_session_created", "session_id", "created_at"),
         Index("ix_conv_msg_mission_created", "mission_id", "created_at"),
     )
+
+
+class ConversationMessageChunk(SQLModel, table=True):
+    """Pedaço embeddado de uma mensagem longa.
+
+    O embedder local (`all-MiniLM-L6-v2`) tem `max_seq_length=256` tokens e
+    trunca em silêncio: o vetor de uma mensagem de 12.811 chars representava só
+    os ~1.000 primeiros. A "Reanálise Completa" da sessão 7330e40c tinha a
+    tabela pedida no offset 9.399 — 9x além do que o vetor enxergava — e caía
+    em 83º de 2.304 numa busca que era exatamente sobre ela.
+
+    Cada pedaço cabe na janela do modelo e ganha vetor próprio; a busca casa o
+    pedaço e devolve a MENSAGEM. Medido no caso real: 0,5457 → 0,7173, à frente
+    do antigo 1º colocado (0,7071). Só mensagens longas são fatiadas — 2,9% do
+    corpus; as curtas continuam com o embedding da própria linha.
+    """
+
+    __tablename__ = "conversation_message_chunk"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    message_id: UUID = Field(
+        sa_column=Column(
+            "message_id", SAUuid,
+            ForeignKey("conversation_message.id", ondelete="CASCADE"),
+            nullable=False, index=True,
+        ),
+    )
+    session_id: UUID = Field(
+        sa_column=Column(
+            "session_id", SAUuid,
+            ForeignKey("conversation_session.id", ondelete="CASCADE"),
+            nullable=False, index=True,
+        ),
+    )
+    user_id: Optional[UUID] = Field(
+        default=None,
+        sa_column=Column("user_id", SAUuid, ForeignKey("user.id"), nullable=True, index=True),
+    )
+    chunk_index: int = Field(
+        sa_column=Column("chunk_index", Integer, nullable=False),
+    )
+    content: str = Field(
+        sa_column=Column("content", Text, nullable=False),
+    )
+    embedding: Optional[list[float]] = Field(
+        default=None,
+        sa_column=Column(
+            "embedding",
+            Vector(384) if HAS_PGVECTOR else JSON,
+            nullable=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column("created_at", nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_conv_chunk_message_idx", "message_id", "chunk_index", unique=True),
+    )

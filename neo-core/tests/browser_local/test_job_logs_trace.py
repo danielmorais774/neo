@@ -28,6 +28,10 @@ class _SandboxVazio:
     async def read_file(self, path, max_bytes=None):
         return SimpleNamespace(ok=False, stdout="", truncated=False)
 
+    # O log de job do sandbox é lido pelo FIM (`read_tail`).
+    async def read_tail(self, path, max_bytes=None):
+        return SimpleNamespace(ok=False, stdout="", truncated=False)
+
 
 def _executor(job):
     ex = JobToolExecutor(

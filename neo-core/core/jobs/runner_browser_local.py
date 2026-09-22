@@ -225,6 +225,10 @@ def build_browser_local_runner(
         if not task:
             return {"status": "failed", "result_summary": "Job de navegador local sem task."}
 
+        # Sem janela (padrão) ou na tela dele? Decidido lá no `_browser_local_task`
+        # — aqui só se propaga, e é cedo porque o health já precisa saber.
+        headless = bool(spec.get("headless"))
+
         device_id = str(spec.get("device_id") or "").strip()
         if not device_id:
             return {
@@ -304,7 +308,10 @@ def build_browser_local_runner(
         # fechado (ou a extensão desligada) — são falhas diferentes e o usuário
         # precisa saber qual é (§5.4).
         try:
-            await act("browser.health", {}, 8.0)
+            # O health precisa perguntar pelo backend que ESTA tarefa vai usar:
+            # headless não depende de extensão nem de navegador aberto, e
+            # perguntar pela extensão matava todo job headless na largada.
+            await act("browser.health", {"mode": "headless"} if headless else {}, 8.0)
         except DeviceOffline:
             return {
                 "status": "failed",
@@ -380,6 +387,8 @@ def build_browser_local_runner(
             vision_model=eye_model,
             trace=trace,
             follow_download=spec.get("follow_download"),
+            # Sem janela, salvo quando o usuário quis VER (ver `_gate_browser`).
+            headless=headless,
             on_download=on_download,
         )
 

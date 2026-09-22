@@ -104,6 +104,17 @@ class ExecutionPlan(BaseModel):
             current.result = step_result
             self.step_results[current.id] = (step_result or "")[:500]
 
+        # O cursor anda AQUI — era o único lugar que podia mexer nele e não
+        # mexia, então `current_step_index` ficava 0 pela vida inteira do plano.
+        # Quem lê isso não é cosmético: `process_tool_result` deriva
+        # `completed_step_idx` daqui e passa pro `advance_and_refine`, que monta
+        # "## 2. Último Resultado / Step N: <descrição>" — com o cursor travado,
+        # TODO passo depois do primeiro chegava no validador com o output de um
+        # passo e a descrição de outro. O log da sessão também escrevia
+        # "Passo 1/N" em todas as conclusões (sessão d9f9417b: "Passo 1/5" duas
+        # vezes seguidas, "Passo 1/4" duas vezes).
+        self.current_step_index = current.index + 1
+
         # Find next pending step
         next_step = self.get_current_step()
         if next_step is None:
@@ -113,6 +124,16 @@ class ExecutionPlan(BaseModel):
             else:
                 self.status = "completed"
         return next_step
+
+    @property
+    def last_advanced_index(self) -> int:
+        """Índice do passo que o último ``advance()`` fechou (0 antes do primeiro).
+
+        Existe para os chamadores pararem de recalcular `current_step_index - 1`
+        cada um do seu jeito — e para o caso do sub-plano, em que o chamador
+        troca o plano ativo depois de já ter calculado o índice do plano antigo.
+        """
+        return max(self.current_step_index - 1, 0)
 
     @property
     def progress_text(self) -> str:

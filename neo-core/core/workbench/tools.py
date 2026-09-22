@@ -20,16 +20,17 @@ WORKBENCH_TOOLS: list[ToolSchema] = [
             "persistente). Use quando não existe uma tool específica e você precisa "
             "computar, processar dados, rodar scripts ou instalar pacotes para "
             "resolver a tarefa. NÃO é a máquina do usuário (para isso use "
-            "run_command). Comandos longos podem estourar o timeout — para trabalho "
-            "demorado prefira rodar em background (disponível em breve)."
+            "run_command). O comando só é interrompido se ficar PARADO (sem CPU, "
+            "disco nem saída); processamento pesado que está andando pode rodar até "
+            "15 min aqui. Acima disso, use neo_bash_background."
         ),
         module="workbench",
         execution="server-side",
         # Hard wall for a foreground call (the global executor kills execute() at
-        # this). Long work must go to neo_bash_background, not raise this. The
-        # WorkbenchExecutor caps the sandbox timeout below this so the sandbox's own
-        # `timeout` fires first (clean kill inside the container).
-        timeout=150,
+        # this). It must outlive the sandbox's own ceiling (WorkbenchExecutor's
+        # _FOREGROUND_CEILING + 10s exec margin) so the sandbox's `timeout` fires
+        # first (clean kill inside the container).
+        timeout=960,
         parameters={
             "command": ToolParameter(
                 type="string",
@@ -43,7 +44,7 @@ WORKBENCH_TOOLS: list[ToolSchema] = [
             ),
             "timeout": ToolParameter(
                 type="integer",
-                description="Timeout em segundos (padrão: 60, máx ~120 no foreground; para mais, use neo_bash_background)",
+                description="Segundos SEM PROGRESSO tolerados antes de matar (padrão 90, entre 30 e 300). Não é prazo total: um comando que está trabalhando segue até 15 min",
                 required=False,
             ),
         },

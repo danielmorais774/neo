@@ -59,6 +59,7 @@ def _entity_from_row(row: Any) -> EntityRecord:
         confidence=_as_float(row["confidence"]),
         sensitivity=row["sensitivity"] or "private",
         last_used_at=row["last_used_at"],
+        updated_at=row.get("updated_at"),
     )
 
 
@@ -850,6 +851,71 @@ class PKSRepository:
             {"entity_id": entity_id},
         )
         return [_field_from_row(row) for row in result.mappings().all()]
+
+    async def workspace_fingerprint(self, session: AsyncSession, workspace_id: UUID) -> tuple:
+        """Muda sempre que entidade, field ou relação do workspace muda.
+
+        Contagem (inclui apagadas) + o maior ``updated_at``/``deleted_at`` de cada
+        tabela: soft delete e upsert tocam ``updated_at``. É o que valida o cache
+        do índice do ranking sem recarregar o workspace inteiro a cada turno.
+        """
+        row = (await session.execute(
+            text(
+                """
+                SELECT
+                  (SELECT count(*)::text || '|' || coalesce(max(updated_at)::text, '') || '|' ||
+                          coalesce(max(deleted_at)::text, '')
+                     FROM pks_entity WHERE workspace_id = :ws) AS ents,
+                  (SELECT count(*)::text || '|' || coalesce(max(f.updated_at)::text, '') || '|' ||
+                          coalesce(max(f.deleted_at)::text, '')
+                     FROM pks_entity_field f JOIN pks_entity e ON e.id = f.entity_id
+                    WHERE e.workspace_id = :ws) AS flds,
+                  (SELECT count(*)::text || '|' || coalesce(max(updated_at)::text, '') || '|' ||
+                          coalesce(max(deleted_at)::text, '') || '|' || coalesce(max(valid_until)::text, '')
+                     FROM pks_entity_relation WHERE workspace_id = :ws) AS rels
+                """
+            ),
+            {"ws": workspace_id},
+        )).one()
+        return tuple(row)
+
+    async def load_workspace_graph(
+        self, session: AsyncSession, workspace_id: UUID
+    ) -> tuple[list[EntityRecord], dict[UUID, list[FieldRecord]], list[RelationRecord]]:
+        """O workspace inteiro em 3 queries: entidades, fields e relações vivas.
+
+        É o E2 do ranking (docs/pks-ranking-plan.md): com ~150 entidades, pontuar
+        TODAS sai mais barato que o caminho antigo, que fazia 2 queries por
+        candidata para montar a vizinhança.
+        """
+        ents = await session.execute(
+            text(
+                """
+                SELECT * FROM pks_entity
+                WHERE workspace_id = :ws AND deleted_at IS NULL
+                """
+            ),
+            {"ws": workspace_id},
+        )
+        entities = [_entity_from_row(row) for row in ents.mappings().all()]
+        fields = await self.get_fields_for_entities(session, [e.id for e in entities])
+        rels = await session.execute(
+            text(
+                """
+                SELECT r.*, fe.name AS from_name, fe.type AS from_type,
+                       te.name AS to_name, te.type AS to_type
+                FROM pks_entity_relation r
+                JOIN pks_entity fe ON fe.id = r.from_entity_id AND fe.deleted_at IS NULL
+                JOIN pks_entity te ON te.id = r.to_entity_id AND te.deleted_at IS NULL
+                WHERE r.workspace_id = :ws
+                  AND r.deleted_at IS NULL
+                  AND r.valid_until IS NULL
+                """
+            ),
+            {"ws": workspace_id},
+        )
+        relations = [_relation_from_row(row) for row in rels.mappings().all()]
+        return entities, fields, relations
 
     async def get_fields_for_entities(
         self, session: AsyncSession, entity_ids: list[UUID]

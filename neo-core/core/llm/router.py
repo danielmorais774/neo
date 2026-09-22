@@ -40,6 +40,10 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     "claude-3-sonnet-20240229": "anthropic",
     "claude-3-haiku-20240307": "anthropic",
     # DeepSeek
+    # ``deepseek-flash`` é o id da flash atual (V4.1) na API direta; o
+    # ``deepseek-v4-flash`` saiu da listagem em 2026-09-20 mas fica aqui para
+    # que uma config antiga continue resolvendo para o provider certo.
+    "deepseek-flash": "deepseek",
     "deepseek-v4-flash": "deepseek",
     "deepseek-v4-pro": "deepseek",
     "deepseek-chat": "deepseek",
@@ -85,18 +89,34 @@ _MODEL_TO_PROVIDER: dict[str, str] = {
     # "custom" no dropdown, como se ninguém o tivesse escolhido.
     "google/gemini-2.5-flash": "openrouter",
     # Sufixo "@slug" = pin de provedor de infra, consumido pelo OpenRouterProvider
-    # (ver _PROVIDER_PIN_SEP lá) e nunca enviado à API. O V4 Flash tem 17 endpoints
-    # no gateway e eles NÃO são equivalentes; o do Baidu (baidu/fp8, sondado em
-    # 2026-09-02) entrega 1M de contexto por $0,08386/$0,1677 por M in/out. Sem o
-    # pin, o gateway escolheria outro a cada chamada, com outro preço e outro teto.
-    # É texto puro (não lê imagem), então fica fora de _VISION_MODELS de propósito.
-    "deepseek/deepseek-v4-flash@baidu": "openrouter",
+    # (ver _PROVIDER_PIN_SEP lá) e nunca enviado à API. O mesmo modelo tem dezenas
+    # de endpoints no gateway e eles NÃO são equivalentes; sem o pin o gateway
+    # escolheria outro a cada chamada, com outro preço, outro teto e outra
+    # velocidade. É texto puro (não lê imagem), então fica fora de _VISION_MODELS
+    # de propósito.
+    #
+    # O V4.1 Flash **não tem endpoint do Baidu** — o pin que o V4 Flash usava não
+    # existe nesta geração. Sondados os 22 endpoints em 2026-09-20 (2 chamadas de
+    # ~200 tokens cada, mais uma com `tool_choice` forçado):
+    #   @fireworks  85/69 tok/s   tool forçada OK   $0,22/$0,66 por M
+    #   @streamlake 46/59 tok/s   tool forçada OK   $0,22/$0,88
+    #   @deepinfra  49/24 tok/s   tool forçada OK   $0,14/$0,42
+    #   @relace / @morph          404 na tool forçada (não servem o caminho quente)
+    #   @deepseek                 404 "No endpoints found" (não roteia por aqui)
+    #   sem pin     50/105 tok/s, sorteando provedor a cada chamada
+    # O @fireworks é o único que empata com os 74-80 tok/s que o @baidu entregava
+    # no V4 Flash E aceita tool forçada — por isso é ele o pin do catálogo.
+    "deepseek/deepseek-v4.1-flash@fireworks": "openrouter",
     # O MESMO modelo sem pin. Precisa estar aqui explicitamente, e não só como
     # opção do seletor: sem esta linha `get_provider_for_model` não acha o ID,
     # cai no provider default e o turno vai parar em `api.deepseek.com` — que é
     # outra carteira, hoje com saldo zero (402 "Insufficient Balance"). O ID com
-    # barra é do GATEWAY; o sem barra (`deepseek-v4-flash`, linha 40) é que é a
-    # API direta da DeepSeek. Eles não são intercambiáveis.
+    # barra é do GATEWAY; o sem barra (`deepseek-flash`, acima) é que é a API
+    # direta da DeepSeek. Eles não são intercambiáveis.
+    "deepseek/deepseek-v4.1-flash": "openrouter",
+    # Geração anterior. Continua no mapa (e não no seletor) porque é ~6x mais
+    # barata na entrada e é para onde se volta se a V4.1 decepcionar.
+    "deepseek/deepseek-v4-flash@baidu": "openrouter",
     "deepseek/deepseek-v4-flash": "openrouter",
 }
 
@@ -159,7 +179,7 @@ DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openai": "gpt-4-turbo-preview",
     "anthropic": "claude-3-opus-20240229",
     "ollama": "gemma4:e2b",
-    "deepseek": "deepseek-v4-flash",
+    "deepseek": "deepseek-flash",
     "gemini": "gemini-2.0-flash",
     "grok": "grok-3-mini",
     "groq": "llama-3.3-70b-versatile",
@@ -177,7 +197,7 @@ def provider_for_model(model_name: str | None) -> str | None:
 def supports_vision(model_name: str | None) -> bool | None:
     """O modelo aceita imagem? ``None`` quando ele não está no catálogo.
 
-    Os três estados importam. ``False`` é um NÃO conhecido (deepseek-v4-flash) e
+    Os três estados importam. ``False`` é um NÃO conhecido (deepseek-flash) e
     justifica barrar a escolha; ``None`` é um modelo que o operador digitou à mão
     e sobre o qual não temos direito de opinar — deixa passar, e o fallback do
     driver cobre se der errado.

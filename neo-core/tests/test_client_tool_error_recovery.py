@@ -80,9 +80,25 @@ async def test_recovery_skips_app_search_for_named_tool_404():
 # NESSA MESMA chamada e ele gerou `mv /workspace/...` mesmo assim — prosa
 # sozinha não é confiável o bastante, então trava por código também.
 
+def _svc_que_desvia():
+    """O comando com /workspace não é mais beco sem saída: vira turno do cérebro
+    (sessão f33632b4, interações 8 e 9 — o pedido morria num "baixe pelo botão")."""
+    svc = _svc()
+    capturado: dict = {}
+
+    async def _cerebro(session_id, user_message, history, decision, trace, sys_context, **kw):
+        capturado["decision"] = decision
+        from modules.desktop.ai_service import AIServiceResponse
+
+        yield AIServiceResponse(intent=IntentType.DIRECT_RESPONSE, session_id=session_id, message="cérebro", is_final=True)
+
+    svc._handle_direct_response = _cerebro
+    return svc, capturado
+
+
 @pytest.mark.asyncio
 async def test_client_tool_blocks_raw_command_referencing_workspace():
-    svc = _svc()
+    svc, capturado = _svc_que_desvia()
     decision = RoutingDecision(
         intent=IntentType.CLIENT_TOOL,
         raw_command="mv /workspace/extrato.xlsx /Users/daniel/Desktop/extrato.xlsx",
@@ -95,15 +111,15 @@ async def test_client_tool_blocks_raw_command_referencing_workspace():
             decision=decision,
         )
     ]
-    assert len(responses) == 1
-    assert responses[0].is_final is True
-    assert responses[0].command_request is None
-    assert "sandbox" in responses[0].message.lower()
+    assert all(r.command_request is None and r.tool_request is None for r in responses)
+    assert responses[-1].message == "cérebro"
+    assert capturado["decision"].intent is IntentType.DIRECT_RESPONSE
+    assert "/workspace" in capturado["decision"].explanation
 
 
 @pytest.mark.asyncio
 async def test_client_tool_blocks_workspace_in_tool_arguments_command():
-    svc = _svc()
+    svc, capturado = _svc_que_desvia()
     decision = RoutingDecision(
         intent=IntentType.CLIENT_TOOL,
         tool_name="run_command",
@@ -115,8 +131,8 @@ async def test_client_tool_blocks_workspace_in_tool_arguments_command():
             session_id=uuid4(), user_message="baixa esse arquivo", decision=decision,
         )
     ]
-    assert len(responses) == 1
-    assert responses[0].is_final is True
+    assert all(r.command_request is None and r.tool_request is None for r in responses)
+    assert capturado["decision"].intent is IntentType.DIRECT_RESPONSE
 
 
 # ── Camada 3: file_id não fundamentado nunca é despachado pro desktop ─────
@@ -137,7 +153,7 @@ class _FakeFileStore:
 
 @pytest.mark.asyncio
 async def test_client_tool_blocks_save_generated_file_with_ungrounded_file_id():
-    svc = _svc()
+    svc, capturado = _svc_que_desvia()
     svc.file_store = _FakeFileStore()  # catálogo vazio — "f8d" não existe
     decision = RoutingDecision(
         intent=IntentType.CLIENT_TOOL,
@@ -154,9 +170,10 @@ async def test_client_tool_blocks_save_generated_file_with_ungrounded_file_id():
             session_id=uuid4(), user_message="envia para area de trabalho", decision=decision,
         )
     ]
-    assert len(responses) == 1
-    assert responses[0].is_final is True
-    assert responses[0].tool_request is None
+    assert all(r.tool_request is None for r in responses)
+    # Não despacha E não morre em "peça de novo": o cérebro assume (sessão 9b0b10cc).
+    assert capturado["decision"].intent is IntentType.DIRECT_RESPONSE
+    assert "sem arquivo no catálogo" in capturado["decision"].explanation
 
 
 @pytest.mark.asyncio

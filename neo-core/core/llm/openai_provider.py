@@ -99,6 +99,47 @@ def _is_rate_limit(error: Exception) -> bool:
     return type(error).__name__ == "RateLimitError" or "429" in str(error)
 
 
+class InBandProviderError(Exception):
+    """O provedor de infra falhou DEPOIS de o gateway aceitar a requisição.
+
+    O OpenRouter devolve 200 assim que aceita a chamada; se o provedor cai no
+    meio (timeout, queda), o erro vem no CORPO — ``{"error": {...}}`` sem
+    ``choices``. O SDK aceita isso como ``ChatCompletion`` com ``choices=None``,
+    e a falha real sumia num ``TypeError: 'NoneType' object is not
+    subscriptable``: sem código, sem retry, sem soltar o pin. Medido nas
+    sessões 5656b9f7 e 615a74b6 (2026-09-16): Baidu fora por ~5 min, o turno
+    esperou 125 s e respondeu "deu erro do meu lado".
+    """
+
+    def __init__(self, error: Any) -> None:
+        body = error if isinstance(error, dict) else {}
+        code = body.get("code")
+        self.body = body
+        self.status_code = code if isinstance(code, int) else None
+        message = body.get("message") or "resposta sem choices e sem objeto de erro"
+        super().__init__(f"provedor falhou dentro de uma resposta 200 (code={code}): {message}")
+
+
+def _in_band_error(response: Any) -> Any:
+    """O objeto ``error`` que veio no corpo de uma resposta 200, se veio."""
+    error = getattr(response, "error", None)
+    if error is None:
+        error = (getattr(response, "model_extra", None) or {}).get("error")
+    return error
+
+
+def is_upstream_failure(error: BaseException | None) -> bool:
+    """O provedor falhou com a requisição JÁ ACEITA pelo gateway?
+
+    Mesmo fato em dois formatos: no bufferizado, ``InBandProviderError``; no
+    streaming, o SDK levanta um ``APIError`` PURO (sem status HTTP — o 200 já
+    tinha saído) quando um evento SSE traz ``error``. Subclasses não contam:
+    ``APIStatusError`` é recusa HTTP de verdade (400/404 falam da requisição, não
+    do provedor) e ``APIConnectionError`` já é ``_is_transient``.
+    """
+    return isinstance(error, InBandProviderError) or type(error).__name__ == "APIError"
+
+
 def forces_tool_call(tool_choice: Any) -> bool:
     """O ``tool_choice`` EXIGE uma tool (vs. deixar o modelo escolher)?
 
@@ -308,6 +349,8 @@ class OpenAIProvider(LLMProvider):
             for attempt in range(_RATE_LIMIT_RETRIES + 1):
                 try:
                     response = await client.chat.completions.create(**params)
+                    if not getattr(response, "choices", None):
+                        raise InBandProviderError(_in_band_error(response))
                     return OpenAICompletionResponse(response)
                 except Exception as e:  # noqa: BLE001 — só 429/5xx/tool_choice são retentáveis
                     last_error = e
@@ -348,9 +391,11 @@ class OpenAIProvider(LLMProvider):
                         )
                         params["tool_choice"] = "auto"
                         continue
-                    # Pin trancado + 429: o chamador consegue consertar a ROTA, e
-                    # isso vale mais que qualquer espera. Sai já, sem dormir.
-                    if bail_on_rate_limit and _is_rate_limit(e):
+                    # Pin trancado + 429 (ou provedor que caiu no meio): o chamador
+                    # consegue consertar a ROTA, e isso vale mais que qualquer
+                    # espera — repetir o mesmo provedor fora do ar custa ~60 s por
+                    # tentativa até o gateway desistir. Sai já, sem dormir.
+                    if bail_on_rate_limit and (_is_rate_limit(e) or is_upstream_failure(e)):
                         logger.info(
                             "[OpenAI] 429 com rota fixada — devolvendo na hora para o "
                             "chamador liberar o fallback (sem gastar o backoff)"
@@ -493,6 +538,8 @@ class OpenAIProvider(LLMProvider):
                 }
                 if param.enum:
                     properties[param_name]["enum"] = param.enum
+                if param.items:
+                    properties[param_name]["items"] = param.items
 
                 if param.required:
                     required.append(param_name)

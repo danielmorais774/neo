@@ -113,60 +113,7 @@ def render_auto_entry(
     # 25 e não 10: o corpo da nota é o lugar barato, e um turno que encadeou 15
     # comandos é justamente o que dói refazer.
     for entry in trace[:25]:
-        tool = entry.get("tool", "?")
-        # `note_detail` é o resultado FARTO, que só existe deste lado (ver
-        # `_summarize_tool_call`). Quando há, ele vem DEPOIS da linha curta: a
-        # linha diz o que foi feito, o bloco diz o que saiu.
-        detalhe = str(entry.get("note_detail") or "").strip()
-        if not entry.get("ok", True):
-            lines.append(f"- {tool}: falhou ({str(entry.get('error', '?'))[:400]})")
-        elif tool == "neo_write_file":
-            lines.append(f"- escrevi {entry.get('path')} ({entry.get('bytes')} bytes)")
-        elif tool == "neo_bash":
-            # Com o bloco farto logo abaixo, a prévia diria a mesma coisa duas
-            # vezes — e a primeira ainda achatada numa linha só.
-            preview = (
-                "" if detalhe
-                else str(entry.get("stdout_preview") or "").strip().replace("\n", " ")
-            )
-            suffix = f" → {preview[:160]}" if preview else ""
-            lines.append(
-                f"- rodei `{entry.get('command')}` (exit={entry.get('exit_code')}){suffix}"
-            )
-        elif entry.get("async_job"):
-            titulo = entry.get("job_title") or "(sem título)"
-            lines.append(
-                f"- abri o job '{titulo}' via {tool} (job {entry.get('job_id')}) — "
-                "ele ainda estava rodando quando este turno acabou; o RESULTADO "
-                "entra nesta nota numa entrada própria quando terminar"
-            )
-        elif tool == "file_read":
-            # Ponteiro, não payload. O caderno guarda ONDE está o arquivo e o
-            # que foi lido dele; o conteúdo se relê (e a cópia envelheceria).
-            trecho = f", linhas {entry['linhas']}" if entry.get("linhas") else ""
-            resto = " (tem mais)" if entry.get("tem_mais") else ""
-            lines.append(
-                f"- li '{entry.get('name')}'{trecho}{resto} — {entry.get('chars', 0)} chars "
-                f"NÃO copiados para cá (file_id={entry.get('file_id')}; releia com "
-                "file_read, ou file_stage p/ processar no sandbox com neo_bash)"
-            )
-        elif tool == "file_stage":
-            lines.append(
-                f"- materializei no sandbox: {entry.get('path')} "
-                f"(file_id={entry.get('file_id')}) — processe com neo_bash"
-            )
-        elif tool == "file_save":
-            lines.append(
-                f"- guardei '{entry.get('name')}' no catálogo (file_id={entry.get('file_id')})"
-            )
-        else:
-            lines.append(f"- {tool}: {str(entry.get('summary', ''))[:160]}")
-        if detalhe and entry.get("ok", True):
-            # Indentado: continua sendo parte do bullet acima, e o preview do
-            # desktop desenha como bloco de código em vez de prosa solta.
-            lines.append("  ```")
-            lines.extend(f"  {linha}" for linha in detalhe.splitlines())
-            lines.append("  ```")
+        lines.extend(_trace_entry_lines(entry))
     for f in (files or [])[:8]:
         lines.append(f"- entreguei ao usuário: '{f.get('name')}' (file_id={f.get('file_id')})")
     if not lines:
@@ -175,6 +122,164 @@ def render_auto_entry(
         "Registro automático do turno (eu não anotei nada por conta própria aqui — "
         "isto é o que de fato foi executado):\n" + "\n".join(lines)
     )
+
+
+def _trace_entry_lines(entry: dict[str, Any]) -> list[str]:
+    """As linhas de UMA entrada de ``tool_trace``.
+
+    Compartilhadas pelo registro do fim do turno (`render_auto_entry`) e pelo
+    registro passo a passo (`render_step_entry`): o mesmo passo não pode ser
+    descrito de dois jeitos dependendo de quando foi anotado.
+    """
+    lines: list[str] = []
+    tool = entry.get("tool", "?")
+    # `note_detail` é o resultado FARTO, que só existe deste lado (ver
+    # `_summarize_tool_call`). Quando há, ele vem DEPOIS da linha curta: a
+    # linha diz o que foi feito, o bloco diz o que saiu.
+    detalhe = str(entry.get("note_detail") or "").strip()
+    if not entry.get("ok", True):
+        lines.append(f"- {tool}: falhou ({str(entry.get('error', '?'))[:400]})")
+    elif entry.get("async_job"):
+        titulo = entry.get("job_title") or "(sem título)"
+        comando = f" `{entry.get('command')}`" if entry.get("command") else ""
+        lines.append(
+            f"- abri o job '{titulo}' via {tool}{comando} (job {entry.get('job_id')}) — "
+            "ele ainda estava rodando quando este passo foi anotado; o RESULTADO "
+            "entra nesta nota numa entrada própria quando terminar"
+        )
+    elif tool == "run_command":
+        lines.append(f"- rodei NA MÁQUINA DO USUÁRIO `{entry.get('command')}`")
+    elif tool == "request_user_file":
+        onde = (
+            f"materializado no sandbox em {entry.get('path')}"
+            if entry.get("path")
+            else "ainda NÃO materializado no sandbox (use file_stage)"
+        )
+        lines.append(
+            f"- recebi do usuário '{entry.get('name')}'{_tamanho(entry.get('size_bytes'))} — "
+            f"file_id={entry.get('file_id')}; {onde}. Não peça de novo: já está no catálogo"
+        )
+    elif tool == "read_user_file":
+        lines.append(f"- li do disco do usuário: {entry.get('path') or entry.get('name')}")
+    elif tool in ("edit_user_file", "delegate_file_edit"):
+        via = " (via opencode)" if tool == "delegate_file_edit" else ""
+        lines.append(f"- alterei no disco do usuário{via}: {entry.get('path') or entry.get('name')}")
+    elif tool in ("save_generated_file", "write_file"):
+        lines.append(f"- entreguei no disco do usuário: {entry.get('path') or entry.get('name')}")
+    elif tool == "neo_write_file":
+        comeco = f" — começa com: {entry['primeira_linha']}" if entry.get("primeira_linha") else ""
+        lines.append(
+            f"- escrevi {entry.get('path')} ({entry.get('bytes')} bytes){comeco} "
+            "(conteúdo NÃO copiado para cá; releia com neo_read_file)"
+        )
+    elif tool == "neo_bash" and entry.get("leitura_chars") is not None:
+        lines.append(
+            f"- li conteúdo de arquivo com `{entry.get('command')}` (exit={entry.get('exit_code')}) — "
+            f"{entry.get('leitura_chars')} chars NÃO copiados para cá (releia rodando o comando)"
+        )
+    elif tool == "neo_bash":
+        # Com o bloco farto logo abaixo, a prévia diria a mesma coisa duas
+        # vezes — e a primeira ainda achatada numa linha só.
+        preview = (
+            "" if detalhe
+            else str(entry.get("stdout_preview") or "").strip().replace("\n", " ")
+        )
+        suffix = f" → {preview[:160]}" if preview else ""
+        lines.append(
+            f"- rodei `{entry.get('command')}` (exit={entry.get('exit_code')}){suffix}"
+        )
+    elif tool == "file_read":
+        # Ponteiro, não payload. O caderno guarda ONDE está o arquivo e o
+        # que foi lido dele; o conteúdo se relê (e a cópia envelheceria).
+        trecho = f", linhas {entry['linhas']}" if entry.get("linhas") else ""
+        resto = " (tem mais)" if entry.get("tem_mais") else ""
+        lines.append(
+            f"- li '{entry.get('name')}'{trecho}{resto} — {entry.get('chars', 0)} chars "
+            f"NÃO copiados para cá (file_id={entry.get('file_id')}; releia com "
+            "file_read, ou file_stage p/ processar no sandbox com neo_bash)"
+        )
+    elif tool == "file_stage":
+        lines.append(
+            f"- materializei no sandbox: {entry.get('path')} "
+            f"(file_id={entry.get('file_id')}) — processe com neo_bash"
+        )
+    elif tool == "file_save":
+        lines.append(
+            f"- guardei '{entry.get('name')}' no catálogo (file_id={entry.get('file_id')})"
+        )
+    else:
+        lines.append(f"- {tool}: {str(entry.get('summary', ''))[:160]}")
+    if detalhe and entry.get("ok", True):
+        # Indentado: continua sendo parte do bullet acima, e o preview do
+        # desktop desenha como bloco de código em vez de prosa solta.
+        lines.append("  ```")
+        lines.extend(f"  {linha}" for linha in detalhe.splitlines())
+        lines.append("  ```")
+    return lines
+
+
+def _tamanho(size_bytes: Any) -> str:
+    try:
+        n = int(size_bytes)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 1024 * 1024:
+        return f" ({n / (1024 * 1024):.0f} MB)"
+    if n >= 1024:
+        return f" ({n / 1024:.0f} KB)"
+    return f" ({n} bytes)"
+
+
+def render_step_entry(entry: dict[str, Any]) -> str:
+    """UM passo, anotado na hora em que aconteceu.
+
+    O registro do fim do turno (`render_auto_entry`) nunca roda num turno
+    cancelado nem no caminho de atuação no cliente — foi assim que as sessões
+    c4f3f7de e 45bd5ad0 subiram um vídeo de 392 MB, geraram 127 quadros e
+    deixaram o caderno sem uma linha.
+    """
+    lines = _trace_entry_lines(entry)
+    if not lines:
+        return ""
+    return "Passo (registrado na hora, automático):\n" + "\n".join(lines)
+
+
+def render_step_summary(entry: dict[str, Any]) -> str:
+    """Linha do ÍNDICE a partir do passo mais recente — é ela que entra no prompt.
+
+    O resumo fixo ("registro automático do que foi executado nesta sessão") não
+    dizia nada que ajudasse a decidir abrir a nota; o endereço do último passo diz.
+    """
+    tool = entry.get("tool", "?")
+    if not entry.get("ok", True):
+        texto = f"{tool} falhou: {entry.get('error', '?')}"
+    elif entry.get("async_job"):
+        texto = f"job '{entry.get('job_title') or '?'}' em background (job {entry.get('job_id')})"
+    elif tool == "request_user_file":
+        texto = (
+            f"recebi '{entry.get('name')}' (file_id={entry.get('file_id')}) → "
+            f"{entry.get('path') or 'catálogo'}"
+        )
+    elif tool == "read_user_file":
+        texto = f"li {entry.get('path')}"
+    elif tool in ("edit_user_file", "delegate_file_edit"):
+        texto = f"alterei {entry.get('path')}"
+    elif tool in ("save_generated_file", "write_file"):
+        texto = f"entreguei {entry.get('path') or entry.get('name')}"
+    elif tool in ("neo_bash", "run_command"):
+        onde = "na máquina do usuário: " if tool == "run_command" else ""
+        texto = f"{onde}`{entry.get('command')}`"
+        if entry.get("exit_code") is not None:
+            texto += f" exit={entry.get('exit_code')}"
+    elif tool == "file_stage":
+        texto = f"{entry.get('path')} no sandbox (file_id={entry.get('file_id')})"
+    elif tool == "file_save":
+        texto = f"guardei '{entry.get('name')}' (file_id={entry.get('file_id')})"
+    elif tool == "neo_write_file":
+        texto = f"escrevi {entry.get('path')}"
+    else:
+        texto = f"{tool}: {entry.get('summary', '')}"
+    return _uma_linha(f"último passo: {texto}", 240)
 
 
 # Teto do resumo do job dentro da entrada. Generoso de propósito: o corpo da

@@ -224,3 +224,192 @@ async def test_evidencia_e_por_sessao():
     svc._record_disk_evidence(a, "ls", _ARQUIVO)
     assert await svc._file_path_is_grounded(_ARQUIVO, a, "pega") is True
     assert await svc._file_path_is_grounded(_ARQUIVO, b, "pega") is False
+
+
+# ── Sessão 0e2fcc86 (2026-09-18): 11 idas ao disco, zero arquivo gravado ────
+#
+# "cria 3 arquivos .md com resumo desses arquivos". O turno morreu com "Parei
+# depois de 10 ações seguidas na sua máquina neste pedido, pra não virar laço" —
+# mas NENHUM comando tinha se repetido literalmente. Três defeitos em cadeia:
+#
+# 1. a janela de saídas (`_ACTUATION_STEPS_KEPT`=6) é menor que o teto de rodadas.
+#    Da 8ª em diante o modelo parava de ver os primeiros passos e voltava a pedir
+#    o que já tinha pedido — enquanto a guarda, que lembra de TODOS, o matava;
+# 2. a guarda comparava string exata, e as rodadas 10 e 11 tinham 3 dos 4 alvos
+#    iguais com a string diferente: passou batido;
+# 3. leitura e escrita dividiam um teto de 10. Ler 7 arquivos e escrever 3 é
+#    impossível assim — o crédito acabou antes da primeira escrita.
+
+_A = "/Users/daniel/Desktop/teste-de-analise"
+_R10 = (
+    f'ls -la {_A}/*.md {_A}/*.pdf {_A}/*.csv {_A}/*.json 2>/dev/null; echo "---"; '
+    f"ls -la {_A}/dados/tratados/txt/ {_A}/dados/tratados/txt_limpo/ 2>/dev/null"
+)
+_R11 = f"ls -la {_A}/*.md {_A}/*.csv {_A}/*.json {_A}/fontes/ 2>/dev/null"
+
+
+def _passos(n: int, *, tool: str = "run_command") -> list[dict]:
+    return [
+        {"command": f"ls -la /pasta/{i}", "ok": True, "output": f"saida<{i}>", "tool": tool}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_indice_mostra_os_passos_que_sairam_da_janela():
+    """O conserto do defeito 1: a saída velha sai, o COMANDO velho fica."""
+    from modules.desktop.ai_service import _ACTUATION_STEPS_KEPT
+
+    passos = _passos(10)
+    note = _render_actuation_steps(passos)
+
+    assert "Índice de tudo que já rodou" in note
+    for i in range(1, 11):
+        assert f"ls -la /pasta/{i}" in note, f"o passo {i} sumiu do índice"
+    # A saída detalhada continua só dos últimos — o índice é barato, a saída não.
+    assert "saida<1>" not in note, "saída antiga não devia voltar"
+    assert "saida<10>" in note
+    fora = 10 - _ACTUATION_STEPS_KEPT
+    assert f"As saídas dos passos 1–{fora} já foram usadas" in note
+
+
+def test_indice_nao_aparece_enquanto_tudo_cabe_na_janela():
+    """Turno curto não paga nada: o índice seria a mesma lista duas vezes."""
+    note = _render_actuation_steps(_passos(3))
+    assert "Índice de tudo que já rodou" not in note
+    assert "### Passo 3:" in note
+
+
+def test_numeracao_do_detalhe_e_absoluta():
+    """Passo 7 tem que se chamar 7 — senão o índice e o detalhe divergem."""
+    note = _render_actuation_steps(_passos(8))
+    assert "### Passo 8:" in note
+    assert "### Passo 1:" not in note, "o 7º passo não pode se chamar 'Passo 1'"
+
+
+def test_quase_repeticao_pega_o_que_a_igualdade_exata_deixava_passar():
+    from modules.desktop.ai_service import (
+        _near_repeated_actuation,
+        _repeated_actuation,
+    )
+
+    steps = [{"command": f"ls -la {_A}/"}, {"command": _R10}]
+
+    assert _repeated_actuation(steps, _R11) is False, "as strings são diferentes"
+    assert _near_repeated_actuation(steps, _R11) == [2], "3 de 4 alvos já respondidos"
+
+
+def test_quase_repeticao_nao_barra_pedido_novo():
+    from modules.desktop.ai_service import _near_repeated_actuation
+
+    steps = [{"command": f"ls -la {_A}/"}, {"command": _R10}]
+
+    # Caminho que nunca apareceu → é pergunta nova, tem que passar.
+    assert _near_repeated_actuation(steps, f"cat {_A}/RESUMO_EXECUTIVO.md") == []
+    assert _near_repeated_actuation(steps, f"ls -la {_A}/fichas/ {_A}/anexos/") == []
+    # Verbo diferente no mesmo caminho lê outra coisa (listar ≠ ler).
+    assert _near_repeated_actuation([{"command": "ls -la /a/b"}], "cat /a/b") == []
+    # Comando sem alvo nenhum: só a igualdade literal conta.
+    assert _near_repeated_actuation(steps, "df -h") == []
+
+
+def test_opcao_que_muda_a_resposta_nao_e_repeticao():
+    """Medido no replay da 0e2fcc86: sem olhar as flags, `ls -laR X/` depois de
+    `ls -la X/` era acusado de repetir — e o -R é justamente informação nova."""
+    from modules.desktop.ai_service import _near_repeated_actuation
+
+    steps = [{"command": f"ls -la {_A}/dados/"}]
+    assert _near_repeated_actuation(steps, f"ls -laR {_A}/dados/") == []
+    assert _near_repeated_actuation(steps, f"grep -r politica {_A}/dados/") == []
+    # Mas reordenar as mesmas flags não engana: `-al` é `-la`.
+    assert _near_repeated_actuation(steps, f"ls -al {_A}/dados/") == [1]
+
+
+@pytest.mark.asyncio
+async def test_quase_repetido_volta_pro_cerebro_em_vez_de_rodar_ou_morrer():
+    """Nem despacha (pagaria uma ida pelo mesmo dado) nem mata o turno (tem 1 alvo novo)."""
+    svc = _svc()
+    sid = uuid4()
+    seen: list[dict] = []
+    _spy_reenter(svc, seen)
+
+    steps = [{"command": f"ls -la {_A}/", "ok": True, "output": "...", "tool": "run_command"},
+             {"command": _R10, "ok": True, "output": "...", "tool": "run_command"}]
+    car = ClientActuationRequested("run_command", {"command": _R11}, "tc")
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=sid, user_message="cria os 3 .md", user_id=None,
+        metadata={}, trace=None, slog=None, depth=2, steps=steps,
+    ))
+
+    assert not any(r.command_request for r in out), "não podia ter despachado"
+    assert seen, "tinha que voltar pro cérebro"
+    assert "ESSE COMANDO NÃO RODOU" in seen[0]["extra_note"]
+    assert "peça SÓ o que falta" in seen[0]["extra_note"]
+    # O empurrão vira passo: é ele que aparece no índice e que limita as voltas.
+    assert seen[0]["steps"][-1]["kind"] == "nudge"
+    assert seen[0]["steps"][-1]["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_terceira_volta_no_mesmo_ponto_encerra():
+    """O empurrão é bom duas vezes; na terceira é laço e o turno fecha."""
+    from modules.desktop.ai_service import _MAX_REPEAT_NUDGES
+
+    svc = _svc()
+    steps = [{"command": _R10, "ok": True, "output": "...", "tool": "run_command"}]
+    # Cada volta com uma string DIFERENTE: repetir letra por letra já cai na guarda
+    # de igualdade, que é outra porta. O que se mede aqui é o reembaralhamento.
+    steps += [
+        {"command": f"ls -la {_A}/*.md {_A}/*.json {_A}/*.csv {_A}/extra{i}/",
+         "ok": False, "kind": "nudge", "tool": "run_command", "error": "x"}
+        for i in range(_MAX_REPEAT_NUDGES)
+    ]
+    car = ClientActuationRequested("run_command", {"command": _R11}, "tc")
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="cria os 3 .md", user_id=None,
+        metadata={}, trace=None, slog=None, depth=3, steps=steps,
+    ))
+
+    assert out[-1].is_final
+    assert "terceira volta no mesmo ponto" in out[-1].message
+
+
+@pytest.mark.asyncio
+async def test_ler_muito_nao_gasta_o_credito_de_escrever():
+    """O defeito 3: 10 leituras matavam o turno antes do primeiro write_file."""
+    from modules.desktop.ai_service import _MAX_READ_ACTUATIONS
+
+    svc = _svc()
+    leituras = [
+        {"command": f"read_user_file /a/{i}.md", "ok": True, "output": "x",
+         "tool": "read_user_file"}
+        for i in range(_MAX_READ_ACTUATIONS)
+    ]
+    car = ClientActuationRequested(
+        "write_file", {"path": "/Users/daniel/Desktop/r.md", "content": "oi"}, "tc"
+    )
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="cria os 3 .md", user_id=None,
+        metadata={}, trace=None, slog=None, depth=len(leituras), steps=leituras,
+    ))
+
+    assert any(r.tool_request for r in out), "a escrita tem orçamento próprio"
+
+
+@pytest.mark.asyncio
+async def test_teto_de_leitura_diz_que_foi_garimpo_e_nao_laco():
+    """O defeito 4: a mensagem acusava repetição quando o que acabou foi crédito."""
+    from modules.desktop.ai_service import _MAX_READ_ACTUATIONS
+
+    svc = _svc()
+    leituras = _passos(_MAX_READ_ACTUATIONS)
+    car = ClientActuationRequested("run_command", {"command": "ls -la /outra/pasta"}, "tc")
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="cria os 3 .md", user_id=None,
+        metadata={}, trace=None, slog=None, depth=len(leituras), steps=leituras,
+    ))
+
+    assert out[-1].is_final
+    assert "leituras/listagens" in out[-1].message
+    assert "laço" not in out[-1].message, "não houve laço nenhum"
+    # A lista de passos usa numeração absoluta.
+    assert f"{_MAX_READ_ACTUATIONS}. `ls -la /pasta/{_MAX_READ_ACTUATIONS}`" in out[-1].message

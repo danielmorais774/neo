@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 # step result + any handoffs. Either element may be None on a given yield.
 StepRunner = Callable[[PipelineStep], AsyncIterator[tuple["object | None", StepOutcome | None]]]
 
-# (kind, human-readable message). Kinds: "anti_loop" | "max_depth" | "budget".
+# (kind, human-readable message).
+# Kinds: "anti_loop" | "max_depth" | "budget" | "parked_client".
 NoticeSink = Callable[[str, str], None]
 
 # How many work notes to carry into a continuation. Older steps fall out: the note
@@ -138,6 +139,38 @@ class PipelineOrchestrator:
             if outcome.work_note:
                 work_notes.append(outcome.work_note)
                 del work_notes[:-MAX_WORK_NOTES]
+
+            # ── O step estacionou no cliente: a fila PARA aqui ──────────────
+            #
+            # Um step CLIENT_TOOL não executa nada: ele emite o pedido e o
+            # gerador acaba. O trabalho real acontece minutos depois, quando o
+            # desktop devolve o resultado por `process_tool_result` — que é outra
+            # entrada e não conhece esta fila. Seguir para o próximo step aqui é
+            # despachá-lo em cima de um resultado que ainda não existe.
+            #
+            # Sessão d9f9417b (2026-09-20): a cascata era {criar pasta, buscar
+            # links, baixar os PDFs}. O step 1 pôs um card de aprovação na tela do
+            # usuário às 17:31:05 e a fila, sem esperar, disparou o step 2 (busca
+            # no navegador) e o step 3 ("baixar os PDFs encontrados") — este
+            # último sem nenhum link, porque a busca ainda estava rodando. Do lado
+            # de fora isso é exatamente "ele pediu permissão e falhou antes de eu
+            # autorizar": o card estava lá, mas o turno já tinha seguido sem ele.
+            #
+            # Os steps que sobram são DESCARTADOS, não perdidos em silêncio: o
+            # notice os nomeia. Retomar a fila depois do round-trip é outro
+            # problema (a retomada vive em `_pending_actuations`, do cérebro, e
+            # não tem equivalente para cascata).
+            if outcome.parked:
+                restantes = [s.input_text[:80] for s in queue]
+                self._notice(
+                    "parked_client",
+                    "passo estacionado no cliente (aguardando o desktop) — a fila "
+                    "para aqui" + (
+                        f"; {len(restantes)} passo(s) descartado(s): {restantes!r}"
+                        if restantes else " (era o último passo)"
+                    ),
+                )
+                break
 
             # Dependent chain stops on failure; classifier-seeded roots never abort
             # the whole turn here (Phase 4 cascades refine this with on_failure).

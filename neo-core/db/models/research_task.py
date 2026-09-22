@@ -51,7 +51,7 @@ class ResearchTask(SQLModel, table=True):
         default="queued",
         sa_column=Column("status", String(32), nullable=False, index=True),
     )
-    # Modelo LLM usado em todas as chamadas do research (ex.: deepseek-v4-flash).
+    # Modelo LLM usado em todas as chamadas do research (ex.: deepseek-flash).
     model: str = Field(
         default="",
         sa_column=Column("model", String(64), nullable=False),

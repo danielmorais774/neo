@@ -166,6 +166,10 @@ class RecallSession:
     hit_count: int
     best_rank: float
     excerpts: list[RecallExcerpt] = field(default_factory=list)
+    #: Quantos acertos desta conversa apareceram de fato no bloco. Sem isto o
+    #: bloco dizia "24 mensagens no assunto", mostrava 4 e não avisava que 20
+    #: tinham ficado de fora — o modelo lia aquilo como a conversa inteira.
+    hits_shown: int = 0
 
 
 @dataclass
@@ -229,6 +233,54 @@ def _fuzzy_hit_indices(
     return sorted(i for _, i in scored[:limit])
 
 
+def _rank_hit_indices(
+    messages: list[dict[str, Any]],
+    folded_terms: list[str],
+    hit_idx: list[int],
+    limit: int,
+    prefer_substance: bool = False,
+) -> list[int]:
+    """Ordena os acertos por relevância ANTES do corte.
+
+    `hit_idx[:limit]` cortava pelos mais ANTIGOS — a lista nasce da varredura
+    cronológica. Numa conversa que evoluiu, o que sobrava era a PRIMEIRA
+    versão, e o pedido "me mostra aquilo que você escreveu" recebia justamente
+    a versão superada. Foi assim que a "Reanálise Completa" da sessão 7330e40c
+    ficou de fora: era o 6º acerto de 31, com per_session=4 — e o modelo, sem a
+    fonte, preencheu o vão de cabeça.
+
+    Critério: quantos termos DISTINTOS a mensagem casa (quem bate
+    "reanalise"+"completa"+"pior" conta mais que quem só bate "pior").
+
+    O DESEMPATE depende do que está sendo pedido, e errar isso custou uma
+    sessão inteira:
+
+    - ``prefer_substance`` (o pedido é VER o texto, `completo=true`): ganha a
+      mensagem MAIOR. Quem pede uma tabela de volta quer a tabela, não quem
+      fala dela. Na sessão 7330e40c, cinco mensagens empatavam em 6/6 termos;
+      desempatando por recência, a "Reanálise Completa" (12.811 chars) caía em
+      5º atrás de quatro recados curtos do tipo "a tabela está corrigida"
+      (255-445 chars) — que eram as tentativas ERRADAS do próprio Neo. Com
+      `per_session=4` ela ficava de fora por uma posição, e o modelo então
+      reproduzia o erro.
+    - sem ele (o pedido é SABER se falaram disso): ganha a mais recente, que é
+      o estado atual do assunto.
+
+    A ordem CRONOLÓGICA volta na apresentação (`sorted(keep)`); aqui é só quem
+    entra.
+    """
+    scored: list[tuple[int, int, int]] = []
+    for i in hit_idx:
+        folded = _strip_accents(str(messages[i]["content"])).lower()
+        distintos = sum(1 for t in folded_terms if t in folded)
+        scored.append((distintos, len(str(messages[i]["content"])), i))
+    if prefer_substance:
+        scored.sort(key=lambda s: (-s[0], -s[1], -s[2]))
+    else:
+        scored.sort(key=lambda s: (-s[0], -s[2]))
+    return [i for _, _, i in scored[:limit]]
+
+
 class ConversationRecallSearch:
     """Busca conversas passadas do usuário por assunto."""
 
@@ -255,14 +307,41 @@ class ConversationRecallSearch:
         keywords: list[str] | None = None,
         before: datetime | None = None,
         exclude_session_id: UUID | None = None,
+        current_session_before: datetime | None = None,
         limit_sessions: int = 3,
         per_session: int = 4,
+        full_excerpts: bool = False,
+        only_session: str | None = None,
     ) -> RecallResult:
         """Busca conversas antigas sobre um assunto.
 
         ``before`` pagina para trás no tempo (o "não foi isso, foi antes ainda").
+
         ``exclude_session_id`` tira a conversa ATUAL do resultado — sem isso a
-        própria pergunta casa com a busca e a resposta fica circular.
+        própria pergunta casa com a busca e a resposta fica circular. Só que
+        excluir a sessão INTEIRA jogou fora o caso mais comum de todos: o
+        usuário pedindo algo que o Neo escreveu HOJE, nesta mesma conversa, mas
+        longe demais para caber na janela de histórico. Foi exatamente isso na
+        sessão 7330e40c — a "Reanálise Completa" estava a 11 mensagens de
+        distância, e a única tool capaz de achá-la tinha a própria sessão na
+        lista negra.
+
+        ``current_session_before`` resolve os dois: a sessão atual VOLTA a ser
+        pesquisável, mas só até esse instante. Passando o timestamp da mensagem
+        que abriu o turno, a pergunta de agora continua fora (sem circularidade)
+        e todo o resto da conversa fica ao alcance.
+
+        ``only_session`` foca numa conversa que o bloco anterior já mostrou
+        (pelo prefixo de 8 chars que aparece ali). A paginação por ``before``
+        só anda para conversas mais ANTIGAS; não havia como dizer "é essa
+        conversa mesmo, me mostra o resto dela" — e era esse o caso da sessão
+        7330e40c, onde a conversa certa estava na tela e a mensagem certa,
+        fora do corte.
+
+        ``full_excerpts`` entrega INTEIRAS as mensagens que casaram, em vez do
+        trecho de 240 chars. É o que separa "a gente já falou disso?" (o trecho
+        basta) de "me mostra aquela análise de novo" (o trecho não basta: com o
+        texto cortado a única saída do modelo é reescrever de cabeça).
         """
         terms = extract_subject_terms(query, keywords)
         if not terms:
@@ -275,23 +354,37 @@ class ConversationRecallSearch:
         rows = await self._search_fts(
             user_id=user_id, terms=terms, before=before,
             exclude_session_id=exclude_session_id,
+            current_session_before=current_session_before,
         )
         track = "fts"
         if not rows:
             rows = await self._search_trigram(
                 user_id=user_id, terms=terms, before=before,
                 exclude_session_id=exclude_session_id,
+                current_session_before=current_session_before,
             )
             track = "trgm"
         if not rows:
             rows = await self._search_vector(
                 user_id=user_id, query=query, before=before,
                 exclude_session_id=exclude_session_id,
+                current_session_before=current_session_before,
             )
             track = "vector"
         if not rows:
             result.track = "none"
             return result
+
+        if only_session:
+            pref = str(only_session).strip().lower().replace("-", "")[:8]
+            focadas = [
+                r for r in rows
+                if str(r["session_id"]).replace("-", "").lower().startswith(pref)
+            ]
+            if focadas:
+                rows = focadas
+            else:
+                logger.info("[Recall] conversa %r não está nos resultados", only_session)
 
         result.track = track
         result.total_sessions = len(rows)
@@ -304,7 +397,12 @@ class ConversationRecallSearch:
             # primeiro hit da conversa mais antiga desta janela.
             result.next_before = window_rows[-1]["first_hit_at"]
 
-        await self._fill_excerpts(window_rows, terms, per_session, result)
+        await self._fill_excerpts(
+            window_rows, terms, per_session, result,
+            full_excerpts=full_excerpts,
+            exclude_session_id=exclude_session_id,
+            current_session_before=current_session_before,
+        )
         return result
 
     # ── trilhos ───────────────────────────────────────────────────────
@@ -341,6 +439,7 @@ class ConversationRecallSearch:
         params: dict[str, Any],
         before: datetime | None,
         exclude_session_id: UUID | None,
+        current_session_before: datetime | None = None,
     ) -> str:
         """Filtros que valem para os três trilhos."""
         clauses = [
@@ -353,7 +452,16 @@ class ConversationRecallSearch:
             clauses.append("cm.created_at < :before")
             params["before"] = before
         if exclude_session_id is not None:
-            clauses.append("cm.session_id <> :exclude_session")
+            if current_session_before is not None:
+                # A sessão atual entra, mas só o que é anterior ao turno de
+                # agora — ver a docstring de `search`.
+                clauses.append(
+                    "(cm.session_id <> :exclude_session"
+                    " OR cm.created_at < :cur_session_before)"
+                )
+                params["cur_session_before"] = current_session_before
+            else:
+                clauses.append("cm.session_id <> :exclude_session")
             params["exclude_session"] = str(exclude_session_id)
         return " AND ".join(clauses)
 
@@ -374,13 +482,16 @@ class ConversationRecallSearch:
         terms: list[str],
         before: datetime | None,
         exclude_session_id: UUID | None,
+        current_session_before: datetime | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "user_id": str(user_id),
             "tsq": build_tsquery(terms),
             "limit": _MAX_AGG_SESSIONS,
         }
-        filters = self._common_filters(params, before, exclude_session_id)
+        filters = self._common_filters(
+            params, before, exclude_session_id, current_session_before,
+        )
         tsv = await self._tsv_expr()
         sql = f"""
             WITH q AS (SELECT to_tsquery('portuguese', :tsq) AS tq)
@@ -406,6 +517,7 @@ class ConversationRecallSearch:
         terms: list[str],
         before: datetime | None,
         exclude_session_id: UUID | None,
+        current_session_before: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Resgate por semelhança de trigramas — pega erro de digitação.
 
@@ -419,7 +531,9 @@ class ConversationRecallSearch:
             "trgm_min": _TRGM_MIN,
             "limit": _MAX_AGG_SESSIONS,
         }
-        filters = self._common_filters(params, before, exclude_session_id)
+        filters = self._common_filters(
+            params, before, exclude_session_id, current_session_before,
+        )
         sim_pieces = []
         for i, term in enumerate(terms):
             params[f"t{i}"] = _strip_accents(term)
@@ -448,12 +562,15 @@ class ConversationRecallSearch:
         query: str,
         before: datetime | None,
         exclude_session_id: UUID | None,
+        current_session_before: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Último resgate: paráfrase sem nenhum termo em comum.
 
-        Vale pouco hoje — só mensagens do USUÁRIO têm embedding (0 de 1520
-        respostas do Neo têm) — mas é barato e não atrapalha: só roda quando os
-        dois trilhos textuais vieram vazios.
+        Valia pouco quando só mensagens do USUÁRIO tinham embedding (0 de
+        1520 respostas do Neo). Hoje o `add_message` embeda os dois lados
+        (2299 de 2444 respostas cobertas), então este trilho enxerga também o
+        que o NEO escreveu — que é justamente o que o usuário costuma pedir de
+        volta. Roda só quando os dois trilhos textuais vieram vazios.
         """
         if self._embeddings is None or not self._embeddings.available:
             return []
@@ -469,7 +586,9 @@ class ConversationRecallSearch:
             "min_sim": 0.45,
             "limit": _MAX_AGG_SESSIONS,
         }
-        filters = self._common_filters(params, before, exclude_session_id)
+        filters = self._common_filters(
+            params, before, exclude_session_id, current_session_before,
+        )
         sim = "1 - (cm.embedding <=> CAST(:embedding AS vector))"
         sql = f"""
             SELECT cm.session_id,
@@ -495,6 +614,9 @@ class ConversationRecallSearch:
         terms: list[str],
         per_session: int,
         result: RecallResult,
+        full_excerpts: bool = False,
+        exclude_session_id: UUID | None = None,
+        current_session_before: datetime | None = None,
     ) -> None:
         """Carrega as mensagens das sessões da janela e escolhe os trechos.
 
@@ -517,6 +639,16 @@ class ConversationRecallSearch:
             params[f"s{i}"] = sid
             placeholders.append(f":s{i}")
 
+        # O mesmo corte da busca vale para os TRECHOS: sem ele, a sessão atual
+        # devolveria como "lembrança" a pergunta que o usuário acabou de fazer.
+        corte = ""
+        if exclude_session_id is not None and current_session_before is not None:
+            corte = (
+                " AND (session_id <> :cut_sid OR created_at < :cut_before)"
+            )
+            params["cut_sid"] = str(exclude_session_id)
+            params["cut_before"] = current_session_before
+
         rows: list[dict[str, Any]] = []
         try:
             async with self._db.get_session() as db:
@@ -528,6 +660,7 @@ class ConversationRecallSearch:
                           AND role IN ('user', 'assistant')
                           AND tool_name IS NULL
                           AND length(btrim(content)) > 8
+                          {corte}
                         ORDER BY session_id, created_at
                         LIMIT :cap
                     """),
@@ -544,10 +677,41 @@ class ConversationRecallSearch:
 
         folded_terms = [_strip_accents(t).lower() for t in terms]
 
+        # Orçamento SOMADO dos trechos longos, gasto da sessão mais recente para
+        # a mais antiga. Sem ele o teto por mensagem não limita nada.
+        from shared.config import get_settings
+
+        budget = [
+            getattr(get_settings(), "conversation_recall_full_total_chars", 40000)
+            if full_excerpts else 0
+        ]
+
+        # ORDEM DE GASTO do orçamento ≠ ordem de apresentação. Gastar da
+        # sessão mais recente para a mais antiga entregava o orçamento à
+        # conversa de AGORA — cujo conteúdo o modelo já tem no histórico — e a
+        # conversa que realmente importa ficava com as sobras. Pior: na sessão
+        # cbff8f81 isso devolveu ao modelo, como "memória recuperada", a
+        # resposta ERRADA que ele mesmo tinha dado dois turnos antes, e ele a
+        # confirmou. Gasta-se por RELEVÂNCIA, com a sessão atual por último.
+        atual = str(exclude_session_id) if exclude_session_id else None
+        ordem_gasto = sorted(
+            window_rows,
+            key=lambda a: (
+                str(a["session_id"]) == atual,      # a de agora por último
+                -float(a.get("best_rank") or 0.0),  # depois, a mais relevante
+            ),
+        )
+        por_sessao: dict[str, list[RecallExcerpt]] = {}
+        for agg in ordem_gasto:
+            sid = str(agg["session_id"])
+            por_sessao[sid] = self._pick_excerpts(
+                by_session.get(sid, []), folded_terms, per_session,
+                full_excerpts=full_excerpts, budget=budget,
+            )
+
         for agg in window_rows:
             sid = str(agg["session_id"])
-            messages = by_session.get(sid, [])
-            excerpts = self._pick_excerpts(messages, folded_terms, per_session)
+            excerpts = por_sessao.get(sid, [])
             result.window.append(RecallSession(
                 session_id=agg["session_id"],
                 service=str(agg.get("service") or ""),
@@ -556,6 +720,7 @@ class ConversationRecallSearch:
                 hit_count=int(agg["hit_count"]),
                 best_rank=float(agg["best_rank"] or 0.0),
                 excerpts=excerpts,
+                hits_shown=sum(1 for e in excerpts if e.is_hit),
             ))
 
     @staticmethod
@@ -563,6 +728,8 @@ class ConversationRecallSearch:
         messages: list[dict[str, Any]],
         folded_terms: list[str],
         per_session: int,
+        full_excerpts: bool = False,
+        budget: list[int] | None = None,
     ) -> list[RecallExcerpt]:
         """Escolhe os acertos e puxa a mensagem vizinha de cada um."""
         hit_idx: list[int] = []
@@ -581,8 +748,14 @@ class ConversationRecallSearch:
         if not hit_idx:
             hit_idx = list(range(min(len(messages), per_session)))
 
+        chosen = _rank_hit_indices(
+            messages, folded_terms, hit_idx, per_session,
+            prefer_substance=full_excerpts,
+        )
+        chosen_set = set(chosen)
+
         keep: set[int] = set()
-        for i in hit_idx[:per_session]:
+        for i in chosen:
             keep.add(i)
             # A vizinha que fecha o par pergunta→resposta.
             if i + 1 < len(messages):
@@ -590,12 +763,37 @@ class ConversationRecallSearch:
             elif i - 1 >= 0:
                 keep.add(i - 1)
 
+        from shared.config import get_settings
+
+        _st = get_settings()
+        curto = getattr(_st, "conversation_recall_excerpt_chars", _EXCERPT_CHARS)
+        longo = getattr(_st, "conversation_recall_full_excerpt_chars", 12000)
+
         excerpts: list[RecallExcerpt] = []
         for i in sorted(keep):
             msg = messages[i]
-            content = " ".join(str(msg["content"]).split())
-            if len(content) > _EXCERPT_CHARS:
-                content = content[:_EXCERPT_CHARS].rstrip() + "…"
+            # Só o acerto ESCOLHIDO vem inteiro; a vizinha é contexto e
+            # continua curta (antes bastava ser acerto, e uma vizinha que
+            # casava o termo comia o orçamento dos trechos longos).
+            teto = curto
+            if full_excerpts and i in chosen_set and budget is not None:
+                disponivel = min(longo, budget[0])
+                if disponivel > curto:
+                    teto = disponivel
+            raw = str(msg["content"])
+            if teto > curto:
+                # No trecho integral as quebras de linha SÃO o conteúdo:
+                # achatar aqui transformava a tabela markdown da mensagem numa
+                # linha só, e a única saída do modelo era reescrevê-la de
+                # cabeça — exatamente a confabulação que `completo=true`
+                # existe para evitar.
+                content = raw.strip()
+            else:
+                content = " ".join(raw.split())
+            if len(content) > teto:
+                content = content[:teto].rstrip() + "…"
+            if teto > curto and budget is not None:
+                budget[0] = max(0, budget[0] - len(content))
             excerpts.append(RecallExcerpt(
                 role=str(msg["role"]),
                 created_at=msg["created_at"],

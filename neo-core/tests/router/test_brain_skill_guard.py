@@ -157,8 +157,10 @@ def test_client_tool_nao_e_desviado():
 
 
 class _ToolFalsa:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, execution: str | None = None) -> None:
         self.name = name
+        if execution is not None:
+            self.execution = execution
 
 
 class _RegistryFalso:
@@ -198,6 +200,40 @@ def test_job_tools_continuam_visiveis_apesar_do_prefixo():
     )
     assert {"neo_bash_background", "deep_research", "browser_task", "job_status"} <= visiveis
     assert "data_list" not in visiveis
+
+
+def test_tool_de_cliente_fica_de_fora_do_agente_do_servidor():
+    """session-30b1e484: o agente do SERVER_TOOL via `run_command`, chamava, e o
+    turno morria em "Executor para módulo 'desktop' não registrado" com o job do
+    browser já na fila — o usuário leu fracasso e pediu de novo."""
+    from modules.desktop.ai_service import AIService
+
+    registry = _RegistryFalso([])
+    registry._tools = [
+        _ToolFalsa("run_command", "client-side"),
+        _ToolFalsa("write_file", "client-side"),
+        _ToolFalsa("get_weather", "server-side"),
+        _ToolFalsa("browser_task", "server-side"),
+        _ToolFalsa("browser_local_task", "server-side"),
+    ]
+    servico = AIService.__new__(AIService)
+    servico.agent = type("Agent", (), {"tool_registry": registry})()
+    visiveis = {t.name for t in servico._server_tool_toolset()}
+
+    assert "run_command" not in visiveis
+    assert "write_file" not in visiveis
+    assert {"get_weather", "browser_task", "browser_local_task"} <= visiveis
+
+
+def test_nenhuma_tool_de_cliente_do_desktop_roda_no_servidor():
+    """Contra o registry REAL: tool nova do desktop não pode vazar para o agente."""
+    from core.router.intent_router import server_tool_can_run
+    from modules.desktop.tools import DESKTOP_TOOLS
+
+    de_cliente = [t for t in DESKTOP_TOOLS if t.execution == "client-side"]
+    assert "run_command" in {t.name for t in de_cliente}
+    for tool in de_cliente:
+        assert server_tool_can_run(tool.name, execution=tool.execution) is False, tool.name
 
 
 def test_o_prefixo_data_realmente_esta_na_lista():

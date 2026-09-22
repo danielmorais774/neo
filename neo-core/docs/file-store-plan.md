@@ -176,7 +176,7 @@ Imagem: sem extração (F1/F2); visão entra depois como derived opcional.
   purge manual). Staged copies em `/workspace/files/` não são geridas pelo GC
   (workspace é rascunho por definição; um `find -mtime` no próprio sandbox
   resolve depois, se incomodar).
-- **Quota**: `NEO_FILES_MAX_FILE_MB` (50) rejeita no upload;
+- **Quota**: `NEO_FILES_MAX_FILE_MB` (500) rejeita no upload;
   `NEO_FILES_QUOTA_GB` (2) — acima disso upload falha com mensagem clara e o
   panel mostra a barra em vermelho.
 
@@ -242,7 +242,7 @@ do `ResearchPanel`:
 ## 12. Config (shared/config.py)
 
 `NEO_FILES_ENABLED` (default **false** até o smoke) · `NEO_FILES_ROOT`
-(`/data/files`) · `NEO_FILES_TTL_DAYS` (7) · `NEO_FILES_MAX_FILE_MB` (50) ·
+(`/data/files`) · `NEO_FILES_TTL_DAYS` (7) · `NEO_FILES_MAX_FILE_MB` (500) ·
 `NEO_FILES_QUOTA_GB` (2) · `NEO_FILES_READ_CAP_CHARS` (8000) ·
 `NEO_FILES_GC_INTERVAL_S` (3600). Rollback = flag off + restart (tools somem do
 registry, rotas devolvem 503).

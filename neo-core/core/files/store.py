@@ -81,7 +81,7 @@ class FileStore:
         db: Any,
         root: str = "/data/files",
         workspace_root: str = "/workspace",
-        max_file_bytes: int = 50 * 1024 * 1024,
+        max_file_bytes: int = 500 * 1024 * 1024,
         quota_bytes: int = 2 * 1024 * 1024 * 1024,
         read_cap_chars: int = 8000,
         ttl_days: int = 7,
@@ -338,7 +338,9 @@ class FileStore:
         meta: dict[str, Any] = {}
         if is_text_mime(mime):
             try:
-                head = blob.read_bytes()[: 256 * 1024].decode("utf-8", errors="replace")
+                # Só o começo: read_bytes() carregava o blob inteiro (até 500 MB) na RAM.
+                with blob.open("rb") as fh:
+                    head = fh.read(256 * 1024).decode("utf-8", errors="replace")
                 meta["preview_head"] = head[:500]
                 # line_count exato só p/ arquivo que cabe no head; senão é estimativa.
                 if blob.stat().st_size <= 256 * 1024:
@@ -625,6 +627,36 @@ class FileStore:
     # ------------------------------------------------------------------
     # Utils
     # ------------------------------------------------------------------
+
+    async def assign_owner(self, file_id: UUID | str, *, user_id: Any, session_id: Any) -> None:
+        """Carimba usuário e sessão num arquivo que entrou sem eles.
+
+        O ``file_save`` roda no executor GLOBAL, que não conhece o turno
+        (``FilesExecutor.set_context`` nunca foi chamado): toda conclusão que o Neo
+        publicava ficava sem dono e sem conversa — e aí "o arquivo final desta
+        conversa" não tinha como ser encontrado (docs/file-links-plan.md). Só
+        preenche o que está vazio; nunca troca o dono de um arquivo.
+        """
+        alvo = self._as_uuid(file_id)
+        if alvo is None:
+            return
+        try:
+            async with self._db.get_session() as session:
+                entry = await session.get(StoredFile, alvo)
+                if entry is None:
+                    return
+                mudou = False
+                if entry.user_id is None and user_id:
+                    entry.user_id = self._as_uuid(user_id)
+                    mudou = True
+                if entry.session_id is None and session_id:
+                    entry.session_id = self._as_uuid(session_id)
+                    mudou = True
+                if mudou:
+                    session.add(entry)
+                    await session.commit()
+        except Exception as exc:  # noqa: BLE001 — carimbo é best-effort
+            logger.warning("[files] assign_owner de %s falhou: %s", file_id, exc)
 
     async def _touch(self, file_id: UUID) -> None:
         try:

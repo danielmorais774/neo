@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -977,3 +977,169 @@ async def read_working_note(
         raise HTTPException(status_code=404, detail=f"Nota '{slug}' não encontrada")
 
     return _serialize_working_note(note)
+
+
+# ============ TAREFAS EM BACKGROUND (visor + cancelar) ============
+#
+# O caderno ganhou janela; os jobs não tinham nenhuma. Agora um comando longo vira
+# job sozinho (WorkbenchExecutor._bash) — e trabalho que roda longe da conversa sem
+# um lugar para olhar é trabalho que o usuário acha que travou. Estas rotas são a
+# fonte da janela "Tarefas" do desktop: mesmo router e mesma resolução de dono do
+# caderno (sem JWT, `get_db` já ligado, zero mudança no `main.py`).
+#
+# Um único gesto de escrita, e deliberado: cancelar. Mesma regra da tool
+# `job_cancel` (`core.jobs.executor.cancel_job`) — num sandbox_task, cancelar é o
+# que mata o processo no container.
+
+_JOB_ACTIVE_STATUSES = ("queued", "running")
+
+
+def _job_detail_text(spec: dict[str, Any]) -> str:
+    """O que foi PEDIDO ao job, qualquer que seja o tipo."""
+    acao = spec.get("action") if isinstance(spec.get("action"), dict) else {}
+    return str(
+        spec.get("command") or spec.get("task") or spec.get("goal")
+        or spec.get("topic") or acao.get("texto") or ""
+    )
+
+
+def _serialize_job(job: Any, *, full: bool = False) -> dict[str, Any]:
+    from datetime import datetime as _datetime
+
+    def stamp(value: Any) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    spec = job.spec_json or {}
+    duracao = None
+    if job.started_at is not None:
+        fim = job.finished_at or _datetime.utcnow()
+        duracao = max(0, int((fim - job.started_at).total_seconds()))
+    detalhe = _job_detail_text(spec)
+    payload: dict[str, Any] = {
+        "id": str(job.id),
+        "kind": job.kind,
+        "title": job.title,
+        "status": job.status,
+        "notify_policy": job.notify_policy,
+        "session_id": str(job.session_id) if job.session_id else None,
+        # ISO-8601 SEM timezone (o core grava `utcnow()`), igual ao caderno.
+        "created_at": stamp(job.created_at),
+        "started_at": stamp(job.started_at),
+        "finished_at": stamp(job.finished_at),
+        "heartbeat_at": stamp(job.heartbeat_at),
+        "duration_s": duracao,
+        "exit_code": job.exit_code,
+        "detail": detalhe if full else detalhe[:300],
+        "preview": (job.result_summary or job.progress_note or "")[:280],
+        "adopted": bool(spec.get("adopted")),
+        "has_then": bool(spec.get("then")),
+        "continuation_of": spec.get("continuation_of"),
+        "has_log": bool(job.log_path),
+    }
+    if full:
+        payload.update({
+            "result_summary": job.result_summary or "",
+            "progress_note": job.progress_note or "",
+            "then": str(spec.get("then") or ""),
+            "log_path": job.log_path,
+            "spec": spec,
+        })
+    return payload
+
+
+async def _owned_job_or_404(db: AsyncPostgresClient, job_id: str, user_id: str | None) -> Any:
+    try:
+        uid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+    job = await db.get_agent_job(uid)
+    owner = await _resolve_working_memory_user(db, user_id)
+    # Job sem dono (agenda antiga, teste) é global, como na tool `job_status`.
+    if job is None or (owner is not None and job.user_id is not None and job.user_id != owner):
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+    return job
+
+
+@router.get("/jobs")
+async def list_jobs(
+    status_filter: str = Query(default="all", alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: str | None = Query(default=None),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    """Tarefas do dono do caderno, ativas primeiro e mais recentes no topo."""
+    from sqlalchemy import case, func, or_
+    from sqlmodel import select
+
+    from db.models.agent_job import AgentJob
+
+    owner = await _resolve_working_memory_user(db, user_id)
+    escopo = [] if owner is None else [or_(AgentJob.user_id == owner, AgentJob.user_id.is_(None))]
+    statement = select(AgentJob).where(*escopo)
+    if status_filter == "active":
+        statement = statement.where(AgentJob.status.in_(_JOB_ACTIVE_STATUSES))
+    statement = statement.order_by(
+        case((AgentJob.status.in_(_JOB_ACTIVE_STATUSES), 0), else_=1),
+        AgentJob.created_at.desc(),
+    ).limit(limit)
+    contagem = select(AgentJob.status, func.count()).where(*escopo).group_by(AgentJob.status)
+
+    async with db.get_session() as session:
+        jobs = list((await session.execute(statement)).scalars().all())
+        counts = {str(s): int(n) for s, n in (await session.execute(contagem)).all()}
+
+    return {
+        "jobs": [_serialize_job(job) for job in jobs],
+        "count": len(jobs),
+        "counts": counts,
+        "active": sum(counts.get(s, 0) for s in _JOB_ACTIVE_STATUSES),
+        "user_id": str(owner) if owner else None,
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(
+    job_id: str,
+    user_id: str | None = Query(default=None),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    return _serialize_job(await _owned_job_or_404(db, job_id, user_id), full=True)
+
+
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: str,
+    request: Request,
+    tail: int = Query(default=16000, ge=500, le=200000),
+    user_id: str | None = Query(default=None),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    """O FIM do log — onde quer que ele more (sandbox, diário local ou resumo)."""
+    from core.jobs.executor import read_job_logs
+
+    job = await _owned_job_or_404(db, job_id, user_id)
+    sandbox = getattr(request.app.state, "workbench_sandbox", None)
+    try:
+        lido = await read_job_logs(job, sandbox, max_bytes=tail)
+    except Exception as exc:  # noqa: BLE001 — log é diagnóstico, a tela segue de pé
+        logger.warning("[jobs] log do job %s indisponível: %s", job.id, exc)
+        lido = {
+            "logs": job.result_summary or job.progress_note or "",
+            "truncated": False,
+            "source": "resumo",
+            "error": str(exc),
+        }
+    return {"job_id": str(job.id), "status": job.status, **lido}
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job_route(
+    job_id: str,
+    request: Request,
+    user_id: str | None = Query(default=None),
+    db: AsyncPostgresClient = Depends(get_db),
+) -> dict[str, Any]:
+    from core.jobs.executor import cancel_job
+
+    job = await _owned_job_or_404(db, job_id, user_id)
+    return await cancel_job(db, getattr(request.app.state, "job_manager", None), job)

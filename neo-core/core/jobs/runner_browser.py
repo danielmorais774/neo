@@ -22,6 +22,7 @@ comer o marcador.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -31,6 +32,8 @@ import httpx
 from core.credentials.browser import build_browser_credentials
 from core.jobs.screenshots import ingest_shots
 from db.models.agent_job import AgentJob
+
+from core.jobs.browser_blocked import anotar_se_bloqueio
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +110,7 @@ def build_browser_runner(
             return bare
         return model
 
-    async def run_browser_job(job: AgentJob) -> dict:
+    async def _run_unlocked(job: AgentJob) -> dict:
         spec = job.spec_json or {}
         task = str(spec.get("task") or "").strip()
         if not task:
@@ -241,10 +244,18 @@ def build_browser_runner(
         # no fracasso (é a tela do erro) do que no sucesso.
         if not payload.get("ok"):
             err = (payload.get("error") or "erro desconhecido")[:300]
+            # O agente que estourou o prazo não é um agente que não descobriu
+            # nada: ele carrega a memória do que já tentou. Até 2026-09-20 isso
+            # era descartado e o usuário recebia só "timeout depois de 570s"
+            # (job 36a81dd6), quando o agente sabia exatamente o problema.
+            diag = (payload.get("diagnosis") or "").strip()
+            resumo = f"A tarefa de browser falhou: {err}"
+            if diag:
+                resumo = f"{resumo}\n\n{diag}"
             return await _with_shots(
                 {
                     "status": "failed",
-                    "result_summary": f"A tarefa de browser falhou: {err}",
+                    "result_summary": anotar_se_bloqueio(resumo),
                 },
                 payload,
             )
@@ -263,7 +274,7 @@ def build_browser_runner(
             return await _with_shots(
                 {
                     "status": "failed",
-                    "result_summary": (
+                    "result_summary": anotar_se_bloqueio(
                         "O subagente do browser terminou sem veredito e sem nenhum "
                         "resultado — não dá para dizer que a tarefa foi feita. "
                         + _summary(payload, task)
@@ -275,7 +286,7 @@ def build_browser_runner(
             return await _with_shots(
                 {
                     "status": "failed",
-                    "result_summary": (
+                    "result_summary": anotar_se_bloqueio(
                         "O subagente do browser não conseguiu completar a tarefa: "
                         + _summary(payload, task)
                     ),
@@ -290,5 +301,33 @@ def build_browser_runner(
             {"status": "completed", "result_summary": _summary(payload, task)},
             payload,
         )
+
+    # UMA tarefa por sessão de browser de cada vez, esperando AQUI e não no container.
+    # O container atende cada sessão em série e o JobManager roda até 3 jobs juntos:
+    # antes, o 2º, 3º e 4º job da mesma sessão iam direto para o POST, esperavam na
+    # fila de lá, e o timeout do httpx corria durante a espera. session-30b1e484:
+    # dois jobs estouraram os 600s sem nunca terem começado e o quinto tomou 429
+    # "fila cheia". Aqui o relógio só começa quando chega a vez — o `timeout_at` é
+    # gravado dentro de `_run_unlocked`, depois do lock. Um processo só (o core roda
+    # um worker), então um lock em memória basta.
+    locks: dict[str, asyncio.Lock] = {}
+
+    async def run_browser_job(job: AgentJob) -> dict:
+        session = str((job.spec_json or {}).get("session") or "user-default")
+        lock = locks.setdefault(session, asyncio.Lock())
+        if lock.locked():
+            try:
+                await db.update_agent_job(
+                    job.id,
+                    heartbeat_at=datetime.utcnow(),
+                    progress_note=(
+                        f"Na fila: a sessão de browser '{session}' está terminando "
+                        "outra tarefa."
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        async with lock:
+            return await _run_unlocked(job)
 
     return run_browser_job

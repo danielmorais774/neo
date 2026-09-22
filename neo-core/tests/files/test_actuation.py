@@ -81,8 +81,10 @@ def _svc(*, store=None, history=None) -> AIService:
 def _spy_reenter(svc, recorder):
     """Substitui _reenter_cognitive (pesado: LLM+DB) por um gerador que só grava a chamada."""
 
-    async def _reenter(session_id, *, user_message, pend, extra_note, slog, trace):
-        recorder.append({"extra_note": extra_note, "user_message": user_message, "pend": pend})
+    async def _reenter(session_id, *, user_message, pend, extra_note, slog, trace, steps=None):
+        recorder.append({
+            "extra_note": extra_note, "user_message": user_message, "pend": pend, "steps": steps,
+        })
         from modules.desktop.ai_service import AIServiceResponse
 
         yield AIServiceResponse(
@@ -217,6 +219,8 @@ async def test_pull_path_grounded_is_kept():
 @pytest.mark.asyncio
 async def test_push_with_unknown_file_id_is_refused_without_dispatch():
     svc = _svc(store=_FakeStore([]))  # catálogo vazio
+    rec: list = []
+    _spy_reenter(svc, rec)
     sid = uuid4()
     car = ClientActuationRequested("save_generated_file", {"file_id": "nao-existe", "file_name": "x.pdf"}, "tc4")
     out = await _collect(svc._emit_client_actuation(
@@ -224,20 +228,53 @@ async def test_push_with_unknown_file_id_is_refused_without_dispatch():
         metadata=None, trace=None, slog=None,
     ))
     assert not any(r.tool_request for r in out)  # nada foi despachado
-    assert out[-1].is_final and "não achei" in out[-1].message.lower()
+    # Sem beco sem saída (sessão 9b0b10cc): o cérebro retoma sabendo por quê.
+    assert rec and "FILE_ID INEXISTENTE" in rec[-1]["extra_note"]
 
 
 @pytest.mark.asyncio
 async def test_actuation_depth_cap_stops_the_loop():
+    """O teto é rede de segurança (a guarda real é a repetição) e, ao parar, o
+    Neo conta o que já rodou em vez de "me diga o que você quer" (sessão 45bd5ad0)."""
+    from modules.desktop.ai_service import _MAX_ACTUATION_DEPTH
+
     svc = _svc()
     sid = uuid4()
     car = ClientActuationRequested("request_user_file", {"mode": "pick"}, "tc5")
+    passos = [{"command": "ffmpeg -i video.mov frames/%04d.jpg", "ok": True, "output": "127 frames"}]
     out = await _collect(svc._emit_client_actuation(
         car, session_id=sid, user_message="de novo", user_id=None,
-        metadata=None, trace=None, slog=None, depth=3,
+        metadata=None, trace=None, slog=None, depth=_MAX_ACTUATION_DEPTH, steps=passos,
     ))
     assert not any(r.tool_request for r in out)
     assert out[-1].is_final
+    assert "ffmpeg -i video.mov" in out[-1].message
+
+
+@pytest.mark.asyncio
+async def test_three_legit_actuations_no_longer_stop_the_turn():
+    svc = _svc()
+    car = ClientActuationRequested("request_user_file", {"mode": "pick"}, "tc6")
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="faz no sandbox", user_id=None,
+        metadata=None, trace=None, slog=None, depth=3,
+    ))
+    assert any(r.tool_request for r in out)
+
+
+@pytest.mark.asyncio
+async def test_repeated_shell_command_stops_and_lists_what_ran():
+    svc = _svc()
+    passos = [{"command": "ls -lh /Users/daniel/Desktop/conversa-l", "ok": True, "output": "..."}]
+    car = ClientActuationRequested(
+        "run_command", {"command": "ls  -lh /Users/daniel/Desktop/conversa-l"}, "tc7"
+    )
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="lista a pasta", user_id=None,
+        metadata=None, trace=None, slog=None, depth=1, steps=passos,
+    ))
+    assert not any(r.command_request for r in out)
+    assert out[-1].is_final and "já rodou neste pedido" in out[-1].message
 
 
 # ── _resume_after_user_file: retomada do PULL ───────────────────────────────
@@ -337,15 +374,37 @@ async def test_resume_success_with_stage_materializes_in_workspace():
 
 
 @pytest.mark.asyncio
-async def test_delivery_saved_confirms():
+async def test_delivery_saved_reenters_para_continuar():
+    """Entregar UM arquivo não encerra o turno.
+
+    `save_generated_file` entrega um por chamada. Fechar aqui fazia "põe os 6
+    PDFs na pasta" virar um por turno, com o usuário cutucando a cada um — na
+    sessão 8c449cb8 ele teve que dizer "e os outros? era pra ser os 6" e "tem
+    mais ainda", e ainda assim só 3 dos 6 chegaram. O orçamento nunca foi o
+    limite (`_MAX_ACTUATION_DEPTH` = 16): faltava perguntar ao cérebro.
+    """
     svc = _svc()
     sid = uuid4()
+    notas: list[str] = []
+
+    from modules.desktop.ai_service import AIServiceResponse
+
+    async def _fake_reenter(session_id, *, user_message, pend, extra_note, **kw):
+        notas.append(extra_note)
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            message="Pronto, salvei.", is_final=True, iterations=1,
+        )
+
+    svc._reenter_cognitive = _fake_reenter
     out = await _collect(svc._confirm_file_delivery(
         sid, success=True, result='{"status": "saved", "path": "/Users/d/Desktop/rel.pdf"}',
         error=None, user_message="salva no desktop", pend={}, slog=None, trace=None,
     ))
-    assert out[-1].is_final and "salvei" in out[-1].message.lower()
-    assert "/Users/d/Desktop/rel.pdf" in out[-1].message
+    assert out[-1].is_final
+    assert notas, "sucesso tem que reentrar no cognitivo"
+    assert "/Users/d/Desktop/rel.pdf" in notas[0]
+    assert "PRÓXIMO" in notas[0], "a nota tem que cobrar a continuação"
 
 
 @pytest.mark.asyncio

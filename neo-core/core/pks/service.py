@@ -16,6 +16,7 @@ from core.pks.context_builder import ContextBuilder
 from core.pks.entity_resolver import EntityResolver
 from core.pks.ledger_guard import is_ledger_memory
 from core.pks.ontology import OntologyResolver, OntologyValidator
+from core.pks.ranking import GLOBAL_TYPES as GLOBAL_RANK_TYPES
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
 from core.pks.schemas import UpsertEntityInput, UpsertFieldInput, UpsertRelationInput
@@ -86,11 +87,13 @@ class PKSService:
         user_id: UUID,
         keywords: list[str] | None,
         user_message: str,
+        recent_messages: list[str] | None = None,
     ) -> tuple[dict[str, Any], str]:
         result, context_text = await self.retriever.retrieve(
             user_id=user_id,
             user_message=user_message,
             keywords=keywords,
+            recent_messages=recent_messages,
         )
         return result.model_dump(mode="json"), context_text
 
@@ -413,6 +416,8 @@ class PKSService:
         As chaves originais do ``EntityRecord`` continuam no dict; ``entity_type`` e
         ``properties`` são os apelidos que os call sites já esperavam.
         """
+        if get_settings().pks_ranker_v2_enabled:
+            return await self._search_ranked(user_id=user_id, query=query)
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
             rows = await self.repository.search_entities(session, workspace_id, query)
@@ -421,6 +426,12 @@ class PKSService:
             fields_by_entity = await self.repository.get_fields_for_entities(
                 session, [entity.id for entity, _, _ in rows]
             )
+            # Sem as relações a ferramenta dizia "o treino existe, os exercícios
+            # não" — e eles estavam no prompt (session-098211a8).
+            relations_by_entity = {
+                entity.id: await self.repository.get_relations(session, entity.id)
+                for entity, _, _ in rows
+            }
 
         results: list[dict[str, Any]] = []
         for entity, score, matched_by in rows:
@@ -440,13 +451,71 @@ class PKSService:
                 f.key: (f.value.isoformat() if isinstance(f.value, datetime) else f.value)
                 for f in fields
             }
+            rels = []
+            for r in relations_by_entity.get(entity.id, []):
+                if r.sensitivity == "secret":
+                    continue
+                if r.from_entity_id == entity.id:
+                    rels.append(f"{r.relation_type} -> {r.to_name}")
+                else:
+                    rels.append(f"{r.relation_type} <- {r.from_name}")
             results.append(
                 {
                     **entity.model_dump(mode="json"),
                     "entity_type": entity.type,
                     "properties": properties,
+                    "relations": rels,
                     "score": score,
                     "matched_by": matched_by,
+                }
+            )
+        return results
+
+    async def _search_ranked(self, *, user_id: UUID, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """``search_pks`` pela MESMA nota do bloco do prompt, com as relações.
+
+        Antes a ferramenta buscava por trigram de nome e devolvia só os fields:
+        na session-098211a8 os 6 exercícios da quinta estavam no prompt, a
+        ferramenta disse que não, e o Neo acreditou nela.
+        """
+        _, outcome, entities, fields, relations = await self.retriever.rank(
+            user_id=user_id,
+            user_message=query,
+            # Quem pergunta pela ferramenta quer achar, não caber no prompt:
+            # orçamento folgado e corte relativo mais permissivo.
+            budget_tokens=4000,
+            relative_cutoff=0.3,
+            touch=False,
+        )
+        by_id = {e.id: e for e in entities}
+        results: list[dict[str, Any]] = []
+        for g in outcome.groups[:limit]:
+            entity = g.head.entity
+            if entity.type in GLOBAL_RANK_TYPES and g.head.score <= 0:
+                continue
+            props = {
+                f.key: (f.value.isoformat() if isinstance(f.value, datetime) else f.value)
+                for f in fields.get(entity.id, [])
+                if f.sensitivity != "secret"
+            }
+            rels: list[str] = []
+            for r in relations:
+                if r.sensitivity == "secret" or r.from_entity_id not in by_id or r.to_entity_id not in by_id:
+                    continue
+                if r.from_entity_id == entity.id:
+                    rels.append(f"{r.relation_type} -> {by_id[r.to_entity_id].name}")
+                elif r.to_entity_id == entity.id:
+                    rels.append(f"{r.relation_type} <- {by_id[r.from_entity_id].name}")
+            results.append(
+                {
+                    **entity.model_dump(mode="json"),
+                    "entity_type": entity.type,
+                    "properties": props,
+                    "relations": rels,
+                    "score": round(g.score, 3),
+                    "matched_by": max(
+                        ("nome", "lex", "conv", "grafo"), key=lambda k: g.head.signals.get(k, 0.0)
+                    ),
                 }
             )
         return results

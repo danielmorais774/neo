@@ -70,7 +70,10 @@ DESKTOP_TOOLS: list[ToolSchema] = [
             "se já existir um arquivo no destino, ela NÃO grava e devolve os dados do arquivo "
             "existente (nome, tamanho, data) com status='conflict' — aí VOCÊ decide (só quando "
             "for obviamente seguro, ex.: o arquivo que você acabou de gerar nesta conversa) ou "
-            "PERGUNTA ao usuário citando nome/tamanho/data antes de reenviar com overwrite=true."
+            "PERGUNTA ao usuário citando nome/tamanho/data antes de reenviar com overwrite=true. "
+            "NÃO serve pra gravar a versão EDITADA de um arquivo: editar a cópia no /workspace "
+            "não muda file_id nenhum, e o id antigo entrega a versão VELHA — pra isso é "
+            "`write_file` com `source_path`."
         ),
         # A regra "sem file_id no histórico não é CLIENT_TOOL" e o mapa de
         # `destination` já estão no prompt do classificador; a política de
@@ -185,7 +188,11 @@ DESKTOP_TOOLS: list[ToolSchema] = [
             "e já publicou no catálogo — esse é o `save_generated_file` (que carrega os "
             "bytes originais, inclusive binário). Nunca sobrescreve às cegas: se o "
             "arquivo já existir com mode='write', devolve status='conflict' com os dados "
-            "do que está lá pra você decidir ou perguntar."
+            "do que está lá pra você decidir ou perguntar. "
+            "Pra ALTERAR um arquivo que já existe prefira `edit_user_file` (troca só os "
+            "trechos, com conferência de versão). Sem ela: `request_user_file` "
+            "(mode='path', stage=true) → altere a cópia no /workspace → esta tool com "
+            "`source_path` e overwrite=true."
         ),
         module="desktop",
         execution="client-side",
@@ -199,10 +206,25 @@ DESKTOP_TOOLS: list[ToolSchema] = [
                 ),
                 required=True,
             ),
+            # Não é obrigatório porque `source_path` é a outra forma de dizer o
+            # texto — e a certa pra arquivo editado no sandbox (sessão 30b1e484).
             "content": ToolParameter(
                 type="string",
-                description="O texto a gravar, exatamente como deve ficar no arquivo.",
-                required=True,
+                description=(
+                    "O texto a gravar, exatamente como deve ficar no arquivo. Passe ESTE "
+                    "ou `source_path`, nunca os dois."
+                ),
+                required=False,
+            ),
+            "source_path": ToolParameter(
+                type="string",
+                description=(
+                    "Caminho de um arquivo de TEXTO no SEU /workspace cujo conteúdo vai ser "
+                    "gravado no disco do usuário (em vez de `content`). É o jeito certo de "
+                    "devolver um arquivo que você editou no sandbox: o texto vai inteiro, "
+                    "sem você precisar reescrevê-lo na chamada."
+                ),
+                required=False,
             ),
             "mode": ToolParameter(
                 type="string",
@@ -216,10 +238,136 @@ DESKTOP_TOOLS: list[ToolSchema] = [
             "overwrite": ToolParameter(
                 type="boolean",
                 description=(
-                    "Só passe true DEPOIS de um status='conflict' e de ter certeza (ou de o "
-                    "usuário confirmar). Na primeira tentativa NUNCA mande true — deixe a "
-                    "ferramenta detectar a colisão."
+                    "true quando o pedido é EDITAR/ATUALIZAR/SUBSTITUIR este arquivo e você "
+                    "leu a versão atual dele nesta conversa (request_user_file), ou depois de "
+                    "um status='conflict' com certeza de que é seguro. Arquivo novo, ou sem ter "
+                    "lido o que está lá: deixe false — se existir, volta status='conflict'. "
+                    "Sem essa leitura o true é ignorado."
                 ),
+                required=False,
+            ),
+            "expected_sha256": ToolParameter(
+                type="string",
+                description=(
+                    "sha256 da versão atual (vem do read_user_file). Com ele o arquivo "
+                    "existente é substituído só se ainda for essa versão — dispensa overwrite."
+                ),
+                required=False,
+            ),
+        },
+    ),
+    # ── Texto do disco do usuário lido/alterado direto pelo desktop ──
+    # services/file_ops.rs no neo-desktop-tauri. Só são oferecidas quando o cliente
+    # anuncia que as executa (`client_tools` no metadata) — ver
+    # `_gate_local_file_tools` em ai_service.py.
+    ToolSchema(
+        name="read_user_file",
+        description=(
+            "Lê um arquivo de TEXTO do computador DO USUÁRIO direto do disco dele (código, "
+            "markdown, csv, config, log) e devolve o conteúdo, o total de linhas e o "
+            "`sha256` da versão lida. Nada sobe pro catálogo nem pro sandbox. Use pra "
+            "analisar um arquivo dele e SEMPRE antes de alterar. Arquivo grande vem em "
+            "partes: continue com `offset`. Binário (PDF, planilha, imagem) não serve — "
+            "pra esses é request_user_file. Caminho só o que o usuário citou ou que "
+            "apareceu numa saída real; nunca invente."
+        ),
+        module="desktop",
+        execution="client-side",
+        parameters={
+            "path": ToolParameter(
+                type="string",
+                description="Caminho absoluto ou começando com '~/'.",
+                required=True,
+            ),
+            "offset": ToolParameter(
+                type="integer",
+                description="Primeira linha a ler (1 = início). Use o next_offset da leitura anterior.",
+                required=False,
+            ),
+            "limit": ToolParameter(
+                type="integer",
+                description="Quantas linhas (padrão 400).",
+                required=False,
+            ),
+        },
+    ),
+    ToolSchema(
+        name="edit_user_file",
+        description=(
+            "Altera um arquivo de TEXTO do computador DO USUÁRIO trocando trechos exatos — "
+            "sem reescrever o resto. Antes, leia com read_user_file e passe o `sha256` que "
+            "veio em `expected_sha256` (se o arquivo mudou desde a leitura, nada é gravado). "
+            "Cada `old_string` precisa aparecer UMA vez, copiado exatamente como veio na "
+            "leitura (espaços e indentação inclusos) — inclua uma linha de contexto pra "
+            "ficar único. Vários trechos numa chamada só. O desktop grava com backup e "
+            "mostra o diff ao usuário com Desfazer; fora de Desktop/Documentos/Downloads "
+            "ele pede aprovação. Pra criar arquivo novo é write_file."
+        ),
+        module="desktop",
+        execution="client-side",
+        parameters={
+            "path": ToolParameter(
+                type="string",
+                description="O mesmo caminho da leitura.",
+                required=True,
+            ),
+            "expected_sha256": ToolParameter(
+                type="string",
+                description="O sha256 que veio do read_user_file.",
+                required=True,
+            ),
+            "edits": ToolParameter(
+                type="array",
+                description=(
+                    "Trechos a trocar, aplicados em ordem: "
+                    "[{\"old_string\": \"texto exato atual\", \"new_string\": \"texto novo\"}]. "
+                    "replace_all=true troca todas as ocorrências."
+                ),
+                required=True,
+                items={
+                    "type": "object",
+                    "properties": {
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                    "required": ["old_string", "new_string"],
+                },
+            ),
+        },
+    ),
+    ToolSchema(
+        name="delegate_file_edit",
+        description=(
+            "Manda o opencode (instalado no computador do usuário) editar um arquivo de "
+            "TEXTO dele. Você ORQUESTRA: escreva a instrução COMPLETA e autocontida — o "
+            "opencode não vê esta conversa, então inclua o que mudar, o tom e os dados que "
+            "o usuário deu. Ele trabalha numa cópia; o desktop aplica o resultado com "
+            "backup e mostra o diff ao usuário com Desfazer. Quando voltar, CONFIRA o diff "
+            "contra o pedido; se faltou algo, chame de novo só com a correção passando o "
+            "`session_id` que veio. Pra só ler o arquivo use read_user_file."
+        ),
+        module="desktop",
+        execution="client-side",
+        parameters={
+            "path": ToolParameter(
+                type="string",
+                description="Caminho absoluto ou começando com '~/'.",
+                required=True,
+            ),
+            "instruction": ToolParameter(
+                type="string",
+                description="O que mudar, completo e autocontido.",
+                required=True,
+            ),
+            "session_id": ToolParameter(
+                type="string",
+                description="Pra continuar a mesma sessão do opencode numa correção.",
+                required=False,
+            ),
+            "expected_sha256": ToolParameter(
+                type="string",
+                description="sha256 da leitura, se você leu antes (garante que é a mesma versão).",
                 required=False,
             ),
         },
@@ -231,7 +379,10 @@ DESKTOP_TOOLS: list[ToolSchema] = [
 # ClientActuationRequested e o resultado volta pelo round-trip
 # tool_request/tool_result (mesmo trilho de save_generated_file/execute_command).
 FILE_ACTUATION_TOOL_NAMES: frozenset[str] = frozenset(
-    {"request_user_file", "save_generated_file", "write_file"}
+    {
+        "request_user_file", "save_generated_file", "write_file",
+        "read_user_file", "edit_user_file", "delegate_file_edit",
+    }
 )
 
 # Shell no MESMO trilho client-actuating (gated por neo_brain_shell_enabled): o

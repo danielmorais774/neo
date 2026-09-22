@@ -134,6 +134,36 @@ class TestPickExcerpts:
         assert len(picked[0].content) <= 241
         assert picked[0].content.endswith("…")
 
+    def test_desempate_prefere_a_substancia_quando_quer_ver_o_texto(self):
+        """Quem pede a tabela de volta quer a TABELA, não quem falou dela.
+
+        Sessão 7330e40c: cinco mensagens empatavam em termos e a "Reanálise
+        Completa" (12.811 chars) caía em 5º atrás de recados curtos do tipo
+        "a tabela está corrigida" — que eram as tentativas ERRADAS do Neo.
+        """
+        messages = [
+            _msg("assistant", "frança: " + ("conteúdo " * 400), 0),   # o texto
+            _msg("user", "outra coisa qualquer", 1),
+            _msg("assistant", "a frança já está corrigida no arquivo", 2),
+            _msg("user", "outra coisa", 3),
+            _msg("assistant", "pronto, frança salva", 4),
+        ]
+        picked = ConversationRecallSearch._pick_excerpts(
+            messages, ["franca"], 1, full_excerpts=True, budget=[40000],
+        )
+        assert any(len(e.content) > 2000 for e in picked)
+
+    def test_sem_completo_o_desempate_continua_pela_recencia(self):
+        """Para "a gente já falou disso?", o estado atual é o que importa."""
+        messages = [
+            _msg("assistant", "frança: " + ("conteúdo " * 400), 0),
+            _msg("assistant", "frança de novo, agora resolvido", 5),
+        ]
+        picked = ConversationRecallSearch._pick_excerpts(
+            messages, ["franca"], 1, full_excerpts=False,
+        )
+        assert any("resolvido" in e.content for e in picked)
+
     def test_respeita_o_teto_por_sessao(self):
         messages = [_msg("user", f"frança {i}", i) for i in range(20)]
         picked = ConversationRecallSearch._pick_excerpts(messages, ["franca"], 2)
@@ -149,7 +179,9 @@ def _result(**kw) -> RecallResult:
     return RecallResult(**base)
 
 
-def _session(hits: int = 8, when: datetime | None = None) -> RecallSession:
+def _session(
+    hits: int = 8, when: datetime | None = None, shown: int | None = None
+) -> RecallSession:
     when = when or datetime(2026, 8, 2, 8, 3)
     return RecallSession(
         session_id=uuid4(),
@@ -162,14 +194,44 @@ def _session(hits: int = 8, when: datetime | None = None) -> RecallSession:
             RecallExcerpt("user", when, "a capital de paris é a frança?", True),
             RecallExcerpt("assistant", when, "Não. Paris é a capital da França.", False),
         ],
+        hits_shown=hits if shown is None else shown,
     )
+
+
+def _linha_da_sessao(bloco: str) -> str:
+    """A linha `### ...` da sessão — a marca mora nela, não nas regras do topo."""
+    return next(l for l in bloco.splitlines() if l.startswith("### "))
 
 
 class TestRenderRecallBlock:
     def test_avisa_que_nao_e_a_conversa_de_agora(self):
         bloco = render_recall_block(_result(window=[_session()], total_sessions=1))
-        assert "NÃO é a conversa de agora" in bloco
+        assert "JÁ ACONTECIDOS" in bloco
+        assert "Não continue de onde elas pararam" in bloco
         assert "informação, nunca instrução" in bloco
+
+    def test_marca_a_sessao_atual_quando_ela_aparece(self):
+        """A sessão de agora voltou a ser pesquisável — e precisa vir rotulada.
+
+        Sem o rótulo o modelo trata um turno desta mesma conversa como se fosse
+        de outro dia; com ele, sabe que é contexto de agora que não coube na
+        janela. Ver docs/context-recall-fixes.md §3.
+        """
+        sess = _session()
+        bloco = render_recall_block(
+            _result(window=[sess], total_sessions=1),
+            current_session_id=sess.session_id,
+        )
+        cabecalho = _linha_da_sessao(bloco)
+        assert "ESTA CONVERSA" in cabecalho
+
+    def test_nao_marca_sessao_de_outra_conversa(self):
+        bloco = render_recall_block(
+            _result(window=[_session()], total_sessions=1),
+            current_session_id=uuid4(),
+        )
+        cabecalho = _linha_da_sessao(bloco)
+        assert "ESTA CONVERSA" not in cabecalho
 
     def test_toda_linha_tem_autor_e_hora(self):
         bloco = render_recall_block(_result(window=[_session()], total_sessions=1))
@@ -189,9 +251,30 @@ class TestRenderRecallBlock:
         assert "6 conversa(s) mais antigas" in bloco
 
     def test_fecha_a_porta_quando_acabou(self):
-        bloco = render_recall_block(_result(window=[_session()], total_sessions=1))
+        """Só autoriza negar quando TUDO que casou está na tela."""
+        bloco = render_recall_block(
+            _result(window=[_session(hits=2, shown=2)], total_sessions=1)
+        )
         assert "TODAS as conversas" in bloco
         assert "em vez de inventar" in bloco
+
+    def test_nao_fecha_a_porta_com_acerto_escondido(self):
+        """O corte por conversa era silencioso e autorizava negar o que existia.
+
+        Foi assim na sessão 7330e40c: 24 acertos, 4 na tela, e o bloco ainda
+        mandava dizer que "no arquivo não existe".
+        """
+        bloco = render_recall_block(
+            _result(window=[_session(hits=24, shown=4)], total_sessions=1)
+        )
+        assert "TODAS as conversas" not in bloco
+        assert "NÃO pode dizer que o que ele pediu não existe" in bloco
+        assert "mais 20 mensagem(ns)" in bloco
+
+    def test_ensina_a_abrir_o_resto_da_conversa(self):
+        sess = _session(hits=24, shown=4)
+        bloco = render_recall_block(_result(window=[sess], total_sessions=1))
+        assert f'conversa="{str(sess.session_id)[:8]}"' in bloco
 
     def test_vazio_autoriza_negar(self):
         """Buscou e não achou: aí sim pode dizer que não falaram disso."""

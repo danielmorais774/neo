@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 CURSOR_TTL_TURNS = 3
 
 
+def _as_bool(raw: Any) -> bool:
+    """`completo` chega como bool, "true" ou 1 dependendo do provider."""
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in ("true", "1", "sim", "yes")
+
+
 def parse_before(raw: Any) -> datetime | None:
     """Lê o ``before`` que o modelo mandou (ISO-8601), tolerante a lixo.
 
@@ -74,25 +83,70 @@ class ConversationRecallExecutor:
         if not query:
             raise ValueError("conversation_recall requer 'query' não-vazia.")
         before = parse_before(arguments.get("before"))
+        completo = _as_bool(arguments.get("completo"))
+        conversa = str(arguments.get("conversa") or "").strip() or None
 
         from shared.config import get_settings
 
         settings = get_settings()
+        current_before: datetime | None = None
+        if getattr(settings, "conversation_recall_include_current_session", True):
+            current_before = await self._current_turn_cutoff()
         result = await self._search.search(
             user_id=self._user_id,
             query=query,
             before=before,
             exclude_session_id=self._session_id,
+            current_session_before=current_before,
             limit_sessions=getattr(settings, "conversation_recall_sessions_per_page", 3),
-            per_session=getattr(settings, "conversation_recall_excerpts_per_session", 4),
+            per_session=(
+                # Focar numa conversa só faz sentido se vier MAIS do que veio
+                # antes — senão a segunda chamada devolve os mesmos trechos.
+                getattr(settings, "conversation_recall_excerpts_focused", 12)
+                if conversa
+                else getattr(settings, "conversation_recall_excerpts_per_session", 4)
+            ),
+            full_excerpts=completo,
+            only_session=conversa,
         )
         await self._save_cursor(result, before)
-        return self.to_payload(result)
+        return self.to_payload(result, current_session_id=self._session_id)
+
+    async def _current_turn_cutoff(self) -> datetime | None:
+        """Instante da mensagem que abriu o turno de agora.
+
+        Tudo da sessão atual que for ANTERIOR a isso pode ser pesquisado; a
+        pergunta de agora fica de fora, que é o que evitava a circularidade
+        quando a solução era banir a sessão inteira.
+
+        A mensagem do usuário já foi gravada quando o cognitivo chega aqui, então
+        o `max(created_at)` da sessão É o turno atual. Best-effort: sem o corte,
+        cai no comportamento antigo (sessão atual inteira fora).
+        """
+        if self._session_id is None:
+            return None
+        try:
+            from sqlalchemy import text
+
+            async with self._db.get_session() as db:
+                res = await db.execute(
+                    text(
+                        "SELECT max(created_at) AS ts FROM conversation_message "
+                        "WHERE session_id = :sid"
+                    ),
+                    {"sid": str(self._session_id)},
+                )
+                row = res.fetchone()
+                return row[0] if row else None
+        except Exception as e:  # noqa: BLE001 — nunca derruba a busca
+            logger.warning("[Recall] corte do turno atual indisponível: %s", e)
+            return None
 
     # ── payload ───────────────────────────────────────────────────────
 
-    @staticmethod
-    def to_payload(result: RecallResult) -> dict[str, Any]:
+    def to_payload(
+        self, result: RecallResult, current_session_id: Any = None
+    ) -> dict[str, Any]:
         """Resultado da tool.
 
         ``bloco`` é o corpo que o loop cognitivo injeta como SYSTEM (fora do
@@ -101,7 +155,9 @@ class ConversationRecallExecutor:
         """
         return {
             "resumo": render_recall_summary(result),
-            "bloco": render_recall_block(result),
+            "bloco": render_recall_block(
+                result, current_session_id=current_session_id
+            ),
             "encontrou": result.found,
             "total_conversas": result.total_sessions,
             "total_mensagens": result.total_messages,

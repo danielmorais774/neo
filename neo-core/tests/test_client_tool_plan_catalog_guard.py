@@ -145,3 +145,161 @@ async def test_plan_step_requiring_approval_goes_out_as_command_request():
     assert approval.metadata["_has_plan"] is True
     assert approval.metadata["flow"] == "client_command"
     assert approval.command_request["command"] == "ls -la ~/Downloads"
+
+
+# ── Placeholder de passo dependente nunca chega no shell (sessão f80b3a90) ──
+#
+# "verifica se arquivo foi atualizado mesmo" (2026-09-18). O plano tinha 2 passos:
+#   1. `ls -la /Users/daniel/Documents/analises`   → a pasta não existe, FALHOU
+#   2. `ls -l {previous_output}` (depends_on_previous)
+# O ramo de FALHA chama `advance_and_refine` com `raw_output="ERRO: …"`; ele voltou
+# sem `refined_step` e o passo 2 saiu **com o template literal**. O usuário viu
+# `ls: {previous_output}: No such file or directory` — um erro que não diz nada
+# sobre o problema real (o passo 1 é que tinha falhado).
+#
+# Os outros TRÊS despachos de passo já passavam por `_dispatch_would_hang`; só este
+# não. E a trava, mesmo onde existia, só pegava o comando que É um placeholder
+# inteiro (`[SERÁ GERADO…]`), não o template EMBUTIDO num comando plausível.
+
+from modules.desktop.ai_service import _dispatch_would_hang
+
+
+def test_template_embutido_conta_como_indespachavel():
+    def barra(cmd, **extra):
+        return _dispatch_would_hang("run_command", {"command": cmd, **extra})
+
+    assert barra("ls -l {previous_output}")
+    assert barra("cat {previous_output_placeholder}")
+    assert barra("echo {STEP_RESULT} > /tmp/x")
+    assert barra("[SERÁ GERADO COM BASE NOS ARQUIVOS LIDOS]")
+    assert barra("")
+    # `working_dir` segue o mesmo caminho até o shell.
+    assert barra("ls -la", working_dir="{previous_output}")
+
+
+def test_chaves_legitimas_de_shell_nao_sao_placeholder():
+    """A trava é estreita de propósito: barrar comando bom é pior que deixar
+    passar um ruim, e `{}` é sintaxe corrente de shell."""
+    def barra(cmd):
+        return _dispatch_would_hang("run_command", {"command": cmd})
+
+    assert not barra("echo ${HOME}")                      # variável
+    assert not barra(r"find . -name x -exec rm {} \;")    # chaves vazias
+    assert not barra("cp /a/{foto1,foto2}.jpg /b/")        # expansão de chaves
+    assert not barra("echo {1..5}")                        # expansão de faixa
+    assert not barra("awk '{print $1}' /tmp/a")            # bloco do awk
+    assert not barra("jq '{name}' /tmp/a.json")            # objeto do jq
+    assert not barra("ls -la /Users/daniel/Desktop")
+
+
+class _PlannerComPlano:
+    """Planner do ramo de falha: `advance_and_refine` não devolve `refined_step`
+    (o fallback real quando o JSON vem vazio/inválido — o caso medido)."""
+
+    def __init__(self, plan, refined=None):
+        self._plan = plan
+        self._refined = refined
+        self.cleared = []
+
+    def get_active_plan(self, sid):
+        return self._plan
+
+    def clear_plans(self, sid):
+        self.cleared.append(sid)
+
+    async def advance_and_refine(self, **kw):
+        return {"refined_step": self._refined, "decision": "continue"}
+
+    async def build_final_response(self, plan, user_message):
+        return "; ".join(f"{s.description}: {s.error or 'ok'}" for s in plan.steps)
+
+    build_plan_update = PlanManager.build_plan_update
+
+
+class _SessionsFake:
+    async def add_message(self, **kw):
+        return None
+
+    async def get_history(self, *a, **kw):
+        return []
+
+    async def get_or_create_session(self, **kw):
+        class _S:
+            id = kw.get("session_id")
+            user_id = None
+
+        return _S()
+
+
+def _svc_apos_falha(refined=None) -> tuple[AIService, ExecutionPlan]:
+    p1 = PlanStep(
+        index=0, description="listar a pasta", tool_name="run_command",
+        tool_arguments={"command": "ls -la /Users/daniel/Documents/analises"},
+    )
+    p2 = PlanStep(
+        index=1, description="ver a data de modificação", tool_name="run_command",
+        tool_arguments={"command": "ls -l {previous_output}"},
+        depends_on_previous=True,
+    )
+    p2.raw_command = "ls -l {previous_output}"
+    plan = ExecutionPlan(goal="verificar atualização", steps=[p1, p2])
+
+    svc = _svc()
+    svc.planner = _PlannerComPlano(plan, refined)
+    svc.sessions = _SessionsFake()
+    svc._pending_actuations = {}
+    svc._pending_traces = {}
+    svc._live_sessions = set()
+    svc._image_capable_sessions = set()
+    svc._session_registers = {}
+    svc._session_disk_evidence = {}
+    svc.tools = _FakeRegistry()
+    return svc, plan
+
+
+async def _falha_o_passo_1(svc) -> list:
+    return [
+        r async for r in svc.process_tool_result(
+            session_id=uuid4(), tool_name="run_command", tool_call_id="t1",
+            success=False, result=None,
+            error="ls: /Users/daniel/Documents/analises: No such file or directory",
+            user_message="verifica se arquivo foi atualizado mesmo",
+            command="ls -la /Users/daniel/Documents/analises",
+            tool_arguments={"command": "ls -la /Users/daniel/Documents/analises"},
+            _has_plan=True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_passo_dependente_sem_refinamento_nao_vai_pro_shell():
+    svc, plan = _svc_apos_falha(refined=None)
+
+    responses = await _falha_o_passo_1(svc)
+
+    assert all(r.tool_request is None for r in responses), (
+        "o template `{previous_output}` não pode ser despachado"
+    )
+    assert plan.steps[1].status == "failed"
+    assert "dependia do resultado do anterior" in plan.steps[1].error
+    # E o usuário fica sabendo o que realmente aconteceu, não "ls: {previous_output}".
+    final = next(r for r in responses if r.is_final)
+    assert "{previous_output}" not in (final.message or "")
+    assert "No such file or directory" in (final.message or "")
+
+
+@pytest.mark.asyncio
+async def test_passo_dependente_refinado_de_verdade_continua_despachando():
+    """Controle: o conserto barra o placeholder, não a recuperação. Quando o
+    refinamento devolve um comando real, o plano segue como sempre seguiu."""
+    svc, plan = _svc_apos_falha(refined={
+        "tool_name": "run_command",
+        "tool_arguments": {"command": "ls -l /Users/daniel/Desktop/teste-de-analise"},
+    })
+
+    responses = await _falha_o_passo_1(svc)
+
+    pedido = next((r for r in responses if r.tool_request), None)
+    assert pedido is not None, "passo refinado tem que ser despachado"
+    assert "{previous_output}" not in pedido.tool_request["arguments"]
+    assert plan.steps[1].status == "running"

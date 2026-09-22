@@ -13,6 +13,7 @@ import unicodedata
 from typing import Any
 
 from core.llm.router import LLMRouter
+from core.memory.recall_triggers import is_conversation_recall_request
 from core.pks.training_envelope import TrainingEnvelopeParser
 from core.tools.registry import ToolRegistry
 from shared import (
@@ -27,6 +28,51 @@ logger = logging.getLogger(__name__)
 
 # Shared parser so bare instances (object.__new__) and the fallback path both work.
 _TRAINING_PARSER = TrainingEnvelopeParser()
+
+def _written_text(command: str) -> str:
+    """O texto que um comando de shell grava (corpo do heredoc ou string de echo/printf)."""
+    heredoc = re.search(r"<<-?\s*['\"]?([A-Za-z_]+)['\"]?\n(.*?)\n\1\b", command or "", re.DOTALL)
+    if heredoc:
+        return heredoc.group(2)
+    literal = re.search(r"\b(?:echo|printf)\s+(['\"])(.*?)\1", command or "", re.DOTALL)
+    return literal.group(2) if literal else command or ""
+
+
+def _text_is_dictated(content: str, user_message: str) -> bool:
+    """O texto a gravar está LITERAL na mensagem do usuário?
+
+    Espaços colapsados e caixa ignorada — ditar "grava 'oi mundo' em notas.txt"
+    passa; um arquivo inteiro que o classificador redigiu a partir de "atualiza o
+    .md" não (ver ``_reject_classifier_file_authoring``).
+    """
+    alvo = " ".join(str(content or "").split()).casefold()
+    if not alvo:
+        return True
+    return alvo in " ".join(str(user_message or "").split()).casefold()
+
+
+# Conciliação de arquivos (docs/file-links-plan.md). Três furos do caminho
+# CLIENT_TOOL medidos na sessão f33632b4:
+#  - "adiciona ao arquivo final e coloque em <pasta>" virou UMA entrega direta, com
+#    o file_id do PDF que tinha subido por último — o "adiciona" sumiu e o PDF foi
+#    gravado como .md. Mudar conteúdo + entregar é trabalho do cérebro;
+#  - "baixe ele para mim e coloque lá" virou um heredoc python que ESCREVIA no Mac um
+#    markdown com texto inventado pelo classificador (só não gravou porque citava
+#    /workspace). Shell que grava texto não ditado é a mesma falha do write_file;
+#  - "me mostra o botão de download" virou um plano de 3 run_command.
+_CONTENT_CHANGE_RE = re.compile(
+    r"\b(adicion[ae]|acrescent[ae]|inclu[ai]|atualiz[ae]|edit[ae]|corrij[ae]|corrig[ae]|"
+    r"alter[ae]|mud[ae]|reescrev[ae]|insir[ae]|inser[ae]|complement[ae]|junt[ae])\b",
+    re.IGNORECASE,
+)
+_DOWNLOAD_BUTTON_RE = re.compile(
+    r"\bbot[aã]o\b[^.?!\n]{0,40}\b(download|baixar)\b|\b(link|bot[aã]o)\s+(de|pra|para)\s+(download|baixar)\b",
+    re.IGNORECASE,
+)
+_SHELL_WRITES_FILE_RE = re.compile(
+    r"<<-?\s*['\"]?[A-Za-z_]+|open\([^)]*,\s*['\"][wa]|\btee\b|(?<![0-9&])>>?\s*['\"]?[~/]"
+)
+
 
 # Deterministic guard: explicit "remember/register in memory" directives must
 # always be a DIRECT_RESPONSE so the PKS write pipeline captures them. Without
@@ -282,6 +328,50 @@ _BROWSER_MEDIA_URL_COMMAND = re.compile(
     r"(youtube\.com|youtu\.be|music\.youtube|open\.spotify)",
     re.I,
 )
+# Baixar da internet PELO SHELL DELE quase sempre é o trilho errado.
+#
+# A máquina do usuário não sabe procurar: ela só executa a URL que o modelo
+# escreveu. E o modelo não tem como saber o deep link de um PDF que ele nunca
+# viu — então ele inventa um plausível. Sessão d9f9417b, três turnos seguidos:
+#     curl -sL "https://relatorios.exemplo.com.br/$candidato.pdf"
+#     curl -sL "https://raw.githubusercontent.com/neo-core/government-plans/…"
+#     curl -L -o relatorio_charlie.pdf 'https://www.planalto.gov.br/ccivil_03/…'
+# Nenhum desses endereços existe. Quem SABE procurar é o cérebro (`web_search` +
+# sandbox com internet), e ele tem a ponte pro disco dele
+# (`file_save` → `save_generated_file`, que aceita pasta literal e a cria).
+#
+# A guarda é estreita: só dispara quando a URL NÃO foi dita na conversa. URL que
+# o usuário deu ("baixa https://x/y.pdf pro meu desktop") continua CLIENT_TOOL —
+# ali o shell dele funciona e é o caminho mais curto. O que morre é o palpite.
+_NET_FETCH_COMMAND = re.compile(r"(?:^|[\s;&|(`$])(?:curl|wget)(?:$|[\s])", re.I)
+_URL_IN_COMMAND = re.compile(r"https?://[^\s'\"`)>|;]+", re.I)
+# Endereço que não exige conhecimento do mundo: não é palpite, é convenção.
+_URL_HOSTS_LOCAIS = re.compile(
+    r"^https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|"
+    r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(?::\d+)?(?:/|$)",
+    re.I,
+)
+
+
+def _urls_nao_fundamentadas(command: str, haystack_lower: str) -> list[str]:
+    """URLs do comando que não aparecem LITERALMENTE na conversa.
+
+    A fundamentação é pela URL inteira, não pelo host: "pega no site do portal de dados" não
+    torna `https://www.exemplo.gov.br/arquivos/plano_2026.pdf` real — o host é
+    plausível e o caminho continua sendo chute, que é justamente o que falha
+    (404, ou pior, um HTML de erro salvo como .pdf). Só a busca produz deep link.
+    """
+    fora: list[str] = []
+    for url in _URL_IN_COMMAND.findall(command or ""):
+        limpa = url.rstrip(".,'\"")
+        if _URL_HOSTS_LOCAIS.match(limpa):
+            continue
+        if limpa.lower() in haystack_lower:
+            continue
+        fora.append(limpa)
+    return fora
+
+
 # Print do navegador DO SERVIDOR não responde pergunta sobre a mídia DELE.
 _SERVER_BROWSER_TOOLS = frozenset({"browser_screenshot", "browser_task"})
 _USER_MEDIA_ANCHORS = (
@@ -384,7 +474,7 @@ _SKILL_OWNED_TOOL_PREFIXES = (
 SKILL_OWNED_TOOL_PREFIXES = _SKILL_OWNED_TOOL_PREFIXES
 
 
-def server_tool_can_run(tool_name: str) -> bool:
+def server_tool_can_run(tool_name: str, *, execution: str | None = None) -> bool:
     """O trilho SERVER_TOOL sabe EXECUTAR esta tool?
 
     Uma definição só, usada nos dois lugares que dependem dela: o toolset que o
@@ -396,6 +486,14 @@ def server_tool_can_run(tool_name: str) -> bool:
     Gated (`data_`, `fin_`, `sql_`, `skill_`, …) = destravada pelo `skill_read` do
     cognitivo, com o usuário do turno. As job tools são a exceção: casam o prefixo,
     mas este trilho tem executor por request para elas (`_with_job_tools`).
+
+    Tool de CLIENTE (``execution="client-side"``: ``run_command``, ``write_file``,
+    ``request_user_file``…) também não roda aqui: ela precisa da ida e volta com o
+    aparelho, que só o trilho do cliente e o cérebro têm, e o executor global não
+    tem módulo ``desktop``. Oferecida ao agente, virou "Executor para módulo
+    'desktop' não registrado" DEPOIS de ele já ter enfileirado o job do browser
+    (session-30b1e484) — o usuário leu fracasso e pediu de novo. Quem não passa
+    ``execution`` (o desvio por skill, que só tem o nome) fica na regra de prefixo.
     """
     if not tool_name:
         return False
@@ -405,9 +503,13 @@ def server_tool_can_run(tool_name: str) -> bool:
         JOB_TOOL_NAMES = frozenset()
     if tool_name in JOB_TOOL_NAMES:
         return True
+    if execution == "client-side":
+        return False
     return not tool_name.startswith(SKILL_OWNED_TOOL_PREFIXES)
 
-_BRAIN_ONLY_CLIENT_TOOLS = frozenset({"request_user_file"})
+_BRAIN_ONLY_CLIENT_TOOLS = frozenset(
+    {"request_user_file", "read_user_file", "edit_user_file", "delegate_file_edit"}
+)
 
 # Skills whose actions have side effects: they may ONLY be fired on a clear,
 # confident imperative. Anything conditional/definitional/uncertain about them is
@@ -554,6 +656,8 @@ Esta é a decisão que mais erra — resolva-a ANTES de escolher tool:
 - Arquivo que já existe no DISCO dele, info do SISTEMA/hardware dele, instalar/ABRIR um programa dele, abrir uma URL/universal link no computador dele → **CLIENT_TOOL**.
 - Na dúvida entre os dois: se a mensagem não fala do disco/sistema/app DELE, é DIRECT_RESPONSE.
 
+**Quem decide o trilho é a ORIGEM do conteúdo, nunca o destino.** Citar a pasta de destino ("põe na área de trabalho", "salva na pasta X") NÃO torna a tarefa CLIENT_TOOL — destino no disco dele é problema da ponte, não do trilho. Conteúdo que vem da INTERNET (baixar PDF/planilha/imagem, com ou sem link em mãos) é **DIRECT_RESPONSE** mesmo quando ele pede o arquivo no disco: o cérebro procura o endereço real com `web_search`, baixa no sandbox, publica com `file_save` e entrega com `save_generated_file` (que aceita caminho literal de pasta e cria a pasta). Só é CLIENT_TOOL quando o conteúdo JÁ ESTÁ na máquina dele. Você NUNCA escreve um `curl`/`wget` com URL que o usuário não citou — você não sabe o endereço de um arquivo que nunca viu, e um endereço plausível baixa um 404 salvo com extensão .pdf.
+
 Nada cruza de um lado pro outro por caminho ou URL escrita à mão: um `run_command` citando `/workspace/...` sempre falha ("No such file or directory" — esse caminho só existe na VPS), e um `curl` pra baixar o arquivo do neo-core nunca funciona (você não sabe, e não pode adivinhar, o host/porta real — só o cliente sabe). Levar um arquivo GERADO PELO CÉREBRO pro lado do usuário ("salva aí", "manda pra mim", "põe no Desktop/Downloads/naquela pasta") tem um caminho só:
 - Já existe `file_id` no histórico → **CLIENT_TOOL** com `tool_name="save_generated_file"` e `tool_arguments={{"file_id": "<o file_id exato, copiado literalmente do histórico>", "file_name": "<nome do arquivo>", "destination": "<destino>"}}`. `destination` é opcional (padrão "desktop"): "downloads"/"documents"/"home" pros atalhos conhecidos, ou um caminho literal (ex: "~/Projetos/financas") se o usuário citou a pasta.
 - Ainda NÃO existe `file_id` → **DIRECT_RESPONSE** primeiro (o cérebro gera e chama `file_save`); só no turno seguinte "coloca no meu disco" vira CLIENT_TOOL.
@@ -563,8 +667,8 @@ Nunca invente um `file_id` nem um caminho que o usuário não mencionou.
 - **DIRECT_RESPONSE** (o núcleo cognitivo / "cérebro"): conversa, conhecimento geral, saudação, jogo, tradução, dados pessoais (treino, dieta, suplemento, rotina — injetados automaticamente) — qualquer coisa respondível em texto — MAIS tudo que roda no sandbox (regra mestra acima). O cérebro também tem `web_search` e as tools `file_*` do catálogo. **Default na dúvida.**
 - **SERVER_TOOL**: dado externo em tempo real (clima via `get_weather`) OU ler/mudar uma CONFIGURAÇÃO do Neo (voz/engine de TTS, etc.). Para MUDAR use `tool_name="config_set"` com `tool_arguments={{"setting": "...", "value": "..."}}`: voz → `{{"setting":"tts.voice","value":"<nome>"}}`; engine/motor → `{{"setting":"tts.engine","value":"<qwen|coqui|dia>"}}`. "quais vozes você tem?" → `voice_list`; "o que dá pra configurar?" → `config_list`.
 - **CLIENT_TOOL**: só o que exige a máquina do usuário (regra mestra acima). Existem TRÊS tools client-side e nenhuma outra — `read_file`, `list_directory`, `search_files`, `get_system_info` NÃO existem, nunca invente uma quarta:
-  - `save_generated_file`: entrega no disco dele um arquivo que o cérebro já publicou (exige um `file_id` real do histórico).
-  - `write_file`: grava TEXTO que você já tem num arquivo do disco dele, em uma chamada — `tool_arguments={{"path": "<absoluto ou ~/...>", "content": "<o texto>"}}` (opcional `mode: "append"`). Prefira esta a um `run_command` com `cat <<EOF`/`echo >`: pelo shell, aspas/crase/`$` no conteúdo corrompem o arquivo calado. Só quando o conteúdo JÁ existe (o usuário ditou, ou está na conversa); se ainda é preciso GERAR o conteúdo, é DIRECT_RESPONSE.
+  - `save_generated_file`: entrega no disco dele um arquivo que o cérebro já publicou (exige um `file_id` real do histórico). Pergunta de verificação ("salvou mesmo?", "atualizou o arquivo?") é DIRECT_RESPONSE — nunca refaça a gravação pra responder. Se o contexto tem o bloco "ARQUIVOS DESTA CONVERSA", o `file_id` sai de LÁ (a versão atual do documento pedido) — nunca o id de outro arquivo só por ser o mais recente. Pedido que muda o conteúdo antes de entregar ("adiciona", "atualiza", "corrige"), arquivo "corrompido/errado", apagar uma cópia ou "botão de download" é DIRECT_RESPONSE.
+  - `write_file`: grava TEXTO que você já tem num arquivo do disco dele, em uma chamada — `tool_arguments={{"path": "<absoluto ou ~/...>", "content": "<o texto>"}}` (opcional `mode: "append"`). Prefira esta a um `run_command` com `cat <<EOF`/`echo >`: pelo shell, aspas/crase/`$` no conteúdo corrompem o arquivo calado. Só quando o usuário DITOU o texto literal NESTA mensagem. EDITAR/ATUALIZAR/CORRIGIR/MELHORAR um arquivo que já existe no disco dele (mesmo com o caminho exato), ou gravar um texto que ainda precisa ser escrito/revisado → **DIRECT_RESPONSE**: o cérebro lê a versão atual, aplica a mudança e grava. Você nunca redige o conteúdo de um arquivo e nunca passa `overwrite`.
   - `run_command`: todo o resto (ler/listar/escrever arquivo, espaço em disco, processos, instalar/abrir programa), via `raw_command` de shell. O comando só pode citar nome/caminho que o USUÁRIO disse nesta mensagem ou no histórico recente — NUNCA invente um nome plausível que ele não mencionou (pediram "meu relatório de finanças" sem dizer o nome → não existe `relatorio.csv` pra chutar; isso é DIRECT_RESPONSE ou plano de sondagem).
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário — pessoal ("avisa minha mãe que vou chegar tarde"), comercial (pizza, delivery, farmácia, mercado, encomenda) ou pra telefone/JID direto. Extraia sempre em `tool_arguments` os campos `text` (o texto) e `recipient` (JID, telefone OU apelido cru como "minha mãe", "pai", "Ana" — NÃO interprete o apelido, o pipeline resolve na agenda). `contact_source` ("whatsapp" = agenda do WhatsApp | "saved" = contatos salvos do Neo) só quando o usuário disser a fonte EXPLICITAMENTE; senão omita.
 - **HOME_ASSISTANT**: a casa inteligente do usuário — luz, tomada/interruptor, clima/termostato, persiana, cena, script, automação ("acende a luz da sala", "ativa o modo cinema", "qual a temperatura do termostato?"). É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*`, NÃO preencha `entity_id`/`tool_arguments` (a skill resolve o dispositivo sozinha) e nunca invente entity_id. NÃO confundir com `list_connected_devices`, que é dos dispositivos do PRÓPRIO Neo (desktop/celular).
@@ -981,6 +1085,8 @@ class IntentRouter:
             decision = self._reject_ungrounded_recipient(
                 decision, user_message, conversation_history
             )
+            decision = self._reject_classifier_file_authoring(decision, user_message)
+            decision = self._reject_recall_shortcut(decision, user_message)
             # Attach raw classifier response + the prompt/messages sent for later inspection
             decision.classifier_raw = raw_text
             decision.classifier_payload = {
@@ -1367,6 +1473,34 @@ class IntentRouter:
             )
             return self._media_status_decision(user_message)
 
+        # Rede do download inventado (ver _NET_FETCH_COMMAND): baixar da internet
+        # pelo shell DELE com uma URL que ninguém disse é palpite, não tarefa de
+        # máquina do usuário. Devolve ao cognitivo, que sabe PROCURAR o endereço
+        # real (`web_search`) e tem a ponte pro disco dele (`file_save` →
+        # `save_generated_file`). De quebra devolve a capacidade de PERGUNTAR:
+        # o loop de clarificação só existe no trilho cognitivo, então em
+        # CLIENT_TOOL "internet ou disco?" nem era uma pergunta possível.
+        if intent == IntentType.CLIENT_TOOL:
+            _cmd_net = raw_command or (
+                tool_arguments.get("command") if isinstance(tool_arguments, dict) else None
+            )
+            if _cmd_net and _NET_FETCH_COMMAND.search(str(_cmd_net)):
+                _hay = (user_message + "\n" + "\n".join(
+                    str(m.get("content", "")) for m in (conversation_history or [])[-8:]
+                )).lower()
+                _urls_chutadas = _urls_nao_fundamentadas(str(_cmd_net), _hay)
+                if _urls_chutadas:
+                    logger.warning(
+                        "Router: CLIENT_TOOL baixando da internet com URL que ninguém "
+                        "citou %r (comando: %r) — devolvendo ao cognitivo, que sabe "
+                        "procurar o endereço real e entregar pelo catálogo",
+                        _urls_chutadas, str(_cmd_net)[:160],
+                    )
+                    intent = IntentType.DIRECT_RESPONSE
+                    tool_name = None
+                    tool_arguments = None
+                    raw_command = None
+
         # Grounding guard: um comando de shell que cita um caminho de arquivo
         # ESPECÍFICO (com extensão) que não apareceu em lugar nenhum da conversa é
         # quase sempre o classificador inventando um nome plausível em vez de admitir
@@ -1385,8 +1519,19 @@ class IntentRouter:
         # vez de inventar OU de só perguntar. Continua CLIENT_TOOL/run_command;
         # só o argumento chutado é descartado — o plano recomeça do zero a partir
         # da mensagem real do usuário.
+        # ⚠️ NÃO reintroduzir `and not data.get("needs_plan")` aqui. A resposta do
+        # guard é forçar needs_plan, então parecia redundante rodá-lo quando o
+        # classificador já pediu plano — mas o guard faz DUAS coisas, e a outra é a
+        # que importa: ele DESCARTA o argumento chutado. Com `needs_plan=true` o
+        # comando inventado não é ignorado, ele vira o passo 1 da cascata
+        # (`pipeline_plan`) e é despachado literalmente. Sessão d9f9417b: os três
+        # turnos vieram com `needs_plan=true`, o guard nunca rodou, e
+        # `curl -sL "https://relatorios.exemplo.com.br/$candidato.pdf"` — domínio que não
+        # existe — foi parar no Mac do usuário como passo 1. O regex pega URL tão bem
+        # quanto caminho de disco (`//relatorios.exemplo.com.br/$candidato.pdf`), só nunca
+        # teve a chance.
         needs_plan_forced = False
-        if intent == IntentType.CLIENT_TOOL and not data.get("needs_plan"):
+        if intent == IntentType.CLIENT_TOOL:
             cmd_to_check = raw_command or (
                 tool_arguments.get("command") if isinstance(tool_arguments, dict) else None
             )
@@ -1411,8 +1556,9 @@ class IntentRouter:
                 ungrounded = self._ungrounded_path_literals(cmd_to_check, haystack)
                 if ungrounded:
                     logger.warning(
-                        "Router: CLIENT_TOOL com caminho não fundamentado na conversa %r "
-                        "(comando: %r) — forçando plano de verificação (needs_plan)",
+                        "Router: CLIENT_TOOL com caminho/URL não fundamentado na "
+                        "conversa %r (comando: %r) — descartando o argumento e "
+                        "forçando plano de verificação (needs_plan)",
                         ungrounded,
                         cmd_to_check,
                     )
@@ -2226,6 +2372,130 @@ class IntentRouter:
         decision.explanation = (
             "classificação descartada: o conteúdo proposto era instrução interna do "
             "Neo, não algo que o usuário pediu"
+        )
+        return decision
+
+    @staticmethod
+    def _reject_classifier_file_authoring(
+        decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """O classificador não redige arquivo nem decide sobrescrever.
+
+        Sessão 30b1e484: "atualiza o arquivo .md que fica em /Users/…" virou
+        ``write_file`` com um ``content`` que o classificador (modelo flash, sem
+        ter lido o arquivo) INVENTOU do zero — 3 turnos seguidos, cada um com um
+        texto diferente, apagando tabelas e seções do original. Só não destruiu o
+        arquivo porque o cliente devolveu ``conflict``. E "atualizou o arquivo
+        mesmo?" — uma PERGUNTA — virou ``save_generated_file`` com
+        ``overwrite=true`` apontando o anexo antigo.
+
+        Teste por CONTEÚDO, em código (o prompt já dizia "se é preciso GERAR o
+        conteúdo, é DIRECT_RESPONSE" e foi ignorado):
+
+        * ``write_file`` só fica com o classificador quando o texto está LITERAL
+          na mensagem do usuário (ditado). Editar/gerar é do cérebro, que lê a
+          versão atual antes de gravar;
+        * pergunta nunca grava — verificar é do cérebro;
+        * ``overwrite`` sai sempre: é decisão de quem viu o arquivo.
+        """
+        if decision.intent is not IntentType.CLIENT_TOOL:
+            return decision
+        tool = decision.tool_name
+        args = decision.tool_arguments if isinstance(decision.tool_arguments, dict) else {}
+
+        motivo = None
+        if _DOWNLOAD_BUTTON_RE.search(user_message or ""):
+            motivo = "botão de download é file_offer/file_save do núcleo cognitivo, não comando na máquina"
+        elif tool in (None, "run_command"):
+            comando = str(decision.raw_command or args.get("command") or "")
+            if comando and _SHELL_WRITES_FILE_RE.search(comando) and not _text_is_dictated(
+                _written_text(comando), user_message
+            ):
+                motivo = (
+                    "comando que GRAVA texto no disco do usuário com conteúdo não ditado — "
+                    "redigir é do núcleo cognitivo"
+                )
+        if motivo is None and tool not in ("write_file", "save_generated_file"):
+            return decision
+
+        if motivo is not None:
+            pass
+        elif decision.speech_act == "question":
+            motivo = "pergunta não grava arquivo — verificar é do núcleo cognitivo"
+        elif tool == "write_file":
+            content = args.get("content")
+            if not isinstance(content, str) or not _text_is_dictated(content, user_message):
+                motivo = (
+                    "o conteúdo do arquivo não foi ditado pelo usuário — editar ou redigir "
+                    "é do núcleo cognitivo, que lê a versão atual antes de gravar"
+                )
+        elif tool == "save_generated_file" and _CONTENT_CHANGE_RE.search(user_message or ""):
+            motivo = (
+                "o pedido muda o CONTEÚDO do arquivo antes de entregar — é do núcleo "
+                "cognitivo, que sabe qual é a versão atual e o que acrescentar"
+            )
+
+        if motivo is None:
+            if "overwrite" in args:
+                decision.tool_arguments = {k: v for k, v in args.items() if k != "overwrite"}
+            return decision
+
+        logger.warning(
+            "[Router] CLIENT_TOOL %s descartado (%s) — caindo no cognitivo. msg=%.120s",
+            tool, motivo, user_message,
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.skill_name = None
+        decision.requires_approval = False
+        decision.needs_memory = True
+        decision.explanation = f"classificação descartada: {motivo}"
+        return decision
+
+    @staticmethod
+    def _reject_recall_shortcut(
+        decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """Pedido de recall não vira entrega de arquivo pelo classificador.
+
+        Sessão 7330e40c: "pega a última reanálise completa que fizemos e coloca
+        tudo em um arquivo .md" virou ``save_generated_file`` apontando um
+        ``resumo_fichas.md`` de OUTRA conversa, com confiança 0,95 e uma
+        explicação inventada ("o histórico mostra que este arquivo já existe
+        lá"). O cérebro — o único que sabe chamar `conversation_recall` — nunca
+        rodou. Sete turnos depois o Neo entregou a análise ERRADA num arquivo e
+        afirmou que era a mensagem que ele tinha postado no chat.
+
+        A referência para trás é a única pista confiável aqui: o classificador
+        vê no máximo 6 mensagens de histórico, então ele não tem como saber se a
+        "última reanálise" é um arquivo do catálogo ou um texto de 11 turnos
+        atrás. Quem sabe é quem pode buscar. Entregar arquivo continua valendo —
+        só depois de o cérebro recuperar o conteúdo certo.
+        """
+        if decision.intent is not IntentType.CLIENT_TOOL:
+            return decision
+        if decision.tool_name not in ("save_generated_file", "write_file"):
+            return decision
+        if not is_conversation_recall_request(user_message):
+            return decision
+
+        logger.warning(
+            "[Router] CLIENT_TOOL %s descartado (pedido se refere a algo dito antes — "
+            "só o cognitivo sabe buscar no arquivo de conversas). msg=%.120s",
+            decision.tool_name, user_message,
+        )
+        decision.intent = IntentType.DIRECT_RESPONSE
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.skill_name = None
+        decision.requires_approval = False
+        decision.needs_memory = True
+        decision.explanation = (
+            "classificação descartada: o pedido se refere a algo dito antes na "
+            "conversa — o núcleo cognitivo busca o conteúdo real antes de entregar"
         )
         return decision
 

@@ -7,8 +7,10 @@ Engine API direto com httpx sobre UDS (sem dependência nova: httpx já é usado
 Isolamento e segurança são do container (compose): usuário não-root, cap_drop,
 sem docker.sock lá dentro, limites de cpu/mem/pids e rede sem LAN. Aqui a defesa
 é: (1) todo path é preso a ``/workspace``; (2) todo comando roda sob ``timeout``
-do coreutils, então processo travado morre dentro do container; (3) saída é
-truncada para não estourar o contexto do LLM.
+do coreutils (teto de relógio), então processo travado morre dentro do
+container — e, quando pedido, sob um vigia que mata o que ficou PARADO (sem CPU,
+I/O nem saída) em vez de matar o que só está demorando; (3) saída é truncada
+para não estourar o contexto do LLM.
 """
 
 from __future__ import annotations
@@ -19,14 +21,63 @@ import json
 import logging
 import shlex
 import struct
+import time
+import uuid
 from dataclasses import dataclass
+from typing import Callable
 
 import httpx
+
+from core.liveness import current_liveness, touch_progress
+
+from core.workbench.user_paths import refusal_for
 
 logger = logging.getLogger(__name__)
 
 # Docker API sobre socket unix: o host da URL é ignorado, mas precisa ser válido.
 _DOCKER_BASE_URL = "http://localhost"
+
+# Todo processo nascido de um `run` herda esta variável com um id único. É por ela
+# que o vigia acha a árvore inteira (timeout, sh, ffmpeg, netos) dentro do
+# container, sem depender do PID do host que a Engine API devolve.
+_EXEC_MARKER_ENV = "NEO_EXEC_ID"
+_PROBE_INTERVAL_S = 5.0
+
+# Roda DENTRO do sandbox (python3 está na imagem). Soma CPU
+# (utime+stime+cutime+cstime) e I/O (rchar+wchar) de todo processo marcado e
+# imprime "<processos> <ticks de cpu> <bytes de io>"; com "kill", manda SIGKILL
+# neles. cutime/cstime entram para o CPU de um filho que já terminou não sumir da
+# soma quando o pai o recolhe.
+_PROBE_SCRIPT = r"""
+import os, signal, sys
+marker = ("%s=%s" % (sys.argv[1], sys.argv[2])).encode()
+pids, cpu, io = [], 0, 0
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    try:
+        with open("/proc/%s/environ" % name, "rb") as f:
+            if marker not in f.read().split(b"\0"):
+                continue
+        with open("/proc/%s/stat" % name, "rb") as f:
+            stat = f.read()
+    except OSError:
+        continue
+    pids.append(int(name))
+    cpu += sum(int(x) for x in stat[stat.rindex(b")") + 2:].split()[11:15])
+    try:
+        with open("/proc/%s/io" % name, "rb") as f:
+            io += sum(int(l.split()[1]) for l in f if l.startswith((b"rchar:", b"wchar:")))
+    except OSError:
+        pass
+if sys.argv[3] == "kill":
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+print(len(pids), cpu, io)
+"""
 
 
 class WorkbenchUnavailableError(RuntimeError):
@@ -42,6 +93,10 @@ class SandboxResult:
     stderr: str
     timed_out: bool = False
     truncated: bool = False
+    # Morto pelo vigia por ficar sem progresso (um caso particular de timed_out).
+    stalled: bool = False
+    # Tamanho real do arquivo lido (read_file/read_tail), quando conhecido.
+    size_bytes: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -66,7 +121,7 @@ class WorkbenchSandbox:
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
         self.run_user = run_user
-        self._transport = httpx.AsyncHTTPTransport(uds=docker_socket)
+        self._docker_socket = docker_socket
 
     # ------------------------------------------------------------------
     # Path safety
@@ -117,13 +172,26 @@ class WorkbenchSandbox:
         cwd: str | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        stall_timeout: int | None = None,
     ) -> SandboxResult:
         """Roda ``command`` (string de shell) no sandbox e devolve o resultado.
 
-        O comando roda sob ``timeout`` do coreutils: se estourar, o processo é
-        morto DENTRO do container (não deixa zumbi). A saída é truncada em
-        ``max_output_bytes`` por fluxo.
+        ``timeout`` é o teto de relógio: o comando roda sob ``timeout`` do
+        coreutils e, se estourar, é morto DENTRO do container (não deixa zumbi).
+        ``stall_timeout`` liga o vigia de progresso: antes do teto, o comando só
+        morre se passar esse tanto de segundos sem gastar CPU, fazer I/O nem
+        escrever saída — se travou, não se está só demorando. A saída é truncada
+        em ``max_output_bytes`` por fluxo.
         """
+        # Ponto ÚNICO por onde passam o `neo_bash` do turno e o `sandbox_task`
+        # em job — por isso a guarda mora aqui e não em cada chamador.
+        recusa = refusal_for(command)
+        if recusa is not None:
+            logger.warning(
+                "[Workbench] comando recusado: cita o disco do usuário — %.200s", command
+            )
+            return SandboxResult(exit_code=126, stdout="", stderr=recusa)
+
         secs = int(timeout or self.default_timeout)
         workdir = self.resolve_path(cwd) if cwd else self.workspace_root
         # `timeout --signal=KILL N sh -lc '<command>'` — garante o kill no host
@@ -138,10 +206,37 @@ class WorkbenchSandbox:
             "-lc",
             wrapped,
         ]
-        result = await self._exec(cmd, workdir=workdir, env=env, wall_timeout=secs + 10)
+        marker = uuid.uuid4().hex
+        # Sem vigia pedido e sem turno esperando sinal de vida (job em background,
+        # por exemplo), não vale gastar um probe a cada poucos segundos.
+        monitor = None
+        if stall_timeout is not None or current_liveness() is not None:
+            monitor = _ProgressMonitor(self, marker, stall_timeout=stall_timeout)
+        started = time.monotonic()
+        try:
+            result = await self._exec(
+                cmd,
+                workdir=workdir,
+                env={**(env or {}), _EXEC_MARKER_ENV: marker},
+                wall_timeout=secs + 10,
+                monitor=monitor,
+            )
+        except asyncio.CancelledError:
+            # Stop no desktop ou cliente caiu: cancelar a task não mata o `docker
+            # exec`, e o processo seguiria no container até o teto — a sessão
+            # 45bd5ad0 deixou um OCR rodando minutos depois do Stop. Mata a árvore
+            # marcada antes de propagar.
+            await asyncio.shield(self._probe(marker, kill=True))
+            raise
         # coreutils timeout: 124 = expirou; 137 = morto (SIGKILL, nosso sinal).
-        if result.exit_code in (124, 137) and not result.stdout and not result.stderr:
-            result.timed_out = True
+        if result.exit_code in (124, 137):
+            if monitor is not None and monitor.stalled:
+                result.timed_out = True
+                result.stalled = True
+            # Pelo relógio, não pela saída vazia: o ffmpeg imprime progresso antes
+            # de morrer, e um 137 rápido sem saída é falta de memória, não prazo.
+            elif time.monotonic() - started >= secs:
+                result.timed_out = True
         return result
 
     async def write_file(self, path: str, content: str) -> SandboxResult:
@@ -161,11 +256,51 @@ class WorkbenchSandbox:
 
     async def read_file(self, path: str, *, max_bytes: int | None = None) -> SandboxResult:
         """Lê ``path`` (texto). Trunca em ``max_bytes`` (default: max_output_bytes)."""
-        target = self.resolve_path(path)
+        target = shlex.quote(self.resolve_path(path))
         cap = int(max_bytes or self.max_output_bytes)
-        # head -c limita no container; o truncamento textual final é do _exec.
-        script = f"head -c {cap} {shlex.quote(target)}"
-        return await self._exec(["sh", "-c", script], workdir=self.workspace_root)
+        # head -c limita no container. O tamanho vem junto porque o corte do head
+        # nunca passava pelo `_truncate` do _exec: um arquivo de 64 KB voltava com
+        # 60 KB e `truncated=False` (session-1fcaa440, a transcrição do OCR).
+        result = await self._exec(
+            ["sh", "-c", f"wc -c < {target} && head -c {cap} {target}"],
+            workdir=self.workspace_root,
+        )
+        if result.exit_code != 0:
+            return result
+        tamanho, _, corpo = result.stdout.partition("\n")
+        try:
+            result.size_bytes = int(tamanho.strip())
+        except ValueError:
+            return result
+        result.stdout = corpo
+        result.truncated = result.truncated or result.size_bytes > cap
+        return result
+
+    async def read_tail(self, path: str, *, max_bytes: int | None = None) -> SandboxResult:
+        """O FIM de ``path`` — o que importa num log ("como está indo").
+
+        ``read_file`` devolve o começo, que num log de job longo é justamente a
+        parte velha. ``truncated`` diz se havia mais antes do trecho devolvido.
+        """
+        target = shlex.quote(self.resolve_path(path))
+        cap = int(max_bytes or self.max_output_bytes)
+        result = await self._exec(
+            ["sh", "-c", f"wc -c < {target} && tail -c {cap} {target}"],
+            workdir=self.workspace_root,
+        )
+        if result.exit_code != 0:
+            return result
+        tamanho, _, corpo = result.stdout.partition("\n")
+        try:
+            cortado = int(tamanho.strip()) > cap
+        except ValueError:
+            return result
+        if cortado:
+            # O corte por bytes cai no meio de uma linha: a primeira é lixo.
+            corpo = corpo.split("\n", 1)[-1]
+        result.stdout = corpo
+        result.truncated = result.truncated or cortado
+        return result
 
     async def list_files(self, path: str | None = None) -> SandboxResult:
         """Lista ``path`` (default: raiz do workspace) com ``ls -la``."""
@@ -184,12 +319,44 @@ class WorkbenchSandbox:
             logger.warning("[Workbench] health check failed: %s", e)
             return False
 
+    async def _probe(self, marker: str, *, kill: bool = False) -> tuple[int, int, int] | None:
+        """Amostra (ou mata, com ``kill``) a árvore de processos de um `run`.
+
+        Devolve ``(processos, ticks de cpu, bytes de io)``, ou ``None`` quando não
+        deu para medir — o vigia nunca derruba o comando que está vigiando.
+        """
+        try:
+            res = await self._exec(
+                [
+                    "python3",
+                    "-c",
+                    _PROBE_SCRIPT,
+                    _EXEC_MARKER_ENV,
+                    marker,
+                    "kill" if kill else "sample",
+                ],
+                workdir=self.workspace_root,
+                wall_timeout=15,
+            )
+            pids, cpu, io = (int(x) for x in res.stdout.split())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Workbench] probe falhou (exec %s): %s", marker, e)
+            return None
+        return pids, cpu, io
+
     # ------------------------------------------------------------------
     # Docker Engine API
     # ------------------------------------------------------------------
 
     async def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=self._transport, base_url=_DOCKER_BASE_URL, timeout=None)
+        # Um transporte por client: sair do `async with` fecha o transporte, e um
+        # compartilhado derrubava qualquer exec em curso — o stream de um comando
+        # morria quando o probe do vigia (ou um job em paralelo) terminava.
+        return httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=self._docker_socket),
+            base_url=_DOCKER_BASE_URL,
+            timeout=None,
+        )
 
     async def _inspect_container(self) -> dict:
         async with await self._client() as client:
@@ -206,6 +373,7 @@ class WorkbenchSandbox:
         workdir: str,
         env: dict[str, str] | None = None,
         wall_timeout: int = 90,
+        monitor: _ProgressMonitor | None = None,
     ) -> SandboxResult:
         """Cria e roda um exec, devolvendo stdout/stderr/exit_code."""
         env_list = [f"{k}={v}" for k, v in (env or {}).items()]
@@ -243,17 +411,23 @@ class WorkbenchSandbox:
                         async for chunk in stream.aiter_bytes():
                             chunks.append(chunk)
                             total += len(chunk)
+                            if monitor is not None:
+                                monitor.saw_output()
                             # Guarda-chuva: para de ler bem além do cap por fluxo.
                             if total > self.max_output_bytes * 4:
                                 break
                         return b"".join(chunks)
 
+                watcher = asyncio.create_task(monitor.watch()) if monitor is not None else None
                 try:
                     raw = await asyncio.wait_for(_run(), timeout=wall_timeout)
                 except asyncio.TimeoutError:
                     return SandboxResult(
                         exit_code=124, stdout="", stderr="", timed_out=True
                     )
+                finally:
+                    if watcher is not None:
+                        watcher.cancel()
 
                 stdout, stderr = _demux(raw)
                 info = await client.get(f"/exec/{exec_id}/json")
@@ -273,6 +447,73 @@ class WorkbenchSandbox:
             stderr=err,
             truncated=out_trunc or err_trunc,
         )
+
+
+class _ProgressMonitor:
+    """Decide, por evidência, se um comando em curso travou.
+
+    Progresso é qualquer mudança observável: saída chegando pelo stream, ou a
+    amostra (processos, CPU, I/O) da árvore marcada diferente da anterior. Todo
+    avanço vira também sinal de vida do turno (``touch_progress``), que é o que
+    mantém o desktop esperando. Sem ``stall_timeout`` o vigia só alimenta esse
+    sinal e nunca mata.
+
+    Um laço infinito queimando CPU conta como progresso — quem pega esse caso é
+    o teto de relógio do ``run``.
+    """
+
+    def __init__(
+        self,
+        sandbox: WorkbenchSandbox,
+        marker: str,
+        *,
+        stall_timeout: float | None,
+        clock: Callable[[], float] = time.monotonic,
+        interval: float = _PROBE_INTERVAL_S,
+    ) -> None:
+        self._sandbox = sandbox
+        self._marker = marker
+        self._stall_timeout = stall_timeout
+        self._clock = clock
+        self._interval = interval
+        self._last_progress = clock()
+        self._last_sample: tuple[int, int, int] | None = None
+        self.stalled = False
+
+    def saw_output(self) -> None:
+        self._progress()
+
+    def observe(self, sample: tuple[int, int, int] | None) -> bool:
+        """Registra uma amostra do probe; True quando o comando deve morrer."""
+        if sample is None:
+            # Probe falhou: não é evidência de avanço nem de parada. Não mata por
+            # isso — o teto de relógio continua valendo.
+            return False
+        if sample != self._last_sample:
+            self._last_sample = sample
+            self._progress()
+            return False
+        if self._stall_timeout is None:
+            return False
+        return self._clock() - self._last_progress >= self._stall_timeout
+
+    async def watch(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            if not self.observe(await self._sandbox._probe(self._marker)):
+                continue
+            self.stalled = True
+            logger.warning(
+                "[Workbench] comando sem progresso há %ss — matando a árvore (exec %s)",
+                self._stall_timeout,
+                self._marker,
+            )
+            await self._sandbox._probe(self._marker, kill=True)
+            return
+
+    def _progress(self) -> None:
+        self._last_progress = self._clock()
+        touch_progress()
 
 
 def _demux(raw: bytes) -> tuple[str, str]:

@@ -136,6 +136,23 @@ FILE_TOOLS: list[ToolSchema] = [
         },
     ),
     ToolSchema(
+        name="file_offer",
+        description=(
+            "Mostra ao usuário o botão de download de um arquivo que JÁ está no seu catálogo "
+            "(tem file_id), sem publicar de novo. Use para 'me mostra o botão de download', "
+            "'me manda de novo o arquivo', 'quero baixar a versão X'. O file_id vem do registro "
+            "de arquivos da conversa. Para algo que só existe no sandbox, é file_save."
+        ),
+        module="files",
+        execution="server-side",
+        timeout=15,
+        parameters={
+            "file_id": ToolParameter(
+                type="string", description="file_id da versão a oferecer (do registro de arquivos)", required=True,
+            ),
+        },
+    ),
+    ToolSchema(
         name="file_set_retention",
         description=(
             "Muda a retenção de um arquivo do catálogo: 'perm' quando o usuário disser "

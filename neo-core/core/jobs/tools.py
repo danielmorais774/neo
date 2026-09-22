@@ -17,7 +17,9 @@ JOB_TOOLS: list[ToolSchema] = [
             "hora, sem travar a conversa. Use para trabalho DEMORADO (baixar/processar "
             "arquivos grandes, treinar/converter algo, esperar um tempo) — você é "
             "avisado automaticamente quando terminar e aí responde ao usuário. Diga ao "
-            "usuário que vai avisar quando concluir. NÃO fique esperando com neo_bash."
+            "usuário que vai avisar quando concluir. NÃO fique esperando com neo_bash. "
+            "Se a tarefa tem um passo DEPOIS (montar, formatar, entregar), descreva-o em "
+            "`then`: ao fim do job você continua sozinho e termina a entrega."
         ),
         module="jobs",
         execution="server-side",
@@ -41,6 +43,17 @@ JOB_TOOLS: list[ToolSchema] = [
             "timeout": ToolParameter(
                 type="integer",
                 description="Timeout do job em segundos (opcional; padrão 1800 = 30min)",
+                required=False,
+            ),
+            "then": ToolParameter(
+                type="string",
+                description=(
+                    "Opcional: o que VOCÊ vai fazer quando o job terminar com sucesso, "
+                    "escrito como ordem completa (ex.: 'leia /workspace/ocr/x/transcricao.txt "
+                    "e entregue ao usuário um .txt com remetente, horário e mensagem'). "
+                    "Com isto você continua sozinho ao fim do job e entrega pronto — sem o "
+                    "usuário precisar pedir de novo."
+                ),
                 required=False,
             ),
         },
@@ -82,6 +95,106 @@ JOB_TOOLS: list[ToolSchema] = [
                     "ciclo de revisão para cumprir requisito."
                 ),
                 enum=["quick", "standard", "deep"],
+                required=False,
+            ),
+        },
+    ),
+    # Leitura delegada de documentos (docs/deep-read-plan.md).
+    ToolSchema(
+        name="deep_read",
+        description=(
+            "LEITURA DELEGADA de documentos grandes ou de VÁRIOS documentos (PDF, DOCX, PPTX, "
+            "planilha, TXT/MD/HTML) que já estão no seu sandbox. Subagentes leem CADA documento "
+            "por inteiro, em paralelo, procurando exatamente o que você pedir; cada um vira "
+            "`notas/<documento>.md` (análise + citações literais conferidas no texto, com página) "
+            "e todos entram num `sintese.md` com quadro comparativo. Nada disso passa pelo seu "
+            "contexto nem pelo seu caderno: você recebe só a pasta e o status. Use SEMPRE que a "
+            "tarefa for analisar, comparar ou extrair algo de documentos longos (dezenas de "
+            "páginas) ou de mais de dois arquivos — não `neo_read_file`/`cat`/`grep` no texto "
+            "inteiro, que enche seu contexto, trunca e perde partes. Antes: liste a pasta de ORIGEM "
+            "(a que o usuário citou) e garanta que TODOS os documentos dela estão no sandbox (sobem com "
+            "request_user_file stage=true). Chame UMA vez, com todos, e avise o usuário que vai "
+            "continuar sozinho ao terminar. Faltou algo numa leitura que já existe? Use `extend` — "
+            "não abra outra. Leva de ~30 s a alguns minutos."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=60,
+        parameters={
+            "files": ToolParameter(
+                type="array",
+                items={"type": "string"},
+                description=(
+                    "TODOS os documentos da tarefa: caminhos no seu sandbox "
+                    "(ex.: '/workspace/files/Plano_X.pdf') ou file_ids do catálogo — o original, não "
+                    ".txt extraído antes. Nunca caminho do disco do usuário (/Users/...): traga antes "
+                    "com request_user_file. Com `extend`, só os documentos NOVOS."
+                ),
+                required=False,
+            ),
+            "questions": ToolParameter(
+                type="array",
+                items={"type": "string"},
+                description=(
+                    "O que procurar em CADA documento, um critério por item, específico "
+                    "(ex.: 'propostas que aumentam a carga tributária: impostos novos, alíquotas "
+                    "maiores, fim de isenções'). Uma por critério que o USUÁRIO pediu, com as palavras "
+                    "dele — não troque por eixos genéricos. Viram as seções das notas. Até 12. Com "
+                    "`extend`, só as perguntas NOVAS (as antigas são mantidas)."
+                ),
+                required=False,
+            ),
+            "goal": ToolParameter(
+                type="string",
+                description="Objetivo da análise em uma frase (ex.: 'comparar os relatórios anuais 2026'). Opcional com `extend`.",
+                required=False,
+            ),
+            "title": ToolParameter(
+                type="string",
+                description="Título curto da leitura para o usuário (vira o nome da pasta). Opcional com `extend`.",
+                required=False,
+            ),
+            "source_dir": ToolParameter(
+                type="string",
+                description=(
+                    "A pasta do disco do USUÁRIO de onde os documentos vieram, quando ele citou uma "
+                    "(ex.: '/Users/daniel/Documents/contratos'). A leitura é conferida contra a listagem "
+                    "real dela — liste com run_command antes. 'nenhuma' se a pasta citada não é a origem."
+                ),
+                required=False,
+            ),
+            "excluded": ToolParameter(
+                type="array",
+                items={"type": "string"},
+                description="Documentos da source_dir que o USUÁRIO mandou deixar de fora (nomes). Não use para esconder falta.",
+                required=False,
+            ),
+            "extend": ToolParameter(
+                type="string",
+                description=(
+                    "Para CORRIGIR ou AMPLIAR uma leitura que já existe ('faltou o X', 'inclui Y', "
+                    "'analisa também Z'): o job_id ou a pasta /workspace/analises/... dela. Mesma pasta, "
+                    "mesmas perguntas, só o novo é lido, e a conclusão já entregue é ATUALIZADA."
+                ),
+                required=False,
+            ),
+            "instructions": ToolParameter(
+                type="string",
+                description=(
+                    "Opcional: critério de julgamento do usuário — o que conta e o que não conta "
+                    "(ex.: 'promessa sem fonte de custeio conta como irrealista; diagnóstico não é proposta')."
+                ),
+                required=False,
+            ),
+            "then": ToolParameter(
+                type="string",
+                description=(
+                    "O que VOCÊ faz quando a leitura terminar, como ordem completa (ex.: 'leia a "
+                    "sintese.md desta leitura, escreva a conclusão comparativa em "
+                    "/workspace/conclusao-planos-2026.md citando as páginas das notas e entregue com "
+                    "file_save'). A pasta exata chega junto do resultado. Sem isto, o usuário só é "
+                    "avisado e a conclusão espera ele pedir."
+                ),
                 required=False,
             ),
         },
@@ -174,25 +287,39 @@ JOB_TOOLS: list[ToolSchema] = [
     ToolSchema(
         name="browser_local_task",
         description=(
-            "Executa a tarefa no navegador REAL da máquina do usuário: na tela dele, "
-            "com ele vendo cada passo e um botão PARE na página. Use nos TRÊS casos: "
-            "(a) ele pediu o navegador dele ('no meu navegador', 'no meu Chrome', "
-            "'quero acompanhar/ver acontecendo'); (b) ele nomeou a MÁQUINA dele como o "
-            "lugar ('no meu macbook', 'nesse pc', 'aqui na minha máquina'); (c) o "
-            "resultado só existe se ele VIR ou OUVIR — tocar música ou vídeo, deixar "
-            "uma página aberta na frente dele, mostrar algo acontecendo (se houver "
-            "tool específica para o pedido, ela vem antes de qualquer navegador). "
-            "No caso (c) "
-            "não é questão de preferência: o browser do servidor não tem tela nem som, "
-            "e lá a tarefa é impossível. Fora esses três, o default continua sendo "
-            "browser_task, que roda no servidor sem atrapalhar ninguém. Demora de 30s "
-            "a minutos — você é avisado ao terminar; diga ao usuário que ele pode "
-            "acompanhar e que você avisa no fim."
+            "Executa a tarefa num navegador na MÁQUINA DO USUÁRIO. Por padrão SEM "
+            "JANELA (headless): não atrapalha nada do que ele está fazendo, e usa a "
+            "conexão de internet dele. Com janela — na tela dele, vendo cada passo e "
+            "com botão PARE — só quando ele quiser VER. "
+            "PREFIRA ESTA a `browser_task` quando o site recusa o servidor: o "
+            "navegador do servidor sai por um IP de datacenter fora do Brasil, e WAF "
+            "de CDN (403/Access Denied) e buscadores (CAPTCHA) recusam esse IP. Se um "
+            "`web_fetch` voltou com `blocked_origin`, este é o próximo passo — e "
+            "repetir no servidor não é. Use também quando: (a) ele pediu o navegador "
+            "dele; (b) ele nomeou a MÁQUINA dele como o lugar ('no meu macbook', "
+            "'nesse pc'); (c) o resultado só existe se ele VIR ou OUVIR — tocar música "
+            "ou vídeo, deixar uma página aberta na frente dele (aí é com janela, e não "
+            "é preferência: o servidor não tem tela nem som). "
+            "NÃO use para baixar arquivo cuja URL você já tem — `web_fetch` diz se o "
+            "arquivo está acessível, e navegador é o pior jeito de pegar binário. "
+            "NÃO use quando o `web_fetch` disse `not_found`: a URL está errada e "
+            "navegador nenhum conserta endereço. Demora de 30s a minutos — você é "
+            "avisado ao terminar."
         ),
         module="jobs",
         execution="server-side",
         timeout=30,
         parameters={
+            "visible": ToolParameter(
+                type="boolean",
+                description=(
+                    "true = abrir na TELA do usuário (ele vê cada passo). Só quando "
+                    "ele quiser acompanhar, ou quando o resultado depende de ele ver "
+                    "ou ouvir. O padrão (false) roda sem janela na mesma máquina — "
+                    "mesmo IP, sem atrapalhar o que ele está fazendo."
+                ),
+                required=False,
+            ),
             "task": ToolParameter(
                 type="string",
                 description=(

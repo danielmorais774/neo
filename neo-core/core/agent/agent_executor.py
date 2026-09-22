@@ -16,6 +16,7 @@ from core.agent.context_manager import ContextManager
 from core.agent.loop_detector import LoopDetector
 from core.agent.prompt_builder import PromptBuilder
 from core.agent.token_counter import TokenCounter
+from core.liveness import TurnLiveness, current_liveness, touch_progress
 from core.llm import LLMRouter
 from core.memory import ConversationMemory
 from core.tools import ToolExecutor, ToolRegistry
@@ -34,6 +35,42 @@ from shared import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _AgentStalled(Exception):
+    """O agente ficou ``idle`` segundos sem avançar."""
+
+    def __init__(self, idle: float, fase: str) -> None:
+        super().__init__(f"sem avanço há {idle:.0f}s ({fase})")
+        self.idle = idle
+        self.fase = fase
+
+
+class _StallWatch:
+    """Há quanto tempo o agente está SEM avançar — não há quanto tempo começou.
+
+    Avanço é o que o próprio loop registra (resposta do LLM, resultado de tool) e,
+    dentro de um turno do desktop, também o que o resto do turno registra no
+    ``TurnLiveness`` (o probe do sandbox toca nele enquanto um ``neo_bash`` longo
+    trabalha). Tocar aqui propaga para o turno: é isso que mantém o keepalive do
+    gRPC saindo enquanto o agente progride.
+    """
+
+    def __init__(self) -> None:
+        self._proprio = TurnLiveness()
+        self.fase = "começando"
+
+    def touch(self, fase: str) -> None:
+        self.fase = fase
+        self._proprio.touch()
+        touch_progress()
+
+    def idle_seconds(self) -> float:
+        parado = self._proprio.idle_seconds()
+        turno = current_liveness()
+        if turno is not None:
+            parado = min(parado, turno.idle_seconds())
+        return parado
 
 
 class AgentExecutor:
@@ -85,6 +122,7 @@ class AgentExecutor:
         tool_subset: list["ToolSchema"] | None = None,
         tool_executor: Any = None,
         available_tools: list["ToolSchema"] | None = None,
+        force_tool_first: bool = False,
     ) -> dict[str, Any]:
         """Executa uma task com resiliência (double-loop).
 
@@ -98,6 +136,16 @@ class AgentExecutor:
             tool_subset: lista de ToolSchema — substitui tools padrão
             tool_executor: executor custom para as tools da skill
             available_tools: tools visíveis ao LLM (mutually exclusive with tool_subset)
+            force_tool_first: impõe ``tool_choice="required"`` no PRIMEIRO round.
+
+                Para quando a decisão de agir já foi tomada antes deste loop e
+                "responder em texto" não é um desfecho válido. Sem isto, o
+                modelo pode devolver uma promessa ("deixa eu ver o estado dos
+                jobs...") e encerrar o turno sem ter feito nada — foi o que
+                aconteceu na sessão 8c449cb8 (2026-09-21): o classificador
+                escolheu `browser_local_task`, montou os argumentos completos, e
+                o agente respondeu prosa em 1 iteração. Nenhum job foi criado, e
+                o usuário só descobriu 9 minutos depois, perguntando.
         Returns:
             Dict com status, final_response, steps, iterations, metadata.
         """
@@ -108,34 +156,43 @@ class AgentExecutor:
         # não a cada iteração: dentro do inner loop uma troca no meio do caminho
         # significaria metade do turno num modelo e metade em outro.
         provider, model = await self._resolve_brain(provider, model)
+        brain = {"provider": provider, "model": model}
 
+        watch = _StallWatch()
         for outer_attempt in range(max_outer_retries):
+            # Os passos vivem FORA do inner loop para sobreviverem ao corte por
+            # inatividade: é o que já foi apurado, e jogar fora é obrigar o
+            # usuário a pagar tudo de novo no turno seguinte.
+            passos: list[AgentStep] = []
             try:
-                result = await asyncio.wait_for(
+                result = await self._run_watched(
                     self._inner_loop(
                         task, session_id, memory, provider, model, loop_hints_injected,
                         system_prompt_override=system_prompt_override,
                         tool_subset=tool_subset,
                         tool_executor=tool_executor,
                         available_tools=available_tools,
+                        force_tool_first=force_tool_first,
+                        steps_sink=passos,
+                        watch=watch,
                     ),
-                    timeout=self.settings.agent_global_timeout,
+                    watch,
                 )
+                result["metadata"] = {**brain, **(result.get("metadata") or {})}
                 return result
 
-            except asyncio.TimeoutError:
+            except _AgentStalled as e:
                 logger.error(
-                    f"Agent timeout após {self.settings.agent_global_timeout}s"
+                    "Agent parado há %.0fs (%s) — %d passo(s) feitos",
+                    e.idle, e.fase, len(passos),
                 )
                 return self._build_result(
                     status=ExecutionStatus.TIMEOUT,
-                    response=(
-                        f"Timeout: execução excedeu "
-                        f"{self.settings.agent_global_timeout}s."
-                    ),
-                    steps=[],
-                    iterations=0,
+                    response=self._stalled_text(e, passos),
+                    steps=passos,
+                    iterations=len(passos),
                     session_id=session_id,
+                    metadata={**brain, "stalled_after_s": round(e.idle), "stalled_in": e.fase},
                 )
 
             except AgentLoopDetectedError as e:
@@ -183,6 +240,62 @@ class AgentExecutor:
             iterations=0,
             session_id=session_id,
         )
+
+    async def _run_watched(self, coro: Any, watch: _StallWatch) -> dict[str, Any]:
+        """Roda o inner loop e o corta só quando ele PARA de avançar.
+
+        Substitui um ``wait_for(300)`` contado do início: um agente lento mas
+        produtivo (5 consultas SQL a 30-60s por ida ao modelo) morria com o
+        trabalho quase pronto. Exceções do loop (loop detectado, overflow)
+        atravessam intactas para o outer loop tratar.
+        """
+        limite = float(self.settings.agent_stall_timeout)
+        vigia = max(0.01, min(5.0, limite / 4))
+        tarefa = asyncio.ensure_future(coro)
+        try:
+            while True:
+                feitas, _ = await asyncio.wait({tarefa}, timeout=vigia)
+                if feitas:
+                    return tarefa.result()
+                parado = watch.idle_seconds()
+                if parado >= limite:
+                    tarefa.cancel()
+                    # O cancelamento chega às tools (o sandbox mata a árvore do
+                    # processo no CancelledError); esperar garante isso antes de
+                    # o turno seguir.
+                    await asyncio.gather(tarefa, return_exceptions=True)
+                    raise _AgentStalled(parado, watch.fase)
+        finally:
+            if not tarefa.done():
+                tarefa.cancel()
+
+    @staticmethod
+    def _stalled_text(stall: _AgentStalled, passos: list[AgentStep]) -> str:
+        """O que o usuário lê quando o agente parou: onde travou e o que já tinha.
+
+        O resultado das últimas tools entra no texto porque ele vira a resposta
+        salva no histórico — o turno seguinte ("continua") parte dali em vez de
+        refazer as consultas.
+        """
+        linhas = [f"Parei: fiquei {stall.idle:.0f}s sem avançar ({stall.fase})."]
+        resultados = [r for p in passos for r in p.tool_results]
+        if not resultados:
+            linhas.append("Nenhuma ferramenta chegou a rodar antes disso.")
+            return "\n".join(linhas)
+
+        contagem: dict[str, int] = {}
+        for r in resultados:
+            contagem[r.name] = contagem.get(r.name, 0) + 1
+        feitas = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in contagem.items())
+        linhas.append(f"Antes disso rodei {len(resultados)} ferramenta(s): {feitas}.")
+
+        for r in passos[-1].tool_results[-2:]:
+            corpo = r.error or str(r.result or "")
+            if len(corpo) > 1500:
+                corpo = corpo[:1500] + "\n[…cortado]"
+            rotulo = "erro" if r.error else "resultado"
+            linhas.append(f"\nÚltimo {rotulo} de `{r.name}`:\n```\n{corpo}\n```")
+        return "\n".join(linhas)
 
     async def _resolve_brain(
         self, provider: str | None, model: str | None
@@ -246,9 +359,18 @@ class AgentExecutor:
         tool_subset: list["ToolSchema"] | None = None,
         tool_executor: Any = None,
         available_tools: list["ToolSchema"] | None = None,
+        force_tool_first: bool = False,
+        steps_sink: list[AgentStep] | None = None,
+        watch: _StallWatch | None = None,
     ) -> dict[str, Any]:
-        """Loop interno: LLM → Tools → LLM com detecção de loops."""
-        steps: list[AgentStep] = []
+        """Loop interno: LLM → Tools → LLM com detecção de loops.
+
+        ``steps_sink``: lista onde os passos são acumulados, para quem chama
+        continuar com eles se o loop for cancelado no meio. ``watch``: onde cada
+        avanço é registrado (o corte por inatividade lê daí).
+        """
+        steps: list[AgentStep] = steps_sink if steps_sink is not None else []
+        watch = watch or _StallWatch()
         status = ExecutionStatus.RUNNING
         iteration = 0
         final_response: str | None = None
@@ -318,12 +440,31 @@ class AgentExecutor:
 
                 # 3. Chamar LLM
                 llm_provider = self.llm_router.get_provider(provider)
+                # `iteration` já foi incrementado no topo do laço: o primeiro
+                # round é o 1. Com `== 0` (como estava) o forçamento nunca
+                # disparava — toda chamada da session-d35696d4 saiu com
+                # tool_choice "auto".
+                forcando = bool(force_tool_first and iteration == 1 and available_tools)
+                # O raciocínio do OpenRouter vem ligado sozinho, é gerado antes do
+                # primeiro token e ignora o max_tokens: na session-d35696d4 cada ida
+                # ao modelo levou 31-61s. Mesma flag do loop cognitivo — é o mesmo
+                # cérebro, não pode pensar de um jeito num trilho e de outro no outro.
+                extra: dict[str, Any] = {
+                    "disable_thinking": not self.settings.cognitive_reasoning_enabled,
+                }
+                if forcando:
+                    extra["tool_choice"] = "required"
+                    # E aqui é obrigatório: o deepseek-v4 RECUSA tool_choice
+                    # forçado com 400 em thinking mode.
+                    extra["disable_thinking"] = True
+                watch.touch("esperando a resposta do modelo")
                 response = await llm_provider.complete(
                     messages=current_messages,
                     tools=available_tools,
                     model=model or self.llm_router.get_default_model(provider),
                     temperature=self.settings.default_temperature,
                     max_tokens=self.settings.default_max_tokens,
+                    **extra,
                 )
 
                 content = response.get_content()
@@ -341,8 +482,10 @@ class AgentExecutor:
                     thought=content,
                     tool_calls=tool_calls,
                 )
+                watch.touch("rodando " + ", ".join(tc.name for tc in tool_calls))
                 step.tool_results = await self._execute_tools(tool_calls, executor=tool_executor)
                 steps.append(step)
+                watch.touch("tools concluídas")
 
                 # 6. Registrar no loop detector
                 loop_detector.record_step(step)

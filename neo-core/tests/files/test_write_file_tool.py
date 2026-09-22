@@ -19,7 +19,8 @@ from uuid import uuid4
 import pytest
 
 from modules.desktop.tools import DESKTOP_TOOLS, FILE_ACTUATION_TOOL_NAMES
-from modules.desktop.ai_service import _CLIENT_ACTUATION_TOOLS
+from modules.desktop.ai_service import _CLIENT_ACTUATION_TOOLS, AIServiceResponse
+from shared.types import IntentType
 
 
 def _tool():
@@ -38,7 +39,9 @@ def test_esta_no_catalogo_como_client_side() -> None:
 def test_path_e_content_sao_obrigatorios() -> None:
     params = _tool().parameters
     assert params["path"].required is True
-    assert params["content"].required is True
+    # `content` OU `source_path` (arquivo editado no /workspace) — sessão 30b1e484.
+    assert params["content"].required is False
+    assert params["source_path"].required is False
     # mode/overwrite são opcionais: o padrão tem que ser o seguro (write, sem
     # sobrescrever), não algo que o modelo precise lembrar de passar.
     assert params["mode"].required is False
@@ -177,6 +180,22 @@ async def test_sucesso_confirma_com_os_bytes() -> None:
         "bytes_written": 128,
     })
 
+    # Depois de gravar, o turno NÃO fecha sozinho: ele reentra no cognitivo
+    # para o cérebro decidir se falta arquivo. Ver o comentário do ramo `saved`
+    # — `save_generated_file` entrega UM por chamada, e fechar aqui fazia "põe
+    # os 6 PDFs na pasta" virar um por turno (sessão 8c449cb8).
+    notas: list[str] = []
+
+    async def _fake_reenter(session_id, *, user_message, pend, extra_note, **kw):
+        notas.append(extra_note)
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            message="Pronto, escrevi o arquivo em /Users/daniel/Desktop/notas.md (128 bytes).",
+            is_final=True, iterations=1,
+        )
+
+    svc._reenter_cognitive = _fake_reenter
+
     saidas = [
         r
         async for r in svc._confirm_file_delivery(
@@ -187,8 +206,10 @@ async def test_sucesso_confirma_com_os_bytes() -> None:
     ]
 
     assert saidas[-1].is_final is True
-    assert "escrevi o arquivo" in saidas[-1].message
-    assert "128 bytes" in saidas[-1].message
+    assert notas, "o sucesso tem que reentrar no cognitivo"
+    # A nota diz o que foi entregue E cobra a decisão de seguir ou fechar.
+    assert "/Users/daniel/Desktop/notas.md" in notas[0]
+    assert "PRÓXIMO" in notas[0]
 
 
 @pytest.mark.asyncio
@@ -196,6 +217,17 @@ async def test_save_generated_file_mantem_a_frase_dele() -> None:
     """Regressão: a tool irmã não pode herdar o texto do write_file."""
     svc = _service()
     payload = json.dumps({"status": "saved", "path": "/Users/daniel/Desktop/x.pdf"})
+
+    notas: list[str] = []
+
+    async def _fake_reenter(session_id, *, user_message, pend, extra_note, **kw):
+        notas.append(extra_note)
+        yield AIServiceResponse(
+            intent=IntentType.DIRECT_RESPONSE, session_id=session_id,
+            message="ok", is_final=True, iterations=1,
+        )
+
+    svc._reenter_cognitive = _fake_reenter
 
     saidas = [
         r
@@ -206,4 +238,5 @@ async def test_save_generated_file_mantem_a_frase_dele() -> None:
         )
     ]
 
-    assert "salvei o arquivo no seu computador" in saidas[-1].message
+    assert saidas[-1].is_final is True
+    assert "/Users/daniel/Desktop/x.pdf" in notas[0]

@@ -479,3 +479,32 @@ do turno. Num turno `CLIENT_TOOL` o trabalho não aconteceu ainda (o resultado
 volta em `process_tool_result`), e o caminho do shell do cérebro já reentra no
 cognitivo — então a nota automática já cobre esse. Anotar o `tool_trace` de todo
 comando one-shot só encheria o índice, que é o recurso mais caro da feature (R3).
+
+## 16. Caderno passo a passo (2026-09-13)
+
+O "deixado de fora de propósito" acima partia de que o caminho do shell do cérebro
+reentra no cognitivo e a nota automática o cobre. Medido nas sessões c4f3f7de e
+45bd5ad0, não cobre: dois turnos terminaram na guarda de atuação e o terceiro foi
+cancelado — um vídeo de 392 MB subido, 127 quadros gerados, e o caderno sem uma
+linha. O turno seguinte pediu o mesmo upload de novo.
+
+Agora o passo é anotado quando acontece, na nota da sessão (`sessao-<8>`, a mesma
+do piso — o índice continua com UMA linha por nota; só o `summary` passa a dizer o
+último passo, em vez do texto fixo):
+- laço cognitivo: `on_step` depois de cada tool em `_WM_STEP_TOOLS`;
+- atuação no cliente: `_resume_after_command` (comando + saída),
+  `_resume_after_user_file` (nome, file_id, tamanho e o caminho no `/workspace`) e
+  `_confirm_file_delivery`;
+- comando que virou job: entrada de job aberto; o resultado continua vindo do
+  `ProactiveDispatcher._note_result`.
+
+A entrada anotada ganha `noted` e o piso do fim do turno a pula; a chave sai do
+trace junto com `note_detail`. Render em `render_step_entry` /
+`render_step_summary` (`core/working_memory/render.py`), com o texto por entrada
+compartilhado com o piso (`_trace_entry_lines`) — o mesmo passo não é descrito de
+dois jeitos conforme o momento em que foi anotado.
+
+Na mesma mudança, o teto `_MAX_ACTUATION_DEPTH` subiu de 3 para 10 e virou rede de
+segurança: quem para o laço é a repetição (`_repeated_actuation`, mesmo comando ou
+mesmo arquivo já pedido neste pedido), e a parada lista o que já rodou em vez de
+"me diga em uma frase o que você quer".
