@@ -7,6 +7,7 @@ import VisaoScreen from './screens/VisaoScreen';
 import LogsScreen from './screens/LogsScreen';
 import DebugPanel from './DebugPanel';
 import ResearchPanel from './ResearchPanel';
+import AgendaPanel from './AgendaPanel';
 import AffectPanel from './AffectPanel';
 import SettingsPanel from './SettingsPanel';
 import SkillsPanel from './SkillsPanel';
@@ -35,6 +36,7 @@ function App() {
             <Route path="/comunicacao" element={<ComunicacaoScreen />} />
             <Route path="/musica" element={<SpotifyPanel />} />
             <Route path="/pesquisas" element={<ResearchPanel />} />
+            <Route path="/agenda" element={<AgendaPanel />} />
             <Route path="/servicos" element={<ServicesPanel />} />
             <Route path="/arquivos" element={<FilesPanel />} />
             {/* Cadastros generativos: a MESMA tela serve todos os cadastros —

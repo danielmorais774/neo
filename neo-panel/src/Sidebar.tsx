@@ -28,6 +28,7 @@ const NAV_GROUPS: NavGroup[] = [
       { path: '/comunicacao', label: 'Comunicação', icon: 'chat' },
       { path: '/musica', label: 'Música', icon: 'music' },
       { path: '/pesquisas', label: 'Pesquisas', icon: 'search' },
+      { path: '/agenda', label: 'Agenda', icon: 'clock' },
       { path: '/servicos', label: 'Serviços', icon: 'gear' },
       { path: '/arquivos', label: 'Arquivos', icon: 'file' },
       { path: '/dados', label: 'Dados', icon: 'table' },

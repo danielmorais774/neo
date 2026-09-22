@@ -3,6 +3,7 @@ import Screen, { type TabDef } from './ui/Screen';
 import Icon from './ui/Icon';
 import ModelosTab from './settings/ModelosTab';
 import VozTab from './settings/VozTab';
+import ArquivosTab from './settings/ArquivosTab';
 import SessionsTab from './SessionsTab';
 import ConnectedDevicesPanel from './ConnectedDevicesPanel';
 
@@ -12,6 +13,7 @@ const SettingsPanel = () => {
   const tabs: TabDef[] = [
     { id: 'modelos', label: 'Modelos', render: () => <ModelosTab reloadToken={reloadToken} /> },
     { id: 'voz', label: 'Voz', render: () => <VozTab reloadToken={reloadToken} /> },
+    { id: 'arquivos', label: 'Arquivos', render: () => <ArquivosTab reloadToken={reloadToken} /> },
     { id: 'comunicacoes', label: 'Comunicações', render: () => <SessionsTab /> },
     { id: 'dispositivos', label: 'Dispositivos', render: () => <ConnectedDevicesPanel /> },
   ];

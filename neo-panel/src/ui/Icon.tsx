@@ -10,7 +10,7 @@ export type IconName =
   | 'key' | 'chat' | 'bug' | 'logs' | 'vision' | 'frame' | 'graph'
   | 'mission' | 'search' | 'device' | 'robot' | 'brain' | 'emotion'
   | 'skill' | 'music' | 'gear' | 'refresh' | 'warn' | 'file' | 'mic'
-  | 'siren' | 'table';
+  | 'siren' | 'table' | 'clock';
 
 const PATHS: Record<IconName, ReactNode> = {
   // Cadastros generativos (/dados): grade de dados — lista + colunas.
@@ -149,6 +149,13 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M7 16a5 5 0 0 1 10 0z" strokeLinejoin="round" />
       <rect x="5" y="16" width="14" height="3.5" rx="1" strokeLinejoin="round" />
       <path strokeLinecap="round" d="M12 4v2.5M5.5 6.5 7.2 8.2M18.5 6.5 16.8 8.2" />
+    </>
+  ),
+  // Agenda (/agenda): relógio — mostrador + ponteiros.
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path strokeLinecap="round" d="M12 7.5V12l3 2" />
     </>
   ),
 };

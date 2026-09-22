@@ -66,7 +66,7 @@ export const PROVIDER_OPTIONS: { value: ProviderType; label: string }[] = [
   { value: 'openai', label: 'OpenAI — GPT-4o, GPT-4.1...' },
   { value: 'groq', label: 'Groq — Llama-3.3, ultra-rápido' },
   { value: 'grok', label: 'Grok (xAI) — Grok-3-mini, Grok-2...' },
-  { value: 'deepseek', label: 'DeepSeek — V4 Flash, V4 Pro...' },
+  { value: 'deepseek', label: 'DeepSeek — Flash, V4 Pro...' },
   { value: 'anthropic', label: 'Anthropic — Claude 3...' },
   { value: 'gemini', label: 'Gemini — Gemini 2.5 Pro...' },
   { value: 'ollama', label: 'Ollama — Local (Gemma4...)' },
@@ -95,7 +95,7 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: st
     { value: 'grok-3', label: 'Grok-3 — mais capaz (pago)' },
   ],
   deepseek: [
-    { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash — mais rápido' },
+    { value: 'deepseek-flash', label: 'DeepSeek Flash — mais rápido (V4.1)' },
     { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro — mais capaz' },
     { value: 'deepseek-chat', label: 'DeepSeek Chat — uso geral' },
     { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner — raciocínio lento' },
@@ -118,15 +118,17 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: st
     { value: 'x-ai/grok-4.5', label: 'Grok 4.5 — mais capaz (raciocínio)' },
     { value: 'x-ai/grok-4.20', label: 'Grok 4.20 — equilíbrio, 2M contexto' },
     { value: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite — econômico' },
-    // O sufixo `@baidu` fixa o provedor de infra do gateway (o neo-core o
+    // O sufixo `@fireworks` fixa o provedor de infra do gateway (o neo-core o
     // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
-    // provedor, com outro preço e outro teto de saída.
+    // provedor, com outro preço, outro teto de saída e outra velocidade.
     //
     // As DUAS entradas existem de propósito (ver o comentário longo no catálogo
-    // gêmeo do desktop, neo-desktop-tauri/src/lib/models.ts): pin = preço do
-    // Baidu num pool que satura; sem pin = qualquer endpoint livre, sem espera.
-    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu) — 1M contexto, barato' },
-    { value: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash (auto) — sem pin, preço varia' },
+    // gêmeo do desktop, neo-desktop-tauri/src/lib/models.ts): pin = endpoint
+    // estável (e cache de prefixo que sobrevive); sem pin = qualquer endpoint
+    // livre, sem espera, mas sorteando velocidade e preço a cada chamada.
+    { value: 'deepseek/deepseek-v4.1-flash@fireworks', label: 'DeepSeek V4.1 Flash (Fireworks) — 1M contexto, 69-85 tok/s' },
+    { value: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash (auto) — sem pin, preço e velocidade variam' },
+    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu) — geração anterior, ~6x mais barato' },
   ],
 };
 
