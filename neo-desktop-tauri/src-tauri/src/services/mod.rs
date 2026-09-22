@@ -1,7 +1,10 @@
 pub mod ai_agent;
 pub mod audio_route;
 pub mod browser_local;
+pub mod command_policy;
 pub mod device_control;
+pub mod file_ops;
+pub mod headless;
 pub mod shell;
 pub mod system_info;
 pub mod wake;

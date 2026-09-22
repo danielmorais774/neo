@@ -4,8 +4,10 @@ import { APP_THEMES, THEME_LABELS } from '../themes/themeTypes';
 import VoiceEnginesPanel from './VoiceEnginesPanel';
 import AudioDevicesPanel from './AudioDevicesPanel';
 import WakeWordPanel from './WakeWordPanel';
+import HeadlessBrowserPanel from './HeadlessBrowserPanel';
 import WakeTestPanel from './WakeTestPanel';
 import { useWakeEnabled } from '../hooks';
+import { VIEWER_SHORTCUT_HINTS } from '../lib/viewerShortcuts';
 import './SettingsModal.css';
 
 interface SettingsModalProps {
@@ -21,9 +23,18 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
   // não como overlay: ler as notas é trabalho lado a lado com o chat — como
   // overlay, conferir o que o Neo anotou obrigava a fechar a tela para voltar à
   // conversa. Chamar com a janela já aberta apenas a traz para a frente.
+  // Mesmo caminho do atalho ⌘⇧M (`lib/viewerShortcuts.ts`), que existe para não
+  // ter de abrir esta tela só para olhar o caderno; o ⌘⇧J abre as tarefas.
   const openNotebook = () => {
     window.electronAPI?.openWorkingMemoryWindow().catch((err) => {
       console.error('[Neo] Falha ao abrir a janela do caderno:', err);
+    });
+  };
+  // Mesma janela própria do caderno: acompanhar uma tarefa longa é olhar ao lado
+  // da conversa, não fechar o chat para ver se ela terminou.
+  const openJobs = () => {
+    window.electronAPI?.openJobsWindow().catch((err) => {
+      console.error('[Neo] Falha ao abrir a janela de tarefas:', err);
     });
   };
   // Portal para document.body: escapa do `.app`, que tem `overflow:hidden` e uma
@@ -93,6 +104,16 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
 
           <div className="settings-section">
             <div className="settings-section-title">
+              <span>Navegador headless local</span>
+              <small>
+                Roda nesta máquina, sem janela — mesmo IP que o seu navegador, sem tomar a tela
+              </small>
+            </div>
+            <HeadlessBrowserPanel />
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
               <span>Dispositivos de áudio</span>
               <small>Microfone e alto-falante usados no Modo Live</small>
             </div>
@@ -144,6 +165,33 @@ export default function SettingsModal({ theme, onThemeChange, onClose }: Setting
                 <strong>Abrir o caderno</strong>
                 <small>Preview do markdown de cada nota, direto do neo-core</small>
               </span>
+              <kbd className="settings-open-screen-kbd">{VIEWER_SHORTCUT_HINTS.workingMemory}</kbd>
+              <span className="settings-open-screen-chevron" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </span>
+            </button>
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <span>Tarefas em background</span>
+              <small>O que o Neo está rodando longe da conversa, com log ao vivo</small>
+            </div>
+            <button type="button" className="settings-open-screen" onClick={openJobs}>
+              <span className="settings-open-screen-icon" aria-hidden="true">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="4" width="18" height="16" rx="2" />
+                  <polyline points="7 9 10 12 7 15" />
+                  <line x1="12" y1="15" x2="17" y2="15" />
+                </svg>
+              </span>
+              <span className="settings-open-screen-copy">
+                <strong>Abrir tarefas</strong>
+                <small>Andamento, resultado e cancelar — direto do neo-core</small>
+              </span>
+              <kbd className="settings-open-screen-kbd">{VIEWER_SHORTCUT_HINTS.jobs}</kbd>
               <span className="settings-open-screen-chevron" aria-hidden="true">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="9 18 15 12 9 6" />

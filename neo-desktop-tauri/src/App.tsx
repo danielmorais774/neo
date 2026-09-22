@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { applySaved } from './lib/headlessLimits';
 import { ChatPage, QuickHelpPage } from './pages';
 import { WindowService } from './lib';
 import type { WindowResizeDirection } from './lib';
@@ -50,6 +51,10 @@ function App() {
     console.log('[Neo] App mounted');
     setRendered(true);
     let cancelled = false;
+
+    // Tetos do navegador headless: o Rust não persiste, então o que o usuário
+    // escolheu na Config é reaplicado aqui, uma vez, no boot.
+    void applySaved();
 
     const checkCoreStatus = async () => {
       try {

@@ -130,6 +130,14 @@ pub fn run_agent_message(
 #[tauri::command]
 pub fn stop_execution(state: State<'_, AppState>) -> Result<(), String> {
     info!("[Neo] stop_execution requested — cancelling in-flight run");
+    // O Stop só derrubava o stream: o comando (ou o opencode) seguia rodando na
+    // máquina, e um card de aprovação ficava esperando 15 min por nada.
+    let killed = crate::services::shell::kill_running();
+    if killed > 0 {
+        info!("[Neo] stop_execution: {} processo(s) encerrado(s)", killed);
+    }
+    crate::services::file_ops::cancel_pending();
+    crate::services::command_policy::cancel_pending();
     // Wake the execute_task read loop, which drops the gRPC stream and thereby
     // cancels the server-side RPC (grpc.aio cancels the handler on client abort).
     state.cancel_notify.notify_waiters();
@@ -139,7 +147,8 @@ pub fn stop_execution(state: State<'_, AppState>) -> Result<(), String> {
 /// Approve or reject a pending command (the agent's `command_request`). Pushes a
 /// CommandApproval into the in-flight stream so neo-core can continue: on approve it
 /// replies with an `execute_command` tool request that this client runs inline; on
-/// reject it closes the turn. Without this the run hangs until the 300s timeout.
+/// reject it closes the turn. Without this the run hangs until the stream's hard
+/// ceiling (the idle timeout is paused while the core waits on an approval).
 #[tauri::command]
 pub async fn respond_to_command(
     state: State<'_, AppState>,
@@ -150,6 +159,13 @@ pub async fn respond_to_command(
         "[Neo] respond_to_command: id={} approved={}",
         command_id, approved
     );
+
+    // Card desenhado pelo próprio cliente (política de comando num passo de plano):
+    // o neo-core está esperando um ToolResult, não um CommandApproval — mandar um
+    // approval pra ele seria responder a um pedido que ninguém fez.
+    if command_id.starts_with(crate::services::command_policy::LOCAL_PREFIX) {
+        return crate::services::command_policy::respond(&command_id, approved);
+    }
 
     let sender = {
         state
@@ -178,6 +194,27 @@ pub async fn respond_to_command(
         .send(msg)
         .await
         .map_err(|e| format!("falha ao enviar aprovação do comando: {}", e))
+}
+
+/// Aprovar/Rejeitar uma alteração (ou leitura) de arquivo que caiu fora das pastas
+/// liberadas — o card do chat chama isto (services/file_ops.rs).
+#[tauri::command]
+pub fn respond_file_change(change_id: String, approved: bool) -> Result<(), String> {
+    info!("[Neo] respond_file_change: id={} approved={}", change_id, approved);
+    crate::services::file_ops::respond(&change_id, approved)
+}
+
+/// Desfazer uma alteração de arquivo (botão do card). Recusa se o arquivo mudou
+/// depois — nunca desfaz por cima de edição do usuário.
+#[tauri::command]
+pub async fn undo_file_change(app: AppHandle, change_id: String) -> Result<(), String> {
+    let meta = tokio::task::spawn_blocking(move || {
+        crate::services::file_ops::undo_change(&change_id)
+    })
+    .await
+    .map_err(|e| format!("falha ao desfazer: {}", e))??;
+    crate::services::file_ops::emit_undone(&app, &meta);
+    Ok(())
 }
 
 #[tauri::command]
@@ -257,7 +294,7 @@ fn neo_core_http_url() -> String {
 
 /// Espelha o limite do servidor (NEO_FILES_MAX_FILE_MB) — o core recusa com 413
 /// de qualquer jeito; isto só evita ler um arquivo gigante do disco à toa.
-const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Abre o picker nativo. Lista vazia = o usuário cancelou.
 #[tauri::command]
@@ -322,18 +359,19 @@ pub async fn upload_path_to_store(
     let mime = mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string();
-    let bytes = tokio::fs::read(path)
+    // Streaming do disco: com até 500 MB, ler tudo pra RAM antes de enviar pesa.
+    let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?;
 
     info!(
         "[Neo] upload_path_to_store: {} ({} bytes, {})",
         file_name,
-        bytes.len(),
+        meta.len(),
         mime
     );
 
-    let part = reqwest::multipart::Part::bytes(bytes)
+    let part = reqwest::multipart::Part::stream_with_length(reqwest::Body::from(file), meta.len())
         .file_name(file_name.clone())
         .mime_str(&mime)
         .map_err(|e| format!("Tipo de arquivo inválido: {}", e))?;
@@ -344,8 +382,11 @@ pub async fn upload_path_to_store(
         .text("session_id", session_id.to_string())
         .text("user_id", user_id.to_string());
 
+    // Timeout proporcional ao tamanho: 120s fixos estouravam antes de um arquivo
+    // grande terminar de subir pelo túnel. +1s por MB (500 MB → ~10 min).
+    let timeout_secs = 120 + meta.len() / (1024 * 1024);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
@@ -506,6 +547,31 @@ fn system_time_iso(t: Option<std::time::SystemTime>) -> Option<String> {
     })
 }
 
+/// `destination` pode ser a PASTA ou o CAMINHO COMPLETO do arquivo. Tratado
+/// sempre como pasta, "~/Desktop/plano/analise.md" fazia `create_dir_all` bater
+/// no arquivo existente e morrer com "File exists (os error 17)" (sessão
+/// 30b1e484). É caminho de arquivo quando já existe um arquivo ali, ou quando o
+/// último segmento tem a mesma extensão do `file_name` e não é uma pasta — uma
+/// pasta "site.com" não vira arquivo por ter ponto no nome.
+async fn split_file_destination(
+    target: std::path::PathBuf,
+    file_name: &str,
+) -> (std::path::PathBuf, String) {
+    let meta = tokio::fs::metadata(&target).await.ok();
+    let is_file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
+    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let ext_of = |p: &std::path::Path| p.extension().map(|e| e.to_string_lossy().to_lowercase());
+    let same_ext = !is_dir
+        && ext_of(&target).is_some()
+        && ext_of(&target) == ext_of(std::path::Path::new(file_name));
+    if is_file || same_ext {
+        if let (Some(parent), Some(name)) = (target.parent(), target.file_name()) {
+            return (parent.to_path_buf(), name.to_string_lossy().to_string());
+        }
+    }
+    (target, file_name.to_string())
+}
+
 /// Baixa um arquivo do catálogo e escreve no destino pedido, sem diálogo.
 /// **Nunca sobrescreve às cegas:** se já existir um arquivo no destino e
 /// `overwrite=false`, NÃO baixa nem grava — devolve `status="conflict"` com os
@@ -519,12 +585,13 @@ pub async fn save_generated_file_to_path(
     destination: &str,
     overwrite: bool,
 ) -> Result<serde_json::Value, String> {
-    let dir = resolve_destination_dir(destination)?;
+    let target = resolve_destination_dir(destination)?;
+    let (dir, final_name) = split_file_destination(target, file_name).await;
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("Falha ao acessar a pasta de destino ({}): {}", dir.display(), e))?;
 
-    let path = dir.join(sanitize_file_name(file_name));
+    let path = dir.join(sanitize_file_name(&final_name));
 
     // Colisão: checa ANTES de baixar/gravar (não paga o download à toa).
     if !overwrite {
@@ -558,100 +625,6 @@ pub async fn save_generated_file_to_path(
     }))
 }
 
-/// Escreve conteúdo de texto DIRETO num arquivo do disco do usuário
-/// (tool_name="write_file", despachada em ai_agent.rs).
-///
-/// Existe porque escrever arquivo por shell é frágil: no `run_command` o
-/// conteúdo vira um heredoc (`cat <<EOF`), e aspas, crase, `$` e a própria
-/// palavra EOF dentro do texto quebram ou corrompem o arquivo em silêncio. Aqui
-/// o conteúdo viaja como argumento, não como script — nada é interpretado.
-///
-/// **Nunca sobrescreve às cegas** (mesma regra de `save_generated_file_to_path`):
-/// com `mode="write"`, arquivo existente e `overwrite=false`, devolve
-/// `status="conflict"` com os dados do que já está lá, para o cérebro decidir
-/// ou perguntar. `mode="append"` não conflita — acrescentar não destrói.
-pub async fn write_text_file(
-    path: &str,
-    content: &str,
-    mode: &str,
-    overwrite: bool,
-) -> Result<serde_json::Value, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return Err("caminho vazio".to_string());
-    }
-    // Caminho relativo não tem âncora: o cwd do app não é o do usuário, e
-    // "notas.txt" acabaria em algum lugar que ninguém pediu. Exigir absoluto (ou
-    // `~/`) é a mesma disciplina do guard de caminho fundamentado no core.
-    let resolved = if let Some(rest) = trimmed.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|h| h.join(rest))
-            .ok_or_else(|| "Não consegui resolver \"~\" (home).".to_string())?
-    } else if trimmed.starts_with('/') {
-        std::path::PathBuf::from(trimmed)
-    } else {
-        return Err(format!(
-            "caminho relativo não é aceito ({}): use um caminho absoluto ou começando com ~/",
-            trimmed
-        ));
-    };
-
-    let append = mode.eq_ignore_ascii_case("append");
-
-    if !append && !overwrite {
-        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
-            if meta.is_file() {
-                return Ok(serde_json::json!({
-                    "status": "conflict",
-                    "path": resolved.to_string_lossy().to_string(),
-                    "existing": {
-                        "name": resolved.file_name().map(|n| n.to_string_lossy().to_string()),
-                        "size_bytes": meta.len(),
-                        "created_at": system_time_iso(meta.created().ok()),
-                        "modified_at": system_time_iso(meta.modified().ok()),
-                    },
-                }));
-            }
-        }
-    }
-
-    if let Some(parent) = resolved.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("Falha ao criar a pasta {}: {}", parent.display(), e))?;
-    }
-
-    let bytes = content.as_bytes();
-    if append {
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&resolved)
-            .await
-            .map_err(|e| format!("Falha ao abrir {} para acrescentar: {}", resolved.display(), e))?;
-        file.write_all(bytes)
-            .await
-            .map_err(|e| format!("Falha ao escrever em {}: {}", resolved.display(), e))?;
-    } else {
-        tokio::fs::write(&resolved, bytes)
-            .await
-            .map_err(|e| format!("Falha ao escrever em {}: {}", resolved.display(), e))?;
-    }
-
-    info!(
-        "[Neo] write_file: {} ({} bytes, mode={})",
-        resolved.display(),
-        bytes.len(),
-        if append { "append" } else { "write" }
-    );
-    Ok(serde_json::json!({
-        "status": "saved",
-        "path": resolved.to_string_lossy().to_string(),
-        "bytes_written": bytes.len(),
-        "mode": if append { "append" } else { "write" },
-    }))
-}
 
 // ============ IMAGENS INLINE NO CHAT ============
 //
@@ -1764,6 +1737,33 @@ pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(
 
 // ============ NOTIFICATIONS ============
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state_id: u32, event_type: u32) -> f64;
+}
+
+/// Segundos desde o último input do usuário (teclado/mouse/trackpad).
+///
+/// É o sinal de presença que faz a notificação temporária esperar quem saiu da
+/// frente do computador, em vez de sumir no vazio (o mesmo comportamento do
+/// GNOME). O host nativo do macOS tem a sua própria leitura em Swift; este
+/// comando existe para a janela de fallback em webview usar a MESMA regra —
+/// duas superfícies com prazos diferentes seria um bug esperando a vez.
+///
+/// Fora do macOS devolve 0 (= "sempre presente"): o prazo passa a ser um
+/// cronômetro comum, que é o que essas plataformas já faziam.
+#[tauri::command]
+pub fn system_idle_seconds() -> f64 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // 1 = kCGEventSourceStateCombinedSessionState, ~0 = kCGAnyInputEventType.
+        CGEventSourceSecondsSinceLastEventType(1, u32::MAX)
+    }
+    #[cfg(not(target_os = "macos"))]
+    0.0
+}
+
 #[tauri::command]
 pub async fn ack_notification(notification_id: String) -> Result<(), String> {
     info!("[Neo] ack_notification: {}", notification_id);
@@ -2217,6 +2217,129 @@ pub async fn read_working_note(slug: String) -> Result<WorkingNoteDetail, String
         .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
 }
 
+// ── Tarefas em background (jobs do neo-core) ────────────────────────────────
+
+/// Label da janela de tarefas. Mesma exigência do caderno: tem que estar em
+/// `capabilities/default.json`, senão todo `invoke` dela é negado pelo ACL.
+const JOBS_WINDOW: &str = "jobs";
+
+/// Abre (ou traz para a frente) a janela de tarefas em background.
+///
+/// Mesmo desenho da janela do caderno: criada sob demanda, decoração nativa, uma
+/// só por vez. Um comando longo agora vira job sozinho e roda longe da conversa;
+/// sem um lugar para olhar, "está trabalhando" e "travou" são indistinguíveis.
+#[tauri::command]
+pub async fn open_jobs_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(JOBS_WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        window
+            .set_focus()
+            .map_err(|e| format!("Não consegui focar a janela de tarefas: {}", e))?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        JOBS_WINDOW,
+        tauri::WebviewUrl::App("index.html?mode=jobs".into()),
+    )
+    .title("Tarefas do Neo")
+    .inner_size(1080.0, 720.0)
+    .min_inner_size(720.0, 440.0)
+    .resizable(true)
+    .decorations(true)
+    .transparent(false)
+    .build()
+    .map_err(|e| format!("Não consegui abrir a janela de tarefas: {}", e))?;
+
+    info!("[Neo] janela de tarefas aberta");
+    Ok(())
+}
+
+/// Proxy CRU para `/api/v1/desktop/jobs*`. A forma do JSON é contrato entre o
+/// neo-core e o TypeScript (`JobSummary` em tauriApi.ts): tipar aqui seria um
+/// terceiro lugar para divergir sem erro de compilação — só com tela vazia.
+async fn jobs_request(
+    method: reqwest::Method,
+    path_and_query: String,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "{}/api/v1/desktop/jobs{}",
+        neo_core_http_url(),
+        path_and_query
+    );
+    let resp = working_memory_client()?
+        .request(method, url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err("Essa tarefa não existe mais.".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("neo-core respondeu {}", resp.status()));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
+}
+
+/// Tarefas do dono do caderno, ativas primeiro. `status`: `all` ou `active`.
+#[tauri::command]
+pub async fn list_jobs(
+    status: Option<String>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    jobs_request(
+        reqwest::Method::GET,
+        format!(
+            "?status={}&limit={}",
+            urlencoding::encode(status.as_deref().unwrap_or("all")),
+            limit.unwrap_or(100)
+        ),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_job(job_id: String) -> Result<serde_json::Value, String> {
+    jobs_request(
+        reqwest::Method::GET,
+        format!("/{}", urlencoding::encode(&job_id)),
+    )
+    .await
+}
+
+/// O FIM do log da tarefa (onde quer que ele more no core).
+#[tauri::command]
+pub async fn get_job_logs(
+    job_id: String,
+    tail: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    jobs_request(
+        reqwest::Method::GET,
+        format!(
+            "/{}/logs?tail={}",
+            urlencoding::encode(&job_id),
+            tail.unwrap_or(16000)
+        ),
+    )
+    .await
+}
+
+/// Cancela a tarefa — num comando do sandbox, é o que mata o processo lá.
+#[tauri::command]
+pub async fn cancel_job(job_id: String) -> Result<serde_json::Value, String> {
+    jobs_request(
+        reqwest::Method::POST,
+        format!("/{}/cancel", urlencoding::encode(&job_id)),
+    )
+    .await
+}
+
 
 #[cfg(test)]
 mod inline_image_tests {
@@ -2544,4 +2667,70 @@ mod working_memory_tests {
         assert_eq!(page.counts.get("auto/active"), Some(&36));
         assert_eq!(page.counts.get("model/active"), Some(&3));
     }
+}
+
+// ─── Navegador headless local ───────────────────────────────────────────────
+//
+// O headless roda na máquina DO USUÁRIO: mesmo IP residencial do navegador
+// visível dele (que é o que destrava sites que recusam o datacenter da VPS),
+// sem tomar a tela. Como é a máquina dele que paga a conta de RAM, os tetos são
+// configuráveis — ver `services::headless`.
+
+#[tauri::command]
+pub async fn headless_stats() -> serde_json::Value {
+    crate::services::headless::stats().await
+}
+
+#[tauri::command]
+pub fn headless_get_limits() -> serde_json::Value {
+    let l = crate::services::headless::limits();
+    serde_json::json!({
+        "max_tabs": l.max_tabs,
+        "max_ram_mb": l.max_ram_mb,
+        "idle_ttl_s": l.idle_ttl_s,
+        "profile": match l.profile {
+            crate::services::headless::Profile::Dedicated => "dedicado",
+            crate::services::headless::Profile::UserProfile => "logado",
+        },
+        "browser_path": l.browser_path,
+        "available": crate::services::headless::available(),
+    })
+}
+
+/// Aplica os tetos vindos da tela de Config.
+///
+/// `max_tabs`/`max_ram_mb` em 0 = "sem teto meu". Não é "sem teto nenhum": o SO
+/// continua sendo a rede de segurança, e o gerente ainda fecha aba ociosa pelo
+/// TTL. Num laptop, teto nenhum de verdade é o Chromium comendo a máquina.
+#[tauri::command]
+pub fn headless_set_limits(
+    max_tabs: Option<usize>,
+    max_ram_mb: Option<u64>,
+    idle_ttl_s: Option<u64>,
+    profile: Option<String>,
+    browser_path: Option<String>,
+) -> serde_json::Value {
+    let atual = crate::services::headless::limits();
+    let proximo = crate::services::headless::Limits {
+        max_tabs: max_tabs.unwrap_or(atual.max_tabs),
+        max_ram_mb: max_ram_mb.unwrap_or(atual.max_ram_mb),
+        // Um TTL de 0 desligaria a única trava que age sem o usuário pedir;
+        // o piso de 30s existe para "desligar por engano" não virar vazamento.
+        idle_ttl_s: idle_ttl_s.map(|v| if v == 0 { 0 } else { v.max(30) })
+            .unwrap_or(atual.idle_ttl_s),
+        profile: match profile.as_deref() {
+            Some("logado") => crate::services::headless::Profile::UserProfile,
+            Some("dedicado") => crate::services::headless::Profile::Dedicated,
+            _ => atual.profile,
+        },
+        browser_path: browser_path.filter(|s| !s.trim().is_empty()).or(atual.browser_path),
+    };
+    crate::services::headless::set_limits(proximo);
+    headless_get_limits()
+}
+
+#[tauri::command]
+pub async fn headless_shutdown() -> serde_json::Value {
+    crate::services::headless::shutdown().await;
+    serde_json::json!({ "ok": true })
 }

@@ -5,7 +5,8 @@
   "windows": [
     "main",
     "notification",
-    "working-memory"
+    "working-memory",
+    "jobs"
   ],
   "permissions": [
     "core:default",

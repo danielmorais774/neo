@@ -31,6 +31,11 @@ pub fn capabilities() -> Value {
         // AGORA é o `browser.health`, porque o host do open-browser-use só
         // existe com o navegador aberto e a extensão carregada.
         "browser_local": crate::services::browser_local::available(),
+        // Headless na máquina DELE: mesmo IP residencial do navegador visível,
+        // sem tomar a tela. Não depende de extensão nem de navegador aberto —
+        // só de ter um Chromium instalado —, então é o degrau que continua
+        // disponível quando o `browser_local` não está.
+        "browser_headless": crate::services::headless::available(),
     })
 }
 

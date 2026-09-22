@@ -272,6 +272,15 @@ impl NotificationRouter {
                                 });
                             }
                         }
+                        // Sumiu por tempo cumprido (com o usuário presente). De
+                        // propósito NÃO vira ack: ninguém disse que leu.
+                        "auto_dismissed" => {
+                            let notification_id = event
+                                .get("notification_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            info!("[Notifications] auto-dispensada: {}", notification_id);
+                        }
                         "ready" => info!("[Notifications] macOS notification host ready"),
                         _ => {}
                     }

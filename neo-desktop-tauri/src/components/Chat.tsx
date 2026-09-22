@@ -3,7 +3,7 @@ import type { Message } from '../types';
 import type { LiveState } from '../hooks/useLiveMode';
 import type { ModelType, ProviderType } from '../lib/models';
 import { MODELS_BY_PROVIDER, PROVIDER_OPTIONS, modelsFor } from '../lib/models';
-import MessageBubble from './MessageBubble';
+import MessageList from './MessageList';
 import GlassSelect from './GlassSelect';
 import './Chat.css';
 
@@ -91,19 +91,7 @@ function Chat({
 }: ChatProps) {
   const [input, setInput] = useState(initialInput || '');
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
-  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  // Se o usuário está grudado no fim da lista. Enquanto true, seguimos o fluxo
-  // (auto-scroll). Se ele rolar pra cima pra ler, vira false e paramos de
-  // arrastá-lo de volta.
-  const isPinnedToBottomRef = useRef(true);
-
-  const handleMessagesScroll = useCallback(() => {
-    const el = messagesContainerRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isPinnedToBottomRef.current = distanceFromBottom < 80;
-  }, []);
 
   const resizeInput = useCallback(() => {
     const el = inputRef.current;
@@ -113,19 +101,7 @@ function Chat({
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   }, []);
 
-  // Auto-scroll pro fim ANTES do paint (useLayoutEffect) e de forma INSTANTÂNEA.
-  // O conteúdo muda de altura a cada evento do agente (bolhas de "thinking" que
-  // entram/saem, e no `complete` todas as thinking somem e o balão de resposta
-  // entra). Se o scroll rodasse depois do paint (useEffect) e com `smooth`, o
-  // navegador pintava primeiro o frame com o conteúdo já mexido e o scroll no
-  // lugar antigo e só então o smooth corria atrás — parecia a janela "encolhendo
-  // e se reajustando". Aqui conteúdo e scroll caem no mesmo frame. Só pinamos se
-  // o usuário já está no fim (senão ele não conseguiria rolar pra cima e ler).
-  useLayoutEffect(() => {
-    if (!isPinnedToBottomRef.current) return;
-    const el = messagesContainerRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, isLoading, isExecuting]);
+  // O auto-scroll pro fim (e a virtualização da lista) mora no MessageList.
 
   useEffect(() => {
     // If the latest message is from the assistant, return focus to the input
@@ -255,8 +231,8 @@ function Chat({
 
   return (
     <div className={`chat-container ${windowMode}`}>
-      <div className="messages-container" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
-        {messages.length === 0 ? (
+      {messages.length === 0 ? (
+        <div className="messages-container">
           <div className="welcome-message">
             <div className="welcome-icon">🤖</div>
             <h2>Olá! Sou o Neo</h2>
@@ -274,42 +250,15 @@ function Chat({
               </button>
             </div>
           </div>
-        ) : (
-          <>
-            {messages.map((message) => (
-              <MessageBubble
-                key={message.id}
-                message={message}
-                onPermissionResponse={onPermissionResponse}
-                onMissionResponse={onMissionResponse}
-              />
-            ))}
-            {isLoading && !isExecuting && (
-              <div className="message assistant">
-                <div className="message-avatar">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <rect x="3" y="11" width="18" height="10" rx="2" />
-                    <circle cx="9" cy="16" r="1" fill="currentColor" />
-                    <circle cx="15" cy="16" r="1" fill="currentColor" />
-                    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
-                  </svg>
-                </div>
-                <div className="message-body">
-                  <div className="message-content">
-                    <div className="message-text">
-                      <div className="typing-indicator">
-                        <span></span>
-                        <span></span>
-                        <span></span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+        </div>
+      ) : (
+        <MessageList
+          messages={messages}
+          showTyping={isLoading && !isExecuting}
+          onPermissionResponse={onPermissionResponse}
+          onMissionResponse={onMissionResponse}
+        />
+      )}
 
       <form className="input-container" onSubmit={handleSubmit}>
         {isLive && (

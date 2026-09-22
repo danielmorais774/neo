@@ -48,7 +48,22 @@ const KIND_ICON: Record<string, string> = {
   mission_completed: '✨',
 };
 
-const AUTO_DISMISS_MS = 6000;
+/*
+ * Auto-dispensa consciente de presença — a MESMA regra do host nativo em Swift
+ * (src-tauri/macos/NeoNotificationHost.swift). Esta janela é o fallback (e o
+ * caminho único fora do macOS); duas superfícies com prazos diferentes seriam um
+ * bug esperando a vez, então os números e a política moram nos dois lugares com
+ * o mesmo valor.
+ *
+ * A regra: o prazo só corre quando há alguém na frente do computador. Sem input
+ * recente o aviso espera — quem saiu para o café volta e encontra o recado, em
+ * vez de descobrir depois que perdeu.
+ */
+const AUTO_DISMISS_MS = 8000;
+/** Sem input por mais que isto = usuário longe; o relógio congela. */
+const IDLE_THRESHOLD_S = 30;
+/** Resolução do relógio de presença. */
+const PRESENCE_TICK_MS = 500;
 const WINDOW_INSET_PX = 8;
 const MIN_CARD_WIDTH = 280;
 const MAX_CARD_WIDTH = 360;
@@ -58,26 +73,68 @@ export default function NotificationWindow() {
   const [notif, setNotif] = useState<NeoNotificationPayload | null>(null);
   const [visible, setVisible] = useState(false);
   const notificationRef = useRef<HTMLDivElement | null>(null);
+  /** Ponteiro em cima do cartão: congela o prazo enquanto se lê. */
+  const hoverRef = useRef(false);
   const lastWindowSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
-    let dismissTimer: number | undefined;
+    let tick: number | undefined;
+    let restanteMs = 0;
+    let ultimoTique = 0;
+
+    const esconder = () => {
+      setVisible(false);
+      window.setTimeout(() => {
+        getCurrentWindow().hide().catch(() => {});
+      }, 280);
+    };
+
+    const pararRelogio = () => {
+      if (tick) window.clearInterval(tick);
+      tick = undefined;
+    };
+
+    const rodarRelogio = () => {
+      pararRelogio();
+      ultimoTique = Date.now();
+      tick = window.setInterval(async () => {
+        const agora = Date.now();
+        const decorrido = agora - ultimoTique;
+        ultimoTique = agora;
+        // Mouse em cima = está lendo; ler é uso, o prazo para.
+        if (hoverRef.current) return;
+        let ocioso = 0;
+        try {
+          ocioso = await invoke<number>('system_idle_seconds');
+        } catch {
+          ocioso = 0; // sem o comando, trata como presente (cronômetro comum)
+        }
+        if (ocioso >= IDLE_THRESHOLD_S) return; // ninguém na frente: segura
+        restanteMs -= decorrido;
+        if (restanteMs <= 0) {
+          pararRelogio();
+          esconder();
+        }
+      }, PRESENCE_TICK_MS);
+    };
 
     listen<NeoNotificationPayload>('notification', (event) => {
       setNotif(event.payload);
       setVisible(true);
+      hoverRef.current = false;
 
-      if (dismissTimer) window.clearTimeout(dismissTimer);
+      // Quem PERGUNTA alguma coisa fica na tela: um pedido de aprovação que some
+      // sozinho é uma decisão perdida. O resto é aviso, e aviso é passageiro.
+      const pedeResposta =
+        (event.payload.actions?.length ?? 0) > 0 || (event.payload.fields?.length ?? 0) > 0;
+      const persistente = event.payload.config?.persistent ?? pedeResposta;
+      const duracao = persistente ? 0 : (event.payload.config?.duration_ms ?? AUTO_DISMISS_MS);
 
-      const duration = event.payload.config?.persistent ? 0 : (event.payload.config?.duration_ms ?? AUTO_DISMISS_MS);
-      if (duration > 0) {
-        dismissTimer = window.setTimeout(() => {
-          setVisible(false);
-          window.setTimeout(() => {
-            getCurrentWindow().hide().catch(() => {});
-          }, 280);
-        }, duration);
+      pararRelogio();
+      if (duracao > 0) {
+        restanteMs = duracao;
+        rodarRelogio();
       }
     }).then((u) => {
       unlistenFn = u;
@@ -85,7 +142,7 @@ export default function NotificationWindow() {
 
     return () => {
       if (unlistenFn) unlistenFn();
-      if (dismissTimer) window.clearTimeout(dismissTimer);
+      pararRelogio();
     };
   }, []);
 
@@ -198,6 +255,8 @@ export default function NotificationWindow() {
       ref={notificationRef}
       className={`macos-notification ${visible ? 'visible' : 'hidden'}`}
       onClick={handleClick}
+      onMouseEnter={() => { hoverRef.current = true; }}
+      onMouseLeave={() => { hoverRef.current = false; }}
       role="alert"
     >
       <button

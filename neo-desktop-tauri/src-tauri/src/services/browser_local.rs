@@ -209,7 +209,26 @@ async fn call(method: &str, params: Value) -> Result<Value, String> {
 
 // ─── CDP ────────────────────────────────────────────────────────────────────
 
+/// Dois backends falam o MESMO CDP; o que muda é só o caminho até ele.
+///
+/// - `tab_id > 0` → aba real do navegador do usuário (extensão + chrome.debugger)
+/// - `tab_id < 0` → aba do navegador headless local (WebSocket CDP direto)
+///
+/// O sinal carrega o backend de propósito: `tab_id` já atravessa as 20 ações e
+/// o canal de controle do core. Passar o modo por fora significaria mudar todas
+/// as assinaturas e o contrato do `/ws/devices/control` — e o único jeito de
+/// errar seria justamente esquecer de propagá-lo em uma delas. Assim é
+/// impossível ter um id sem backend.
+///
+/// Ids do headless nascem positivos lá dentro; quem nega é o `claim` aqui.
+fn is_headless(tab_id: i64) -> bool {
+    tab_id < 0
+}
+
 async fn cdp(tab_id: i64, method: &str, params: Value) -> Result<Value, String> {
+    if is_headless(tab_id) {
+        return super::headless::cdp(-tab_id, method, params).await;
+    }
     call(
         "executeCdp",
         json!({
@@ -1946,19 +1965,62 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
     match action {
         // ── saúde / abas ──
         "browser.health" => {
+            // O health TEM que responder pelo backend que a tarefa vai usar.
+            //
+            // Ele existia só para o caminho da extensão, e perguntava pelo
+            // socket do host nativo. Numa tarefa headless isso é a pergunta
+            // errada: o headless não depende de extensão nem de navegador
+            // aberto. Como o runner confere a saúde ANTES de prometer, um
+            // health preso à extensão matava todo job headless na largada —
+            // com a mensagem errada ("a extensão não está ativa"), que manda o
+            // usuário arrumar uma coisa que não é o problema.
+            if args.get("mode").and_then(|v| v.as_str()) == Some("headless") {
+                if !super::headless::available() {
+                    return Err(
+                        "não achei Chrome, Brave, Chromium nem Edge instalado nesta \
+                         máquina — o navegador headless precisa de um deles"
+                            .to_string(),
+                    );
+                }
+                return Ok(json!({ "ok": true, "backend": "headless" }));
+            }
             let info = call("getInfo", json!({})).await?;
             Ok(json!({ "ok": true, "backend": info }))
         }
         "browser.tabs" => {
+            // "Abas do usuário" é uma pergunta sobre o navegador QUE ELE VÊ. No
+            // headless não existem abas dele — existem as que o Neo abriu.
+            if args.get("mode").and_then(|v| v.as_str()) == Some("headless") {
+                return Ok(json!({ "tabs": [], "mode": "headless" }));
+            }
             let tabs = call("getUserTabs", json!({})).await?;
             Ok(json!({ "tabs": tabs }))
         }
 
         // ── reivindicar a aba (é o que dá o tab_ref de todo o resto) ──
+        // Estado do headless para a tela de Config (e para diagnóstico).
+        "browser.headless_stats" => Ok(super::headless::stats().await),
+        "browser.headless_shutdown" => {
+            super::headless::shutdown().await;
+            Ok(json!({ "ok": true }))
+        }
+
         "browser.claim" => {
             STOP_REQUESTED.store(false, Ordering::SeqCst);
             let explicit = args.get("tab_id").and_then(|v| v.as_i64());
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Modo HEADLESS: mesma máquina, mesmo IP residencial, sem tomar a
+            // tela do usuário. É o que resolve o bloqueio por origem sem o custo
+            // de invadir o navegador que ele está usando.
+            if args.get("mode").and_then(|v| v.as_str()) == Some("headless") {
+                let alvo = if url.is_empty() { "about:blank" } else { url };
+                let id = super::headless::open_tab(alvo).await?;
+                let tab_ref = -id; // negativo = headless (ver `is_headless`)
+                let _ = cdp(tab_ref, "Page.enable", json!({})).await;
+                info!("[BrowserLocal] aba headless {} aberta (url={})", tab_ref, alvo);
+                return Ok(json!({ "tab_ref": tab_ref, "mode": "headless" }));
+            }
 
             let id = match explicit {
                 Some(id) => {
@@ -2089,6 +2151,12 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         // ── faixa do Neo / freio / fim ──
         "browser.banner" => {
             let id = tab_id(args)?;
+            // O banner existe para o usuário VER que o Neo está dirigindo a aba
+            // dele. Sem janela não há quem veja: injetar DOM ali só custa um
+            // round-trip e polui a página que vai ser lida no snapshot seguinte.
+            if is_headless(id) {
+                return Ok(json!({ "ok": true, "skipped": "headless" }));
+            }
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
             let _ = eval(id, &js_banner(text, active, false)).await?;
@@ -2204,6 +2272,25 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             eval(id, JS_NET).await
         }
         "browser.downloads" => {
+            // O headless não tem `chrome.downloads` (é API de extensão), e o
+            // perfil dedicado nem baixa por padrão. Devolver lista vazia com a
+            // razão é melhor que estourar: o driver já sabe lidar com "nenhum
+            // download" e reporta honestamente, enquanto um erro cru mataria a
+            // tarefa inteira por causa de uma sondagem acessória.
+            //
+            // LIMITAÇÃO CONHECIDA: baixar arquivo PELO headless ainda não é
+            // suportado. Para pegar arquivo, o caminho é `web_fetch` (que
+            // agora diz `download` quando a URL é um binário acessível) ou
+            // curl — navegador é o pior jeito de pegar binário de qualquer
+            // forma.
+            if args.get("mode").and_then(|v| v.as_str()) == Some("headless")
+                || tab_id(args).map(is_headless).unwrap_or(false)
+            {
+                return Ok(json!({
+                    "files": [],
+                    "unsupported": "o navegador headless não acompanha downloads",
+                }));
+            }
             let seconds = args
                 .get("since_s")
                 .and_then(|v| v.as_u64())
@@ -2214,6 +2301,15 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         }
         "browser.release" => {
             let id = tab_id(args)?;
+            // Headless: soltar é FECHAR. Não há usuário olhando para quem
+            // devolver a aba, e deixá-la aberta é exatamente o vazamento que o
+            // gerente de memória existe para evitar.
+            if is_headless(id) {
+                super::headless::close_tab(-id).await?;
+                STOP_REQUESTED.store(false, Ordering::SeqCst);
+                info!("[BrowserLocal] aba headless {} fechada", id);
+                return Ok(json!({ "ok": true }));
+            }
             // Melhor esforço: a aba pode já ter sido fechada pelo usuário, e
             // nesse caso "soltar" já está feito.
             let _ = eval(id, &js_banner("", false, false)).await;
@@ -2407,5 +2503,110 @@ mod tests {
     #[test]
     fn jpeg_invalido_nao_derruba_o_print() {
         assert!(draw_marks(b"nao sou uma imagem", &[json!([1, 0, 0, 10, 10])], 100.0, 1.0).is_none());
+    }
+}
+
+// ─── Testes ─────────────────────────────────────────────────────────────────
+//
+// Exercitam o DISPATCHER real (`execute`) contra um Chromium de verdade, em
+// modo headless. É o que prova o que o `cargo check` não prova: que o
+// vocabulário de ações e o JS de página — os mesmos ~1.100 linhas que rodam no
+// navegador visível — funcionam sem janela nenhuma.
+//
+//     cargo test --lib browser_local -- --ignored --test-threads=1
+#[cfg(test)]
+mod tests_headless {
+    use super::*;
+
+    #[test]
+    fn o_sinal_do_tab_ref_escolhe_o_backend() {
+        assert!(is_headless(-1), "negativo é headless");
+        assert!(!is_headless(1), "positivo é a aba do usuário");
+        assert!(!is_headless(0));
+    }
+
+    /// Página autossuficiente: sem rede, o teste mede o NOSSO código e não a
+    /// internet (nem o humor de um site de terceiro num dia qualquer).
+    const PAGINA: &str = "data:text/html,\
+        <html><head><title>Teste Neo</title></head><body>\
+        <h1>Ola headless</h1>\
+        <a href='https://exemplo.com'>um link</a>\
+        <button id='b'>Clicar</button>\
+        <input id='campo' type='text'>\
+        </body></html>";
+
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn snapshot_e_screenshot_funcionam_sem_janela() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": PAGINA }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+        assert!(tab < 0, "claim headless tem que devolver id negativo: {tab}");
+        assert_eq!(claim["mode"], "headless");
+
+        // O inventário é o miolo caro (js_snapshot, 635 linhas). Se ele funciona
+        // aqui, o vocabulário inteiro funciona neste backend.
+        let snap = execute("browser.snapshot", &json!({ "tab_ref": tab }))
+            .await
+            .expect("snapshot");
+        let texto = serde_json::to_string(&snap).unwrap_or_default();
+        assert!(texto.contains("Ola headless"), "o snapshot não viu a página: {texto:.400}");
+        assert!(texto.contains("um link"), "o inventário perdeu o link: {texto:.400}");
+
+        // Print sem janela: o `--window-size` do launcher é o que dá tamanho.
+        let shot = execute("browser.screenshot", &json!({ "tab_ref": tab }))
+            .await
+            .expect("screenshot");
+        assert_eq!(shot["format"], "jpeg");
+        let b64 = shot.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(b64.len() > 1000, "print vazio ou minúsculo ({} chars)", b64.len());
+        // JPEG de verdade começa com os bytes ffd8ff — em base64, "/9j/".
+        assert!(b64.starts_with("/9j/"), "não é um JPEG: {:.20}", b64);
+
+        // Banner é no-op aqui: não há quem veja, e injetar DOM sujaria o
+        // snapshot seguinte.
+        let banner = execute("browser.banner", &json!({ "tab_ref": tab, "text": "oi" }))
+            .await
+            .expect("banner");
+        assert_eq!(banner["skipped"], "headless");
+
+        // Sondagem acessória não pode matar a tarefa por não existir aqui.
+        let dls = execute("browser.downloads", &json!({ "tab_ref": tab }))
+            .await
+            .expect("downloads degrada, não estoura");
+        assert!(dls["unsupported"].is_string());
+
+        // Soltar, no headless, é FECHAR.
+        execute("browser.release", &json!({ "tab_ref": tab }))
+            .await
+            .expect("release");
+        assert_eq!(super::super::headless::stats().await["tabs"], 0);
+
+        super::super::headless::shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn health_headless_nao_depende_da_extensao() {
+        if super::super::headless::available() == false {
+            return;
+        }
+        // Este é o teste que importa: o host da extensão NÃO está no ar nesta
+        // máquina, e mesmo assim o health tem que dizer que dá para trabalhar.
+        // Antes, um health preso à extensão matava todo job headless na largada
+        // — com a mensagem errada, mandando o usuário arrumar o que não era o
+        // problema.
+        let h = execute("browser.health", &json!({ "mode": "headless" }))
+            .await
+            .expect("health headless");
+        assert_eq!(h["ok"], true);
+        assert_eq!(h["backend"], "headless");
     }
 }

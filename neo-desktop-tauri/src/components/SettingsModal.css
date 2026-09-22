@@ -327,6 +327,22 @@
   color: var(--text-secondary);
 }
 
+/* Dica do atalho de teclado. O combo vem de `lib/viewerShortcuts.ts`, que é quem
+   o implementa: escrito à mão aqui, viraria uma dica mentindo em silêncio no dia
+   em que a tecla mudasse. */
+.settings-open-screen-kbd {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  background: var(--selected-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
 .settings-open-screen-chevron {
   flex: 0 0 auto;
   display: inline-flex;

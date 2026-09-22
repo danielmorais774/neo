@@ -259,6 +259,16 @@ export const ChatPage = () => {
       if (!text) return;
       const notificationId = String(notification.id || `${Date.now()}`);
       const jobId = String(payload.job_id || payload.jobId || '').trim();
+      // Arquivo entregue pelo job (ex.: o .txt da continuação de um OCR): mesma forma
+      // {id, name, sizeBytes} das respostas normais, para a bolha mostrar o download.
+      const rawFiles: Array<Record<string, unknown>> = Array.isArray(payload.files) ? payload.files : [];
+      const files = rawFiles
+        .filter((f) => f && f.id)
+        .map((f) => ({
+          id: String(f.id),
+          name: String(f.name || 'arquivo'),
+          sizeBytes: Number(f.sizeBytes ?? f.size_bytes ?? 0),
+        }));
 
       setMessages(prev => {
         if (prev.some(msg => msg.details?.notificationId === notificationId)) {
@@ -275,6 +285,7 @@ export const ChatPage = () => {
             notificationId,
             jobId,
           },
+          ...(files.length ? { files } : {}),
         };
         return [...prev, jobMessage];
       });
@@ -405,7 +416,9 @@ export const ChatPage = () => {
   // .command) e a função saía antes de enviar, deixando o botão travado em
   // "Aguardando..." e o core esperando até o timeout de 300s. O envio vem primeiro e
   // não depende de encontrar a bolha — o estado visual é consequência, não pré-requisito.
-  const handlePermissionResponse = async (messageId: string, requestId: string, approved: boolean) => {
+  // useCallback (aqui e no de missão): as bolhas são memoizadas e recebem estes
+  // handlers; recriá-los a cada render re-renderizaria a lista inteira.
+  const handlePermissionResponse = useCallback((messageId: string, requestId: string, approved: boolean) => {
     if (!requestId) {
       console.error('[ChatPage] aprovação sem requestId — nada a enviar', { messageId, approved });
       return;
@@ -426,9 +439,9 @@ export const ChatPage = () => {
           : msg
       )
     );
-  };
+  }, [setMessages]);
 
-  const handleMissionResponse = async (missionId: string, approved: boolean, editedText?: string) => {
+  const handleMissionResponse = useCallback(async (missionId: string, approved: boolean, editedText?: string) => {
     setMessages(prev =>
       prev.map(msg =>
         msg.mission?.missionId === missionId && msg.mission.status === 'pending'
@@ -457,7 +470,7 @@ export const ChatPage = () => {
     } catch (e) {
       console.error('[ChatPage] handleMissionResponse failed:', e);
     }
-  };
+  }, [setMessages]);
 
   const handleNewChat = async () => {
     if (isExecuting) {

@@ -2,12 +2,13 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github-dark.css';
-import { useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import type { Message, PlanStep } from '../types';
 import PlanTracker from './PlanTracker';
 import InlineImages from './InlineImages';
 import CodeBlock, { CopyButton } from './CodeBlock';
 import { extractInlineImages } from '../lib/inlineImages';
+import FileChangeCard from './FileChangeCard';
 import './MessageBubble.css';
 
 interface MessageBubbleProps {
@@ -25,6 +26,7 @@ function humanFileSize(bytes: number): string {
 function MessageBubble({ message, onPermissionResponse, onMissionResponse }: MessageBubbleProps) {
   const [responding, setResponding] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   // Imagens que a resposta pediu via `[[IMAGE:…]]`: o marcador sai do texto e
   // vira imagem de verdade abaixo dele (bytes lidos do disco pelo Rust, nunca
@@ -79,6 +81,7 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
       case 'approved': return 'Aprovado';
       case 'rejected': return 'Rejeitado';
       case 'executed': return 'Executado';
+      case 'auto': return 'Executado sem pedir';
       default: return status;
     }
   };
@@ -304,8 +307,6 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
     );
   }
 
-  const [detailsOpen, setDetailsOpen] = useState(false);
-
   const renderDetails = () => {
     const detailEntries = [
       ...(message.details ? Object.entries(message.details) : []),
@@ -388,6 +389,8 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
 
           {renderFiles()}
 
+          {message.fileChange && <FileChangeCard change={message.fileChange} />}
+
           {message.command && (
             <div className="command-box">
               <div className="command-header">
@@ -402,6 +405,12 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
               {message.command.explanation && (
                 <div className="command-explanation">
                   💡 {message.command.explanation}
+                </div>
+              )}
+
+              {message.command.status === 'auto' && message.command.autoReason && (
+                <div className="command-explanation command-auto-reason">
+                  ⚡ Rodou sem perguntar: {message.command.autoReason}
                 </div>
               )}
               
@@ -457,4 +466,7 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
   );
 }
 
-export default MessageBubble;
+// Memo: com a lista virtualizada as bolhas montadas re-renderizam só quando a
+// PRÓPRIA mensagem muda (os updates de `messages` são imutáveis, então as
+// outras chegam com a mesma referência). Exige callbacks estáveis do ChatPage.
+export default memo(MessageBubble);

@@ -30,9 +30,12 @@ export interface ExecutionPlan {
 export interface CommandInfo {
   cmd: string;
   explanation: string;
-  status: 'pending' | 'approved' | 'rejected' | 'executed';
+  /** `auto`: a política do cliente liberou sem perguntar (services/command_policy.rs). */
+  status: 'pending' | 'approved' | 'rejected' | 'executed' | 'auto';
   output?: string;
   requestId?: string;
+  /** Por que rodou sozinho — só vem com `status: 'auto'`. */
+  autoReason?: string;
 }
 
 export interface MissionInfo {
@@ -65,7 +68,25 @@ export interface GeneratedFile {
   sizeBytes: number;
 }
 
-export type MessageType = 'text' | 'thinking' | 'plan' | 'plan_update' | 'step' | 'command' | 'mission' | 'result' | 'error' | 'iteration';
+// Alteração (ou pedido de leitura) de arquivo feita no disco do usuário pelo
+// desktop — services/file_ops.rs emite `file_change` a cada mudança de estado.
+// `cardId` é estável; `changeId` vira o id do backup quando grava (Desfazer usa ele).
+export interface FileChangeInfo {
+  cardId?: string;
+  changeId: string;
+  path: string;
+  status: 'pending' | 'applied' | 'rejected' | 'failed' | 'undone';
+  kind?: 'write' | 'read';
+  engine?: string;
+  reason?: string | null;
+  summary?: string | null;
+  created?: boolean;
+  linesAdded?: number;
+  linesRemoved?: number;
+  diff?: string;
+}
+
+export type MessageType = 'text' | 'thinking' | 'plan' | 'plan_update' | 'step' | 'command' | 'mission' | 'result' | 'error' | 'iteration' | 'file_change';
 
 export interface Message {
   id: string;
@@ -81,4 +102,5 @@ export interface Message {
   mission?: MissionInfo;
   details?: MessageDetails;
   files?: GeneratedFile[];
+  fileChange?: FileChangeInfo;
 }

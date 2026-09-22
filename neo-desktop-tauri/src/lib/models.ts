@@ -28,7 +28,7 @@ export const PROVIDER_OPTIONS: CatalogOption<ProviderType>[] = [
   { value: 'openai',    label: 'OpenAI',       description: 'GPT-4o, GPT-4.1...' },
   { value: 'groq',      label: 'Groq',         description: 'Llama-3.3, ultra-rápido' },
   { value: 'grok',      label: 'Grok (xAI)',   description: 'Grok-3-mini, Grok-2...' },
-  { value: 'deepseek',  label: 'DeepSeek',     description: 'V4 Flash, V4 Pro...' },
+  { value: 'deepseek',  label: 'DeepSeek',     description: 'Flash, V4 Pro...' },
   { value: 'anthropic', label: 'Anthropic',    description: 'Claude 3...' },
   { value: 'gemini',    label: 'Gemini',       description: 'Gemini 2.5 Pro...' },
   { value: 'ollama',    label: 'Ollama',       description: 'Local (Gemma4...)' },
@@ -57,7 +57,7 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, CatalogOption<ModelType>[]
     { value: 'grok-3',           label: 'Grok-3',           description: 'Mais capaz (pago)' },
   ],
   deepseek: [
-    { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', description: 'Mais rápido' },
+    { value: 'deepseek-flash',    label: 'DeepSeek Flash',    description: 'Mais rápido (V4.1)' },
     { value: 'deepseek-v4-pro',   label: 'DeepSeek V4 Pro',   description: 'Mais capaz' },
     { value: 'deepseek-chat',     label: 'DeepSeek Chat',     description: 'Uso geral' },
     { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner', description: 'Raciocínio lento' },
@@ -80,18 +80,21 @@ export const MODELS_BY_PROVIDER: Record<ProviderType, CatalogOption<ModelType>[]
     { value: 'x-ai/grok-4.5',                label: 'Grok 4.5',      description: 'Mais capaz (raciocínio)' },
     { value: 'x-ai/grok-4.20',               label: 'Grok 4.20',     description: 'Equilíbrio, 2M contexto' },
     { value: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite', description: 'Econômico' },
-    // O sufixo `@baidu` fixa o provedor de infra do gateway (o neo-core o
+    // O sufixo `@fireworks` fixa o provedor de infra do gateway (o neo-core o
     // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
     // provedor, com outro preço e outro teto de saída.
     //
-    // As DUAS entradas existem de propósito, e a escolha é preço x latência:
-    // o pin garante 1M de contexto pelo preço sondado do Baidu, mas o pool dele
-    // é compartilhado e satura (429 `rate-limited upstream`, medido na
-    // session-d94dc42f: 19 chamadas falhas e ~40s de backoff num turno só).
-    // Sem o pin o gateway roteia para qualquer endpoint livre — responde na
-    // hora, aceita `tool_choice=required` e cobra o que o endpoint da vez cobrar.
-    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu)', description: '1M contexto, barato — pool pode saturar' },
-    { value: 'deepseek/deepseek-v4-flash',       label: 'DeepSeek V4 Flash (auto)',  description: 'Sem pin: qualquer endpoint livre, preço varia' },
+    // As DUAS entradas existem de propósito, e a escolha é preço x latência.
+    // O V4.1 Flash NÃO tem endpoint do Baidu (o pin da geração anterior); dos 22
+    // endpoints sondados em 2026-09-20, o Fireworks foi o único que empatou com
+    // os 74-80 tok/s do Baidu (85/69) aceitando `tool_choice=required` — o
+    // @relace e o @morph devolvem 404 na tool forçada, e o @deepinfra oscilou
+    // entre 49 e 24 tok/s. Sem o pin o gateway roteia para qualquer endpoint
+    // livre: responde na hora, mas sorteia velocidade (50 e 105 tok/s nas duas
+    // medições) e joga fora o cache de prefixo a cada troca de provedor.
+    { value: 'deepseek/deepseek-v4.1-flash@fireworks', label: 'DeepSeek V4.1 Flash (Fireworks)', description: '1M contexto, 69-85 tok/s — endpoint estável' },
+    { value: 'deepseek/deepseek-v4.1-flash',           label: 'DeepSeek V4.1 Flash (auto)',      description: 'Sem pin: qualquer endpoint livre, preço varia' },
+    { value: 'deepseek/deepseek-v4-flash@baidu',       label: 'DeepSeek V4 Flash (Baidu)',       description: 'Geração anterior — ~6x mais barato na entrada' },
   ],
 };
 

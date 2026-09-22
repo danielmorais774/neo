@@ -100,6 +100,25 @@
   gap: 4px;
   position: relative;
   z-index: 1;
+  /* A âncora de scroll é feita à mão (lib/messageVirtualizer.ts); a nativa, onde
+     existir, corrigiria em dobro. `position: relative` acima também é usado lá:
+     faz desta lista o offsetParent dos slots. */
+  overflow-anchor: none;
+}
+
+/* Cada mensagem mora num slot que, longe da tela, fica vazio com a altura que a
+   bolha tinha (MessageList.tsx). O slot é coluna flex pra bolha dentro dele
+   continuar se alinhando como antes (`.message.user` usa align-self/margin-left
+   auto). `flex-shrink: 0` é obrigatório: um slot vazio não tem conteúdo que
+   segure a altura e a coluna o espremeria até zero. */
+.message-slot {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.messages-container .message-slot--static > * {
+  animation: none;
 }
 
 /* Mais larga que a global (6px): aqui a barra é alvo de arrasto, não só

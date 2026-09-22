@@ -27,7 +27,7 @@ tauri-plugin-fs = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 log = "0.4"
 uuid = { version = "1.11", features = ["v4"] }
 chrono = "0.4"
@@ -42,6 +42,12 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 urlencoding = "2.1"
 mime_guess = "2"
+# Arquivos do usuário (services/file_ops.rs): hash que prova "o arquivo ainda é o
+# que o Neo leu" antes de gravar. Já vinham na árvore por dependência do tauri.
+sha2 = "0.10"
+hex = "0.4"
+# Shell (services/shell.rs): encerrar o GRUPO de processos no Parar e no timeout.
+libc = "0.2"
 # Só para desenhar as marcações NA IMAGEM (services/browser_local.rs). Desenhar
 # na página fazia a tela do usuário piscar a cada passo e atrapalhava SPAs
 # pesadas; aqui o navegador dele nunca é tocado. A versão já vinha na árvore

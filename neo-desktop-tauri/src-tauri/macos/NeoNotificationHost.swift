@@ -1,4 +1,45 @@
 import AppKit
+import CoreGraphics
+
+// ── Auto-dispensa consciente de presença (docs/notification-dismiss.md) ──
+//
+// Notificação do Neo era PERMANENTE por acidente: quem publica (o dispatcher de
+// jobs, a agenda, o chat proativo) não manda `config`, então `duration_ms` caía
+// em 0 e o 0 ligava o modo persistente. O resultado era uma pilha de cartões que
+// só saía no clique.
+//
+// O conserto não é só "colocar um timer": um timer bobo dispensa o aviso
+// enquanto o usuário está no banheiro, e ele nunca fica sabendo. Então o relógio
+// aqui é o mesmo do GNOME — **só anda quando há alguém na frente do computador**.
+// Sem input recente, o cartão espera; quando a pessoa volta, aí sim ele conta o
+// tempo dele e some.
+
+/// Lê um número do ambiente (mesmo padrão de `NEO_NOTCH_IDLE_TIMEOUT_S`).
+private func envDouble(_ key: String, _ fallback: Double) -> Double {
+    guard let raw = ProcessInfo.processInfo.environment[key], let value = Double(raw), value > 0
+    else { return fallback }
+    return value
+}
+
+/// Quanto tempo um aviso comum fica na tela — contado só em presença ativa.
+private let kDefaultDurationMs = Int(envDouble("NEO_NOTIF_DURATION_MS", 8000))
+
+/// Sem input por mais que isto = usuário longe; o relógio dos avisos congela.
+/// 30s é o mesmo patamar que o GNOME usa para considerar a sessão ociosa: curto
+/// o bastante para pegar quem saiu, longo o bastante para não congelar por causa
+/// de alguém que está lendo a tela parado.
+private let kIdleThresholdSeconds: TimeInterval = envDouble("NEO_NOTIF_IDLE_S", 30)
+
+/// Resolução do relógio. 0,5s dá precisão de sobra para um prazo de 8s e custa
+/// praticamente nada (uma leitura de contador do CoreGraphics por tique).
+private let kPresenceTickSeconds: TimeInterval = 0.5
+
+/// Segundos desde o último input do usuário (teclado, mouse, trackpad).
+/// `~0` é o `kCGAnyInputEventType`: qualquer evento serve como sinal de vida.
+private func secondsSinceLastUserInput() -> TimeInterval {
+    guard let anyEvent = CGEventType(rawValue: ~0) else { return 0 }
+    return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyEvent)
+}
 
 final class NotificationContentView: NSView {
     var onHoverChanged: ((Bool) -> Void)?
@@ -146,7 +187,15 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
     private var windows: [String: NSWindow] = [:]
     private var buttonActionData: [String: [String: Any]] = [:]
     private var fieldControls: [String: [[String: Any]]] = [:]
-    private var dismissTimers: [String: DispatchWorkItem] = [:]
+    /// Milissegundos de PRESENÇA que ainda faltam para cada aviso sumir.
+    /// Não é um instante-alvo de propósito: o prazo só é descontado nos tiques em
+    /// que havia gente na frente, então "8 segundos" quer dizer 8 segundos vistos.
+    private var remainingMs: [String: Double] = [:]
+    /// Avisos com o ponteiro do mouse em cima — a leitura não pode ser cortada.
+    private var hovered: Set<String> = []
+    /// Um relógio só para todos os avisos (não um por cartão).
+    private var presenceTimer: Timer?
+    private var lastTick: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         sendEvent(["type": "ready"])
@@ -156,6 +205,13 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
     }
 
     private func readLoop() {
+        // O laço acaba quando o pai (neo-desktop) fecha o stdin — normalmente
+        // porque ele morreu. Sem o `terminate` abaixo, este processo continuava
+        // vivo para sempre sem ninguém para conversar: hoje há 4 hosts órfãos de
+        // restarts anteriores do `tauri dev` em qualquer máquina de dev.
+        defer {
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
         while let line = readLine() {
             guard let data = line.data(using: .utf8) else { continue }
             guard
@@ -179,8 +235,12 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
         let payload = (notification["payload"] as? [String: Any]) ?? [:]
         let fields = (notification["fields"] as? [[String: Any]]) ?? []
         let config = (notification["config"] as? [String: Any]) ?? [:]
-        let durationMs = (config["duration_ms"] as? Int) ?? 0
-        let persistent = (config["persistent"] as? Bool) ?? (durationMs == 0)
+        let durationMs = (config["duration_ms"] as? Int) ?? kDefaultDurationMs
+        // Quem PERGUNTA alguma coisa fica: um pedido de aprovação que some sozinho
+        // é uma decisão perdida. O resto é aviso, e aviso é passageiro.
+        // `config.persistent` explícito continua mandando nos dois sentidos.
+        let pedeResposta = !actions.isEmpty || !fields.isEmpty
+        let persistent = (config["persistent"] as? Bool) ?? pedeResposta
         let position = (config["position"] as? String) ?? "top_right"
 
         let width: CGFloat = 360
@@ -243,10 +303,16 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
         closeButton.action = #selector(handleClose(_:))
         closeButton.identifier = NSUserInterfaceItemIdentifier(rawValue: notificationId)
         outer.addSubview(closeButton)
-        outer.onHoverChanged = { hovering in
+        outer.onHoverChanged = { [weak self] hovering in
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.12
                 closeButton.animator().alphaValue = hovering ? 1 : 0
+            }
+            // Ler é uso: com o mouse em cima, o prazo para de correr.
+            if hovering {
+                self?.hovered.insert(notificationId)
+            } else {
+                self?.hovered.remove(notificationId)
             }
         }
 
@@ -388,11 +454,7 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
 
         if !persistent && durationMs > 0 {
-            let item = DispatchWorkItem { [weak self] in
-                DispatchQueue.main.async { self?.dismiss(notificationId: notificationId) }
-            }
-            dismissTimers[notificationId] = item
-            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(durationMs), execute: item)
+            armAutoDismiss(notificationId: notificationId, durationMs: durationMs)
         }
     }
 
@@ -422,7 +484,9 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
     private func dismiss(notificationId: String) {
         guard let window = windows.removeValue(forKey: notificationId) else { return }
         fieldControls.removeValue(forKey: notificationId)
-        dismissTimers.removeValue(forKey: notificationId)?.cancel()
+        remainingMs.removeValue(forKey: notificationId)
+        hovered.remove(notificationId)
+        stopPresenceTimerIfIdle()
 
         let origin = window.frame.origin
         let slideDistance: CGFloat = window.frame.width + 32
@@ -440,6 +504,59 @@ final class NotificationHostApp: NSObject, NSApplicationDelegate {
         }, completionHandler: {
             window.close()
         })
+    }
+
+    // ── Relógio de presença ───────────────────────────────────────────
+
+    /// Marca quanto tempo de presença este aviso ainda precisa cumprir.
+    private func armAutoDismiss(notificationId: String, durationMs: Int) {
+        remainingMs[notificationId] = Double(durationMs)
+        guard presenceTimer == nil else { return }
+        lastTick = Date()
+        let timer = Timer(timeInterval: kPresenceTickSeconds, repeats: true) { [weak self] _ in
+            self?.tickPresence()
+        }
+        // .common: sem isto o relógio congela enquanto um menu está aberto ou a
+        // janela está sendo arrastada — e o aviso ficaria presente a mais.
+        RunLoop.main.add(timer, forMode: .common)
+        presenceTimer = timer
+    }
+
+    private func tickPresence() {
+        let agora = Date()
+        let decorrido = agora.timeIntervalSince(lastTick ?? agora)
+        lastTick = agora
+        guard !remainingMs.isEmpty else {
+            stopPresenceTimerIfIdle()
+            return
+        }
+        // O ponto da feature: sem gente na frente, o relógio não anda. O aviso
+        // fica esperando o usuário voltar — e só então cumpre o tempo dele.
+        guard secondsSinceLastUserInput() < kIdleThresholdSeconds else { return }
+
+        for (identificador, restante) in remainingMs {
+            if hovered.contains(identificador) { continue }
+            let novo = restante - decorrido * 1000
+            if novo <= 0 {
+                remainingMs.removeValue(forKey: identificador)
+                // Evento próprio, separado do "dismissed" do botão de fechar: sumir
+                // por tempo NÃO é o usuário dizendo que leu, então isto não pode
+                // virar ack no core (o aviso continua na lista do notch). Serve
+                // para o log responder "por que aquele cartão sumiu?".
+                sendEvent(["type": "auto_dismissed", "notification_id": identificador])
+                dismiss(notificationId: identificador)
+            } else {
+                remainingMs[identificador] = novo
+            }
+        }
+        stopPresenceTimerIfIdle()
+    }
+
+    private func stopPresenceTimerIfIdle() {
+        guard remainingMs.isEmpty else { return }
+        presenceTimer?.invalidate()
+        presenceTimer = nil
+        lastTick = nil
     }
 
     private func collectFieldPayload(notificationId: String) -> [String: Any] {

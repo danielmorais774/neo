@@ -3,9 +3,10 @@
 use crate::grpc_gen::neo_desktop::neo_desktop_service_client::NeoDesktopServiceClient;
 use crate::ext_bridge::ExtBridge;
 use crate::grpc_gen::neo_desktop::{
-    core_message, desktop_message, CoreMessage, DesktopMessage, ToolResult, UserInput,
-    VoiceSettings,
+    core_message, desktop_message, CommandApproval, CoreMessage, DesktopMessage, ToolResult,
+    UserInput, VoiceSettings,
 };
+use crate::services::command_policy;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,14 @@ use uuid::Uuid;
 /// step starting (`CYCLE_PROGRESS_MARKER` in modules/desktop/ai_service.py). Both
 /// sides must agree on it; it is stripped before the text reaches the chat.
 const CYCLE_PROGRESS_MARKER: &str = "[[CYCLE]]";
+
+/// Silence (no CoreMessage at all) after which a run counts as stuck. While a turn
+/// makes progress neo-core sends an empty keepalive every 15s (`with_keepalive` in
+/// grpc_server.py), so this is ~6 missed beats, never a slow-but-working turn.
+const STREAM_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(90);
+
+/// Last-resort cap for one run, progressing or not.
+const STREAM_MAX_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(60 * 60);
 
 /// Shared handle to the active bidi stream's input sender. Lets UI-driven actions
 /// (command approval/rejection via `respond_to_command`) inject a message into the
@@ -259,6 +268,14 @@ impl GrpcClient {
         metadata.insert("downloads_dir".to_string(), user_dir(dirs::download_dir(), &homedir, "Downloads"));
         metadata.insert("documents_dir".to_string(), user_dir(dirs::document_dir(), &homedir, "Documents"));
         metadata.insert("desktop_dir".to_string(), user_dir(dirs::desktop_dir(), &homedir, "Desktop"));
+        // Tools de arquivo que ESTE binário executa (services/file_ops.rs). O core só
+        // oferece ao Neo o que estiver aqui — um app antigo não recebe tool sem braço
+        // (a lição das tools fantasmas que travavam o turno 300s).
+        metadata.insert(
+            "client_tools".to_string(),
+            serde_json::to_string(&crate::services::file_ops::client_tools())
+                .unwrap_or_else(|_| "[]".to_string()),
+        );
 
         // Snapshot of open music tabs from the browser extension (Etapa 3). Lets the
         // music skill reuse an existing YouTube/Spotify tab via media_context.browser_tabs
@@ -311,10 +328,14 @@ impl GrpcClient {
         let mut stream = response.into_inner();
 
         // Read CoreMessages and emit each one to the frontend as it arrives.
-        // Whole-stream timeout: gives plenty of room for long agent runs but
-        // protects us from a stuck server.
-        let total_timeout = tokio::time::Duration::from_secs(300);
-        let task_deadline = tokio::time::Instant::now() + total_timeout;
+        // Liveness, not a stopwatch: a fixed 300s deadline used to kill runs that
+        // were still producing (session c4f3f7de, an ffmpeg in the sandbox). We give
+        // up only after STREAM_IDLE_TIMEOUT of silence; while the turn waits on THIS
+        // client (a tool request or command approval we owe the core) silence is
+        // expected, so only the hard ceiling applies.
+        let task_ceiling = tokio::time::Instant::now() + STREAM_MAX_DURATION;
+        let mut last_activity = tokio::time::Instant::now();
+        let mut awaiting_client = false;
 
         let mut got_final = false;
         let mut last_response_message: Option<String> = None;
@@ -329,6 +350,7 @@ impl GrpcClient {
         let mut active_session_id = self.session_id.clone();
 
         loop {
+            let deadline = stream_deadline(last_activity, awaiting_client, task_ceiling);
             let next = tokio::select! {
                 biased;
                 // User pressed Stop: drop the stream (cancels the server RPC) and
@@ -347,11 +369,19 @@ impl GrpcClient {
                     let _ = app_handle.emit("agent-event", &stopped_evt);
                     return Ok(()); // dropping `stream`/`tx` here cancels the RPC
                 }
-                res = tokio::time::timeout_at(task_deadline, stream.message()) => res,
+                res = tokio::time::timeout_at(deadline, stream.message()) => res,
             };
 
             match next {
                 Ok(Ok(Some(core_msg))) => {
+                    // Keepalives (no content) count as activity too. The latest
+                    // message decides whether the core is now waiting on us.
+                    last_activity = tokio::time::Instant::now();
+                    awaiting_client = matches!(
+                        core_msg.content,
+                        Some(core_message::Content::ToolRequest(_))
+                            | Some(core_message::Content::CommandRequest(_))
+                    );
                     if !core_msg.session_id.is_empty() && core_msg.session_id != active_session_id {
                         let previous_session_id = active_session_id.clone();
                         active_session_id = core_msg.session_id.clone();
@@ -367,11 +397,57 @@ impl GrpcClient {
                         let _ = app_handle.emit("agent-event", &evt);
                     }
 
+                    // Comando simples roda sem card (services/command_policy.rs).
+                    // Até 2026-09-17 TODO `command_request` parava o turno num
+                    // "Aguardando permissão" — `ls`, `find`, `mkdir` inclusive —, e
+                    // num pedido de várias etapas isso era um clique por passo (sessão
+                    // 718a681a). A política confere verbo, caminho resolvido, tamanho
+                    // e sobrescrita; o que ela não souber conferir continua virando
+                    // card. O veredito é do CLIENTE de propósito: o comando chega
+                    // escrito por um LLM e metade dos critérios (tamanho real,
+                    // symlink, destino já existente) só existe neste disco.
+                    let auto_aprovado = match &core_msg.content {
+                        Some(core_message::Content::CommandRequest(c)) => {
+                            let verdict = command_policy::evaluate(&c.command, None);
+                            info!(
+                                "[policy] {} — {} :: {}",
+                                if verdict.is_auto() { "auto" } else { "pede permissão" },
+                                verdict.reason(),
+                                c.command.chars().take(120).collect::<String>(),
+                            );
+                            verdict.is_auto().then(|| (c.command_id.clone(), verdict))
+                        }
+                        _ => None,
+                    };
+
                     // Emit a real-time event for this CoreMessage.
-                    if let Some(evt) = self.core_message_to_event(&core_msg) {
+                    if let Some(mut evt) = self.core_message_to_event(&core_msg) {
+                        // O card continua no chat mesmo quando roda sozinho: é o
+                        // registro do que foi executado sem passar por você.
+                        if let Some((_, verdict)) = &auto_aprovado {
+                            evt.data["status"] = serde_json::json!("auto");
+                            evt.data["autoReason"] = serde_json::json!(verdict.reason());
+                        }
                         if let Err(e) = app_handle.emit("agent-event", &evt) {
                             warn!("[GrpcClient] failed to emit agent-event: {}", e);
                         }
+                    }
+
+                    if let Some((command_id, _)) = auto_aprovado {
+                        // Mesmo caminho do clique em "Aprovar": o core responde com o
+                        // `execute_command` e o turno segue. Nada no neo-core muda.
+                        let aprovacao = DesktopMessage {
+                            session_id: active_session_id.clone(),
+                            user_id: self.user_id.clone(),
+                            content: Some(desktop_message::Content::CommandApproval(
+                                CommandApproval { command_id, approved: true },
+                            )),
+                        };
+                        if let Err(e) = tx.send(aprovacao).await {
+                            warn!("[GrpcClient] falha ao auto-aprovar o comando: {}", e);
+                        }
+                        // Já respondemos: a espera agora é pelo core, não por você.
+                        awaiting_client = false;
                     }
 
                     // Music actuation (neo-music-feature): the generic client-tool
@@ -455,20 +531,65 @@ impl GrpcClient {
                             let needs_approval = t.requires_approval;
                             let sid = active_session_id.clone();
                             let uid = self.user_id.clone();
+                            let app = app_handle.clone();
                             tokio::spawn(async move {
                                 // Não existe UI de aprovação para um ToolRequest — só
                                 // para CommandRequest. O core roteia passo destrutivo
                                 // por lá; se mesmo assim chegar um aqui, recuse com
                                 // resultado em vez de executar sem permissão (ou de
                                 // travar esperando um "aprovar" que ninguém pode dar).
-                                let (success, result_text, error_text) = if needs_approval {
-                                    (
-                                        false,
-                                        String::new(),
+                                //
+                                // `execute_command` já passou pela aprovação (o card,
+                                // ou a auto-aprovação da política) e roda direto. O
+                                // `run_command` de um passo de plano NÃO passou por
+                                // nada: quem marca `requires_approval` ali é o LLM que
+                                // montou o plano, então um `rm -rf` com a marca errada
+                                // rodava calado. Aqui ele passa pela mesma política do
+                                // card — e, quando ela pede permissão, o card é
+                                // desenhado por este cliente (id `local:`), porque o
+                                // core está esperando um ToolResult, não um approval.
+                                let veto = if needs_approval {
+                                    Some(
                                         "comando exige aprovação e chegou como tool_request \
                                          (sem UI de aprovação) — não executado"
                                             .to_string(),
                                     )
+                                } else if tool_name == "run_command" {
+                                    let args: serde_json::Value =
+                                        serde_json::from_str(&arguments)
+                                            .unwrap_or(serde_json::Value::Null);
+                                    let cmd = args
+                                        .get("command")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let wd =
+                                        args.get("working_dir").and_then(|v| v.as_str());
+                                    let verdict = command_policy::evaluate(cmd, wd);
+                                    if verdict.is_auto() {
+                                        info!("[policy] auto — {}", verdict.reason());
+                                        None
+                                    } else if command_policy::ask_user(
+                                        &app,
+                                        &sid,
+                                        cmd,
+                                        verdict.reason(),
+                                    )
+                                    .await
+                                    {
+                                        None
+                                    } else {
+                                        Some(format!(
+                                            "o usuário não autorizou este comando ({}) — \
+                                             não executado",
+                                            verdict.reason()
+                                        ))
+                                    }
+                                } else {
+                                    None
+                                };
+                                let (success, result_text, error_text) = if let Some(erro) = veto
+                                {
+                                    (false, String::new(), erro)
                                 } else {
                                     tokio::task::spawn_blocking(move || {
                                         run_command_blocking(&arguments)
@@ -564,45 +685,36 @@ impl GrpcClient {
                                     );
                                 }
                             });
-                        } else if t.tool_name == "write_file" {
-                            // Escrever arquivo SEM passar pelo shell. Pelo
-                            // `run_command` o conteúdo vira heredoc e aspas,
-                            // crase, `$` ou um "EOF" dentro do texto corrompem o
-                            // arquivo calado. Aqui o conteúdo é argumento, não
-                            // script. Off the read loop, mesmo padrão dos irmãos.
+                        } else if matches!(
+                            t.tool_name.as_str(),
+                            "write_file" | "read_user_file" | "edit_user_file" | "delegate_file_edit"
+                        ) {
+                            // Arquivos de texto do usuário (services/file_ops.rs): regras de
+                            // acesso, hash, backup, card com diff e Desfazer. Off the read
+                            // loop — o opencode leva dezenas de segundos e uma aprovação
+                            // espera o clique do usuário.
                             let tx2 = tx.clone();
                             let arguments = t.arguments.clone();
                             let tool_call_id = t.tool_call_id.clone();
                             let tool_name = t.tool_name.clone();
                             let sid = active_session_id.clone();
                             let uid = self.user_id.clone();
+                            let app = app_handle.clone();
                             tokio::spawn(async move {
+                                use crate::services::file_ops;
                                 let args: serde_json::Value =
                                     serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
-                                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                                let content =
-                                    args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                let mode =
-                                    args.get("mode").and_then(|v| v.as_str()).unwrap_or("write");
-                                // Só sobrescreve quando o cérebro manda true de
-                                // propósito, depois de ver um status="conflict".
-                                let overwrite = args
-                                    .get("overwrite")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                let (success, result_text, error_text) = if path.is_empty() {
-                                    (false, String::new(), "path ausente".to_string())
-                                } else {
-                                    match crate::commands::write_text_file(
-                                        path, content, mode, overwrite,
-                                    )
-                                    .await
-                                    {
-                                        // JSON string ({status,path,bytes_written}) — o core
-                                        // trata saved vs conflict como no save_generated_file.
-                                        Ok(v) => (true, v.to_string(), String::new()),
-                                        Err(e) => (false, String::new(), e),
-                                    }
+                                let outcome = match tool_name.as_str() {
+                                    "read_user_file" => file_ops::run_read(&app, &args).await,
+                                    "edit_user_file" => file_ops::run_edit(&app, &args).await,
+                                    "delegate_file_edit" => file_ops::run_delegate(&app, &args).await,
+                                    _ => file_ops::run_write(&app, &args).await,
+                                };
+                                // JSON com `status` (ok/saved/conflict/stale/denied/…): quem
+                                // decide o que dizer é o core. `Err` só pra argumento torto.
+                                let (success, result_text, error_text) = match outcome {
+                                    Ok(v) => (true, v.to_string(), String::new()),
+                                    Err(e) => (false, String::new(), e),
                                 };
                                 let tr = DesktopMessage {
                                     session_id: sid,
@@ -610,7 +722,7 @@ impl GrpcClient {
                                     content: Some(desktop_message::Content::ToolResult(
                                         ToolResult {
                                             tool_call_id,
-                                            tool_name,
+                                            tool_name: tool_name.clone(),
                                             success,
                                             result: result_text,
                                             error: error_text,
@@ -618,7 +730,7 @@ impl GrpcClient {
                                     )),
                                 };
                                 if let Err(e) = tx2.send(tr).await {
-                                    warn!("[GrpcClient] failed to send write_file result: {}", e);
+                                    warn!("[GrpcClient] failed to send {} result: {}", tool_name, e);
                                 }
                             });
                         } else if t.tool_name == "request_user_file" {
@@ -750,12 +862,28 @@ impl GrpcClient {
                     return Err(format!("Stream error: {}", e));
                 }
                 Err(_) => {
-                    error!("[GrpcClient] stream timeout after 300s");
+                    let message = if tokio::time::Instant::now() >= task_ceiling {
+                        error!(
+                            "[GrpcClient] run hit the {}s ceiling",
+                            STREAM_MAX_DURATION.as_secs()
+                        );
+                        format!(
+                            "O turno passou do teto de {} min e foi interrompido",
+                            STREAM_MAX_DURATION.as_secs() / 60
+                        )
+                    } else {
+                        error!(
+                            "[GrpcClient] stream idle for {}s, no progress from neo-core",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        );
+                        format!(
+                            "Neo Core ficou {}s sem dar sinal de progresso e o turno foi interrompido",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        )
+                    };
                     let evt = AgentEvent {
                         event_type: "error".to_string(),
-                        data: serde_json::json!({
-                            "message": "Neo Core não respondeu em tempo hábil (timeout 300s)"
-                        }),
+                        data: serde_json::json!({ "message": message }),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     };
                     let _ = app_handle.emit("agent-event", &evt);
@@ -1064,7 +1192,13 @@ fn run_command_blocking(arguments: &str) -> (bool, String, String) {
 
     // Shell da plataforma (ver services::shell): era `/bin/bash` fixo, que no Windows
     // não existe e derrubava o comando antes de rodar.
-    match crate::services::shell::run_in(command, working_dir) {
+    // O schema do run_command sempre anunciou `timeout` e o executor ignorava.
+    let timeout = args
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(crate::services::shell::DEFAULT_TIMEOUT);
+    match crate::services::shell::run_with(command, working_dir, timeout) {
         Ok(output) => crate::services::shell::split_output(output),
         Err(e) => (false, String::new(), e),
     }
@@ -1144,5 +1278,49 @@ fn run_media_tool(tool_name: &str, arguments: &str) -> (bool, String, String) {
         "open_url" => open_with("url"),
         "launch_uri" => open_with("uri"),
         other => (false, String::new(), format!("tool de mídia desconhecida: {}", other)),
+    }
+}
+
+/// Instant at which the read loop gives up on the core: STREAM_IDLE_TIMEOUT after
+/// the last message, or only the hard ceiling while the core waits on this client.
+fn stream_deadline(
+    last_activity: tokio::time::Instant,
+    awaiting_client: bool,
+    ceiling: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if awaiting_client {
+        ceiling
+    } else {
+        std::cmp::min(last_activity + STREAM_IDLE_TIMEOUT, ceiling)
+    }
+}
+
+#[cfg(test)]
+mod stream_deadline_tests {
+    use super::*;
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn idle_deadline_follows_the_last_message() {
+        let start = Instant::now();
+        let ceiling = start + STREAM_MAX_DURATION;
+        assert_eq!(stream_deadline(start, false, ceiling), start + STREAM_IDLE_TIMEOUT);
+        // A run already 10 min in is still alive if it just spoke.
+        let later = start + Duration::from_secs(600);
+        assert_eq!(stream_deadline(later, false, ceiling), later + STREAM_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn waiting_on_the_client_only_honours_the_ceiling() {
+        let start = Instant::now();
+        let ceiling = start + STREAM_MAX_DURATION;
+        assert_eq!(stream_deadline(start, true, ceiling), ceiling);
+    }
+
+    #[test]
+    fn ceiling_caps_the_idle_deadline() {
+        let start = Instant::now();
+        let ceiling = start + Duration::from_secs(10);
+        assert_eq!(stream_deadline(start, false, ceiling), ceiling);
     }
 }

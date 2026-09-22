@@ -6,6 +6,37 @@ import { emit } from '@tauri-apps/api/event';
 import type { AudioRoute } from './audioDevices';
 
 // Types matching the original ElectronAPI interface
+/** Tetos do navegador headless local. `0` em max_tabs/max_ram_mb = sem teto NOSSO. */
+export interface HeadlessLimits {
+  max_tabs: number;
+  max_ram_mb: number;
+  idle_ttl_s: number;
+  profile: 'dedicado' | 'logado';
+  browser_path: string | null;
+  /** Existe Chromium instalado nesta máquina? */
+  available: boolean;
+}
+
+export interface HeadlessLimitsInput {
+  maxTabs: number;
+  maxRamMb: number;
+  idleTtlS: number;
+  profile: 'dedicado' | 'logado';
+  browserPath: string | null;
+}
+
+export interface HeadlessStats {
+  running: boolean;
+  browser?: string;
+  pid?: number;
+  uptime_s?: number;
+  /** phys_footprint da árvore de processos — NÃO soma de RSS. */
+  ram_mb?: number;
+  tabs?: number;
+  tab_urls?: string[];
+  limits: { max_tabs: number; max_ram_mb: number; idle_ttl_s: number };
+}
+
 export interface AgentEvent {
   type: string;
   data: any;
@@ -205,6 +236,8 @@ export interface ElectronAPI {
   loadChatImage: (source: string) => Promise<ChatImage>;
   // Abre o arquivo no app padrão do sistema (ver a imagem em tamanho real).
   revealLocalFile: (path: string) => Promise<void>;
+  respondFileChange: (changeId: string, approved: boolean) => Promise<void>;
+  undoFileChange: (changeId: string) => Promise<void>;
   stopExecution: () => void;
   resetAgent: (newSessionId: string) => Promise<string>;
   onAgentEvent: (callback: (event: AgentEvent) => void) => UnlistenFn;
@@ -257,6 +290,13 @@ export interface ElectronAPI {
   /** Persiste a escolha (null limpa) e reenvia o config ao notch nativo. */
   setAudioInput: (name: string | null) => Promise<void>;
   // Wake word local (Estágio 1 do Modo Live).
+  // Navegador headless LOCAL (services/headless.rs): mesmo IP residencial do
+  // navegador visível dele, sem tomar a tela. Os tetos de RAM/abas são daqui
+  // porque é a máquina DELE que paga a conta.
+  headlessStats: () => Promise<HeadlessStats>;
+  headlessGetLimits: () => Promise<HeadlessLimits>;
+  headlessSetLimits: (limits: Partial<HeadlessLimitsInput>) => Promise<HeadlessLimits>;
+  headlessShutdown: () => Promise<{ ok: boolean }>;
   wakeStart: () => Promise<WakeStatus>;
   wakeStop: () => Promise<WakeStatus>;
   wakeStatus: () => Promise<WakeStatus>;
@@ -300,6 +340,14 @@ export interface ElectronAPI {
   readWorkingNote: (slug: string) => Promise<WorkingNoteDetail>;
   /** Abre (ou foca, se já aberta) a janela separada do caderno. */
   openWorkingMemoryWindow: () => Promise<void>;
+  // Tarefas em background (tabela `agent_job` no core): lista, detalhe, fim do log
+  // e cancelar. Proxy cru do Rust — a forma do JSON é a destes tipos.
+  listJobs: (status?: 'active' | 'all', limit?: number) => Promise<JobsPage>;
+  getJob: (jobId: string) => Promise<JobDetail>;
+  getJobLogs: (jobId: string, tail?: number) => Promise<JobLogs>;
+  cancelJob: (jobId: string) => Promise<JobCancelResult>;
+  /** Abre (ou foca, se já aberta) a janela de tarefas. */
+  openJobsWindow: () => Promise<void>;
 }
 
 export interface SessionInfo {
@@ -332,6 +380,66 @@ export interface WorkingNoteSummary {
 export interface WorkingNoteDetail extends WorkingNoteSummary {
   /** Markdown inteiro, sem a truncagem que o `wm_read` aplica para o modelo. */
   body: string;
+}
+
+/** Uma tarefa em background (linha de `agent_job` no core). */
+export interface JobSummary {
+  id: string;
+  kind: string;
+  title: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled' | string;
+  notify_policy: string;
+  session_id: string | null;
+  /** ISO-8601 SEM timezone, gravado pelo core como UTC (igual ao SessionInfo). */
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  /** Último sinal de vida de um comando que virou job. */
+  heartbeat_at: string | null;
+  duration_s: number | null;
+  exit_code: number | null;
+  /** O que foi pedido (comando, tarefa, tópico); encurtado na lista. */
+  detail: string;
+  preview: string;
+  /** Nasceu como `neo_bash` em primeiro plano e virou job por demorar. */
+  adopted: boolean;
+  /** Tem continuação combinada: ao fim, o Neo termina a entrega sozinho. */
+  has_then: boolean;
+  continuation_of: string | null;
+  has_log: boolean;
+}
+
+export interface JobDetail extends JobSummary {
+  result_summary: string;
+  progress_note: string;
+  /** O que o Neo combinou fazer quando a tarefa terminar. */
+  then: string;
+  log_path: string | null;
+  spec: Record<string, unknown>;
+}
+
+export interface JobsPage {
+  jobs: JobSummary[];
+  count: number;
+  /** status → quantidade, sobre TODAS as tarefas do dono (não só a página). */
+  counts: Record<string, number>;
+  active: number;
+}
+
+export interface JobLogs {
+  job_id: string;
+  status: string;
+  logs: string;
+  /** Havia mais antes do trecho devolvido (o log vem pelo FIM). */
+  truncated: boolean;
+  source: string;
+  error?: string;
+}
+
+export interface JobCancelResult {
+  ok: boolean;
+  status?: string;
+  error?: string;
 }
 
 export interface WorkingNotesPage {
@@ -414,6 +522,13 @@ export const electronAPI: ElectronAPI = {
   loadChatImage: (source: string) => invoke<ChatImage>('load_chat_image', { source }),
 
   revealLocalFile: (path: string) => invoke<void>('reveal_local_file', { path }),
+
+  // Card de arquivo (services/file_ops.rs): aprovar/rejeitar fora das pastas
+  // liberadas, e Desfazer uma alteração já gravada.
+  respondFileChange: (changeId: string, approved: boolean) =>
+    invoke<void>('respond_file_change', { changeId, approved }),
+
+  undoFileChange: (changeId: string) => invoke<void>('undo_file_change', { changeId }),
 
   stopExecution: () => invoke('stop_execution'),
 
@@ -646,6 +761,11 @@ export const electronAPI: ElectronAPI = {
   getAudioInput: () => invoke('get_audio_input'),
   setAudioInput: (name: string | null) => invoke('set_audio_input', { name }),
 
+  headlessStats: () => invoke('headless_stats'),
+  headlessGetLimits: () => invoke('headless_get_limits'),
+  headlessSetLimits: (limits) => invoke('headless_set_limits', limits),
+  headlessShutdown: () => invoke('headless_shutdown'),
+
   wakeStart: () => invoke('wake_start'),
   wakeStop: () => invoke('wake_stop'),
   wakeStatus: () => invoke('wake_status'),
@@ -793,4 +913,12 @@ export const electronAPI: ElectronAPI = {
     invoke<WorkingNotesPage>('list_working_notes', { limit }),
   readWorkingNote: (slug: string) => invoke<WorkingNoteDetail>('read_working_note', { slug }),
   openWorkingMemoryWindow: () => invoke<void>('open_working_memory_window'),
+
+  // Tarefas em background (proxy pro neo-core, ver commands/mod.rs).
+  listJobs: (status?: 'active' | 'all', limit?: number) =>
+    invoke<JobsPage>('list_jobs', { status, limit }),
+  getJob: (jobId: string) => invoke<JobDetail>('get_job', { jobId }),
+  getJobLogs: (jobId: string, tail?: number) => invoke<JobLogs>('get_job_logs', { jobId, tail }),
+  cancelJob: (jobId: string) => invoke<JobCancelResult>('cancel_job', { jobId }),
+  openJobsWindow: () => invoke<void>('open_jobs_window'),
 };

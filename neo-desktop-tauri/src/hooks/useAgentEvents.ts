@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import type { Message, AgentEvent, ExecutionPlan } from '../types';
+import type { Message, AgentEvent, ExecutionPlan, FileChangeInfo } from '../types';
 import { newMessageId } from '../lib/messageId';
 
 interface UseAgentEventsProps {
@@ -192,6 +192,38 @@ export const useAgentEvents = ({
           setCurrentIteration(event.data.current);
           setMaxIterations(event.data.max);
           break;
+
+        case 'file_change': {
+          const change = event.data as FileChangeInfo;
+          if (!change?.changeId) break;
+          const key = change.cardId || change.changeId;
+          setMessages(prev => {
+            const idx = prev.findIndex(m =>
+              m.fileChange &&
+              ((m.fileChange.cardId || m.fileChange.changeId) === key ||
+                m.fileChange.changeId === change.changeId)
+            );
+            if (idx >= 0) {
+              const updated = [...prev];
+              const current = updated[idx].fileChange!;
+              // O evento de "desfeito" só traz id/caminho/status: o diff já exibido fica.
+              updated[idx] = {
+                ...updated[idx],
+                fileChange: { ...current, ...change, diff: change.diff ?? current.diff },
+              };
+              return updated;
+            }
+            return [...prev, {
+              id: newMessageId(),
+              role: 'assistant',
+              content: '',
+              messageType: 'file_change',
+              fileChange: change,
+              timestamp: new Date(),
+            }];
+          });
+          break;
+        }
 
         case 'command_request':
           setMessages(prev => [...prev, {

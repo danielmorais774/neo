@@ -562,6 +562,12 @@
   background: var(--accent);
 }
 
+/* Liberado pela política do cliente: verde, mas sem o pulso do "te esperando". */
+.status-dot.auto {
+  background: var(--success);
+  opacity: 0.75;
+}
+
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -573,6 +579,12 @@
   color: var(--text-secondary);
   background: rgba(59, 130, 246, 0.04);
   border-bottom: 1px solid rgba(59, 130, 246, 0.06);
+}
+
+/* Por que o comando não parou pra pedir permissão — discreto, mas auditável. */
+.command-auto-reason {
+  background: rgba(34, 197, 94, 0.05);
+  border-bottom-color: rgba(34, 197, 94, 0.08);
 }
 
 .command-code-wrapper {

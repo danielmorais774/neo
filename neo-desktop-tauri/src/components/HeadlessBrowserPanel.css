@@ -1,0 +1,133 @@
+/* HeadlessBrowserPanel — segue os tokens de superfície dos outros painéis
+   (var(--surface-*)), para acompanhar a troca de tema sem tratamento próprio. */
+
+.headless-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.headless-muted {
+  opacity: 0.6;
+  font-size: 12px;
+}
+
+.headless-warn {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-1);
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.9;
+}
+
+.headless-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-1);
+}
+
+.headless-status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.headless-status-text strong {
+  font-size: 12px;
+}
+
+.headless-status-text small,
+.headless-row small {
+  font-size: 11px;
+  opacity: 0.6;
+  display: block;
+  line-height: 1.35;
+}
+
+.headless-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--surface-border);
+  flex: none;
+}
+
+.headless-dot-on {
+  background: #3ddc84;
+}
+
+.headless-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-1);
+  border: 1px solid var(--surface-border);
+  overflow: hidden;
+}
+
+.headless-bar-fill {
+  height: 100%;
+  background: #3ddc84;
+  transition: width 0.4s ease;
+}
+
+/* Perto do teto o gerente começa a fechar aba — o usuário merece ver isso
+   chegando antes de uma aba sumir "sozinha". */
+.headless-bar-hot {
+  background: #ffb020;
+}
+
+.headless-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-1);
+  font-size: 12px;
+}
+
+.headless-row > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.headless-row input,
+.headless-row select {
+  flex: none;
+  width: 140px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-2, var(--surface-1));
+  color: inherit;
+  font-size: 12px;
+}
+
+.headless-row input[type='number'] {
+  width: 96px;
+  text-align: right;
+}
+
+.headless-btn {
+  flex: none;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-2, var(--surface-1));
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.headless-btn:hover {
+  opacity: 0.8;
+}
