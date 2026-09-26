@@ -46,6 +46,9 @@ const KIND_ICON: Record<string, string> = {
   unsolicited_message: '📩',
   mission_started: '⚡',
   mission_completed: '✨',
+  // Liberação de dado pessoal: ícone próprio porque este card não é aviso, é
+  // decisão — e a diferença tem que ser visível antes de ler (release-request-plan §11).
+  release_request: '🔐',
 };
 
 /*

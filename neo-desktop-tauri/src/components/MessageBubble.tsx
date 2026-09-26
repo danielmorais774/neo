@@ -379,6 +379,14 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
                 pre: ({ children, className }) => (
                   <CodeBlock className={className}>{children}</CodeBlock>
                 ),
+                // `![](https://…)` no markdown NÃO vira imagem. Quem desenha
+                // imagem aqui é o marcador [[IMAGE:…]], que o Rust baixa e
+                // entrega como data URL (fetch_remote_image_bytes) — o webview
+                // nunca fala com terceiro. A CSP já recusa (`img-src 'self'
+                // data:`); isto evita o ícone de imagem quebrada e deixa a
+                // razão escrita: uma resposta pode conter texto de uma página
+                // hostil, e buscar a URL dela vazaria dado no query string.
+                img: ({ alt }) => (alt ? <em>[imagem: {alt}]</em> : null),
               }}
             >
               {displayText}
