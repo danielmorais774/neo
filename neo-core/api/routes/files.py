@@ -2,13 +2,18 @@
 
 Padrão research.py/missions.py: APIRouter + set_store() no bootstrap.
 
-**Auth (§14.1 resolvido):** as rotas do desktop hoje NÃO têm guarda
-(`app.include_router(desktop.router, prefix="/api/v1")` — sem require_panel_jwt),
-e as do panel usam JWT. Replicamos isso em vez de inventar esquema novo: upload
-e download ficam abertos (o desktop precisa deles e é o mesmo nível de exposição
-do chat, que já é aberto); a GESTÃO do catálogo (list/info/patch/delete/usage)
-exige panel JWT. Se um dia as rotas do desktop ganharem guarda, estas seguem
-junto — o ponto é não abrir MENOS nem MAIS que o cliente que já existe.
+**Auth (§14.1, revisto em 2026-09-25 — docs/api-auth-plan.md).** A regra antiga
+era "espelhar as rotas do desktop", e as do desktop não tinham guarda nenhuma.
+Agora têm, e estas seguem junto:
+
+* ``POST ""`` (upload) — ``require_owner``; o dono do arquivo sai da credencial,
+  não do campo ``user_id`` do multipart;
+* ``GET {id}/download`` — ``require_owner`` **ou** URL assinada. A assinatura
+  existe porque o painel baixa por ``<a href download>``, e navegação de âncora
+  não manda header nenhum: fechar só com header quebraria o download (§7.3). Quem
+  pede o link já está autenticado (``GET {id}/download-url``);
+* gestão do catálogo (list/info/patch/delete/usage) — segue no panel JWT, que é
+  tela de administração.
 """
 
 from __future__ import annotations
@@ -17,9 +22,11 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from api.auth import Principal, owner_of, require_owner
+from api.auth import signed_url
 from api.security import require_panel_jwt
 from core.files.store import FileStore, FileStoreError
 
@@ -74,14 +81,17 @@ def _serialize(entry: Any) -> dict[str, Any]:
 
 @router.post("")
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     retention: str = Form("temp"),
     origin: str = Form("upload-desktop"),
     session_id: str | None = Form(None),
     user_id: str | None = Form(None),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """Ingere um arquivo (multipart). Devolve o file_id para citar no chat."""
     store = _require_store()
+    dono = owner_of(principal, _as_uuid(user_id), request=request)
     try:
         entry = await store.ingest_stream(
             file.file,
@@ -89,7 +99,7 @@ async def upload_file(
             mime=file.content_type,
             origin=origin,
             retention=retention,
-            user_id=_as_uuid(user_id),
+            user_id=dono,
             session_id=_as_uuid(session_id),
         )
     except FileStoreError as exc:
@@ -98,14 +108,92 @@ async def upload_file(
     return _serialize(entry)
 
 
-@router.get("/{file_id}/download")
-async def download_file(file_id: str) -> FileResponse:
-    """Baixa o conteúdo. ``attachment`` sempre — nunca renderizar HTML hostil
-    no domínio do painel (§11.7)."""
+@router.get("/{file_id}/download-url")
+async def download_url(
+    file_id: str,
+    request: Request,
+    principal: Principal = Depends(require_owner),
+) -> dict[str, Any]:
+    """Devolve um link de download de vida curta, para usar em ``<a download>``.
+
+    Quem pede está autenticado; o link carrega a autorização na assinatura
+    (HMAC sobre ``arquivo|dono|prazo``), porque a âncora não manda header.
+    """
     store = _require_store()
     entry = await store.get(file_id)
     if entry is None or entry.status != "available":
         raise HTTPException(status_code=404, detail="arquivo não encontrado ou indisponível")
+    _confere_dono_do_arquivo(entry, principal, request)
+
+    params = signed_url.sign(f"file:{file_id}", principal.user_id or "")
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return {
+        "url": f"/api/v1/files/{file_id}/download?{query}",
+        "expires_at": int(params["exp"]),
+    }
+
+
+def _confere_dono_do_arquivo(entry: Any, principal: Principal, request: Request) -> None:
+    """Arquivo sem dono passa (legado e arquivo gerado pelo servidor).
+
+    Mesma escolha das sessões antigas: a coluna é anulável e há linha anterior à
+    auth. Endurecer isso sem backfill esconderia anexo do próprio dono.
+    """
+    dono = getattr(entry, "user_id", None)
+    if dono is None or principal.user_id is None or dono == principal.user_id:
+        return
+
+    from api.auth.principal import MODE_OFF, MODE_SHADOW, auth_mode
+
+    if auth_mode() in (MODE_OFF, MODE_SHADOW):
+        logger.warning(
+            "[auth:sombra] %s: arquivo %s é do usuário %s, não de %s",
+            request.url.path, getattr(entry, "id", "?"), dono, principal.user_id,
+        )
+        return
+    raise HTTPException(status_code=403, detail="este arquivo não é seu")
+
+
+@router.get("/{file_id}/download")
+async def download_file(
+    file_id: str,
+    request: Request,
+    exp: str | None = Query(None),
+    uid: str | None = Query(None),
+    sig: str | None = Query(None),
+) -> FileResponse:
+    """Baixa o conteúdo. ``attachment`` sempre — nunca renderizar HTML hostil
+    no domínio do painel (§11.7).
+
+    Aceita DUAS credenciais: a normal (header do aparelho / access token) ou a
+    URL assinada emitida por ``/download-url``. A assinatura cobre o file_id, de
+    modo que um link não serve para outro arquivo.
+    """
+    from api.auth.principal import resolve_principal
+
+    principal = await resolve_principal(request)
+    if not principal.tem_dono:
+        try:
+            dono_assinado = signed_url.verify(f"file:{file_id}", exp=exp, uid=uid, sig=sig)
+        except signed_url.SignatureError as erro:
+            from api.auth.principal import MODE_OFF, MODE_SHADOW, auth_mode
+
+            if auth_mode() in (MODE_OFF, MODE_SHADOW):
+                logger.warning(
+                    "[auth:sombra] GET %s passaria a ser barrado: %s",
+                    request.url.path, erro,
+                )
+                dono_assinado = None
+            else:
+                raise HTTPException(status_code=401, detail=f"download não autorizado: {erro}")
+        if dono_assinado is not None:
+            principal = Principal(kind="user", user_id=dono_assinado, label="link assinado")
+
+    store = _require_store()
+    entry = await store.get(file_id)
+    if entry is None or entry.status != "available":
+        raise HTTPException(status_code=404, detail="arquivo não encontrado ou indisponível")
+    _confere_dono_do_arquivo(entry, principal, request)
     blob = store.blob_path(entry.sha256)
     if not blob.exists():
         raise HTTPException(status_code=410, detail="conteúdo já removido do store")

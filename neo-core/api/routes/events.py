@@ -27,6 +27,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from api.auth import require_principal
 from api.security import require_panel_jwt
 
 logger = logging.getLogger(__name__)
@@ -74,11 +75,16 @@ async def _resolve_user(user_id: str | None) -> UUID:
 
 
 # ---------------------------------------------------------------------------
-# Caminho quente (sem JWT — ver docstring do módulo)
+# Caminho quente
 # ---------------------------------------------------------------------------
 
 
-@router.post("/midia")
+# `require_principal` (e não `require_owner`): quem chama é o desktop, com o token
+# do aparelho, e o dono do evento sai do `device_id` do corpo — resolvido pelo bus
+# contra o registro de devices. Pedir dono aqui não acrescentaria verdade; pedir
+# CREDENCIAL acrescenta, porque esta rota dispara ação (trocar a faixa).
+# Ver docs/api-auth-plan.md.
+@router.post("/midia", dependencies=[Depends(require_principal)])
 async def media_event(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Evento de mídia do aparelho. Devolve a ação a executar (ou ``acao=nada``).
 
@@ -100,14 +106,18 @@ async def media_event(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/inscricoes")
+@router.get("/inscricoes", dependencies=[Depends(require_principal)])
 async def list_subscriptions(
     user_id: str | None = Query(default=None),
     device_id: str | None = Query(default=None),
     incluir_encerradas: bool = Query(default=False),
 ) -> dict[str, Any]:
-    """Inscrições vivas. Sem JWT: é o que o desktop chama ao reconectar para
-    re-armar o que estava observando antes de reiniciar."""
+    """Inscrições vivas — o que o desktop chama ao reconectar para re-armar o
+    que estava observando antes de reiniciar.
+
+    Sem panel JWT (o desktop não tem), mas com credencial: o token do aparelho
+    serve. Ver docs/api-auth-plan.md.
+    """
     _require_bus()
     states = ("armada", "pausada", "encerrada") if incluir_encerradas else ("armada", "pausada")
     user = None

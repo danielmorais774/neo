@@ -1,4 +1,12 @@
-"""Desktop routes - endpoints da API para o módulo desktop."""
+"""Desktop routes - endpoints da API para o módulo desktop.
+
+**Autenticação (docs/api-auth-plan.md).** Este router é montado com
+``dependencies=[Depends(require_owner)]`` em ``api/main.py``: rota nova aqui nasce
+pedindo credencial com dono. O ``user_id`` que chega no corpo/query é **advisório**
+— o que vale é ``principal.user_id``, e ``owner_of`` recusa (403) quando o pedido
+declara outro dono. Nos degraus ``off``/``shadow`` nada disso barra: o declarado
+continua valendo e a divergência só aparece no log.
+"""
 
 import json
 import logging
@@ -8,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import Uuid as SAUuid, bindparam
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -20,6 +29,7 @@ from api.schemas.requests import (
     SessionHistoryResponse,
     ToolInfoSchema,
 )
+from api.auth import Principal, owner_of, require_owner, require_principal
 from api.routes.missions import _execute_mission_command
 from db.async_client import AsyncPostgresClient
 from db.models import ConversationMessage, Mission
@@ -278,6 +288,38 @@ def _build_pending_reply_card(message: ConversationMessage, mission: Mission) ->
     }
 
 
+async def _sessao_do_dono(
+    db: AsyncPostgresClient,
+    session_id: UUID,
+    principal: Principal,
+    request: Request,
+):
+    """Confere que a sessão é do dono da credencial. Devolve a sessão (ou None).
+
+    **Sessão com ``user_id`` NULL passa.** A coluna é anulável e existe conversa
+    antiga de antes de qualquer auth: barrá-las faria o histórico dele desaparecer
+    do seletor de sessões, que é pior do que o risco real (uma conta só com dado).
+    O backfill é `scripts/backfill_session_owner.py`; depois dele, isto pode
+    endurecer.
+    """
+    sessao = await db.get_conversation_session(session_id)
+    if sessao is None:
+        return None
+    dono = getattr(sessao, "user_id", None)
+    if dono is None or principal.user_id is None or dono == principal.user_id:
+        return sessao
+
+    from api.auth.principal import MODE_OFF, MODE_SHADOW, auth_mode
+
+    if auth_mode() in (MODE_OFF, MODE_SHADOW):
+        logger.warning(
+            "[auth:sombra] %s %s: sessão %s é do usuário %s, não de %s",
+            request.method, request.url.path, session_id, dono, principal.user_id,
+        )
+        return sessao
+    raise HTTPException(status_code=403, detail="esta sessão não é sua")
+
+
 @router.post("/execute", response_model=ExecuteTaskResponse)
 async def execute_task(
     request: ExecuteTaskRequest,
@@ -323,7 +365,9 @@ async def execute_task(
 @router.post("/chat", response_model=dict)
 async def handle_desktop_chat_message(
     request: DesktopChatMessage,
+    http_request: Request,
     ai_service: AIService = Depends(get_ai_service),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """Handle structured desktop chat messages.
 
@@ -331,6 +375,11 @@ async def handle_desktop_chat_message(
     without calling IntentRouter. Natural user input stays on the normal
     execution path.
     """
+    # O dono sai da CREDENCIAL. O `user_id` do corpo é advisório (e em enforce,
+    # declarar outro é 403) — era por ele que um pedido se dizia dono da memória
+    # de qualquer um. Ver docs/api-auth-plan.md §3.1.
+    dono = owner_of(principal, request.user_id, request=http_request)
+
     if request.type == MessageType.MISSION_COMMAND:
         if not request.command:
             raise HTTPException(status_code=400, detail="command é obrigatório para mission_command")
@@ -344,7 +393,7 @@ async def handle_desktop_chat_message(
                 command=request.command,
                 mission_id=request.mission_id,
                 edited_text=request.edited_text,
-                user_id=request.user_id,
+                user_id=dono,
             ),
             source="desktop-chat",
         )
@@ -370,7 +419,7 @@ async def handle_desktop_chat_message(
     async for resp in ai_service.process_user_input(
         user_message=request.user_message.strip(),
         session_id=request.session_id,
-        user_id=request.user_id,
+        user_id=dono,
         service="desktop-chat",
         metadata=metadata,
     ):
@@ -384,7 +433,7 @@ async def handle_desktop_chat_message(
     try:
         from modules.voice import get_active_voice
         final_voice = await get_active_voice(
-            ai_service.db, request.user_id, getattr(ai_service, "settings", None)
+            ai_service.db, dono, getattr(ai_service, "settings", None)
         )
     except Exception:  # pragma: no cover - defensive
         final_voice = None
@@ -549,7 +598,9 @@ async def _stream_ai_events(
 @router.post("/chat/stream")
 async def handle_desktop_chat_stream(
     request: DesktopChatMessage,
+    http_request: Request,
     ai_service: AIService = Depends(get_ai_service),
+    principal: Principal = Depends(require_owner),
 ) -> StreamingResponse:
     """Mesma entrada do `/chat`, mas em streaming NDJSON (thinking/plan/command/
     complete em tempo real) — ver comentário de módulo acima."""
@@ -567,7 +618,7 @@ async def handle_desktop_chat_stream(
     resp_iter = ai_service.process_user_input(
         user_message=request.user_message.strip(),
         session_id=request.session_id,
-        user_id=request.user_id,
+        user_id=owner_of(principal, request.user_id, request=http_request),
         service="neo-panel",
         metadata=metadata,
     )
@@ -591,11 +642,21 @@ class DesktopCommandResponseMessage(BaseModel):
 @router.post("/chat/command-response")
 async def handle_desktop_command_response(
     request: DesktopCommandResponseMessage,
+    http_request: Request,
     ai_service: AIService = Depends(get_ai_service),
+    principal: Principal = Depends(require_owner),
+    db: AsyncPostgresClient = Depends(get_db),
 ) -> StreamingResponse:
     """Continuação de um turno pausado por `command_request`. Aprovar não executa
     nada pelo painel (sem acesso a shell local) — o turno fecha informando isso;
-    rejeitar fecha o turno normalmente. Ver módulo `_stream_ai_events` acima."""
+    rejeitar fecha o turno normalmente. Ver módulo `_stream_ai_events` acima.
+
+    **Amarrado ao dono.** Esta rota aprovava pendência de QUALQUER sessão: era o
+    caminho mais curto para alguém que alcançasse a :8000 transformar um comando
+    pendente em execução na máquina dele. Agora a sessão tem que ser sua.
+    """
+    await _sessao_do_dono(db, request.session_id, principal, http_request)
+
     resp_iter = ai_service.process_command_approval(
         session_id=request.session_id,
         command_id=request.command_id,
@@ -609,6 +670,9 @@ async def handle_desktop_command_response(
     )
 
 
+# O inventário de ferramentas é mapa para quem ataca ("o que essa máquina sabe
+# fazer"). Herda o `require_owner` do router: não é dado pessoal, mas também não
+# é cartaz de rua, e uma dependência mais frouxa por rota não afrouxaria o router.
 @router.get("/tools", response_model=ListToolsResponse)
 async def list_tools(
     service: DesktopService = Depends(get_desktop_service),
@@ -643,6 +707,7 @@ async def list_sessions(
     service_name: str = Query(default="neo-desktop-tauri", alias="service"),
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """Lista sessões anteriores (mais recentes primeiro) para o seletor de sessões.
 
@@ -650,6 +715,13 @@ async def list_sessions(
     primeira mensagem do usuário da sessão. Sessões sem mensagem nenhuma são
     omitidas: o cliente cria a sessão ao abrir o app, então listá-las encheria a
     lista de conversas vazias.
+
+    **Escopo por dono** (docs/api-auth-plan.md F4). Antes o filtro era só
+    `service` — qualquer um que alcançasse a rota listava as conversas de todos.
+    Sessão com `user_id` NULL continua aparecendo: a coluna é anulável e há
+    conversa antiga de antes da auth; esconder o histórico dele seria pior do que
+    o risco de uma conta só. `scripts/backfill_session_owner.py` resolve a NULL,
+    e depois o `OR ... IS NULL` pode cair.
     """
     from sqlalchemy import text
 
@@ -671,13 +743,19 @@ async def list_sessions(
           FROM conversation_session s
          WHERE s.service = :service
            AND s.message_count > 0
+           AND (:owner IS NULL OR s.user_id = :owner OR s.user_id IS NULL)
          ORDER BY s.last_activity_at DESC
          LIMIT :limit
         """
-    )
+    ).bindparams(bindparam("owner", type_=SAUuid))
 
     async with db.get_session() as session:
-        rows = (await session.execute(stmt, {"service": service_name, "limit": limit})).all()
+        rows = (
+            await session.execute(
+                stmt,
+                {"service": service_name, "limit": limit, "owner": principal.user_id},
+            )
+        ).all()
 
     sessions = [
         {
@@ -695,9 +773,13 @@ async def list_sessions(
 @router.get("/session/{session_id}", response_model=SessionHistoryResponse)
 async def get_session_history(
     session_id: UUID,
+    http_request: Request,
     service: DesktopService = Depends(get_desktop_service),
+    db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> SessionHistoryResponse:
-    """Retorna histórico de uma sessão."""
+    """Retorna histórico de uma sessão (cópia em memória do DesktopService)."""
+    await _sessao_do_dono(db, session_id, principal, http_request)
     history = service.get_session_history(session_id)
 
     if not history:
@@ -712,10 +794,17 @@ async def get_session_history(
 @router.get("/session/{session_id}/history", response_model=dict)
 async def get_persistent_session_history(
     session_id: UUID,
+    http_request: Request,
     limit: int = Query(default=100, ge=1, le=300),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
-    """Retorna histórico persistente da sessão, incluindo cards de missão."""
+    """Retorna histórico persistente da sessão, incluindo cards de missão.
+
+    Confere o dono antes de ler: era a rota que entregava a conversa inteira de
+    qualquer sessão a quem soubesse (ou sorteasse) um UUID.
+    """
+    await _sessao_do_dono(db, session_id, principal, http_request)
     messages = await db.fetch_session_messages(
         session_id=session_id,
         limit=limit,
@@ -756,9 +845,13 @@ async def get_persistent_session_history(
 @router.delete("/session/{session_id}")
 async def clear_session(
     session_id: UUID,
+    http_request: Request,
     service: DesktopService = Depends(get_desktop_service),
+    db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, str]:
-    """Limpa uma sessão."""
+    """Limpa uma sessão (apagar é irreversível — o dono é conferido antes)."""
+    await _sessao_do_dono(db, session_id, principal, http_request)
     deleted = service.clear_session(session_id)
 
     if not deleted:
@@ -770,13 +863,9 @@ async def clear_session(
     return {"message": "Session cleared successfully"}
 
 
-@router.get("/sessions")
-async def list_sessions(
-    service: DesktopService = Depends(get_desktop_service),
-) -> dict[str, list[str]]:
-    """Lista todas as sessões ativas."""
-    sessions = service.list_active_sessions()
-    return {"sessions": sessions, "count": len(sessions)}
+# Havia aqui um SEGUNDO `@router.get("/sessions")` (sessões ativas em memória).
+# O FastAPI casa a primeira rota registrada, então ele nunca respondeu nada desde
+# que o seletor de sessões chegou — código morto removido em 2026-09-25.
 
 
 # ============ MEMÓRIA DE TRABALHO (leitura) ============
@@ -850,9 +939,17 @@ def _serialize_working_note(note: Any) -> dict[str, Any]:
 
 
 async def _resolve_working_memory_user(
-    db: AsyncPostgresClient, user_id: str | None
+    db: AsyncPostgresClient,
+    user_id: str | None,
+    principal: Principal | None = None,
+    request: Request | None = None,
 ) -> UUID | None:
-    """Explícito ganha; senão, o dono do CADERNO — não "o único usuário".
+    """A CREDENCIAL ganha; sem ela, o dono do CADERNO — não "o único usuário".
+
+    A ordem mudou em 2026-09-25 (docs/api-auth-plan.md F4): antes o `user_id` do
+    query param vinha primeiro, então bastava declarar o UUID de alguém para ler
+    o caderno dele. Agora, autenticado, quem manda é o dono do token; o param só
+    sobrevive para os degraus `off`/`shadow`, onde `owner_of` o deixa passar.
 
     A política de `events.py`/`datasets.py` ("se houver exatamente um usuário,
     é ele") não serve aqui: a base de produção tem 5 linhas em `user`, das
@@ -865,7 +962,11 @@ async def _resolve_working_memory_user(
     "caderno vazio" — que é a verdade — em vez de um erro que o usuário leria
     como desktop quebrado.
     """
-    if user_id:
+    if principal is not None:
+        dono = owner_of(principal, user_id, request=request)
+        if dono is not None:
+            return dono
+    elif user_id:
         try:
             return UUID(user_id)
         except ValueError:
@@ -894,9 +995,11 @@ async def _resolve_working_memory_user(
 
 @router.get("/working-memory/notes")
 async def list_working_notes(
+    http_request: Request,
     user_id: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """Todas as notas do caderno, ativas primeiro e mais recentes no topo.
 
@@ -906,7 +1009,7 @@ async def list_working_notes(
     from db.models.working_note import WorkingNote
     from sqlmodel import select
 
-    user = await _resolve_working_memory_user(db, user_id)
+    user = await _resolve_working_memory_user(db, user_id, principal, http_request)
     if user is None:
         return {"notes": [], "count": 0, "counts": {}, "user_id": None}
 
@@ -950,9 +1053,11 @@ async def list_working_notes(
 
 @router.get("/working-memory/notes/{slug}")
 async def read_working_note(
+    http_request: Request,
     slug: str,
     user_id: str | None = Query(default=None),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """O markdown inteiro de uma nota.
 
@@ -963,7 +1068,7 @@ async def read_working_note(
     from db.models.working_note import WorkingNote
     from sqlmodel import select
 
-    user = await _resolve_working_memory_user(db, user_id)
+    user = await _resolve_working_memory_user(db, user_id, principal, http_request)
     if user is None:
         raise HTTPException(status_code=404, detail=f"Nota '{slug}' não encontrada")
 
@@ -1047,13 +1152,19 @@ def _serialize_job(job: Any, *, full: bool = False) -> dict[str, Any]:
     return payload
 
 
-async def _owned_job_or_404(db: AsyncPostgresClient, job_id: str, user_id: str | None) -> Any:
+async def _owned_job_or_404(
+    db: AsyncPostgresClient,
+    job_id: str,
+    user_id: str | None,
+    principal: Principal | None = None,
+    request: Request | None = None,
+) -> Any:
     try:
         uid = UUID(job_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     job = await db.get_agent_job(uid)
-    owner = await _resolve_working_memory_user(db, user_id)
+    owner = await _resolve_working_memory_user(db, user_id, principal, request)
     # Job sem dono (agenda antiga, teste) é global, como na tool `job_status`.
     if job is None or (owner is not None and job.user_id is not None and job.user_id != owner):
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
@@ -1062,10 +1173,12 @@ async def _owned_job_or_404(db: AsyncPostgresClient, job_id: str, user_id: str |
 
 @router.get("/jobs")
 async def list_jobs(
+    http_request: Request,
     status_filter: str = Query(default="all", alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
     user_id: str | None = Query(default=None),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """Tarefas do dono do caderno, ativas primeiro e mais recentes no topo."""
     from sqlalchemy import case, func, or_
@@ -1073,7 +1186,7 @@ async def list_jobs(
 
     from db.models.agent_job import AgentJob
 
-    owner = await _resolve_working_memory_user(db, user_id)
+    owner = await _resolve_working_memory_user(db, user_id, principal, http_request)
     escopo = [] if owner is None else [or_(AgentJob.user_id == owner, AgentJob.user_id.is_(None))]
     statement = select(AgentJob).where(*escopo)
     if status_filter == "active":
@@ -1100,10 +1213,13 @@ async def list_jobs(
 @router.get("/jobs/{job_id}")
 async def get_job(
     job_id: str,
+    http_request: Request,
     user_id: str | None = Query(default=None),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
-    return _serialize_job(await _owned_job_or_404(db, job_id, user_id), full=True)
+    job = await _owned_job_or_404(db, job_id, user_id, principal, http_request)
+    return _serialize_job(job, full=True)
 
 
 @router.get("/jobs/{job_id}/logs")
@@ -1113,11 +1229,12 @@ async def get_job_logs(
     tail: int = Query(default=16000, ge=500, le=200000),
     user_id: str | None = Query(default=None),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     """O FIM do log — onde quer que ele more (sandbox, diário local ou resumo)."""
     from core.jobs.executor import read_job_logs
 
-    job = await _owned_job_or_404(db, job_id, user_id)
+    job = await _owned_job_or_404(db, job_id, user_id, principal, request)
     sandbox = getattr(request.app.state, "workbench_sandbox", None)
     try:
         lido = await read_job_logs(job, sandbox, max_bytes=tail)
@@ -1138,8 +1255,9 @@ async def cancel_job_route(
     request: Request,
     user_id: str | None = Query(default=None),
     db: AsyncPostgresClient = Depends(get_db),
+    principal: Principal = Depends(require_owner),
 ) -> dict[str, Any]:
     from core.jobs.executor import cancel_job
 
-    job = await _owned_job_or_404(db, job_id, user_id)
+    job = await _owned_job_or_404(db, job_id, user_id, principal, request)
     return await cancel_job(db, getattr(request.app.state, "job_manager", None), job)

@@ -44,19 +44,29 @@ async def list_connected_devices(user_id: str | None = None) -> dict:
     return {"devices": devices}
 
 
-@router.get("/devices/resolve")
+@ws_router.get("/devices/resolve")
 async def resolve_device_by_hardware_id(
-    user_id: str,
     hardware_id: str,
+    token: str,
 ) -> dict:
-    """Resolve the canonical device_id for a user/hardware_id pair."""
+    """Resolve o ``device_id`` canônico deste aparelho, pelo hardware_id.
+
+    O desktop chama isto quando perdeu o arquivo do ``device_id`` local mas a
+    máquina já foi pareada — para reusar o registro em vez de criar um device
+    novo a cada reinstalação.
+
+    **Mudou de lugar em 2026-09-25** (docs/api-auth-plan.md F1). Vivia no router
+    do painel, atrás do panel JWT, que o desktop não tem: ou seja, esta rota
+    **nunca respondeu** para quem a chama, e o `.ok()?` do Rust engolia o 401 em
+    silêncio. Agora a credencial é o token do próprio aparelho, e o ``user_id``
+    sai DELE — antes vinha como query param, então bastava declarar o UUID de
+    alguém para descobrir os aparelhos dessa pessoa.
+    """
     if not _db:
         raise HTTPException(status_code=503, detail="DB unavailable")
 
-    try:
-        uid_uuid = UUID(user_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
+    device = await _device_from_token(token)
+    uid_uuid = device.user_id
 
     normalized_hardware_id = hardware_id.strip().upper()
     if not normalized_hardware_id:

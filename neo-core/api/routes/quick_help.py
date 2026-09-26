@@ -1,4 +1,9 @@
-"""Quick help endpoint - respostas em streaming via LLM para perguntas pontuais."""
+"""Quick help endpoint - respostas em streaming via LLM para perguntas pontuais.
+
+**Autenticação (docs/api-auth-plan.md).** Não devolve dado pessoal, mas GASTA a
+carteira de LLM dele — uma rota aberta que chama modelo pago é um cartão de
+crédito com URL. O router é montado com ``require_owner`` em ``api/main.py``.
+"""
 
 import os
 from typing import AsyncGenerator

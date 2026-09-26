@@ -35,7 +35,8 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, letta, intent_config, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules
+from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules, release
+from api.auth import assert_secret_configured, auth_mode, require_owner, require_principal
 from api.security import require_panel_jwt
 from core import (
     AgentExecutor,
@@ -325,6 +326,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     get_file_store=lambda: getattr(app.state, "file_store", None),
                     max_screenshots=settings.browser_local_max_screenshots,
                     trace_dir=settings.browser_local_trace_dir,
+                    # Mesmo padrão do File Store: o PKS nasce DEPOIS do
+                    # JobManager, então entra por getter tardio. Sem ele o
+                    # `«pks:campo»` não resolve (e não vira valor por acidente).
+                    get_pks_service=lambda: getattr(app.state, "pks_service", None),
                     # O olho do driver. None = modo texto (o comportamento antigo).
                     vision_model=(
                         settings.browser_local_vision_model
@@ -577,6 +582,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Personal Knowledge Store ─────────────────────────────────
     _pks = PKSService(db=_db, llm_router=_llm_router)
+    # Publicado no app.state para quem foi construído ANTES dele (o runner
+    # do navegador local, que resolve `«pks:campo»` com liberação aprovada).
+    app.state.pks_service = _pks
     context.set_pks_service(_pks)
     knowledge_graph.set_pks_service(_pks)
     affect.set_pks_service(_pks)
@@ -824,6 +832,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wire devices route
     devices.set_db(_db)
 
+    # Login de usuário (docs/api-auth-plan.md §5). O portão de autenticação em si
+    # não precisa de wiring: ele resolve o token de aparelho pela mesma função das
+    # rotas de device, e o JWT pelo segredo das settings.
+    auth.set_db(_db)
+    assert_secret_configured()
+    print(f"✅ Auth das rotas: NEO_API_AUTH_MODE={auth_mode()}")
+
+    # Solicitação de Liberação (docs/release-request-plan.md §11): o serviço é
+    # dono do ciclo de vida; o card (notificação + WS) entra injetado, então o
+    # core/release não conhece transporte. A tool `solicitar_dado` NÃO é
+    # registrada no registry global de propósito — ela é inline no cognitivo
+    # (que tem o usuário do turno). Registrar sem executor por-request é a
+    # armadilha do "registrar ≠ ligar" (neo-job-tools-dead-on-server-tool-path).
+    from core.release import ReleaseService
+    from core.release.notify import (
+        build_decision_announcer,
+        build_release_notifier,
+        build_text_announcer,
+    )
+    from core.release.resume import build_resumer
+
+    _release_service = ReleaseService(_db, notifier=build_release_notifier(_db))
+    # O portão consulta liberação aprovada ANTES de barrar (F4). Injetado
+    # aqui para core/authority não importar core/release no topo — aquele
+    # pacote é carregado sempre, este puxa db.models.
+    from core.authority import set_release_service
+
+    set_release_service(_release_service)
+
+    release.set_service(
+        _release_service,
+        announcer=build_decision_announcer(_db),
+        # A retomada roda um turno a partir do clique. O AIService entra por
+        # getter tardio (ele é construído depois deste ponto), e o resultado
+        # volta como bolha na mesma sessão.
+        resumer=build_resumer(
+            get_ai_service=lambda: getattr(app.state, "ai_service", None),
+            announce=build_text_announcer(_db),
+        ),
+    )
+
     # Wire research route (neo-panel → aba Pesquisas)
     research.set_db(_db)
     research.set_job_manager(_job_manager)
@@ -857,6 +906,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     desktop.set_desktop_service(_desktop_service)
     desktop.set_ai_service(_ai_service)
+    # Quem foi construído antes do AIService o alcança por aqui (a retomada
+    # da liberação, que dispara um turno depois do seu clique).
+    app.state.ai_service = _ai_service
     desktop.set_db(_db)
 
     providers = _llm_router.list_available_providers()
@@ -957,29 +1009,42 @@ app = FastAPI(
 )
 
 # CORS middleware
+# CORS: `allow_headers=["*"]` já cobriria, mas os nomes ficam explícitos porque
+# um preflight que não liste `X-Device-Token` barra o pedido ANTES de chegar na
+# rota — e o erro aparece como "falha de rede" no cliente (gotcha §7.6 do plano).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization", "X-Panel-Token", "X-Device-Token", "Content-Type"],
 )
 
 # Register routers
 app.include_router(health.router)
-app.include_router(desktop.router, prefix="/api/v1")
+app.include_router(auth.router)  # login: fora do portão, por definição
+# docs/api-auth-plan.md: `require_owner` no ROUTER, não rota por rota — assim
+# rota nova nasce protegida em vez de nascer aberta e esperar alguém lembrar.
+# Dependência de router SEMPRE roda, então nenhuma rota daqui pede menos.
+app.include_router(desktop.router, prefix="/api/v1", dependencies=[Depends(require_owner)])
 app.include_router(debug.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(session_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
-app.include_router(context.router, prefix="/api/v1")
+app.include_router(context.router, prefix="/api/v1", dependencies=[Depends(require_owner)])
 app.include_router(knowledge_graph.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(affect.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
-app.include_router(quick_help.router, prefix="/api/v1")
+# Gasta LLM da carteira dele: pede dono, não só credencial.
+app.include_router(quick_help.router, prefix="/api/v1", dependencies=[Depends(require_owner)])
 app.include_router(whatsapp.router)
-app.include_router(missions.router, dependencies=[Depends(require_panel_jwt)])
+# Missions NÃO é só tela de administração: o desktop aprova/edita card de
+# missão e dá ack em notificação por estas rotas — e fazia isso com `fetch` sem
+# header nenhum, ou seja, tomando 401 em silêncio desde que o panel JWT entrou
+# aqui. `require_principal` aceita as duas credenciais (painel e aparelho).
+app.include_router(missions.router, dependencies=[Depends(require_principal)])
 app.include_router(research.router, dependencies=[Depends(require_panel_jwt)])
-# File Store: SEM guarda global — upload/download seguem o nível das rotas do
-# desktop (que não têm JWT); a gestão do catálogo pede panel JWT por endpoint.
-# Ver docs/file-store-plan.md §8 e o cabeçalho de api/routes/files.py.
+# File Store: guardas POR ROTA, não no router — o upload pede dono, o download
+# também aceita URL assinada (âncora `<a download>` não manda header nenhum) e a
+# gestão do catálogo segue no panel JWT. Ver docs/file-store-plan.md §8,
+# docs/api-auth-plan.md §7.3 e o cabeçalho de api/routes/files.py.
 app.include_router(files.router)
 # Service Gateway (docs/service-gateway-dsl-plan.md §8): tela de administração
 # (conexões, cofre de credenciais, auditoria) — sempre atrás do panel JWT.
@@ -995,8 +1060,11 @@ app.include_router(datasets.install_router)
 app.include_router(datasets.router)
 app.include_router(events.router)
 app.include_router(schedules.router)
+# Liberações: decisão exige token de APARELHO PAREADO (o painel só lê — o JWT
+# dele não diz quem está olhando). Ver o cabeçalho de api/routes/release.py.
+app.include_router(release.router)
+app.include_router(release.panel_router)
 app.include_router(skills.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 # Spotify OAuth: open (the callback is a browser redirect from Spotify, no JWT);
 # identity is bound via a signed `state`. See api/routes/spotify.py.
 app.include_router(spotify.router, prefix="/api/v1")
-app.include_router(letta.router)

@@ -1,5 +1,6 @@
 """Package exports for DB models."""
 from .user import User
+from .auth_refresh_token import AuthRefreshToken
 from .user_message import UserMessage
 from .conversation import (
     ConversationSession,
@@ -41,6 +42,7 @@ from .dataset import DatasetAudit, DatasetDefinition, SkillInstall
 from .event import EventDelivery, EventSubscription
 from .scheduled_task import ScheduledTask
 from .file_link import FileLink
+from .release_request import ReleaseRequest
 
 __all__ = [
     "User",
@@ -83,4 +85,6 @@ __all__ = [
     "EventSubscription",
     "SkillInstall",
     "FileLink",
+    "ReleaseRequest",
+    "AuthRefreshToken",
 ]

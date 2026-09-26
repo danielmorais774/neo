@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from db.models.whatsapp_contact import WhatsAppContact
 from db.models.user_notification import UserNotification
 from db.models.connected_device import ConnectedDevice
 from db.models.agent_job import AgentJob
+from db.models.auth_refresh_token import AuthRefreshToken
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -963,6 +965,11 @@ class AsyncPostgresClient:
             result = await db.execute(stmt)
             return result.scalars().first()
 
+    async def get_user_by_id(self, user_id: UUID) -> User | None:
+        """Usuário pelo id. Usado pelo ``/auth/me`` e pela renovação de token."""
+        async with self.get_session() as db:
+            return await db.get(User, user_id)
+
     async def list_user_ids(self) -> list[UUID]:
         """IDs de todos os usuários. Usado pelo pareamento: com um único usuário
         (o caso real hoje) o painel não precisa pedir UUID digitado à mão."""
@@ -971,13 +978,148 @@ class AsyncPostgresClient:
             return [row[0] for row in result.all()]
 
     async def ensure_user_exists(self, user_id: UUID) -> None:
-        """Create user record with given ID if it doesn't exist yet."""
+        """Garante a linha do usuário — e, com auth ligada, PARA de criá-la.
+
+        Criar aqui era um caminho de identidade: o ``user_id`` chegava no corpo
+        do pedido, a sessão era aberta e esta função inventava a conta. Um UUID
+        novo virava usuário (provável origem dos usuários de produção que ninguém
+        cadastrou); o UUID do dono virava acesso à memória dele.
+
+        Com ``NEO_API_AUTH_MODE`` em ``enforce``/``strict`` o ``user_id`` vem da
+        credencial, então a linha SEMPRE existe — e uma que não existe é sinal de
+        pedido forjado, não de cadastro novo. Nos degraus ``off``/``shadow`` o
+        comportamento antigo continua, senão a virada de chave derrubaria fluxo
+        em produção. Ver docs/api-auth-plan.md F4.
+        """
         async with self.get_session() as db:
             existing = await db.get(User, user_id)
-            if existing is None:
-                db.add(User(id=user_id))
-                await db.commit()
-                logger.info(f"[DB] Auto-created user {user_id}")
+            if existing is not None:
+                return
+
+            try:
+                from api.auth.principal import MODE_ENFORCE, MODE_STRICT, auth_mode
+
+                fechado = auth_mode() in (MODE_ENFORCE, MODE_STRICT)
+            except Exception:  # noqa: BLE001 - db não deve depender de api
+                fechado = False
+
+            if fechado:
+                logger.warning(
+                    "[DB] recusei criar usuário %s: auth ligada, o user_id tem "
+                    "que vir de credencial existente",
+                    user_id,
+                )
+                raise ValueError(f"usuário {user_id} não existe")
+
+            db.add(User(id=user_id))
+            await db.commit()
+            logger.info(f"[DB] Auto-created user {user_id}")
+
+    async def set_user_password_hash(self, user_id: UUID, password_hash: str) -> None:
+        """Grava o hash da senha. Usado pelo login ao migrar o formato legado."""
+        async with self.get_session() as db:
+            user = await db.get(User, user_id)
+            if user is None:
+                return
+            user.password_hash = password_hash
+            db.add(user)
+            await db.commit()
+
+    # ---------------------------------------------------------------
+    # Refresh tokens do login (docs/api-auth-plan.md §5)
+    # ---------------------------------------------------------------
+
+    async def create_refresh_token(
+        self,
+        *,
+        user_id: UUID,
+        token_hash: str,
+        expires_at: datetime,
+        origem: str = "",
+    ) -> AuthRefreshToken:
+        """Guarda o HASH de um refresh novo. O token cru nunca chega aqui."""
+        row = AuthRefreshToken(
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            origem=(origem or "")[:128],
+        )
+        async with self.get_session() as db:
+            db.add(row)
+            await db.commit()
+            await db.refresh(row)
+            return row
+
+    async def get_refresh_token(self, token_hash: str) -> AuthRefreshToken | None:
+        if not token_hash:
+            return None
+        async with self.get_session() as db:
+            stmt = select(AuthRefreshToken).where(AuthRefreshToken.token_hash == token_hash)
+            return (await db.execute(stmt)).scalars().first()
+
+    async def rotate_refresh_token(
+        self,
+        *,
+        antigo_hash: str,
+        novo_hash: str,
+        expires_at: datetime,
+        origem: str = "",
+    ) -> AuthRefreshToken | None:
+        """Consome um refresh e emite outro, na MESMA transação.
+
+        Rotação num passo atômico: sem isso, duas abas do painel renovando ao
+        mesmo tempo consomem o mesmo token e uma cai para a tela de login.
+        """
+        agora = datetime.utcnow()
+        async with self.get_session() as db:
+            stmt = select(AuthRefreshToken).where(AuthRefreshToken.token_hash == antigo_hash)
+            antigo = (await db.execute(stmt)).scalars().first()
+            if antigo is None or antigo.revoked_at is not None or antigo.expires_at < agora:
+                return None
+
+            novo = AuthRefreshToken(
+                user_id=antigo.user_id,
+                token_hash=novo_hash,
+                expires_at=expires_at,
+                origem=(origem or antigo.origem or "")[:128],
+            )
+            db.add(novo)
+            await db.flush()
+
+            antigo.revoked_at = agora
+            antigo.last_used_at = agora
+            antigo.rotated_to = novo.id
+            db.add(antigo)
+
+            await db.commit()
+            await db.refresh(novo)
+            return novo
+
+    async def revoke_refresh_token(self, token_hash: str) -> bool:
+        async with self.get_session() as db:
+            stmt = select(AuthRefreshToken).where(AuthRefreshToken.token_hash == token_hash)
+            row = (await db.execute(stmt)).scalars().first()
+            if row is None or row.revoked_at is not None:
+                return False
+            row.revoked_at = datetime.utcnow()
+            db.add(row)
+            await db.commit()
+            return True
+
+    async def revoke_all_refresh_tokens(self, user_id: UUID) -> int:
+        """Sair de todos os aparelhos."""
+        async with self.get_session() as db:
+            stmt = (
+                update(AuthRefreshToken)
+                .where(
+                    AuthRefreshToken.user_id == user_id,
+                    AuthRefreshToken.revoked_at.is_(None),
+                )
+                .values(revoked_at=datetime.utcnow())
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return int(result.rowcount or 0)
 
     # ---------------------------------------------------------------
     # User Preferences CRUD

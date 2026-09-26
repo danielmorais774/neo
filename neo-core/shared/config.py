@@ -965,6 +965,26 @@ class Settings(BaseSettings):
         "aí e me manda a saída' (sessão 69feab87). Off → o cérebro volta a só sugerir.",
     )
 
+    # ── Liberação de informação (docs/release-request-plan.md) ─────────
+    neo_pks_redaction_enabled: bool = Field(
+        default=True,
+        description="Campo de identificação do PKS (cpf, endereço, cep, telefone, "
+        "e-mail, cartão, saldo, senha) sai do prompt e do resultado do search_pks, "
+        "trocado por um endereço `«pks:<campo>»`. O valor volta sob demanda pela tool "
+        "`pks_reveal` — que num turno contaminado passa pelo portão. Off → o valor "
+        "viaja inteiro em todo turno que recuperar a entidade, como era antes.",
+    )
+    neo_release_gate_mode: str = Field(
+        default="shadow",
+        description="Portão de autoridade do turno (core/authority). Três degraus: "
+        "'shadow' (padrão) não barra nada e só registra '[authority][sombra]'; "
+        "'revelacao' barra o que ENTREGA a terceiro (email_send, whatsapp, gateway, "
+        "web_fetch) mais os 'negar' explícitos, e deixa ATUAÇÃO (terminal, sandbox, "
+        "casa, memória) em sombra — porque revelação tem caminho de recuperação "
+        "(solicitar_dado → card → sua aprovação) e atuação ainda não tem; "
+        "'enforce' vale para tudo.",
+    )
+
     # ── Controle de devices (docs/device-control-plan.md) ──────────────
     neo_device_control_enabled: bool = Field(
         default=True,
@@ -992,14 +1012,57 @@ class Settings(BaseSettings):
         "quebrar. Ligue depois que todo device estiver pareado.",
     )
 
-    # Panel auth (temporary without login flow)
+    # ── Auth da API (docs/api-auth-plan.md) ──────────────────────
+    # O segredo assina TODOS os JWT (o legado do painel e o do login de
+    # usuário). O default embutido é o de desenvolvimento: ele está no repo, e
+    # quem lê o repo emite token de admin. Em produção vem do .env da RAIZ.
     panel_jwt_secret: str = Field(
         default="l5L0mJ30C7v10OTI4eEOvxShOGwhGkPSEst7eicOiFGq8qG6TgL9u4CQUr6mByjV",
-        description="Shared secret used to validate neo-panel JWT tokens (HS256)",
+        description="Segredo HS256 dos JWT (painel legado e login de usuário). "
+        "TROQUE em produção: o default está no código-fonte.",
     )
     panel_jwt_subject: str = Field(
         default="neo-panel",
-        description="Expected JWT subject for neo-panel bearer tokens",
+        description="Subject do JWT ESTÁTICO do painel (legado). Não identifica "
+        "usuário — por isso não aprova liberação (release-request-plan §11).",
+    )
+    neo_api_auth_mode: str = Field(
+        default="shadow",
+        description="Portão de autenticação das rotas HTTP (api/auth/principal.py). "
+        "`off` = como antes de existir auth (rollback de incidente). "
+        "`shadow` (padrão) = resolve o principal, LOGA e deixa passar — mede quem "
+        "chama o quê sem derrubar cliente nenhum. `enforce` = 401 sem credencial "
+        "(o JWT estático do painel ainda vale nas telas de administração). "
+        "`strict` = só token de aparelho pareado e login de usuário; o JWT "
+        "estático é recusado. Suba os degraus nesta ordem: os clientes precisam "
+        "carregar a credencial ANTES do enforce.",
+    )
+    neo_api_auth_secret_required: bool = Field(
+        default=False,
+        description="Recusa subir com `panel_jwt_secret` no default embutido. "
+        "Default OFF para não travar dev/teste; ligue junto com o enforce.",
+    )
+    access_token_ttl_s: int = Field(
+        default=1800, ge=60,
+        description="Validade do access token do login de usuário (segundos).",
+    )
+    refresh_token_ttl_s: int = Field(
+        default=60 * 60 * 24 * 30, ge=3600,
+        description="Validade do refresh token (opaco, no banco, revogável).",
+    )
+    login_max_attempts: int = Field(
+        default=8, ge=1,
+        description="Tentativas de login por (usuário+IP) dentro da janela antes "
+        "de recusar. Contador em memória, como o TTL do código de pareamento.",
+    )
+    login_attempt_window_s: int = Field(
+        default=300, ge=30,
+        description="Janela do contador de tentativas de login (segundos).",
+    )
+    signed_url_ttl_s: int = Field(
+        default=300, ge=30,
+        description="Validade da URL assinada de download (`/files/{id}/download`). "
+        "Existe porque `<a href download>` não manda header nenhum.",
     )
 
     # ── Context Compaction ────────────────────────────────────────

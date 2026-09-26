@@ -187,8 +187,8 @@ _connected_devices = ConnectedDevicesRegistry()
 _devices_ws_registry = DevicesWSRegistry()
 
 
-async def _grpc_device_authorized(context, device_id: str | None) -> bool:
-    """Autoriza uma chamada gRPC pelo token do device (F5).
+async def _grpc_device_owner(context, device_id: str | None):
+    """Autoriza uma chamada gRPC pelo token do device e DEVOLVE o dono.
 
     O token viaja na **metadata da chamada** (`x-device-token`), nunca no corpo
     da mensagem: o `metadata` do `user_input` alimenta o contexto do prompt
@@ -196,6 +196,15 @@ async def _grpc_device_authorized(context, device_id: str | None) -> bool:
 
     Mesma assimetria dos canais WS: token errado recusa sempre; token ausente só
     recusa com ``neo_device_auth_required`` ligada.
+
+    **Por que devolve o dono** (docs/api-auth-plan.md §1.4). Antes isto era um
+    ``bool``, e o ``user_id`` do turno continuava saindo de ``desktop_msg.user_id``
+    — do CORPO. Ou seja: um token válido do aparelho A podia declarar-se dono de
+    qualquer usuário. Autenticava sem amarrar. Devolvendo o ``user_id`` do
+    pareamento, a amarração acontece no único lugar que sabe a verdade.
+
+    Devolve ``(autorizado, user_id_do_token)``; ``user_id`` é ``None`` quando não
+    havia token (degraus antigos, sem ``neo_device_auth_required``).
     """
     from shared.config import get_settings
 
@@ -211,22 +220,22 @@ async def _grpc_device_authorized(context, device_id: str | None) -> bool:
         if required:
             logger.warning("[auth] gRPC recusado: %s sem token", device_id)
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "device não pareado")
-            return False
-        return True
+            return False, None
+        return True, None
 
     from api.routes import devices as devices_routes
     from modules.devices.pairing import hash_device_token
 
     db = devices_routes._db
     if db is None:
-        return not required
+        return (not required), None
 
     device = await db.get_device_by_token_hash(hash_device_token(token))
     if device is None or (device_id and device.device_id != device_id):
         logger.warning("[auth] gRPC recusado: token inválido para %s", device_id)
         await context.abort(grpc.StatusCode.UNAUTHENTICATED, "token de device inválido")
-        return False
-    return True
+        return False, None
+    return True, device.user_id
 
 
 class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
@@ -262,10 +271,37 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         liveness = TurnLiveness()
         bind_liveness(liveness)
 
+        # Dono resolvido pelo TOKEN deste stream (não pelo corpo das mensagens).
+        # Resolvido uma vez, na primeira mensagem, e reusado: a metadata da
+        # chamada é a mesma durante todo o stream.
+        token_user_id: UUID | None = None
+        autorizado_no_stream = False
+
         try:
             async for desktop_msg in request_iterator:
                 session_id = desktop_msg.session_id
                 sid_uuid = UUID(session_id) if session_id else None
+
+                # ── Auth do stream (docs/api-auth-plan.md §1.4) ───────────
+                # Antes esta checagem vivia DENTRO do registro de device, que só
+                # roda no primeiro `user_input` e só quando dá para descobrir um
+                # `device_id`. Sem `device_id` na metadata e sem `session_id`, o
+                # stream inteiro passava sem token mesmo com
+                # NEO_DEVICE_AUTH_REQUIRED=true. Agora é a primeira coisa que
+                # acontece no stream, para todo tipo de mensagem.
+                if not autorizado_no_stream:
+                    device_id_declarado = device_id
+                    if device_id_declarado is None and desktop_msg.HasField("user_input"):
+                        meta_inicial = (
+                            dict(desktop_msg.user_input.metadata)
+                            if desktop_msg.user_input.metadata
+                            else {}
+                        )
+                        device_id_declarado = meta_inicial.get("device_id") or None
+                    ok, token_user_id = await _grpc_device_owner(context, device_id_declarado)
+                    if not ok:
+                        return
+                    autorizado_no_stream = True
 
                 # Extract user_id from DesktopMessage (optional)
                 uid_uuid: UUID | None = None
@@ -274,6 +310,19 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         uid_uuid = UUID(desktop_msg.user_id)
                     except ValueError:
                         logger.warning(f"[gRPC] Invalid user_id: {desktop_msg.user_id}")
+
+                # O TOKEN manda. O `user_id` do corpo fica como diagnóstico: um
+                # cliente que declara outro dono é cliente desatualizado (ou
+                # pedido forjado), e nos dois casos a verdade é o pareamento.
+                if token_user_id is not None:
+                    if uid_uuid is not None and uid_uuid != token_user_id:
+                        logger.warning(
+                            "[auth] gRPC: user_id declarado (%s) ≠ dono do token (%s) — "
+                            "usando o do token",
+                            uid_uuid, token_user_id,
+                        )
+                    uid_uuid = token_user_id
+
                 if uid_uuid:
                     stream_user_id = uid_uuid  # continuations (tool_result/approval) reuse it
 
@@ -295,14 +344,18 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                             "os_version": metadata.get("os_release", "unknown"),
                             "client_version": metadata.get("client_version", "unknown"),
                             "ip_address": metadata.get("ip_address", ""),
-                            "user_id": desktop_msg.user_id or "",
+                            # O dono do registro é o do TOKEN quando existe —
+                            # o corpo só serve enquanto não há auth ligada.
+                            "user_id": str(uid_uuid) if uid_uuid else (desktop_msg.user_id or ""),
                         }
                         if device_id:
-                            # F5: valida o token do device antes de registrar.
-                            # Aqui é onde o desktop se declara dono de um
-                            # device_id — sem a checagem, "sou de quem eu quiser"
-                            # continuaria valendo.
-                            if not await _grpc_device_authorized(context, device_id):
+                            # A validação do token já aconteceu no topo do stream
+                            # (uma vez, para toda mensagem). Aqui só confirmamos
+                            # que o device_id que ele declara agora é o mesmo que
+                            # o token autoriza — senão o registro mentiria sobre
+                            # qual máquina está online.
+                            ok, _dono = await _grpc_device_owner(context, device_id)
+                            if not ok:
                                 return
                             _connected_devices.register(device_id, device_info)
                             # Sync to DB (async, non-blocking)
@@ -843,8 +896,19 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         except ValueError:
             uid_uuid = None
 
-        if not await _grpc_device_authorized(context, device_id):
+        autorizado, token_user_id = await _grpc_device_owner(context, device_id)
+        if not autorizado:
             return neo_desktop_pb2.RegisterDeviceResponse(ok=False)
+        # Quem registra o aparelho é o dono do token, não quem o pedido diz ser:
+        # este é o caminho por onde um device entrava na conta de outro usuário.
+        if token_user_id is not None:
+            if uid_uuid is not None and uid_uuid != token_user_id:
+                logger.warning(
+                    "[auth] RegisterDevice: user_id declarado (%s) ≠ dono do token (%s)",
+                    uid_uuid, token_user_id,
+                )
+            uid_uuid = token_user_id
+            user_id_str = str(token_user_id)
 
         device_info = {
             "device_id": device_id,

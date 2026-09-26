@@ -1,10 +1,18 @@
-"""Context routes — endpoint de busca de contexto no PKS."""
+"""Context routes — endpoint de busca de contexto no PKS.
+
+**Autenticação (docs/api-auth-plan.md).** Estas duas rotas despejam o bloco do
+PKS e o prompt montado — ou seja, dado pessoal cru. O router é montado com
+``require_owner`` em ``api/main.py``, e o ``user_id`` do CORPO é advisório: quem
+manda é o dono da credencial (``owner_of``). Antes, mandar o UUID de alguém no
+corpo entregava a memória dessa pessoa a quem alcançasse a porta.
+"""
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from api.auth import Principal, owner_of, require_owner
 from core.pks import PKSService
 
 router = APIRouter(prefix="/context", tags=["context"])
@@ -106,11 +114,13 @@ def get_pks_service() -> PKSService:
 @router.post("/retrieve", response_model=ContextRetrieveResponse)
 async def retrieve_context(
     body: ContextRetrieveRequest,
+    request: Request,
     pks: PKSService = Depends(get_pks_service),
+    principal: Principal = Depends(require_owner),
 ):
     """Busca contexto relevante no PKS do usuário."""
     result, context_text = await pks.retrieve_context(
-        user_id=body.user_id,
+        user_id=owner_of(principal, body.user_id, request=request) or body.user_id,
         user_message=body.user_input,
         keywords=None,
     )
@@ -124,7 +134,11 @@ async def retrieve_context(
 
 
 @router.post("/prompt-preview", response_model=PromptPreviewResponse)
-async def prompt_preview(body: PromptPreviewRequest):
+async def prompt_preview(
+    body: PromptPreviewRequest,
+    request: Request,
+    principal: Principal = Depends(require_owner),
+):
     """Reproduz a montagem do prompt do turno real, sem escrever nem chamar o LLM.
 
     Roda o MESMO pré-processamento de ``_handle_direct_response`` — classificação
@@ -142,7 +156,7 @@ async def prompt_preview(body: PromptPreviewRequest):
         )
 
     result = await _ai_service.preview_prompt(
-        user_id=body.user_id,
+        user_id=owner_of(principal, body.user_id, request=request) or body.user_id,
         user_message=body.user_input,
         metadata=body.metadata or None,
     )

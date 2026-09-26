@@ -98,7 +98,9 @@ def _bad_request(exc: Exception) -> HTTPException:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/tipos")
+# A docstring do módulo já dizia "Auth: painel JWT" — esta rota tinha ficado sem.
+# Achado pela varredura de tests/auth/test_route_coverage.py.
+@router.get("/tipos", dependencies=[Depends(require_panel_jwt)])
 async def field_types() -> dict[str, Any]:
     """Mapa fechado de tipos — a fonte que o painel usa para escolher widget."""
     return {
