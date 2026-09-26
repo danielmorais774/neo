@@ -195,6 +195,19 @@ def _resolve_store(getter: Callable[[], Any] | None) -> Any:
         return None
 
 
+def _build_filler(db: Any, pks_service: Any) -> Any:
+    """ReleaseFiller do job, ou ``None`` quando não há memória para resolver."""
+    if pks_service is None:
+        return None
+    try:
+        from core.release import ReleaseFiller, ReleaseService
+
+        return ReleaseFiller(ReleaseService(db), pks_service)
+    except Exception:  # noqa: BLE001 — sem filler o placeholder só não resolve
+        logger.exception("[browser_local] não consegui montar o preenchimento escopado")
+        return None
+
+
 def build_browser_local_runner(
     *,
     db: Any,
@@ -208,6 +221,7 @@ def build_browser_local_runner(
     max_screenshots: int = 3,
     vision_model: str | None = None,
     trace_dir: str = "",
+    get_pks_service: Callable[[], Any] | None = None,
 ) -> Callable[[AgentJob], Awaitable[dict]]:
     """Fecha as dependências e devolve ``run_browser_local_job(job) -> dict``."""
 
@@ -390,6 +404,11 @@ def build_browser_local_runner(
             # Sem janela, salvo quando o usuário quis VER (ver `_gate_browser`).
             headless=headless,
             on_download=on_download,
+            # Preenchimento escopado (F3b): o driver substitui `«pks:campo»`
+            # só com liberação aprovada para o domínio da aba. O dono do dado
+            # vem do JOB, nunca do texto do modelo.
+            filler=_build_filler(db, get_pks_service() if get_pks_service else None),
+            user_id=job.user_id,
         )
 
         try:

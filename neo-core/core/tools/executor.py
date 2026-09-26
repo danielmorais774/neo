@@ -3,6 +3,7 @@
 import asyncio
 from typing import Any, Callable, Protocol
 
+from core.authority import gate_tool_call, note_tool_result
 from core.tools.registry import ToolRegistry
 from core.tools.validator import ToolValidator
 from shared import ToolCall, ToolExecutionError, ToolResult, get_settings
@@ -76,6 +77,19 @@ class ToolExecutor:
                 tool, tool_call.arguments
             )
 
+            # Portão de autoridade (docs/release-request-plan.md §5.2). Este é um
+            # dos DOIS trilhos que executam tool; o outro é o
+            # `CognitiveReadExecutor`. A decisão mora numa função só — duas
+            # divergiriam no primeiro nome novo, em silêncio (foi o que já
+            # aconteceu com as job tools). Em `shadow` (padrão) nada é barrado:
+            # só sai a linha `[authority][sombra]` que alimenta o relatório.
+            decisao = await gate_tool_call(tool_call.name, validated_args, tool_call.id)
+            if decisao.blocked:
+                raise ToolExecutionError(
+                    decisao.mensagem(),
+                    details={"tool": tool_call.name, "efeito": decisao.efeito},
+                )
+
             # Executa baseado no tipo
             if tool.execution == "server-side":
                 result = await self._execute_server_side(
@@ -86,6 +100,10 @@ class ToolExecutor:
                 result = await self._execute_client_side(
                     tool.module, tool_call.name, validated_args, tool_call.id
                 )
+
+            # Procedência + contaminação: o que este resultado trouxe para o
+            # turno (URLs vistas, texto de terceiro). Nunca levanta.
+            note_tool_result(tool_call.name, result)
 
             execution_time = asyncio.get_event_loop().time() - start_time
 

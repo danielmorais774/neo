@@ -170,12 +170,137 @@ não há risco de `TypeError` no caminho que cai no provider default.
 
 ---
 
-## 6. Testes
+## 6. ✅ FECHADO (2026-09-24) — amnésia do ciclo e anti-loop que matava o turno
+
+Medido na `session-389114d4`, interação 29 (input "tem o mais recente do INSS que foi
+um rombo ainda maior"): **4 rodadas de LLM, 30,1 s, zero tool, 4 bolhas quase
+idênticas** e, no lugar da resposta, `"Parei aqui: o próximo passo seria repetir um
+que já rodou neste turno"`. Aconteceu 2× nessa sessão. Três defeitos somados.
+
+### 6.1 O ciclo não lembrava do que ele mesmo disse
+
+`history` vinha de um `get_history` único, feito no começo do request, e era
+repassado **idêntico** a todos os passos (o snapshot nunca era refeito, mesmo com a
+resposta do passo já no banco). O payload do passo 2:
+
+```
+[49] assistant  "Achei o fio…"                     ← turno ANTERIOR
+[50] user       "tem o mais recente do INSS…"
+[51] user       "levantar o histórico completo…"   ← a ordem sintetizada
+                 ↑ a resposta do passo 1 não existe
+```
+
+Duas `user` seguidas leem como pedido novo: as quatro respostas abriram com a mesma
+frase ("Você tem razão — e esse é o caso mais grave que eu deixei de fora").
+
+A nota de trabalho não cobre isso **de propósito** — ela é montada só do `tool_trace`
+(senão uma promessa volta como resultado) e passo sem tool vira "nenhuma ação
+executada", que é verdade e ainda assim não conta o que ele JÁ DISSE.
+
+**Fix:** `cycle_history` em `_run_pipeline` — cópia própria que CRESCE, com a ordem e
+a fala de cada passo apendadas quando uma continuação vai ler. Teto por resposta
+(`_CYCLE_REPLY_CHARS = 1200`) e **sem janela deslizante**: manter só as últimas N
+recria o bug de 2026-09-18 (janela do prompt menor que o teto de rodadas). Append no
+fim também preserva o cache de prefixo.
+
+⚠️ `history` alimenta também PKS, memória de conversa e `_find_memory_artifact`. Os
+dois primeiros ficam mais corretos; o terceiro pode eleger uma resposta
+INTERMEDIÁRIA do ciclo como "o artefato" — é o ponto a olhar se aparecer estranheza.
+
+### 6.2 A chave do anti-loop era igualdade de string, o gerador é um LLM
+
+As quatro ordens sintetizadas, verbatim:
+
+```
+1. …com status processual para fechar a camada 5
+2. …com status processual real e fonte                      (0,80 de cobertura sobre a 1)
+3. …real, o que foi provado, o que foi anulado…, e a fonte   (0,53 sobre a 1)
+4. idêntica à 3                                              ← só AQUI a guarda acordava
+```
+
+**Fix:** `order_is_near_repeat` / `content_tokens` / `ORDER_COVERAGE=0.7` em
+`core/pipeline/types.py` — conjunto de palavras de conteúdo, cobertura do texto NOVO
+pelo antigo (alvo inédito passa). Espelha o `_near_repeated_actuation` do loop de
+shell, calibrado no mesmo tipo de falha.
+
+⚠️ **Vale só dentro do ciclo.** Cascata do classificador tem passos parecidos de
+propósito ("buscar os links" / "baixar os links"); aplicar cobertura ali
+transformaria cascata em correção. Fora do ciclo segue valendo só a igualdade
+literal, com o comportamento antigo (descarta e segue a fila).
+
+⚠️ A ordem 3 fica em **0,53/0,67 — abaixo do corte, e isso é proposital**: baixar o
+limiar compraria falso positivo em ordem que só compartilha assunto, e falso positivo
+aqui não custa uma chamada barata, custa recusar um passo que ia trabalhar. Quem
+fecha esse caso é a §6.3.
+
+### 6.3 Guarda nova: passo que só fala não é progresso
+
+`outcome.ok` era `True` porque "respondeu", então a fila andava. `StepOutcome.acted`
+(tool rodada ou arquivo entregue — nunca texto) + `MAX_IDLE_CYCLE_STEPS=2`: dois
+passos de ciclo seguidos sem executar nada **e o ciclo pedindo outra volta** fecham o
+turno. Só intervém se a cadeia ia continuar — passo sem handoff já fechou sozinho com
+`is_final`, e aí não há nada a corrigir.
+
+### 6.4 Guarda não mata mais o turno: ela manda pensar de novo
+
+`PipelineStep.self_correction(kind=)`, enfileirado à frente da fila por repetição,
+orçamento, profundidade ou falha:
+
+- **`retry`** (1ª volta, `MAX_CYCLE_NUDGES=1`) — irmão do empurrão do loop de shell:
+  não despacha, devolve ao cérebro dizendo ONDE a resposta já está, com uma lista
+  FECHADA — (a) responda agora, (b) chame a tool que traz a peça que falta, (c)
+  pergunte em uma linha e pare — e o aviso de que reescrever o plano não conta como
+  nenhuma das três. A versão sem a lista recebia "vou levantar o histórico…" outra vez.
+- **`close`** (2ª volta, ou orçamento/profundidade/falha) — passo final que escreve a
+  resposta com o que existe. Roda com **`enable_handoff=False`**: sem handoff não há
+  verificador de promessa (que leria o próprio fecho como promessa e abriria outro
+  ciclo) e a resposta é `is_final` por `handoff_defers_final`. **É ela que fecha o
+  turno** — fala do Neo, não string do sistema.
+
+Detalhes que são carga, não estilo:
+
+- `depth` do fechamento é o do **pai**, não `+1`: com `+1` a guarda de profundidade
+  mataria justamente o passo que existe para o turno não morrer.
+- Fechamento é isento do orçamento e roda **uma vez** por turno (`closed_once`).
+- A fila **ignora handoff vindo de um `close`**: em produção ele nem emite, mas a
+  fila não pode depender disso — senão o fecho daria outra volta na guarda e o turno
+  ganharia um segundo aviso pelo mesmo motivo.
+- O rótulo da bolha de progresso deixa de ser "Continuando (5/8): <ordem repetida>",
+  que era a bolha mentindo: vira "Repensando o próximo passo" / "Fechando com o que
+  já tenho".
+- `_CYCLE_CLOSING_MESSAGE` virou **último recurso** (o passo de fechamento não
+  respondeu nada, ex.: erro de provider), com entradas novas para `near_repeat` e
+  `idle_cycle`.
+
+### 6.5 Replay da sequência real
+
+As 4 ordens da interação 29, sem tool nenhuma, contra o código novo:
+
+```
+1. [normal] tem o mais recente do INSS…          2. [normal] levantar o histórico…
+3. [retry ] levantar o histórico…                4. [close ] fechar o turno com o que já foi levantado
+avisos: near_repeat, idle_cycle
+```
+
+Mesma contagem de passos (4), com três diferenças que importam: o laço é detectado no
+**3º** passo e não no 5º, o 3º passo recebe a ordem de agir ou responder (chance de
+se corrigir), e o 4º é **resposta de verdade** em vez de string de erro.
+
+## 7. Testes
 
 `tests/pipeline/test_self_continuation.py` (parser, policy, orçamento, anti-loop,
 profundidade, notas de trabalho, gate de promessa, e o contrato com o desktop:
 marcador por passo, `persist_reply` nas intermediárias, terminador na cadeia cortada).
 `tests/pipeline/test_cycle_stream_marker.py` (marcador não vaza no NDJSON).
+`tests/pipeline/test_order_near_repeat.py` (as 4 ordens REAIS + fronteira 0,53/0,67 +
+falso positivo de palavra de função).
+`tests/pipeline/test_cycle_history_and_correction.py` (fala do passo entra no
+histórico do seguinte, truncada e sem janela; ciclo ocioso fecha falando; empurrão
+carrega a instrução; ciclo que trabalha não é interrompido; cascata intocada).
+
+⚠️ Os dois harnesses (`_drive` e `_install_handler`) **precisam honrar
+`enable_handoff`** — é por ele que o fechamento fecha. Harness que ignora o parâmetro
+devolve o fecho como não-final e reproduz o bug em vez do conserto.
 
 **Rollback:** `pipeline_self_handoff_enabled=false` — o bloco continua sendo removido do
 texto (nunca vaza) e o turno volta a terminar como antes.

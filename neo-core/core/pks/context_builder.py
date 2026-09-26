@@ -6,6 +6,7 @@ from datetime import date, datetime
 
 from core.pks.ontology import normalize_token
 from core.pks.schemas import Neighborhood, RetrievalResult
+from core.pks.sensitivity import SECRET, effective_level, redact_value, redaction_enabled
 
 
 class ContextBuilder:
@@ -26,7 +27,20 @@ class ContextBuilder:
                 and (field.sensitivity != "sensitive" or self._direct_match(entity.name, direct_terms))
             ]
             for field in visible_fields:
+                # F2 (docs/release-request-plan.md §7): campo de identificação
+                # não viaja no prompt — vai o ENDEREÇO dele. Credencial some de
+                # vez (o lugar dela é o cofre, não a memória). O valor volta sob
+                # demanda por `pks_reveal`, que num turno contaminado passa pelo
+                # portão. Classificar na LEITURA cobre as linhas que já estão no
+                # banco, todas gravadas como `private`.
+                nivel = effective_level(field.key, field.sensitivity)
+                if redaction_enabled() and nivel == SECRET:
+                    continue
                 value = self._format_field_value(field.key, field.value)
+                value, redigido = redact_value(field.key, value, field.sensitivity)
+                if redigido:
+                    lines.append(f"- {field.key}: {value}")
+                    continue
                 suffix = f" {field.unit}" if field.unit else ""
                 lines.append(f"- {field.key}: {value}{suffix}")
 

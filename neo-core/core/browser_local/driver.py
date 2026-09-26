@@ -472,6 +472,14 @@ Ações e argumentos:
 - dblclick  {"ref": 12}                   duplo clique — é assim que se ABRE item de lista
 - right_click {"ref": 12}                 botão direito — abre o menu do item
 - fill      {"ref": 7, "value": "texto"}  escreve num campo
+                                          Dado pessoal do Daniel NÃO se digita
+                                          de cabeça: se o valor aparece como
+                                          `«pks:cep»` na memória, escreva o
+                                          PRÓPRIO `«pks:cep»` como value — eu
+                                          troco pelo valor real, e só se ele
+                                          tiver liberado esse campo para ESTE
+                                          site. Sem liberação o passo falha e
+                                          diz o que fazer (solicitar_dado).
 - select    {"ref": 4, "option": "São Paulo"}
 - press     {"key": "Enter"}              Enter|Tab|Escape|Backspace|ArrowDown|
                                           ArrowUp|PageDown|PageUp|Home|End
@@ -674,8 +682,18 @@ class BrowserLocalDriver:
         follow_download: bool | None = None,
         on_download: Callable[[list[dict]], Awaitable[None]] | None = None,
         headless: bool = False,
+        filler: Any = None,
+        user_id: Any = None,
     ) -> None:
         self._act = act
+        # Preenchimento escopado (docs/release-request-plan.md §7.2 / F3b): o
+        # modelo escreve `«pks:campo»` num `fill` e QUEM substitui é o driver,
+        # só se houver liberação aprovada para este domínio. Sem filler, o
+        # placeholder não vira valor — ele vai literal e a página não recebe nada.
+        self._filler = filler
+        self._release_user_id = user_id
+        #: URL da última percepção — é o escopo de domínio da substituição.
+        self._last_seen_url = ""
         # Headless: mesma máquina, mesmo IP residencial, SEM janela.
         #
         # É o degrau que resolve bloqueio por origem sem o custo de tomar a tela
@@ -2572,6 +2590,31 @@ class BrowserLocalDriver:
         )
         return await self._perform(action, {**args, "ref": novo})
 
+    async def _resolver_placeholder(self, args: dict) -> dict:
+        """Troca ``«pks:campo»`` pelo valor, se houver liberação para esta aba.
+
+        Recusa é ERRO, não silêncio: preencher metade de um formulário e seguir
+        seria pior que parar — o agente precisa saber que o campo ficou vazio e
+        por quê (a mensagem já vem pronta para virar `solicitar_dado`).
+        """
+        valor = str(args.get("value") or "")
+        if not valor or "pks:" not in valor.lower():
+            return args
+        if self._filler is None or self._release_user_id is None:
+            raise RuntimeError(
+                "não consigo resolver «pks:…» neste job — peça o dado com "
+                "solicitar_dado e espere a aprovação"
+            )
+        out = await self._filler.resolve(
+            user_id=self._release_user_id, texto=valor, url=self._last_seen_url
+        )
+        if not out.ok:
+            # A razão vai para o histórico do passo, que é o que o modelo lê na
+            # próxima decisão.
+            raise RuntimeError("; ".join(out.motivos[:2]) or "dado não liberado")
+        self._log("note", "dado liberado", f"{', '.join(out.substituidos)} → {self._host_of(self._last_seen_url)}")
+        return {**args, "value": out.texto}
+
     async def _perform(self, action: str, args: dict, snapshot: dict | None = None) -> str:
         """Executa e devolve o detalhe para o histórico. Erro sobe como exceção."""
         if action == "note":
@@ -2599,6 +2642,9 @@ class BrowserLocalDriver:
 
         if action == "downloads":
             return await self._conferir_downloads(args)
+
+        if action == "fill":
+            args = await self._resolver_placeholder(args)
 
         result = await self._call(f"browser.{action}", args)
         if action == "navigate":

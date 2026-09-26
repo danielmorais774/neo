@@ -108,7 +108,12 @@ async def test_cycle_runs_until_the_model_stops_asking():
         yield f"r{n}", None
         if n < 4:
             yield None, StepOutcome(
-                ok=True, handoffs=[_self(f"tentativa {n + 1}")], work_note=f"passo {n}: falhou"
+                ok=True, handoffs=[_self(f"tentativa {n + 1}")],
+                work_note=f"passo {n}: falhou",
+                # Tentativa que EXECUTOU e falhou é progresso — o ciclo existe para
+                # isso. Sem `acted`, três rodadas de puro texto são cortadas pela
+                # guarda de passo ocioso, que é outro teste.
+                acted=True,
             )
         else:
             yield None, StepOutcome(ok=True, final_text="pronto")
@@ -147,7 +152,12 @@ async def test_continuation_receives_the_accumulated_work_notes():
 
 @pytest.mark.asyncio
 async def test_cycle_gets_the_larger_budget_not_the_skill_one():
-    """A retry cycle burns steps fast; MAX_STEPS=4 would cut it at 3 attempts."""
+    """A retry cycle burns steps fast; MAX_STEPS=4 would cut it at 3 attempts.
+
+    ``acted=True`` em cada passo não é detalhe: desde a guarda de passo ocioso, um
+    ciclo que só produz texto é cortado em ``MAX_IDLE_CYCLE_STEPS`` (é o defeito da
+    session-389114d4). O orçamento grande existe para o ciclo que EXECUTA.
+    """
     runs = 0
 
     async def runner(step):
@@ -155,23 +165,36 @@ async def test_cycle_gets_the_larger_budget_not_the_skill_one():
         runs += 1
         n = runs
         yield f"r{n}", None
-        yield None, StepOutcome(ok=True, handoffs=[_self(f"tentativa {n + 1}")])
+        yield None, StepOutcome(
+            ok=True, handoffs=[_self(f"tentativa {n + 1}")], acted=True
+        )
 
     orch = PipelineOrchestrator(runner, self_max_steps=8, self_max_depth=7)
     out = [r async for r in orch.run([_step(text="raiz")])]
 
-    assert len(out) == 8
+    # 8 passos de trabalho + o passo de fechamento que o estouro de orçamento
+    # enfileira (é ele que faz o turno terminar falando, não com string fixa).
+    assert len(out) == 9
     assert PipelineOrchestrator.MAX_STEPS == 4   # the ordinary chain is untouched
 
 
 @pytest.mark.asyncio
 async def test_budget_exhaustion_reports_a_notice():
-    """Silence here is the bug: the turn would end with no way to know why."""
+    """Silence here is the bug: the turn would end with no way to know why.
+
+    E o aviso não pode ser a ÚNICA coisa que acontece: estourar orçamento
+    enfileira o passo de fechamento, que é quem escreve a resposta final. Sem ele,
+    o turno acaba sem `is_final` e o usuário recebe a string fixa do sistema.
+    """
     notices: list[tuple[str, str]] = []
+    vistos: list[str | None] = []
 
     async def runner(step):
+        vistos.append(step.correction)
         yield "r", None
-        yield None, StepOutcome(ok=True, handoffs=[_self(f"passo {step.depth + 2}")])
+        yield None, StepOutcome(
+            ok=True, handoffs=[_self(f"passo {step.depth + 2}")], acted=True
+        )
 
     orch = PipelineOrchestrator(
         runner, self_max_steps=3, self_max_depth=7, on_notice=lambda k, m: notices.append((k, m))
@@ -180,38 +203,53 @@ async def test_budget_exhaustion_reports_a_notice():
 
     assert [k for k, _ in notices] == ["budget"]
     assert "orçamento" in notices[0][1]
+    # Orçamento efetivo é 4, não 3: o orquestrador ergue o teto do ciclo ao piso
+    # do handoff comum (`max(self_max_steps, MAX_STEPS)`).
+    assert vistos == [None, None, None, None, "close"]
 
 
 @pytest.mark.asyncio
-async def test_repeating_the_same_order_stops_the_cycle_loudly():
-    """Model repeats itself → anti-loop fires, and it is reported, not swallowed."""
+async def test_repeating_the_same_order_corrects_instead_of_dying():
+    """Modelo repete a ordem → empurrão, depois fecho. Nunca morte calada.
+
+    Antes isto descartava o passo e o turno terminava sem `is_final`, o que fazia
+    o fechamento forçado cuspir "Parei aqui: o próximo passo seria repetir um que
+    já rodou neste turno" — um erro de mecânica interna no lugar da resposta. O
+    aviso continua saindo (auditoria), mas quem fala com o usuário é o cérebro.
+    """
     notices: list[tuple[str, str]] = []
-    runs = 0
+    vistos: list[str | None] = []
 
     async def runner(step):
-        nonlocal runs
-        runs += 1
-        yield f"r{runs}", None
-        yield None, StepOutcome(ok=True, handoffs=[_self("baixar a imagem")])
+        vistos.append(step.correction)
+        yield f"r{len(vistos)}", None
+        yield None, StepOutcome(
+            ok=True, handoffs=[_self("baixar a imagem")], acted=True
+        )
 
     orch = PipelineOrchestrator(
         runner, self_max_steps=8, self_max_depth=7, on_notice=lambda k, m: notices.append((k, m))
     )
     out = [r async for r in orch.run([_step(text="baixar a imagem")])]
 
-    # Root already consumed the key, so the identical continuation never runs.
-    assert runs == 1
-    assert out == ["r1"]
-    assert [k for k, _ in notices] == ["anti_loop"]
+    # raiz → (repete) retry → (repete) close. Termina, e termina rodando.
+    assert vistos == [None, "retry", "close"]
+    assert out == ["r1", "r2", "r3"]
+    assert [k for k, _ in notices] == ["anti_loop", "anti_loop"]
 
 
 @pytest.mark.asyncio
 async def test_depth_guard_reports_before_the_budget_would():
     notices: list[tuple[str, str]] = []
 
+    vistos: list[str | None] = []
+
     async def runner(step):
+        vistos.append(step.correction)
         yield "r", None
-        yield None, StepOutcome(ok=True, handoffs=[_self(f"passo {step.depth + 2}")])
+        yield None, StepOutcome(
+            ok=True, handoffs=[_self(f"passo {step.depth + 2}")], acted=True
+        )
 
     orch = PipelineOrchestrator(
         runner, self_max_steps=20, self_max_depth=2, on_notice=lambda k, m: notices.append((k, m))
@@ -219,6 +257,9 @@ async def test_depth_guard_reports_before_the_budget_would():
     [r async for r in orch.run([_step(text="raiz")])]
 
     assert [k for k, _ in notices] == ["max_depth"]
+    # O passo de fechamento herda a profundidade do pai, não `+1`: com `+1` a
+    # própria guarda mataria o passo que existe para o turno não morrer.
+    assert vistos[-1] == "close"
 
 
 # ---------------------------------------------------------------- promise gate
@@ -284,12 +325,14 @@ async def test_notice_sink_failure_never_breaks_the_turn():
 
     async def runner(step):
         yield "r", None
-        yield None, StepOutcome(ok=True, handoffs=[_self("mesma ordem")])
+        yield None, StepOutcome(ok=True, handoffs=[_self("mesma ordem")], acted=True)
 
     orch = PipelineOrchestrator(runner, self_max_steps=8, on_notice=boom)
     out = [r async for r in orch.run([_step(text="mesma ordem")])]
 
-    assert out == ["r"]
+    # O que importa é terminar: a cadeia é finita mesmo com a telemetria caindo
+    # em TODA guarda (raiz + retry + close, com o sink explodindo nas três).
+    assert out == ["r", "r", "r"]
 
 
 # ------------------------------------------------- contrato com o desktop
@@ -335,7 +378,12 @@ async def _drive(svc, decision, scripted):
         plan = scripted[min(len(calls) - 1, len(scripted) - 1)]
 
         async def _gen():
-            handoffs = plan.get("handoffs") or []
+            # Honrar `enable_handoff` não é detalhe do harness: é COMO o passo de
+            # fechamento fecha. Ele roda com handoff desligado, então não emite
+            # bloco, e sem handoff a resposta é `is_final` (handoff_defers_final).
+            # Um harness que ignora isso devolve o fecho como não-final e produz
+            # exatamente o sintoma que o fecho existe para evitar.
+            handoffs = (plan.get("handoffs") or []) if kw.get("enable_handoff", True) else []
             yield AIServiceResponse(
                 intent=IT.DIRECT_RESPONSE,
                 session_id=_sid,
@@ -352,7 +400,14 @@ async def _drive(svc, decision, scripted):
                     is_final=False,
                     metadata={
                         "__pipeline_handoffs__": handoffs,
-                        "__pipeline_work__": {"reply": plan["reply"], "tool_trace": [], "files": []},
+                        # `tool_trace` não-vazio = o passo EXECUTOU. Sem isto a
+                        # guarda de passo ocioso fecha o ciclo na 2ª volta e o
+                        # teste de orçamento nunca chega a exercitar o orçamento.
+                        "__pipeline_work__": {
+                            "reply": plan["reply"],
+                            "tool_trace": [{"tool": "neo_bash", "ok": True}],
+                            "files": [],
+                        },
                     },
                 )
 
@@ -427,11 +482,17 @@ async def test_a_cycle_cut_by_a_guard_still_terminates_the_turn():
         for i in range(1, 7)
     ])
 
-    assert len(calls) == 5, "o orçamento tem que parar a cadeia no 5º passo"
+    from modules.desktop.ai_service import _CYCLE_CLOSING_MESSAGE
+
+    # 5 passos de trabalho + o passo de fechamento que o estouro enfileira.
+    assert len(calls) == 6, "o orçamento para a cadeia e manda fechar"
+    assert calls[-1] == "fechar o turno com o que já foi levantado"
     assert out[-1].is_final is True, "a cadeia cortada tem que fechar o turno"
-    assert "limite de passos" in out[-1].message
-    # E o fechamento é mensagem própria, não um eco da última resposta.
-    assert out[-1].message != "tentativa 5"
+    # O fecho é FALA DO NEO, não string do sistema. Era isto que aparecia antes:
+    # "Bati no limite de passos deste turno…" — mecânica interna na cara do
+    # usuário, sobre um passo que ele nunca pediu.
+    assert out[-1].message not in _CYCLE_CLOSING_MESSAGE.values()
+    assert "limite de passos" not in out[-1].message
 
 
 # ------------------------------------------- verificador vê o que foi despachado

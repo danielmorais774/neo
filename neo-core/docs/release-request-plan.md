@@ -1,7 +1,13 @@
 # Liberação de Informação — plano de arquitetura
 
-**Status:** **PLANO** (nada implementado) — escrito a partir da auditoria de
-2026-09-22.
+**Status:** **F0 + F1 + F2 + F3 + F4 EM PRODUÇÃO** (2026-09-22). O portão avalia e
+registra, sem barrar (`NEO_RELEASE_GATE_MODE=shadow`, padrão). Já VALENDO: a CSP
+do desktop, a redação de campo de identificação do PKS e a Solicitação de
+Liberação (objeto + card + aprovação autenticada). Estado detalhado no §18.
+O portão segue em SOMBRA por decisão explícita (ver §18, F4): ligar o
+`enforce` antes de fechar a infraestrutura e de marcar `externo` barraria seu uso
+legítimo sem fechar o caminho do atacante. Pendentes: F5 (quarentena) e F6
+(avaliação de destino, permissões fixas, juiz).
 **Data:** 2026-09-22
 **Objetivo:** o Neo continua com todas as ferramentas que tem hoje, mas conteúdo
 que veio de fora (página web, e-mail, mensagem de WhatsApp, PDF de terceiro)
@@ -169,9 +175,15 @@ exatamente isso que aconteceu com as job tools e com `data_*`/`fin_*`
 
 ### 5.3 Classificação das tools
 
-Campo novo em `ToolSchema` (`shared/types.py:156`), porque hoje **não existe
-nenhuma noção de risco** — `neo_bash` e `get_weather` são indistinguíveis para
-quem monta o toolset:
+Hoje **não existe nenhuma noção de risco** — `neo_bash` e `get_weather` são
+indistinguíveis para quem monta o toolset.
+
+> **Decisão revista na implementação (2026-09-22):** a classificação virou uma
+> **tabela** (`core/authority/risk.py`), não um campo no `ToolSchema`. O campo
+> obrigaria a mexer nos 27 `tools.py` para uma informação lida num lugar só, e —
+> pior — um schema novo nasceria sem classe, com o default decidindo segurança em
+> silêncio. Na tabela o default é explícito (tool desconhecida = atuação) e um
+> teste varre o fonte e falha quando alguém declara tool que a tabela não conhece.
 
 | Classe | Significado | Exemplos |
 |---|---|---|
@@ -446,11 +458,13 @@ porta dos fundos. Ver a memória `neo-security-audit-prompt-injection`.
 
 | Fase | Entrega | Pronto quando |
 |---|---|---|
-| **F0** | `TurnAuthority` + campo `risk` no `ToolSchema` + portão em **modo sombra** (só registra o que teria barrado) | Uma semana de produção com relatório: quantos turnos teriam pedido liberação, e quantos seriam ruído |
-| **F1** | §12.1 e §12.2 (CSP + procedência de imagem) | `![](http…)` não renderiza; `[[IMAGE:]]` de URL não vista é recusado; `compras` segue mostrando foto |
-| **F2** | Rotulagem do PKS + handles no bloco de contexto | `search_pks` devolve `«pks:cpf»` e o prompt não tem mais CPF/endereço |
-| **F3** | `release_request` + card + aprovação autenticada + preenchimento escopado | O caso do frete (§14.1) roda ponta a ponta |
-| **F4** | Portão real nos sinks de mensagem + tabela de necessidade | §14.2 e §14.3 passam |
+| **F0** ✅ | `TurnAuthority` + tabela de risco + portão em **modo sombra** (só registra o que teria barrado) | Uma semana de produção com relatório: quantos turnos teriam pedido liberação, e quantos seriam ruído |
+| **F1** ✅ | §12.1 e §12.2 (CSP + procedência de imagem) | `![](http…)` não renderiza; `[[IMAGE:]]` de URL não vista é recusado; `compras` segue mostrando foto |
+| **F2** ✅ | Rotulagem do PKS + handles no bloco de contexto | `search_pks` devolve `«pks:cpf»` e o prompt não tem mais CPF/endereço |
+| **F3a** ✅ | `release_request` + card + aprovação autenticada | Pedido nasce, card chega, só o dono decide |
+| **F3b** ✅ | Preenchimento escopado por domínio (navegador local) | O caso do frete (§14.1) roda ponta a ponta |
+| **F3c** ✅ | Retomada do turno depois da aprovação | Aprovar continua o trabalho sem você redigitar o pedido |
+| **F4** ✅ | Destino por tool + liberação destravando a saída + tabela de necessidade | §14.2 e §14.3 passam |
 | **F5** | Leitores em quarentena (e-mail primeiro) | `email_inbox` devolve schema; texto de terceiro chega marcado |
 | **F6** | Avaliação de destino + `release_grant` + juiz cognitivo | §14.4 passa; volume de card cai com os grants |
 
@@ -553,3 +567,372 @@ que carrega dado rotulado vira solicitação. É aqui que a permissão por
   `modules/desktop/ai_service.py`, `shared/types.py`,
   `neo-desktop-tauri/src-tauri/src/{commands/mod.rs,services/command_policy.rs}`,
   `neo-desktop-tauri/src-tauri/tauri.conf.json`.
+
+---
+
+## 18. Estado da implementação (2026-09-22)
+
+### F0 — autoridade do turno + portão em sombra (EM PRODUÇÃO)
+
+Pacote novo `core/authority/`, deliberadamente leve (nada de banco, nada de LLM
+— ele é importado pelo executor de tools, que carrega sempre; mesmo cuidado de
+`core/credentials/__init__.py`):
+
+- `risk.py` — a tabela de classes (§5.3). Default explícito: nome desconhecido
+  cai em atuação.
+- `turn.py` — `TurnAuthority` (principal, contaminação, procedência de URL) num
+  `ContextVar`, mesmo padrão do `core/liveness.py`: instalado no início do turno,
+  escrito pelas camadas de baixo sem viajar por parâmetro.
+- `gate.py` — `evaluate()` (pura, é o que os testes exercitam) e
+  `gate_tool_call()` (aplica o modo e registra).
+- `images.py` — §12.2.
+
+Ligações (duas, porque são dois trilhos e a definição é uma só):
+
+- `core/tools/executor.py` → `execute_tool_call` (trilho global/SERVER_TOOL);
+- `core/cognitive/read_tools.py` → `CognitiveReadExecutor.execute_tool_call`.
+
+A autoridade é instalada em `AIService.process_user_input` — **um lugar só, e
+vale para desktop, painel, agenda e WhatsApp**, porque todos entram por ali.
+
+Flag: `neo_release_gate_mode` (`shared/config.py`), default `shadow`. Em
+`enforce` a tool barrada levanta erro com o motivo em português — o que já
+funciona, mas só faz sentido depois da F3, senão barrar é quebrar o turno sem
+oferecer saída.
+
+Testes: `tests/authority/` (34). Inclui `test_risk_cobre_o_registry.py`, que
+varre `core/**/tools.py` e `modules/**/tools.py` e falha quando existe tool
+declarada sem classificação — é o que impede a tabela de envelhecer em silêncio.
+Suíte completa: 3073 passando.
+
+### F1 — canais que não passam por tool (EM PRODUÇÃO)
+
+- **CSP fechada** (`neo-desktop-tauri/src-tauri/tauri.conf.json`):
+  `img-src 'self' data:`. Verificado antes de mexer: as únicas `<img>` do app
+  usam `image.dataUrl`, então nada legítimo dependia de `https:`. Complemento em
+  `MessageBubble.tsx`: `![](…)` do markdown não vira `<img>` (sem isso, apareceria
+  ícone de imagem quebrada). **Exige reiniciar o `tauri dev`** — CSP é lida no
+  boot do webview.
+- **Procedência do `[[IMAGE:]]`** saneada no construtor do `AIServiceResponse` —
+  um seam só, em vez dos 24 lugares que constroem resposta.
+
+**Por que a imagem ficou em sombra e não valendo:** existe um falso positivo
+conhecido e real — "mostra de novo aquela foto" num turno seguinte cita uma URL
+que apareceu no turno ANTERIOR, e a procedência é por turno. Ligar antes de medir
+quebraria a `compras` em silêncio. A correção certa (antes do `enforce`) é semear
+a procedência com as URLs que já estão no histórico da sessão carregado no
+contexto.
+
+### O que falta para a sombra virar medição útil
+
+1. **Ninguém marca `principal=externo` ainda.** A derivação existe
+   (`principal_from_metadata`), mas o pipeline do WhatsApp e o leitor de e-mail
+   precisam declarar. Enquanto isso, todo turno é `admin` e o portão só enxerga
+   contaminação.
+2. **Semear procedência com o histórico da sessão** (acima).
+3. **Relatório**: contar as linhas `[authority][sombra]` por tool e por motivo no
+   app.log, para decidir o que vira card na F4 e o que vira grant na F6.
+
+### F2 — dado de identificação fora do prompt (EM PRODUÇÃO, VALENDO)
+
+**Medição que mudou a leitura da fase** (contagem real no PKS de produção, sem
+valores): 102 chaves distintas, e de identificação existem apenas `email` (2) e
+`cnpj` (2), mais resíduo financeiro (`balance`, `amount`). Não havia CPF, nem
+endereço, nem telefone. Ou seja: a F2 é **preventiva** — ela fecha o mecanismo
+antes de o dado existir, e por isso o custo de ligar agora é quase zero.
+
+`core/pks/sensitivity.py`: classificação por NOME DE CAMPO, aplicada na LEITURA.
+Ler (e não escrever) é o que faz valer para as linhas que já estão no banco —
+todas gravadas como `private` — sem migração destrutiva, e para as futuras mesmo
+que quem escreveu esqueça de rotular. O nível gravado continua valendo quando é
+mais restritivo: quem marcou `secret` na mão não é rebaixado por um regex.
+
+- `sensitive` (vira `«pks:campo»`): documento, endereço, CEP, contato, cartão,
+  saldo, nascimento.
+- `secret` (some do bloco): senha, token, chave, CVV — o lugar disso é o cofre.
+- Exceções explícitas: `name`, `full_name`, `preferred_name` e `birthday` (que já
+  sai truncado em dia/mês, e é o que faz o "amanhã é aniversário dele" funcionar).
+
+Três pontos de saída, uma função: `ContextBuilder.format` (bloco do prompt) e os
+DOIS construtores de `properties` do `PKSService` (busca legada e ranqueada) —
+o resultado do `search_pks` vai para o prompt igual ao bloco, então redigir só um
+deixaria o outro aberto.
+
+**A válvula: `pks_reveal(entidade, campo)`.** Sem ela a redação seria pior que o
+problema: o Neo não conseguiria responder nem ao DONO do dado. Ela é estreita de
+propósito — um campo por chamada (pedir o CEP não entrega o endereço junto),
+credencial nunca, e `search_entities(redact=False)` só por aqui. Classificada na
+tabela de risco como `{leitura_privada, revelação}`: pôr identificação no
+contexto é o passo que precede qualquer vazamento, então num turno contaminado
+ela passa pelo portão como qualquer outra saída.
+
+Flag: `neo_pks_redaction_enabled` (default ON) para desligar na hora se algo
+quebrar.
+
+Verificado em produção contra dado real (2026-09-22): a consulta que recupera a
+entidade com CNPJ devolve `«pks:cnpj»` e nenhum dígito de CNPJ no bloco.
+Regressão checada: a cidade do usuário é NOME DE ENTIDADE, não campo, então
+clima/localização não são afetados.
+
+Testes: `tests/authority/test_pks_redaction.py` (ponta a ponta no bloco do prompt)
+e `tests/authority/test_pks_reveal.py`. Suíte completa: 3133 passando.
+
+**Limite conhecido:** a classificação olha o NOME do campo, não o valor. Um CPF
+escrito dentro de um campo `description` ou `content` continua passando — e o PKS
+de hoje tem vários campos de texto livre. Fechar isso é detecção por valor (§10.3
+da F6), não regex de chave.
+
+### F3a — o objeto, o card e a aprovação autenticada (EM PRODUÇÃO)
+
+Migração `f1a2b3c4d5e6` aplicada em produção (tabela `release_request` + 3
+índices; `alembic_version` = `f1a2b3c4d5e6`).
+
+**Achado do caminho: o repositório tem TRÊS heads de migração** — `b1c2d3e4f5a6`
+(o que está aplicado), `e2f3a4b5c6d7` e `h1i2j3k4l5m6` — então `alembic upgrade
+head` não roda. Medido: as duas pendentes são no-op na prática (o banco já tem
+`connected_device.hardware_id` e as tabelas legadas do grafo já não existem), ou
+seja foram aplicadas fora do alembic. Esta revisão é filha do que está DE FATO
+aplicado e foi aplicada por nome (`alembic upgrade f1a2b3c4d5e6`). Um merge
+revision seria o certo para o grafo, mas faria o alembic tentar rodar as duas
+pendentes — drop de tabela inexistente e add de coluna existente quebram no meio.
+**Consertar o grafo é tarefa própria, deliberada.**
+
+Peças:
+
+- `db/models/release_request.py` — a linha. Guarda RÓTULO, nunca valor; guarda a
+  evidência do terceiro (o texto original), que é o que deixa o card dizer "isto
+  veio de um e-mail, não de você"; e `payload_hash`, que amarra a aprovação ao
+  conteúdo exato (muda o texto, morre a aprovação).
+- `core/release/service.py` — ciclo de vida. Fora deste módulo não existe caminho
+  para mudar `status`. Regras que valem a pena citar: **só o dono decide** (quem
+  decide vem do token, e ainda é conferido contra o dono do pedido); **uso único**
+  (`consume`); TTL de 15 min (não os 5 do gateway — liberar dado exige LER o card);
+  **pedido idêntico já pendente devolve o mesmo** (laço do modelo não vira fila de
+  card); teto de 20 pendentes.
+- `core/release/notify.py` — o card, pelo MESMO caminho da missão do WhatsApp
+  (`user_notification` + `DeviceNotifBroadcaster` + `actions`). O corpo do card
+  põe em destaque de quem partiu o pedido. Também o aviso de decisão, como bolha
+  `chat_message` na sessão onde o trabalho parou.
+- `modules/release/` — a tool `solicitar_dado`. Máximo de 4 campos por pedido, e
+  a origem do pedido **não** vem do modelo: sai da `TurnAuthority`, senão a
+  própria injeção assinaria o pedido como "pedido do Daniel". Registrada **só**
+  no conjunto cognitivo, de propósito: registrar no registry global sem executor
+  por-request é a armadilha do "registrar ≠ ligar".
+- `api/routes/release.py` — decisão exige **token de aparelho pareado**, resolvido
+  pela mesma `_device_from_token` de `/devices/mine`. **O JWT do painel não
+  aprova**: ele é estático (`sub="neo-panel"`) e não diz quem está olhando;
+  aceitá-lo seria fingir uma identidade. O painel lista.
+- Desktop: ramo novo em `process_notification_action` (`commands/mod.rs`) que
+  manda a decisão com o token deste aparelho, e ícone `🔐` no card. A janela de
+  notificação (React) e o host nativo em Swift já desenham `actions` de forma
+  genérica — não precisaram mudar.
+
+Verificado ao vivo contra produção: sem token → 422; token inválido → 401 nas duas
+rotas; painel sem JWT → 401; painel com JWT → `{"total":0,"liberacoes":[]}`.
+`cargo check` do desktop limpo. Testes: `tests/authority/test_release_service.py`
+(17). Suíte completa: 3156 passando.
+
+**O que F3a NÃO faz, e por quê:**
+
+1. **Não preenche formulário com o dado liberado** (F3b). O contrato de
+   placeholder escopado por domínio existe no browser do servidor
+   (`core/credentials/browser.py`), mas quem abre preço de loja brasileira é o
+   navegador LOCAL, que não tem o equivalente. Sem isso, o caso do frete para na
+   hora de digitar.
+2. **Não retoma o turno sozinha** (F3c). A aprovação vira uma bolha no chat
+   ("liberei X para Y, pode seguir") e você diz "continua". Disparar turno de
+   dentro de um endpoint de aprovação precisa de guarda contra laço (liberação
+   aprovada que pede outra liberação) e de transporte para a resposta — é passo
+   próprio, não efeito colateral de um clique.
+3. **Não mostra o VALOR no card**, só o rótulo. Mostrar exige resolver o dado na
+   hora de montar o card, e é o que torna o consentimento informado — fica junto
+   da F3b, onde o valor de fato flui.
+
+### F3b — preenchimento escopado por domínio (EM PRODUÇÃO)
+
+`core/release/fill.py`. O modelo escreve `«pks:cep»` como `value` de um `fill`;
+quem substitui é o **driver do navegador local** (`core/browser_local/driver.py`,
+em `_perform`, um seam só), e só quando as quatro condições valem: liberação
+aprovada para aquele campo, domínio da ABA casando com o destino aprovado
+(apex + subdomínio, com o ponto obrigatório antes do sufixo — `loja.com.br` não
+cobre `loja.com.br.atacante.tld`), valor inequívoco no PKS, e a liberação é
+consumida na substituição.
+
+Três decisões que valem registro:
+
+- **O escopo sai da ABA, não do modelo.** O driver guarda a URL de cada snapshot
+  (`_last_seen_url`); o modelo não é fonte de verdade sobre onde está.
+- **Recusa é erro do passo, não silêncio.** Preencher metade de um formulário e
+  seguir seria pior: o agente recebe o motivo em português, já redigido para
+  virar `solicitar_dado`.
+- **Ambíguo não chuta.** Dois `email` na memória (o do Daniel e o do Neo) → recusa
+  pedindo para dizer de quem é. Chutar aqui é vazar para o destino errado.
+
+O prompt do driver ganhou a instrução do marcador — sem ela o modelo nunca
+escreveria `«pks:campo»` e tentaria digitar de cabeça (e não tem o valor).
+
+**Navegador do servidor (browser-use) não foi alterado:** ele está desligado em
+produção (`browser_agent_enabled` default off) e, pela realidade medida em
+`neo-product-search-antibot-reality`, loja brasileira recusa o IP da VPS. O
+contrato de placeholder dele já existe para senha (`core/credentials/browser.py`);
+estender para PII é o mesmo formato, quando houver caso.
+
+### F3c — retomada depois da aprovação (EM PRODUÇÃO)
+
+`core/release/resume.py`. Você clica "Liberar" e o trabalho continua sem
+redigitar o pedido. É conveniência: **toda falha aqui é silenciosa para a
+decisão** — a liberação já está gravada e vale mesmo que o turno não aconteça.
+
+Guardas (são elas que fazem disparar-turno-a-partir-de-clique ser aceitável):
+só aprovação; só com sessão; **uma vez por liberação** (em memória — se o core
+reinicia, o turno pendente morreu junto e não há o que duplicar); prazo de 420s;
+`unattended` no metadata (tira as tools client-side da mesa — as de job, inclusive
+o navegador local, continuam, e é por elas que o trabalho segue); `principal=admin`
+(quem aprovou foi você, num aparelho pareado). A instrução do turno **proíbe pedir
+a mesma liberação de novo** — sem isso, um turno que falha vira um card atrás do
+outro.
+
+O resultado volta como bolha `chat_message` na mesma sessão.
+
+### Também nesta rodada: o card mostra o que você aprova
+
+Faltava um furo real: numa liberação de MENSAGEM, o texto não aparecia em lugar
+nenhum — você aprovaria um conteúdo invisível. Agora o texto vai como `preview`
+até o card (mesmo lugar onde a missão do WhatsApp guarda o `draft_text`) e **não**
+é persistido na `release_request`, que continua guardando só o hash: o pedido não
+vira uma segunda cópia do dado.
+
+**O que fica para a F4:** o portão consultar liberação aprovada. Hoje quem lê a
+autorização é o preenchimento (`ReleaseFiller`); para `email_send` e
+`service_request` valerem em `enforce`, o portão precisa saber QUAL argumento de
+cada tool é o destino — mapeamento por tool, que é trabalho da F4 e não deste
+passo.
+
+Testes desta rodada: `test_release_fill.py` (12), `test_release_resume.py` (9),
+mais o preview em `test_release_service.py`. Suíte completa: **3180 passando**.
+Produção healthy, zero traceback.
+
+### F4 — o portão fecha o laço (EM PRODUÇÃO, ainda em sombra)
+
+Três peças novas, e uma correção de desenho que só apareceu ao montar a fase.
+
+**1. Destino por tool** (`core/authority/sinks.py`). O portão sabia dizer "isto é
+uma saída"; agora sabe **para onde**: `email_send` → `para`,
+`whatsapp_send_message` → `recipient`, `service_request` → o slug da conexão (o
+host nunca vem do LLM no gateway, então o slug É o destino comparável),
+`web_fetch` → o host da URL. Sem este mapa, "aprovei mandar o CEP para a loja"
+não teria como ser comparado com "o modelo está chamando `email_send` para
+outro@dominio". Os navegadores devolvem `None` de propósito: a tarefa é texto
+livre e o site só se sabe passo a passo — quem guarda ali é o preenchimento
+escopado, comparando o domínio da ABA.
+
+Casamento: e-mail e WhatsApp exigem **igualdade**; domínio aceita subdomínio pela
+mesma regra do fill (`loja.com.br` não cobre `loja.com.br.atacante.tld`). Tipo
+diferente não casa — liberação de e-mail não autoriza entrega a um domínio.
+
+**2. Liberação destravando a saída.** `evaluate()` recebe as aprovadas e, se uma
+cobre o destino, devolve `permitir` com o id dela. `gate_tool_call` virou **async**
+e faz o resto: consulta o serviço **só quando barraria** (turno normal não paga
+consulta nenhuma) e **consome** a liberação ao permitir. O consumo é onde o
+`payload_hash` é conferido — texto mudado depois do seu clique não passa, e o
+motivo real entra no log em vez de um "barrado" seco.
+
+É isto que fecha o laço que a F3c deixaria aberto: sem a consulta, o turno
+retomado depois da sua aprovação seria barrado de novo e pediria a mesma
+autorização para sempre.
+
+**3. Tabela de necessidade** (`core/release/necessity.py`), conferida em
+`solicitar_dado` ANTES de virar card. `frete → [cep]`, `nota fiscal → [cpf,
+endereço, …]`, `entrega`, `cadastro`, `contato`, `pagamento` (cartão **não**
+entra). Duas escolhas que evitam teatro: finalidade que a tabela não conhece
+**não reprova nada** (lista fechada viraria recusa em todo caso novo, e a reação
+seria desligar a checagem), e campo fora da tabela também passa quando a
+finalidade é desconhecida. O que ela pega é o caso clássico — e é a resposta
+direta ao §14.2: *"'cpf' não é necessário para 'calcular o frete'. Para isso
+basta: cep."*
+
+**4. A correção que a fase revelou:** com a classificação da F0, o SEGUNDO
+`web_fetch` de uma pesquisa se auto-barraria — a primeira página contamina o
+turno, e ler a segunda seria "saída em turno contaminado". Em `enforce` isso
+quebraria a pesquisa normal; em sombra, enchia o log de ruído que esconderia o
+sinal. Agora **procedência destrava**: URL que apareceu em resultado de tool (ou
+que você escreveu) passa; URL inventada, com dado no query string, continua
+pedindo liberação. É a regra §12.3 do plano, em código.
+
+**Por que o modo segue `shadow`.** A máquina está pronta (o teste
+`test_portao_consome_a_liberacao_ao_permitir` roda em `enforce`), mas ligar em
+produção agora seria cerimônia sem segurança: a `:8000` continua alcançável na
+rede sem autenticação (§12.4) e **ninguém marca `principal=externo`** ainda, então
+o portão só enxerga contaminação. Nessa combinação, o `enforce` barraria seu uso
+legítimo e não fecharia o caminho do atacante. A ordem certa é: infraestrutura →
+`externo` marcado → relatório da sombra → `enforce`.
+
+Testes: `tests/authority/test_f4_gate_e_necessidade.py` (21). Suíte completa:
+**3202 passando**. Produção healthy, zero traceback.
+
+---
+
+## 19. Infraestrutura fechada + `enforce` de revelação (2026-09-24)
+
+O que faltava para o portão significar alguma coisa: enquanto a `:8000`
+respondesse sem autenticação na rede, quem chegasse nela **era** `principal=admin`
+e não precisava convencer o Neo de nada.
+
+**Medido antes de mexer** (é o que tornou a mudança segura): o acesso do usuário é
+por TÚNEL SSH — o Core Tunnel encaminha 8000, 50051, 5002 e 5434 para o
+`127.0.0.1` do Mac, e túnel SSH termina no loopback da VPS. As conexões vivas na
+8000 eram só loopback; há **um** tipo de aparelho registrado (o desktop); o
+`neo-whatsapp` fala com o core pelo NOME na rede Docker, não pela porta
+publicada; e as engines de voz são chamadas PELO core (saída). Ou seja: publicar
+em `0.0.0.0` não servia a nenhum cliente real.
+
+Aplicado:
+
+- `docker-compose.yml`: 8000, 50051, 5434, 27018, 5002, 5011, 11434, 8283, 5435,
+  8001/50052 e 5436 passam a publicar em `127.0.0.1`. Seguem públicas só as duas
+  que são de propósito e têm token: 8091 (notify) e 4100 (session-worker).
+- `docker/neo-workbench-proxy/filter`: o IP público da VPS (v4 e v6) entra na
+  denylist. Segunda tranca — se uma porta reabrir um dia, o sandbox continua sem
+  alcançar.
+- `tinyproxy.conf`: `ConnectPort 443/8443`. Sem isso o CONNECT abria qualquer
+  porta de host público, inclusive o Postgres pelo IP público.
+
+**Validado ao vivo, os quatro pontos:**
+
+| Teste | Antes | Depois |
+|---|---|---|
+| host → IP público `:8000/health` | 200 | sem resposta |
+| sandbox → IP público `:8000` pelo proxy | chegava | **403** |
+| sandbox → CONNECT `:5434` | abria | falha |
+| sandbox → internet normal | 200 | **200** (não quebrou) |
+
+De fora (nc do Mac): 8000, 50051, 5434, 27018 e 5002 fechadas.
+
+**Correção de um erro meu na auditoria:** eu disse duas vezes que a 5435 aberta
+era o `neo-letta-postgres` com senha padrão `letta:letta`. **Está errado.** O
+compose mapeia 5435 para o Letta, mas esse container não está rodando; quem
+publica a porta é `mr-abagnale-db` (postgres:16, outro projeto na mesma VPS),
+iniciado por `docker run` sem labels de compose, com senha de 32 caracteres. O
+risco real é menor do que eu afirmei — segue exposta à internet, mas não com
+credencial padrão. **Fica pendente e é decisão do dono daquele projeto:**
+republicar em `127.0.0.1:5435` ou fechar no firewall.
+
+### `NEO_RELEASE_GATE_MODE=revelacao` — o degrau do meio
+
+Em produção desde 2026-09-24. Três degraus agora: `shadow` (só registra),
+**`revelacao`** e `enforce` (tudo).
+
+`revelacao` barra o que **entrega a terceiro** — `email_send`,
+`whatsapp_send_message`, `service_request`/`service_confirm`, `web_fetch` — mais
+os `negar` explícitos (agendar prompt a partir de texto de terceiro, a trava de
+persistência). **Atuação segue em sombra**: terminal, sandbox, casa e memória não
+têm card, e barrar ali seria tirar a ferramenta da mão sem oferecer saída.
+
+Junto veio a peça que faltava para barrar sem quebrar: **a recusa ensina o
+caminho de volta**. `GateDecision.mensagem()` devolve ao modelo, para revelação,
+*"chame solicitar_dado(campos=…, destino=…, finalidade=…) e ENCERRE o turno"*;
+para atuação, *"diga ao Daniel o que você precisava fazer e por quê"*. Sem isso o
+modelo recebia um "não" seco e tentava outro caminho — o comportamento exato que
+não se quer.
+
+Testes: 3221 passando. Produção healthy, modo confirmado dentro do container.

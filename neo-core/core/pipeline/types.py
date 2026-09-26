@@ -31,6 +31,66 @@ def normalize_input(text: str) -> str:
     return " ".join(no_accents.split())
 
 
+# Palavras de função — saem antes de comparar duas ordens. Sem elas, duas ordens
+# sobre assuntos diferentes já empatam em metade dos tokens só de artigo e
+# preposição, e a guarda de quase-repetição viraria falso positivo constante.
+_STOPWORDS = frozenset(
+    """
+    a as o os um uma uns umas de do da dos das e em no na nos nas por para com
+    que ao aos ou se ja agora depois antes ate apos como cada todo toda todos
+    todas isso isto esse essa este esta aquele aquela aquilo pelo pela pelos
+    pelas sobre entre sem sob nao mais menos muito pouco tambem entao assim
+    """.split()
+)
+
+#: Cobertura mínima para chamar duas ordens de "a mesma coisa". Espelha o
+#: ``_REPEAT_COVERAGE`` do loop de actuation (0.7), que foi calibrado no MESMO
+#: tipo de falha — modelo reembaralhando o pedido em vez de repeti-lo.
+ORDER_COVERAGE = 0.7
+
+#: Abaixo disto a ordem é curta demais para comparar por conteúdo ("tentar de
+#: novo", "continuar"): só a igualdade literal significa repetição. Mesma trava
+#: que faz `df -h` ser comparado só por string no loop de shell.
+_MIN_ORDER_TOKENS = 3
+
+
+def content_tokens(text: str) -> frozenset[str]:
+    """Palavras que dizem SOBRE O QUE a ordem é (sem função gramatical)."""
+    limpo = normalize_input(text)
+    for sep in (",", ";", ":", "(", ")", "[", "]", "\u2014", "\u2013", "/"):
+        limpo = limpo.replace(sep, " ")
+    return frozenset(t for t in limpo.split() if len(t) > 2 and t not in _STOPWORDS)
+
+
+def order_is_near_repeat(text: str, earlier: list[str]) -> str | None:
+    """A ordem anterior que já cobre esta, ou ``None`` se ela pede coisa nova.
+
+    ``PipelineStep.key`` só pega repetição LITERAL, e quem escreve as ordens do
+    ciclo é um LLM que parafraseia. session-389114d4, interação 29 — as quatro
+    ordens sintetizadas em sequência, todas pedindo a mesma pesquisa:
+
+        1. "…com status processual para fechar a camada 5"
+        2. "…com status processual real e fonte"
+        3. "…real, o que foi provado, o que foi anulado ou prescrito, e a fonte"
+        4. idêntica à 3          ← só AQUI a guarda antiga acordou
+
+    Três voltas no mesmo lugar passaram batido; por conteúdo, a 2 já cobre 80%
+    do que a 1 pedia. A cobertura é do texto NOVO pelo antigo, de propósito: uma
+    ordem que acrescenta alvo inédito ("escrever o veredito em veredito.md") tem
+    interseção baixa e passa — o mesmo princípio que faz
+    ``_near_repeated_actuation`` liberar o comando quando um segmento pede algo
+    que ainda não apareceu.
+    """
+    novos = content_tokens(text)
+    if len(novos) < _MIN_ORDER_TOKENS:
+        return None
+    for anterior in earlier:
+        antigos = content_tokens(anterior)
+        if antigos and len(novos & antigos) / len(novos) >= ORDER_COVERAGE:
+            return anterior
+    return None
+
+
 @dataclass
 class Handoff:
     """A runtime request to run another pipeline next (Phase 2).
@@ -67,6 +127,16 @@ class PipelineStep:
     # continuation's prompt so it never redoes finished work. Built by the step
     # runner (never by the model) from the real reply/tool trace.
     context_note: str | None = None
+    # Passo de AUTOCORREÇÃO do ciclo: ``"retry"`` (a ordem repetia um passo que já
+    # rodou — volta ao cérebro para ele escolher outro caminho) ou ``"close"``
+    # (o ciclo acabou — este passo escreve a resposta final com o que existe).
+    # Serve a três coisas ao mesmo tempo: isenta o passo das guardas de repetição
+    # e profundidade (senão a própria correção seria descartada), impede correção
+    # de correção, e diz ao step runner qual instrução injetar.
+    correction: str | None = None
+    # A ordem anterior que este passo estava repetindo, para a instrução poder
+    # dizer ao cérebro ONDE a resposta já está em vez de só recusar.
+    covered_by: str | None = None
 
     def key(self) -> tuple[str, str]:
         """Stable identity for anti-loop detection (Phase 3)."""
@@ -96,6 +166,45 @@ class PipelineStep:
             context_note=context_note if handoff.is_self else None,
         )
 
+    @classmethod
+    def self_correction(
+        cls,
+        parent: "PipelineStep",
+        *,
+        kind: str,
+        context_note: str | None = None,
+        covered_by: str | None = None,
+        input_text: str | None = None,
+    ) -> "PipelineStep":
+        """O ciclo parou num beco: em vez de morrer, pensa de novo.
+
+        Antes, repetição/orçamento/profundidade descartavam o passo e o turno
+        terminava sem ``is_final`` — o fechamento forçado então cuspia uma string
+        fixa do sistema ("Parei aqui: o próximo passo seria repetir um que já
+        rodou neste turno"). Do lado do usuário isso é um erro na cara, sobre uma
+        mecânica interna que ele nunca pediu.
+
+        O passo de correção é um passo cognitivo normal: roda, escreve uma
+        resposta de verdade e — sendo ``"close"``, que corre sem handoff — fecha o
+        turno com fala do Neo. Mesma ideia do empurrão do loop de shell
+        (``_near_repeated_actuation``): não despacha, devolve ao cérebro dizendo o
+        que já está respondido e o que sobrou.
+
+        ``depth`` é o do pai, não ``+1``: isto não é trabalho novo, é o mesmo
+        trabalho sendo fechado — herdar ``+1`` faria a guarda de profundidade
+        matar justamente o passo que existe para não morrer.
+        """
+        return cls(
+            intent=parent.intent,
+            input_text=input_text or parent.input_text,
+            skill_name=parent.skill_name,
+            origin="self",
+            depth=parent.depth,
+            context_note=context_note,
+            correction=kind,
+            covered_by=covered_by,
+        )
+
 
 @dataclass
 class StepOutcome:
@@ -114,3 +223,9 @@ class StepOutcome:
     # do gerador, mas não fez nada ainda — quem tratar isso como passo concluído
     # despacha o próximo em cima de um resultado que não existe.
     parked: bool = False
+    # O step EXECUTOU alguma coisa (rodou tool ou entregou arquivo)? Passo que só
+    # falou não é progresso: na session-389114d4 interação 29 o ciclo deu quatro
+    # voltas sem uma única tool, reescrevendo a mesma resposta, e a fila seguiu
+    # porque `ok=True` ("respondeu"). O orquestrador conta os passos sem ação
+    # seguidos e fecha o ciclo antes da quarta bolha idêntica.
+    acted: bool = False

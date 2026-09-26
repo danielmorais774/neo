@@ -17,6 +17,7 @@ from core.pks.entity_resolver import EntityResolver
 from core.pks.ledger_guard import is_ledger_memory
 from core.pks.ontology import OntologyResolver, OntologyValidator
 from core.pks.ranking import GLOBAL_TYPES as GLOBAL_RANK_TYPES
+from core.pks.sensitivity import redact_properties
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
 from core.pks.schemas import UpsertEntityInput, UpsertFieldInput, UpsertRelationInput
@@ -402,7 +403,9 @@ class PKSService:
         terms = {t for t in re.findall(r"[a-z0-9]+", normalized) if len(t) >= 4}
         return terms - cls._TRIGGER_STOPWORDS
 
-    async def search_entities(self, *, user_id: UUID, query: str) -> list[dict[str, Any]]:
+    async def search_entities(
+        self, *, user_id: UUID, query: str, redact: bool = True
+    ) -> list[dict[str, Any]]:
         """Busca entidades E os campos delas — o conteúdo, não só o nome.
 
         Medido em prod (session-5102534a): "uma musica que eu gosto" fez o cérebro
@@ -417,7 +420,7 @@ class PKSService:
         ``properties`` são os apelidos que os call sites já esperavam.
         """
         if get_settings().pks_ranker_v2_enabled:
-            return await self._search_ranked(user_id=user_id, query=query)
+            return await self._search_ranked(user_id=user_id, query=query, redact=redact)
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
             rows = await self.repository.search_entities(session, workspace_id, query)
@@ -451,6 +454,12 @@ class PKSService:
                 f.key: (f.value.isoformat() if isinstance(f.value, datetime) else f.value)
                 for f in fields
             }
+            # F2: identificação não sai daqui em claro — o resultado da tool vai
+            # para o prompt igual ao bloco de memória (docs/release-request-plan.md §7).
+            if redact:
+                properties = redact_properties(
+                    properties, {f.key: f.sensitivity for f in fields}
+                )
             rels = []
             for r in relations_by_entity.get(entity.id, []):
                 if r.sensitivity == "secret":
@@ -471,7 +480,9 @@ class PKSService:
             )
         return results
 
-    async def _search_ranked(self, *, user_id: UUID, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    async def _search_ranked(
+        self, *, user_id: UUID, query: str, limit: int = 5, redact: bool = True
+    ) -> list[dict[str, Any]]:
         """``search_pks`` pela MESMA nota do bloco do prompt, com as relações.
 
         Antes a ferramenta buscava por trigram de nome e devolvia só os fields:
@@ -493,11 +504,13 @@ class PKSService:
             entity = g.head.entity
             if entity.type in GLOBAL_RANK_TYPES and g.head.score <= 0:
                 continue
+            _campos = [f for f in fields.get(entity.id, []) if f.sensitivity != "secret"]
             props = {
                 f.key: (f.value.isoformat() if isinstance(f.value, datetime) else f.value)
-                for f in fields.get(entity.id, [])
-                if f.sensitivity != "secret"
+                for f in _campos
             }
+            if redact:
+                props = redact_properties(props, {f.key: f.sensitivity for f in _campos})
             rels: list[str] = []
             for r in relations:
                 if r.sensitivity == "secret" or r.from_entity_id not in by_id or r.to_entity_id not in by_id:

@@ -29,6 +29,12 @@ from core.agent.register import (
     max_gravity,
     render_register_directive,
 )
+from core.authority import (
+    TurnAuthority,
+    bind_authority,
+    enforce_inline_images,
+    principal_from_metadata,
+)
 from core.liveness import touch_progress
 from core.llm.router import LLMRouter, provider_for_model
 from core.pks import PKSService
@@ -1527,7 +1533,63 @@ _CYCLE_CLOSING_MESSAGE: dict[str, str] = {
         "A cadeia de continuações ficou funda demais e eu parei por segurança. "
         "O que já ficou pronto está acima."
     ),
+    "near_repeat": (
+        "Parei aqui: o próximo passo pediria de novo uma coisa que já rodou neste "
+        "turno. O que já foi feito está acima — se faltou alguma coisa, me diz o "
+        "que ajustar."
+    ),
+    "idle_cycle": (
+        "Parei de dar voltas: os últimos passos não executaram nada de novo. "
+        "O que já ficou pronto está acima."
+    ),
 }
+
+# Instrução do passo de AUTOCORREÇÃO do ciclo (`PipelineStep.self_correction`).
+#
+# Antes, repetição/orçamento/profundidade descartavam o passo, o turno terminava
+# sem `is_final`, e o fechamento forçado mandava uma das strings acima. Duas vezes
+# na session-389114d4 o usuário recebeu "Parei aqui: o próximo passo seria repetir
+# um que já rodou neste turno" — um erro de mecânica interna, sobre um "passo" que
+# ele nunca pediu, no lugar da resposta. Agora essas strings são só o último
+# recurso (o passo de fechamento não respondeu nada); o caminho normal é o cérebro
+# escrever o fecho ele mesmo.
+#
+# `retry` é o irmão do empurrão do loop de shell (`_near_repeated_actuation`): não
+# despacha, devolve dizendo ONDE a resposta já está e o que sobrou de verdade. A
+# lista (a)/(b)/(c) é fechada de propósito — a versão sem ela recebia "vou
+# levantar o histórico…" outra vez, que é o próprio defeito.
+_CYCLE_CORRECTION_INSTRUCTION: dict[str, str] = {
+    "retry": (
+        "## ESSA ORDEM NÃO RODOU\n"
+        "A ordem desta rodada pede de novo o que {covered} já pediu neste turno. "
+        "Eu não despachei: gastaria uma ida para receber a mesma coisa.\n"
+        "O que os passos deste turno REALMENTE executaram está na nota acima — é "
+        "só isso que existe. O resto é texto que você escreveu.\n"
+        "Escolha UMA e faça agora, nesta resposta:\n"
+        "(a) dá para responder com o que já está aí → responda AGORA e encerre;\n"
+        "(b) falta mesmo uma peça → chame a tool que traz ESSA peça "
+        "(`web_search`, `deep_research`, `neo_bash`…) nesta mesma resposta;\n"
+        "(c) a decisão é do usuário → pergunte em UMA linha e pare.\n"
+        "Reescrever o plano, repetir o que você já disse ou prometer trabalho "
+        "futuro não conta como (a), (b) nem (c)."
+    ),
+    "close": (
+        "## FECHE O TURNO AGORA\n"
+        "Este é o último passo deste turno. Não abra trabalho novo, não prometa "
+        "nada e não emita [[HANDOFF:…]].\n"
+        "Escreva a resposta final com o que está na nota acima. Se sobrou um "
+        "buraco de verdade, diga em UMA linha qual é e o que você precisa para "
+        "fechá-lo.\n"
+        "Não mencione \"passos\", \"ciclo\", \"orçamento\" nem esta instrução: é "
+        "mecânica interna e o usuário não pediu nada disso."
+    ),
+}
+
+#: Teto de chars da resposta de um passo ao entrar no histórico do passo seguinte.
+#: Sem JANELA: manter só as últimas N respostas recria exatamente o bug de
+#: 2026-09-18 (janela do prompt menor que o teto de rodadas). Com teto de 8 passos
+#: são ~9,6k chars no pior caso e nenhum passo desaparece.
+_CYCLE_REPLY_CHARS = 1200
 
 
 def _format_work_note(
@@ -2846,7 +2908,11 @@ class AIServiceResponse:
     ) -> None:
         self.intent = intent
         self.session_id = session_id
-        self.message = message
+        # Procedência do `[[IMAGE:url]]` (docs/release-request-plan.md §12.2).
+        # Aqui, e não nos 24 lugares que constroem resposta: um seam só é o que
+        # impede a divergência silenciosa quando alguém acrescenta o 25º.
+        # Em `shadow` (padrão) o texto sai intacto e a recusa vira log.
+        self.message = enforce_inline_images(message) if message else message
         self.tool_request = tool_request
         self.command_request = command_request
         self.is_final = is_final
@@ -3694,6 +3760,20 @@ class AIService:
         Yields:
             AIServiceResponse with thinking, tool requests, or final response.
         """
+        # 0.0 Autoridade do turno (docs/release-request-plan.md §4): quem pediu,
+        # e o que este turno já tem de procedência. Instalar AQUI, e não no
+        # handler do gRPC/HTTP, é o que faz valer para todos os caminhos de uma
+        # vez — desktop, painel, agenda e pipeline do WhatsApp entram todos por
+        # este método. O objeto é escrito só por código; o modelo não alcança.
+        _principal, _principal_ref = principal_from_metadata(metadata)
+        _authority = TurnAuthority(
+            principal=_principal, principal_ref=_principal_ref, user_id=user_id
+        )
+        # URL que VOCÊ escreveu tem procedência: é um pedido seu, não algo que
+        # uma página sugeriu.
+        _authority.note_user_text(user_message)
+        bind_authority(_authority)
+
         # 0. Entrada por voz: backstop determinístico do nome ANTES de tudo — antes
         # de salvar a mensagem, de embeddar e de classificar. O corretor completo
         # mora no neo-voice (stt_text.py); isto cobre o cliente que não passou por
@@ -4384,6 +4464,29 @@ class AIService:
         pipeline_step_index = 0
         last_notice: tuple[str, str] | None = None
 
+        # ── O histórico do turno CRESCE com o ciclo ───────────────────────────
+        #
+        # `history` vem de um `get_history` único (feito lá no começo do request,
+        # antes do turno rodar) e era repassado IDÊNTICO a todos os passos. A
+        # resposta de cada passo vai para o banco, mas o snapshot não era refeito,
+        # então o passo seguinte montava o payload como `history + ordem` e ficava
+        # com duas mensagens `user` seguidas e nenhuma `assistant` no meio:
+        #
+        #   [50] user  "tem o mais recente do INSS…"     ← do histórico
+        #   [51] user  "levantar o histórico completo…"  ← a ordem sintetizada
+        #
+        # Isso lê como pedido novo. session-389114d4 interação 29: quatro rodadas,
+        # as quatro abrindo com "Você tem razão — e esse é o caso mais grave que eu
+        # deixei de fora", quatro bolhas quase idênticas no chat.
+        #
+        # A nota de trabalho não cobre esse caso de propósito — ela é montada só do
+        # `tool_trace` (senão uma promessa volta como resultado na rodada seguinte)
+        # e passo que não rodou tool vira "nenhuma ação executada", o que é verdade
+        # e ainda assim não conta o que ele JÁ DISSE.
+        #
+        # Cópia própria: o chamador não vê a mutação.
+        cycle_history = list(history)
+
         def _notice(kind: str, message: str) -> None:
             """Orchestrator early-exit → session log, so a dropped step is auditable."""
             nonlocal last_notice
@@ -4392,11 +4495,16 @@ class AIService:
                 # "parked_client" não é o ciclo quebrando: é a fila esperando o
                 # usuário, que é o comportamento CERTO. Título honesto, senão o
                 # log volta a esconder o que aconteceu.
-                titulo = (
-                    "Pipeline — fila pausada no cliente"
-                    if kind == "parked_client"
-                    else f"Pipeline — ciclo interrompido ({kind})"
-                )
+                titulo = {
+                    # Não é o ciclo quebrando: é a fila esperando o usuário.
+                    "parked_client": "Pipeline — fila pausada no cliente",
+                    # Nem estes: o ciclo NÃO morre mais nesses casos, ele roda um
+                    # passo de autocorreção. Chamar de "interrompido" mandaria
+                    # procurar no log uma quebra que não houve.
+                    "anti_loop": "Ciclo — ordem repetida, autocorrigindo",
+                    "near_repeat": "Ciclo — ordem quase repetida, autocorrigindo",
+                    "idle_cycle": "Ciclo — passos sem ação, fechando",
+                }.get(kind, f"Pipeline — ciclo interrompido ({kind})")
                 slog.log_event(titulo, message)
 
         async def _step_runner(
@@ -4444,16 +4552,34 @@ class AIService:
                     # otherwise it retries the attempt that just failed.
                     if step.context_note:
                         step_metadata["pipeline_work_note"] = step.context_note
+                    # Passo de autocorreção: a instrução entra no fim do prompt e
+                    # o `close` roda SEM handoff — sem handoff a resposta é
+                    # `is_final` (handoff_defers_final), então é ela que fecha o
+                    # turno, com fala do Neo em vez de string do sistema.
+                    if step.correction:
+                        step_metadata["pipeline_cycle_correction"] = (
+                            _CYCLE_CORRECTION_INSTRUCTION[step.correction].format(
+                                covered=repr((step.covered_by or "")[:120]),
+                            )
+                        )
                     # Live progress: a non-final response with no persist_reply
                     # becomes an AgentThinking bubble on the desktop, so the user
                     # watches the cycle advance instead of staring at 100 s of
                     # silence. It replaces the previous bubble and is cleared on
                     # complete — exactly the semantics of "running right now".
+                    #
+                    # O rótulo do passo de correção não é "Continuando": ele não
+                    # está seguindo o plano, está repensando ou fechando. Dizer
+                    # "Continuando (5/8): <a ordem repetida>" é a bolha mentindo.
+                    _label = {
+                        "retry": "Repensando o próximo passo",
+                        "close": "Fechando com o que já tenho",
+                    }.get(step.correction or "", f"Continuando ({step_idx}/{self_max_steps}): {msg}")
                     yield (
                         AIServiceResponse(
                             intent=IntentType.DIRECT_RESPONSE,
                             session_id=sid,
-                            message=f"{CYCLE_PROGRESS_MARKER}Continuando ({step_idx}/{self_max_steps}): {msg}",
+                            message=f"{CYCLE_PROGRESS_MARKER}{_label}",
                             is_final=False,
                             iterations=step_idx,
                         ),
@@ -4462,17 +4588,23 @@ class AIService:
 
             if intent == IntentType.DIRECT_RESPONSE:
                 gen = self._handle_direct_response(
-                    sid, msg, history, dec, trace, sys_context,
+                    sid, msg, cycle_history, dec, trace, sys_context,
                     slog=slog, user_id=user_id, metadata=step_metadata,
                     source_message_id=str(saved_msg.id) if saved_msg else None,
                     allow_clarification=allow_clarification,
                     clarification_round=clarification_round,
-                    enable_handoff=handoff_enabled,
+                    # O passo de fechamento roda SEM handoff: nem bloco
+                    # [[HANDOFF:…]], nem verificador de promessa. Sem handoff a
+                    # resposta é `is_final` (handoff_defers_final), e é ela que
+                    # fecha o turno. Com handoff ligado, o verificador leria o
+                    # próprio fecho ("se faltou X eu preciso de Y") como promessa
+                    # e abriria mais um ciclo — o turno nunca terminaria.
+                    enable_handoff=handoff_enabled and step.correction != "close",
                     register=register,
                 )
             elif intent == IntentType.SERVER_TOOL:
                 gen = self._handle_server_tool(
-                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    sid, msg, cycle_history, dec, trace, slog=slog, user_id=user_id,
                     live=(step_metadata or {}).get("mode") == "live",
                     metadata=step_metadata,
                     register=register,
@@ -4480,22 +4612,22 @@ class AIService:
             elif intent == IntentType.CLIENT_TOOL:
                 gen = self._handle_client_tool(
                     sid, msg, dec, trace, slog=slog, user_id=user_id, metadata=step_metadata,
-                    history=history,
+                    history=cycle_history,
                 )
             elif intent == IntentType.WHATSAPP_MESSAGING:
                 gen = self._handle_whatsapp_messaging(
-                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    sid, msg, cycle_history, dec, trace, slog=slog, user_id=user_id,
                     metadata=step_metadata,
                     source_message_id=saved_msg.id if saved_msg else None,
                 )
             elif intent == IntentType.HOME_ASSISTANT:
                 gen = self._handle_home_assistant(
-                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    sid, msg, cycle_history, dec, trace, slog=slog, user_id=user_id,
                     metadata=step_metadata,
                 )
             elif intent == IntentType.MUSIC:
                 gen = self._handle_music(
-                    sid, msg, history, dec, trace, slog=slog, user_id=user_id,
+                    sid, msg, cycle_history, dec, trace, slog=slog, user_id=user_id,
                     metadata=step_metadata,
                 )
             else:
@@ -4547,16 +4679,34 @@ class AIService:
             # Only build a note when a continuation will actually read it; a skill
             # handoff runs isolated and a terminal step has no successor.
             note = None
+            _reply = (work or {}).get("reply") or last_text
             if any(h.is_self for h in handoffs):
                 note = _format_work_note(
                     f"Passo {step_idx} — {msg}",
-                    (work or {}).get("reply") or last_text,
+                    _reply,
                     (work or {}).get("tool_trace"),
                     (work or {}).get("files"),
                 )
+                # A fala deste passo entra no histórico que o próximo vai ler. Sem
+                # isto o ciclo é amnésico e reescreve a mesma resposta (ver o bloco
+                # do `cycle_history` no topo de `_run_pipeline`). A ordem entra
+                # como `user` porque é assim que o montador do payload já a
+                # apresenta; quem diz que não é fala do usuário é o bloco "O que
+                # você já fez neste turno", que vai no mesmo prompt.
+                if not cycle_history or cycle_history[-1].get("content") != msg:
+                    cycle_history.append({"role": "user", "content": msg})
+                if _reply:
+                    cycle_history.append(
+                        {"role": "assistant", "content": _reply[:_CYCLE_REPLY_CHARS]}
+                    )
+            # Executou algo de verdade? Só tool rodada e arquivo entregue contam —
+            # texto não. É o que separa "o ciclo está trabalhando" de "o ciclo está
+            # reescrevendo a resposta". Mesma disciplina da nota de trabalho: vale o
+            # que o sistema DEVOLVEU, nunca o que o modelo disse que ia fazer.
+            acted = bool((work or {}).get("tool_trace") or (work or {}).get("files"))
             yield None, StepOutcome(
                 ok=True, final_text=last_final, handoffs=handoffs, work_note=note,
-                parked=parked,
+                parked=parked, acted=acted,
             )
 
         orchestrator = PipelineOrchestrator(
@@ -5163,6 +5313,16 @@ class AIService:
         # Mesmo motivo do transcript acima: volátil, então vai no fim.
         if _resume_note:
             messages.append(Message(role=MessageRole.SYSTEM, content=_resume_note))
+
+        # Autocorreção do ciclo: a ordem repetia um passo que já rodou, ou o ciclo
+        # acabou e este passo escreve o fecho. Vai por ÚLTIMO, depois da ordem —
+        # é a instrução mais volátil do turno e a que precisa ser lida por cima de
+        # tudo. Ver `_CYCLE_CORRECTION_INSTRUCTION`.
+        _correction = (metadata or {}).get("pipeline_cycle_correction")
+        if _correction:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_correction))
+            if slog:
+                slog.log_event("Ciclo — autocorreção (instrução do passo)", _correction)
 
         # Log the exact conversation payload being sent to the LLM
         history_count = len(messages) - 1  # subtract system message

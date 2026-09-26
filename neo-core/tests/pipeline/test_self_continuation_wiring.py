@@ -73,6 +73,11 @@ def _install_handler(svc: AIService, scripted):
     async def fake_handle_direct_response(sid, msg, history, dec, trace, sys_context, **kw):
         seen.append((msg, dict(kw.get("metadata") or {})))
         reply, handoffs = scripted(msg)
+        # O passo de fechamento roda com handoff DESLIGADO — é isso que faz a
+        # resposta dele ser `is_final` e o turno terminar falando. Ignorar o
+        # parâmetro aqui faria o harness reproduzir o bug, não o conserto.
+        if not kw.get("enable_handoff", True):
+            handoffs = []
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=sid,
@@ -204,15 +209,19 @@ async def test_budget_exhaustion_still_terminates_the_turn():
             )
         ]
 
-    _install_handler(svc, scripted)
+    seen = _install_handler(svc, scripted)
     out = await _run(svc)
+
+    from modules.desktop.ai_service import _CYCLE_CLOSING_MESSAGE
 
     finals = [r for r in out if r.is_final]
     assert len(finals) == 1
-    # The closer explains the real reason and is its own message — never a repeat
-    # of the last reply, which already reached the chat as its own bubble.
-    assert "limite de passos" in finals[0].message
-    assert finals[0].message not in {"tentativa 1", "tentativa 2"}
+    # O turno termina, e termina com FALA — o passo de fechamento escreve a
+    # resposta. A string fixa do sistema ("Bati no limite de passos deste turno")
+    # virou último recurso e não deve aparecer num estouro normal de orçamento.
+    assert finals[0].message not in _CYCLE_CLOSING_MESSAGE.values()
+    assert "limite de passos" not in finals[0].message
+    assert [m for m, _ in seen][-1] == "fechar o turno com o que já foi levantado"
 
 
 @pytest.mark.asyncio
@@ -228,14 +237,23 @@ async def test_anti_loop_stop_also_terminates_and_names_the_reason():
             )
         ]
 
-    _install_handler(svc, scripted)
+    seen = _install_handler(svc, scripted)
     out = await _run(svc)
+
+    from modules.desktop.ai_service import _CYCLE_CLOSING_MESSAGE
 
     finals = [r for r in out if r.is_final]
     assert len(finals) == 1
-    assert "repetir um que já rodou" in finals[0].message
-    # A ordem repetida não quer dizer que algo falhou (session-30b1e484).
-    assert "falhou" not in finals[0].message
+    # Contrato novo: ordem repetida não encerra o turno com string do sistema. O
+    # ciclo roda um empurrão ("pensa de novo") e, na segunda volta, um passo de
+    # fechamento — quem fala com o usuário é o cérebro, sempre.
+    ordens = [m for m, _ in seen]
+    assert ordens[-1] == "fechar o turno com o que já foi levantado"
+    assert finals[0].message not in _CYCLE_CLOSING_MESSAGE.values()
+    assert "repetir um que já rodou" not in finals[0].message
+    # A instrução do empurrão chegou ao passo que tinha que repensar.
+    empurrao = next(md for m, md in seen if md.get("pipeline_cycle_correction"))
+    assert "ESSA ORDEM NÃO RODOU" in empurrao["pipeline_cycle_correction"]
 
 
 @pytest.mark.asyncio

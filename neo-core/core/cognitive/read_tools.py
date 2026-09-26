@@ -16,6 +16,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from core.authority import gate_tool_call, note_tool_result
 from core.files.tools import FILE_TOOLS
 from modules.config.tools import CONFIG_TOOLS
 from modules.conversation_recall import (
@@ -27,6 +28,7 @@ from modules.finance import FINANCE_TOOL_NAMES
 from modules.location.tools import LOCATION_TOOLS
 from modules.pks_search.tools import PKS_SEARCH_TOOLS
 from modules.pks_write import PKS_WRITE_TOOL_NAMES, PKS_WRITE_TOOLS
+from modules.release.tools import RELEASE_TOOL_NAMES, RELEASE_TOOLS
 from modules.services.tools import SERVICE_TOOLS
 from modules.skills_library.tools import SKILLS_LIBRARY_TOOLS
 from modules.datasets.tools import DATA_DEFINE_TOOL_NAMES, DATA_TOOL_NAMES
@@ -50,6 +52,10 @@ def _by_name(tools: list[ToolSchema], name: str) -> ToolSchema:
 
 COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     _by_name(PKS_SEARCH_TOOLS, "search_pks"),
+    # F2 (docs/release-request-plan.md §7): a volta da redação. Fica no read
+    # set porque o dono do dado perguntando o próprio dado é o caso NORMAL —
+    # quem decide se a chamada vale num turno contaminado é o portão.
+    _by_name(PKS_SEARCH_TOOLS, "pks_reveal"),
     # Arquivo de conversas (docs/conversation-recall-plan.md): o cognitivo só tem
     # no contexto as mensagens DESTA sessão — "a gente já falou de X?" só tem
     # resposta honesta indo ao banco. Sem ela o modelo nega de cabeça (foi o que
@@ -109,6 +115,11 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
     # 2ª tool com efeito colateral aqui, e a fronteira com pks_remember está
     # escrita nas duas descriptions — trocar uma pela outra é o risco R1.
     *WORKING_MEMORY_TOOLS,
+    # Solicitação de Liberação (docs/release-request-plan.md §6): o caminho
+    # honesto quando a tarefa precisa de dado redigido e o turno não é um
+    # pedido limpo do dono. Fica SEMPRE disponível — se ela também passasse
+    # pelo portão, a saída de emergência teria fechadura.
+    *RELEASE_TOOLS,
 ]
 
 # Tools that need a user to be meaningful — only offered when user_id is known.
@@ -117,6 +128,7 @@ COGNITIVE_READ_TOOLS: list[ToolSchema] = [
 _USER_SCOPED = frozenset(
     {
         "search_pks",
+        "pks_reveal",
         "list_connected_devices",
         "get_user_location",
         "device_control",
@@ -128,6 +140,7 @@ _USER_SCOPED = frozenset(
     | WORKING_MEMORY_TOOL_NAMES
     | DATASET_TOOL_NAMES
     | EVENT_TOOL_NAMES
+    | RELEASE_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -262,6 +275,7 @@ class CognitiveReadExecutor:
         self._events: Any = None
         self._tool_index: Any = None
         self._pks_write: Any = None
+        self._release: Any = None
         self._recall: Any = None
         self._working_memory: Any = None
         # Voice reads (voice_list/voice_get) work with or without a user — a fresh,
@@ -298,6 +312,17 @@ class CognitiveReadExecutor:
             from modules.working_memory import WorkingMemoryExecutor
 
             self._working_memory = WorkingMemoryExecutor(db=db)
+
+            # Liberação: o serviço só precisa do banco, então o executor nasce
+            # aqui em vez de atravessar o AIService inteiro por parâmetro.
+            from core.release import ReleaseService
+            from core.release.notify import build_release_notifier
+            from modules.release import ReleaseToolExecutor
+
+            self._release = ReleaseToolExecutor(
+                ReleaseService(db, notifier=build_release_notifier(db))
+            )
+            self._release.set_context(user_id, session_id)
             self._working_memory.set_context(user_id, session_id)
             # Finanças (fin_*, gated pela skill 'financas') — executor fresco e
             # user-scoped por request, como devices (o global fica sem usuário).
@@ -367,12 +392,19 @@ class CognitiveReadExecutor:
         try:
             if name in _USER_SCOPED and self._user_id is None:
                 raise ValueError(f"{name} requer um usuário identificado.")
+            # Portão de autoridade — o OUTRO trilho é o `ToolExecutor`. Mesma
+            # função, uma definição só (docs/release-request-plan.md §5.2). O
+            # fallthrough para o executor global passa pelo portão lá, e a
+            # segunda checagem é idempotente (a decisão não tem efeito colateral).
+            _decisao = await gate_tool_call(name, tool_call.arguments, tool_call.id)
+            if _decisao.blocked:
+                raise ValueError(_decisao.mensagem())
             if (
                 name in ("list_connected_devices", "device_control", "device_power")
                 and self._devices is not None
             ):
                 result = await self._devices.execute(name, tool_call.arguments)
-            elif name == "search_pks" and self._pks_search is not None:
+            elif name in ("search_pks", "pks_reveal") and self._pks_search is not None:
                 result = await self._pks_search.execute(name, tool_call.arguments)
             elif name == "get_user_location" and self._location is not None:
                 result = await self._location.execute(name, tool_call.arguments)
@@ -394,9 +426,12 @@ class CognitiveReadExecutor:
                 result = await self._pks_write.execute(name, tool_call.arguments)
             elif name in WORKING_MEMORY_TOOL_NAMES and self._working_memory is not None:
                 result = await self._working_memory.execute(name, tool_call.arguments)
+            elif name in RELEASE_TOOL_NAMES and self._release is not None:
+                result = await self._release.execute(name, tool_call.arguments)
             else:
                 # Read-only globals (e.g. get_weather) go through the global executor.
                 return await self._global.execute_tool_call(tool_call)
+            note_tool_result(name, result)
             return ToolResult(
                 tool_call_id=tool_call.id,
                 name=name,
