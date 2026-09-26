@@ -332,6 +332,26 @@ export interface ElectronAPI {
   // Sessões anteriores — a fonte é o neo-core (tabela conversation_session);
   // o desktop não mantém índice local. Rejeita se o core estiver inacessível.
   listSessions: (limit?: number) => Promise<SessionInfo[]>;
+  /**
+   * Decide um card de missão (aprovar / editar / cancelar).
+   *
+   * Passa pelo Rust porque a chamada precisa do token do aparelho: o `fetch`
+   * direto do webview ia sem header e tomava 401 em silêncio desde que as rotas
+   * de missão ganharam credencial (neo-core/docs/api-auth-plan.md).
+   */
+  missionCommand: (
+    missionId: string,
+    command: 'approve' | 'cancel' | 'edit' | 'retry',
+    editedText?: string,
+  ) => Promise<unknown>;
+  /**
+   * Token da ponte da extensão de música (`ws://127.0.0.1:17872`).
+   *
+   * A ponte passou a exigir credencial: loopback não é fronteira de confiança —
+   * qualquer processo da máquina alcança, e uma PÁGINA abre WebSocket para
+   * 127.0.0.1. Este token é colado no popup da extensão uma vez.
+   */
+  extBridgeToken: () => Promise<string>;
   /** Sessão ativa agora (para destacar a linha atual na lista). */
   getSessionId: () => Promise<string>;
   // Caderno de trabalho do Neo (tabela `working_note` no core). Read-only: o
@@ -906,6 +926,9 @@ export const electronAPI: ElectronAPI = {
 
   // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
   listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),
+  missionCommand: (missionId, command, editedText) =>
+    invoke('mission_command', { missionId, command, editedText }),
+  extBridgeToken: () => invoke<string>('ext_bridge_token'),
   getSessionId: () => invoke<string>('get_session_id'),
 
   // Caderno de trabalho (proxy pro neo-core, ver commands/mod.rs).

@@ -390,8 +390,9 @@ pub async fn upload_path_to_store(
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let resp = client
-        .post(format!("{}/api/v1/files", neo_core_http_url()))
+    let resp = crate::with_device_token(
+        client.post(format!("{}/api/v1/files", neo_core_http_url())),
+    )
         .multipart(form)
         .send()
         .await
@@ -431,12 +432,11 @@ async fn fetch_generated_file_bytes(file_id: &str) -> Result<Vec<u8>, String> {
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let resp = client
-        .get(format!(
-            "{}/api/v1/files/{}/download",
-            neo_core_http_url(),
-            file_id
-        ))
+    let resp = crate::with_device_token(client.get(format!(
+        "{}/api/v1/files/{}/download",
+        neo_core_http_url(),
+        file_id
+    )))
         .send()
         .await
         .map_err(|e| format!("Download falhou: {}", e))?;
@@ -1082,6 +1082,71 @@ pub async fn reveal_local_file(path: String) -> Result<(), String> {
         .map_err(|e| format!("Não consegui abrir o arquivo: {}", e))
 }
 
+/// O token da ponte da extensão de música, para colar no popup dela.
+///
+/// Mostrar a credencial na tela é aceitável aqui e não é no `device-token`: esta
+/// existe justamente para ser copiada para outro programa (a extensão), enquanto
+/// aquela é do processo. Gera na primeira chamada se ainda não existir.
+#[tauri::command]
+pub fn ext_bridge_token() -> Result<String, String> {
+    crate::ext_bridge_token()
+}
+
+/// Aprovar / editar / cancelar um card de missão a partir do CHAT.
+///
+/// Existe porque o `ChatPage.tsx` fazia isto com `fetch` puro do webview, sem
+/// header nenhum — e as rotas de missão estão atrás de credencial no core desde
+/// que o painel ganhou JWT, ou seja, **o botão do card não funcionava** e o erro
+/// morria num `console.error`. Aqui a chamada leva o token do aparelho, e a falha
+/// volta para a UI como `Err` em vez de sumir.
+#[tauri::command]
+pub async fn mission_command(
+    mission_id: String,
+    command: String,
+    edited_text: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let base_url = neo_core_http_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let mut payload = serde_json::json!({ "command": command });
+    if let Some(texto) = edited_text.filter(|t| !t.trim().is_empty()) {
+        payload["edited_text"] = serde_json::Value::String(texto);
+    }
+
+    let resp = crate::with_device_token(
+        client.post(format!("{}/api/v1/missions/{}/command", base_url, mission_id)),
+    )
+    .json(&payload)
+    .send()
+    .await
+    .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("neo-core respondeu {}: {}", status, body));
+    }
+    let data: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+    // O ack é melhor-esforço: a decisão já foi registrada, e falhar aqui só
+    // deixaria a notificação marcada como não vista.
+    let ack = crate::with_device_token(client.post(format!(
+        "{}/api/v1/missions/{}/notifications/ack",
+        base_url, mission_id
+    )))
+    .send()
+    .await;
+    if let Err(e) = ack {
+        warn!("[Neo] ack da notificação da missão {} falhou: {}", mission_id, e);
+    }
+
+    Ok(data)
+}
+
+
 async fn ack_notification_http(notification_id: &str) -> Result<(), String> {
     let base_url = neo_core_http_url();
     let client = reqwest::Client::builder()
@@ -1089,11 +1154,10 @@ async fn ack_notification_http(notification_id: &str) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let resp = client
-        .post(format!(
-            "{}/api/v1/missions/notifications/{}/ack",
-            base_url, notification_id
-        ))
+    let resp = crate::with_device_token(client.post(format!(
+        "{}/api/v1/missions/notifications/{}/ack",
+        base_url, notification_id
+    )))
         .send()
         .await
         .map_err(|e| format!("Notification ack request failed: {}", e))?;
@@ -1139,7 +1203,7 @@ pub async fn get_conversation_history(state: State<'_, AppState>) -> Result<Vec<
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
     let url = format!("{}/api/v1/desktop/session/{}/history", base_url, session_id);
-    match client.get(url).send().await {
+    match crate::with_device_token(client.get(url)).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<ConversationHistoryResponse>().await {
             Ok(history) => return Ok(history.messages),
             Err(e) => warn!("[Neo] Failed to parse backend history, using local history: {}", e),
@@ -1213,8 +1277,7 @@ pub async fn list_sessions(limit: Option<u32>) -> Result<Vec<SessionInfo>, Strin
         limit.unwrap_or(50)
     );
 
-    let resp = client
-        .get(url)
+    let resp = crate::with_device_token(client.get(url))
         .send()
         .await
         .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
@@ -1703,8 +1766,9 @@ pub async fn quick_help_ask_stream(window: Window, question: String) -> Result<(
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let resp = client
-        .post(format!("{}/api/v1/quick-help/ask", url))
+    let resp = crate::with_device_token(
+        client.post(format!("{}/api/v1/quick-help/ask", url)),
+    )
         .json(&serde_json::json!({ "question": question }))
         .send()
         .await
@@ -1791,6 +1855,51 @@ pub async fn process_notification_action(
         notification_id, action_type
     );
 
+    // Solicitação de Liberação (docs/release-request-plan.md §11). A decisão vai
+    // autenticada pelo TOKEN DESTE APARELHO: é ele que diz ao core QUEM aprovou.
+    // Sem token não há decisão — e isso é o ponto, não um contratempo: aparelho
+    // não pareado não libera dado pessoal.
+    if matches!(action_type.as_str(), "liberar" | "recusar") {
+        let payload = action_payload.clone().unwrap_or_default();
+        let release_id = payload
+            .get("release_id")
+            .or_else(|| payload.get("releaseId"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "notification action missing release_id".to_string())?;
+        let token = crate::device_token()
+            .ok_or("Este aparelho não está pareado — pareie antes de liberar dados.")?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("Failed to create client: {}", e))?;
+
+        let resp = client
+            .post(format!(
+                "{}/api/v1/liberacoes/{}/decidir",
+                neo_core_http_url(),
+                release_id
+            ))
+            .query(&[("token", token.as_str())])
+            .json(&serde_json::json!({
+                "aprovar": action_type == "liberar",
+                "origem": "desktop",
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Falha ao registrar a decisão: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Decisão recusada pelo core: {} {}", status, body));
+        }
+        info!(
+            "[Neo] liberação {} decidida: {}",
+            release_id, action_type
+        );
+    }
+
     if matches!(action_type.as_str(), "approve" | "cancel" | "retry") {
         let payload = action_payload.clone().unwrap_or_default();
         let mission_id = payload
@@ -1806,8 +1915,9 @@ pub async fn process_notification_action(
             .build()
             .map_err(|e| format!("Failed to create client: {}", e))?;
 
-        let resp = client
-            .post(format!("{}/api/v1/missions/{}/command", base_url, mission_id))
+        let resp = crate::with_device_token(
+            client.post(format!("{}/api/v1/missions/{}/command", base_url, mission_id)),
+        )
             .json(&serde_json::json!({ "command": action_type }))
             .send()
             .await
@@ -2171,8 +2281,7 @@ pub async fn list_working_notes(limit: Option<u32>) -> Result<WorkingNotesPage, 
         limit.unwrap_or(200)
     );
 
-    let resp = working_memory_client()?
-        .get(url)
+    let resp = crate::with_device_token(working_memory_client()?.get(url))
         .send()
         .await
         .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
@@ -2196,8 +2305,7 @@ pub async fn read_working_note(slug: String) -> Result<WorkingNoteDetail, String
         urlencoding::encode(&slug)
     );
 
-    let resp = working_memory_client()?
-        .get(url)
+    let resp = crate::with_device_token(working_memory_client()?.get(url))
         .send()
         .await
         .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
@@ -2269,8 +2377,7 @@ async fn jobs_request(
         neo_core_http_url(),
         path_and_query
     );
-    let resp = working_memory_client()?
-        .request(method, url)
+    let resp = crate::with_device_token(working_memory_client()?.request(method, url))
         .send()
         .await
         .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;

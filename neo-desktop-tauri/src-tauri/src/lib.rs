@@ -88,6 +88,71 @@ pub fn device_token() -> Option<String> {
     }
 }
 
+/// Injeta a credencial do aparelho em uma chamada HTTP ao neo-core.
+///
+/// **Por que um helper e não um header por chamada.** O token já existia (e já
+/// viajava no gRPC e nos WS), mas NENHUMA das chamadas HTTP o mandava: histórico,
+/// sessões, caderno, tarefas, upload, download e quick-help iam nuas. Com o
+/// portão de autenticação do core (`neo-core/docs/api-auth-plan.md`) elas passam
+/// a levar 401 em `enforce` — e um helper garante que a próxima chamada nasça com
+/// credencial, em vez de nascer nua e ser descoberta em produção.
+///
+/// Sem token (aparelho não pareado) a chamada sai igual: quem decide se isso
+/// passa é o modo do core, não o cliente.
+pub fn with_device_token(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match device_token() {
+        Some(token) => req.header("X-Device-Token", token),
+        None => req,
+    }
+}
+
+/// Credencial da ponte da extensão de música (`ws://127.0.0.1:17872`).
+///
+/// **Por que existe.** A ponte nasceu sem autenticação nenhuma: `accept_async`
+/// aceitava qualquer handshake, sem token e sem olhar `Origin`. Isso não era só
+/// "alguém mexe na música":
+///
+/// * a ponte guarda UMA conexão (`set_connection`), então quem conecta depois
+///   **desloca a extensão de verdade** em vez de coexistir;
+/// * o que entra como `type:"tabs"` vira `metadata["media_context"]["browser_tabs"]`
+///   e chega ao prompt do turno — `title`/`url` são string livre, ou seja, um
+///   canal de injeção por fora do modelo de ameaça do `release-request-plan`;
+/// * `type:"media_event"` faz ESTE processo chamar `/api/v1/eventos/midia`
+///   **com o token do aparelho**. Um gatilho local aberto empresta a credencial:
+///   o atacante não precisa tê-la, ele pede para quem tem.
+///
+/// O token é gerado na primeira execução e guardado em disco com 0600, do mesmo
+/// jeito que o `device-token`. Nada o expira: ele identifica a extensão instalada,
+/// e trocá-lo é apagar o arquivo (aí a extensão precisa colar o novo).
+pub fn ext_bridge_token() -> Result<String, String> {
+    let dir = device_config_dir();
+    let path = dir.join("ext-token");
+
+    if let Ok(existente) = std::fs::read_to_string(&path) {
+        let existente = existente.trim().to_string();
+        if !existente.is_empty() {
+            return Ok(existente);
+        }
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("não consegui criar {:?}: {}", dir, e))?;
+    // Dois UUID v4 = 64 hex de CSPRNG (o `uuid` usa `getrandom`). Evita somar
+    // uma dependência de `rand` só para isto.
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(&path, &token).map_err(|e| format!("não consegui gravar o token: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
+}
+
 /// Apaga o token local — usado quando ESTE device é removido da conta.
 ///
 /// Sem isto o aparelho ficaria com um token que o core já não reconhece, e o
@@ -116,13 +181,17 @@ fn store_device_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_existing_device_id(
-    user_id: &str,
-    hardware_id: &str,
-) -> Option<String> {
+/// O `device_id` que este hardware já tem na conta, se houver.
+///
+/// Precisa do token de pareamento: o `user_id` agora sai DELE no core, não de um
+/// query param (antes bastava declarar o UUID de alguém para descobrir os
+/// aparelhos dessa pessoa). Sem token — aparelho nunca pareado — não há registro
+/// a reusar de qualquer forma, e o chamador gera um id novo.
+fn resolve_existing_device_id(hardware_id: &str) -> Option<String> {
     if hardware_id.is_empty() {
         return None;
     }
+    let token = device_token()?;
 
     tauri::async_runtime::block_on(async move {
         let client = reqwest::Client::builder()
@@ -132,7 +201,7 @@ fn resolve_existing_device_id(
 
         let response = client
             .get(format!("{}/api/v1/devices/resolve", neo_core_http_url()))
-            .query(&[("user_id", user_id), ("hardware_id", hardware_id)])
+            .query(&[("hardware_id", hardware_id), ("token", token.as_str())])
             .send()
             .await
             .ok()?;
@@ -197,7 +266,7 @@ fn get_or_create_session_id() -> String {
     new_id
 }
 
-fn get_or_create_device_id(user_id: &str, hardware_id: &str) -> String {
+fn get_or_create_device_id(hardware_id: &str) -> String {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("neo-desktop");
@@ -212,7 +281,7 @@ fn get_or_create_device_id(user_id: &str, hardware_id: &str) -> String {
 
     let _ = std::fs::create_dir_all(&config_dir);
 
-    if let Some(existing_device_id) = resolve_existing_device_id(user_id, hardware_id) {
+    if let Some(existing_device_id) = resolve_existing_device_id(hardware_id) {
         info!("[Neo] Reusing existing device_id from hardware match");
         let _ = std::fs::write(&id_path, &existing_device_id);
         return existing_device_id;
@@ -227,9 +296,14 @@ fn get_or_create_device_id(user_id: &str, hardware_id: &str) -> String {
 pub fn run() {
     let system_info = collect_system_info();
     let hardware_id = system_info.hardware_id.clone();
-    let user_id = std::env::var("NEO_USER_ID")
-        .unwrap_or_else(|_| "5a998544-c3f3-423f-bebb-1cc42fca6063".to_string());
-    let device_id = get_or_create_device_id(&user_id, &hardware_id);
+    // `NEO_USER_ID` já não é a fonte da verdade: com o aparelho pareado, o core
+    // resolve o dono pelo TOKEN e IGNORA o que o cliente declarar
+    // (neo-core/docs/api-auth-plan.md §1.4). O UUID que estava hardcoded aqui saiu:
+    // ele fazia qualquer instalação se dizer dona da conta de produção, e quando o
+    // token existe o valor não é usado para nada. Fica a variável, vazia por
+    // padrão, porque o campo do protobuf continua existindo.
+    let user_id = std::env::var("NEO_USER_ID").unwrap_or_default();
+    let device_id = get_or_create_device_id(&hardware_id);
     let session_id = get_or_create_session_id();
 
     info!("[Neo] Device ID: {}", device_id);
@@ -319,6 +393,8 @@ pub fn run() {
             commands::clear_conversation_history,
             commands::save_conversation_history,
             commands::list_sessions,
+            commands::mission_command,
+            commands::ext_bridge_token,
             commands::get_session_id,
             commands::list_working_notes,
             commands::read_working_note,

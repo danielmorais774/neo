@@ -827,3 +827,36 @@
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* ── Token da ponte da extensão (aba Dispositivos) ──────────────────────────
+   A credencial que a extensão de música apresenta no handshake da ponte local.
+   Mostrada mascarada por padrão: ela vive numa tela que fica aberta, e um
+   screenshot ou um ombro é o jeito mais banal de uma credencial vazar.
+   Ver neo-core/docs/api-auth-plan.md §11.                                    */
+.ext-token-card {
+  border-style: dashed;
+}
+
+.ext-token-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ext-token-value {
+  flex: 1;
+  min-width: 200px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.5px;
+  word-break: break-all;
+}
+
+.ext-token-error {
+  color: #fca5a5;
+}

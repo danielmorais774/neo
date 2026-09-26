@@ -168,6 +168,77 @@ function DeviceName({ device, onRenamed }: { device: DeviceInfo; onRenamed: () =
   );
 }
 
+/**
+ * Credencial da ponte da extensão de música.
+ *
+ * A ponte (`ws://127.0.0.1:17872`) passou a exigir token no handshake. Loopback
+ * não é fronteira de confiança: qualquer processo da máquina alcança, e uma
+ * PÁGINA WEB abre WebSocket para 127.0.0.1 — e como a ponte guarda só uma
+ * conexão, a hostil deslocava a extensão de verdade. Ver
+ * neo-core/docs/api-auth-plan.md §11.
+ *
+ * Mostrar esta credencial na tela é o ponto dela: existe para ser copiada para
+ * outro programa. O `device-token` continua sem aparecer em lugar nenhum.
+ */
+function ExtBridgeTokenCard() {
+  const [token, setToken] = useState<string | null>(null);
+  const [erro, setErro] = useState<string | null>(null);
+  const [revelado, setRevelado] = useState(false);
+  const [copiado, setCopiado] = useState(false);
+
+  useEffect(() => {
+    window.electronAPI
+      ?.extBridgeToken()
+      .then(setToken)
+      .catch((e: unknown) =>
+        setErro(typeof e === 'string' ? e : (e as Error)?.message || 'falhou'),
+      );
+  }, []);
+
+  const copiar = async () => {
+    if (!token) return;
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopiado(true);
+      setTimeout(() => setCopiado(false), 1800);
+    } catch {
+      // Sem clipboard (permissão do webview): revelar já resolve, dá pra
+      // selecionar com o mouse.
+      setRevelado(true);
+    }
+  };
+
+  return (
+    <div className="device-card ext-token-card">
+      <div className="device-info">
+        <div className="device-header">
+          <span className="device-type">Extensão de música</span>
+        </div>
+        <div className="device-meta">
+          Cole este token no popup da extensão (Neo Music Bridge) uma vez. Sem ele
+          a ponte recusa a conexão — e é isso que impede uma página web qualquer de
+          se passar pela extensão.
+        </div>
+        {erro ? (
+          <div className="device-meta ext-token-error">Não consegui ler o token: {erro}</div>
+        ) : (
+          <div className="ext-token-row">
+            <code className="ext-token-value">
+              {token ? (revelado ? token : `${token.slice(0, 6)}${'•'.repeat(18)}`) : 'carregando…'}
+            </code>
+            <button className="device-remove" onClick={() => setRevelado((v) => !v)} disabled={!token}>
+              {revelado ? 'Ocultar' : 'Mostrar'}
+            </button>
+            <button className="device-remove" onClick={copiar} disabled={!token}>
+              {copiado ? 'Copiado ✓' : 'Copiar'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function formatTimestamp(unix: number): string {
   if (!unix) return '—';
   const d = new Date(unix * 1000);
@@ -276,6 +347,7 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
 
   return (
     <div className="devices-list">
+      <ExtBridgeTokenCard />
       {devices.map((device) => (
         <div
           key={device.device_id}

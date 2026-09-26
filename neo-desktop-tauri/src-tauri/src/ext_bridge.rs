@@ -7,6 +7,14 @@
 //
 // Single extension connection at a time (last wins). Loopback-only bind — no LAN
 // exposure. See neo-music-feature (Etapa 3).
+//
+// **Credencial (2026-09-26).** O handshake exige `?token=` (o arquivo
+// `ext-token`, ver `crate::ext_bridge_token`) e recusa `Origin` de página web.
+// Antes disto a ponte aceitava qualquer conexão: loopback não é fronteira de
+// confiança, porque (a) qualquer processo da máquina alcança, e (b) uma PÁGINA
+// abre WebSocket para 127.0.0.1 — o navegador manda `Origin`, e quem não olha não
+// se defende. Como só uma conexão vive por vez, uma conexão hostil DESLOCAVA a
+// extensão real. Ver neo-core/docs/api-auth-plan.md §11.
 
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
@@ -16,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Loopback port the browser extension connects to.
@@ -606,7 +616,13 @@ async fn report_media_event(
             return;
         }
     };
-    let response = match client.post(&url).json(&body).send().await {
+    // Credencial do aparelho: esta rota dispara AÇÃO (trocar a faixa), e passou a
+    // exigir credencial no core (neo-core/docs/api-auth-plan.md).
+    let response = match crate::with_device_token(client.post(&url))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("[ExtBridge] evento de mídia falhou: {}", e);
@@ -691,6 +707,16 @@ async fn report_media_event(
 /// `tokio::spawn`s are valid because they run inside this already-spawned task.
 /// If the port is taken it logs and returns (the bridge stays disconnected).
 pub async fn run(bridge: ExtBridge) {
+    // Resolvido UMA vez, no start: se falhar, a ponte não sobe. Subir sem token
+    // seria subir sem credencial — exatamente o que esta mudança fecha.
+    let token = match crate::ext_bridge_token() {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            error!("[ExtBridge] sem credencial, ponte NÃO vai subir: {}", e);
+            return;
+        }
+    };
+
     let addr = format!("127.0.0.1:{}", EXT_BRIDGE_PORT);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -706,8 +732,9 @@ pub async fn run(bridge: ExtBridge) {
         match listener.accept().await {
             Ok((stream, _peer)) => {
                 let bridge = bridge.clone();
+                let token = token.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, bridge).await {
+                    if let Err(e) = handle_conn(stream, bridge, token).await {
                         warn!("[ExtBridge] connection ended: {}", e);
                     }
                 });
@@ -717,10 +744,104 @@ pub async fn run(bridge: ExtBridge) {
     }
 }
 
-async fn handle_conn(stream: TcpStream, bridge: ExtBridge) -> Result<(), String> {
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| e.to_string())?;
+/// Comparação em tempo constante. Sem isto, o tempo de resposta vaza o prefixo
+/// certo do token — e adivinhar 64 hex byte a byte é viável, enquanto adivinhar
+/// o token inteiro de uma vez não é.
+fn tokens_iguais(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// `Origin` aceitável: só extensão de navegador.
+///
+/// Uma página (`https://…`) que abra WebSocket para cá manda o `Origin` dela. Um
+/// service worker de extensão manda `chrome-extension://…` (ou nada, em alguns
+/// navegadores) — então **ausência de `Origin` passa** e `http(s)://` **nunca**
+/// passa. É o inverso do que a intuição sugere, e é o que torna a regra útil sem
+/// depender da versão do navegador.
+fn origin_aceitavel(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => {
+            let o = o.trim().to_ascii_lowercase();
+            o.starts_with("chrome-extension://")
+                || o.starts_with("moz-extension://")
+                || o.starts_with("safari-web-extension://")
+                || o == "null"
+        }
+    }
+}
+
+/// Extrai `token` da query da URI do handshake.
+fn token_da_uri(uri: &str) -> Option<String> {
+    let query = uri.split_once('?')?.1;
+    for par in query.split('&') {
+        if let Some((chave, valor)) = par.split_once('=') {
+            if chave == "token" {
+                return Some(valor.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Recusa ANTES de completar o handshake.
+///
+/// Tem que ser antes: aceitar e fechar depois vira 101 seguido de close, que o
+/// cliente lê como queda de rede e responde com reconexão infinita — a mesma
+/// lição dos canais WS do core (`neo_device_auth_required`). Devolvendo
+/// `ErrorResponse`, o tungstenite responde HTTP 401/403 e o handshake nunca sobe.
+fn validar_handshake(req: &Request, resp: Response, esperado: &str) -> Result<Response, ErrorResponse> {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok());
+
+    if !origin_aceitavel(origin) {
+        warn!("[ExtBridge] handshake recusado: Origin {:?} não é extensão", origin);
+        return Err(ErrorResponse::new(Some(
+            "esta ponte aceita apenas extensão de navegador".to_string(),
+        )));
+    }
+
+    let apresentado = token_da_uri(&req.uri().to_string());
+    match apresentado {
+        Some(tok) if tokens_iguais(&tok, esperado) => Ok(resp),
+        Some(_) => {
+            // Nunca logar o token apresentado: log vira arquivo, e arquivo vaza.
+            warn!("[ExtBridge] handshake recusado: token inválido");
+            let mut erro = ErrorResponse::new(Some("token inválido".to_string()));
+            *erro.status_mut() = StatusCode::UNAUTHORIZED;
+            Err(erro)
+        }
+        None => {
+            warn!("[ExtBridge] handshake recusado: sem token (extensão desatualizada?)");
+            let mut erro = ErrorResponse::new(Some(
+                "falta ?token= — copie o token na aba Dispositivos do Neo".to_string(),
+            ));
+            *erro.status_mut() = StatusCode::UNAUTHORIZED;
+            Err(erro)
+        }
+    }
+}
+
+async fn handle_conn(
+    stream: TcpStream,
+    bridge: ExtBridge,
+    token_esperado: Arc<String>,
+) -> Result<(), String> {
+    let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+        validar_handshake(req, resp, token_esperado.as_str())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     info!("[ExtBridge] extension connected");
     let (mut write, mut read) = ws.split();
 
@@ -865,5 +986,82 @@ mod tests {
         assert!(tab.extra.is_empty());
         let de_volta = serde_json::to_value(&tab).expect("serialize");
         assert_eq!(de_volta["tabId"], 7);
+    }
+}
+
+#[cfg(test)]
+mod handshake_auth_tests {
+    use super::*;
+
+    // ── Origin ───────────────────────────────────────────────────────────────
+    //
+    // A regra é contraintuitiva de propósito: AUSÊNCIA de Origin passa, e
+    // `http(s)://` nunca passa. Um service worker de extensão pode não mandar
+    // Origin; uma página SEMPRE manda o dela. Inverter isso deixaria a ponte
+    // dependente da versão do navegador.
+
+    #[test]
+    fn extensao_passa() {
+        assert!(origin_aceitavel(Some("chrome-extension://abcdefghijklmnop")));
+        assert!(origin_aceitavel(Some("moz-extension://abc")));
+        assert!(origin_aceitavel(Some("safari-web-extension://abc")));
+    }
+
+    #[test]
+    fn sem_origin_passa() {
+        assert!(origin_aceitavel(None));
+        assert!(origin_aceitavel(Some("null")));
+    }
+
+    #[test]
+    fn pagina_web_nao_passa() {
+        // O vetor que motivou tudo: uma página abre WebSocket para 127.0.0.1.
+        assert!(!origin_aceitavel(Some("https://evil.example")));
+        assert!(!origin_aceitavel(Some("http://localhost:3000")));
+        assert!(!origin_aceitavel(Some("https://www.youtube.com")));
+    }
+
+    #[test]
+    fn origin_nao_escapa_por_caixa_alta() {
+        assert!(!origin_aceitavel(Some("HTTPS://EVIL.EXAMPLE")));
+        assert!(origin_aceitavel(Some("CHROME-EXTENSION://abc")));
+    }
+
+    // ── token na URI ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn le_o_token_da_query() {
+        assert_eq!(token_da_uri("/?token=abc123").as_deref(), Some("abc123"));
+        assert_eq!(token_da_uri("/ws?x=1&token=abc").as_deref(), Some("abc"));
+        assert_eq!(token_da_uri("/?token=abc&y=2").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn sem_query_nao_inventa_token() {
+        assert!(token_da_uri("/").is_none());
+        assert!(token_da_uri("/?outro=abc").is_none());
+        // Não casar por prefixo: `mytoken` não é `token`.
+        assert!(token_da_uri("/?mytoken=abc").is_none());
+    }
+
+    // ── comparação ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn compara_tokens() {
+        assert!(tokens_iguais("abc", "abc"));
+        assert!(!tokens_iguais("abc", "abd"));
+        assert!(!tokens_iguais("abc", "ab"));
+        assert!(!tokens_iguais("", "x"));
+        assert!(tokens_iguais("", ""));
+    }
+
+    #[test]
+    fn prefixo_certo_nao_basta() {
+        // O modo de falha que a comparação em tempo constante existe para não
+        // vazar: adivinhar byte a byte.
+        let real = "a".repeat(64);
+        assert!(!tokens_iguais(&"a".repeat(63), &real));
+        assert!(!tokens_iguais(&format!("{}b", "a".repeat(63)), &real));
+        assert!(tokens_iguais(&real, &real));
     }
 }

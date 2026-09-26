@@ -451,22 +451,11 @@ export const ChatPage = () => {
     );
 
     try {
+      // Via Rust, não `fetch`: a chamada precisa do token do aparelho, e o
+      // webview não o tem. Enquanto isso era `fetch` puro, a rota respondia 401
+      // e o botão do card não fazia nada (neo-core/docs/api-auth-plan.md F1).
       const command = approved ? (editedText ? 'edit' : 'approve') : 'cancel';
-      const payload = editedText
-        ? { command, edited_text: editedText }
-        : { command };
-      const url = `http://127.0.0.1:8000/api/v1/missions/${missionId}/command`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      await fetch(`http://127.0.0.1:8000/api/v1/missions/${missionId}/notifications/ack`, {
-        method: 'POST',
-      }).catch((ackErr) => {
-        console.warn('[ChatPage] notification ack by mission failed:', ackErr);
-      });
+      await window.electronAPI.missionCommand(missionId, command, editedText);
     } catch (e) {
       console.error('[ChatPage] handleMissionResponse failed:', e);
     }
