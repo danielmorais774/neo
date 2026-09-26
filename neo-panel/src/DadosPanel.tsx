@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { DEFAULT_USER_ID } from './lib/chatApi';
+import { currentUserId } from './lib/auth';
 
 /*
  * Tela "Dados" — CRUD GENÉRICO dos cadastros generativos.
@@ -91,7 +91,8 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 const withUser = (path: string, extra: Record<string, string | number | undefined> = {}) => {
-  const params = new URLSearchParams({ user_id: DEFAULT_USER_ID });
+  const dono = currentUserId();
+  const params = new URLSearchParams(dono ? { user_id: dono } : {});
   for (const [k, v] of Object.entries(extra)) {
     if (v !== undefined && v !== '') params.set(k, String(v));
   }

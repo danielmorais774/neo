@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Screen from './ui/Screen';
 import Icon from './ui/Icon';
-import { DEFAULT_USER_ID } from './lib/chatApi';
+import { currentUserId } from './lib/auth';
 
 /*
  * Tela Agenda (/agenda) — o cron do Neo.
@@ -95,7 +95,13 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-const withUser = (path: string) => `${path}${path.includes('?') ? '&' : '?'}user_id=${DEFAULT_USER_ID}`;
+// O dono é o usuário logado (era um UUID fixo no fonte). Sem sessão, a rota vai
+// sem `user_id` e o core resolve pela credencial.
+const withUser = (path: string) => {
+  const dono = currentUserId();
+  if (!dono) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}user_id=${dono}`;
+};
 
 // ── Formulário ───────────────────────────────────────────────────────────────
 

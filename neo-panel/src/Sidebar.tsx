@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import Icon, { type IconName } from './ui/Icon';
+import { currentUser, logout } from './lib/auth';
 
 interface NavItem {
   path: string;
@@ -67,6 +68,7 @@ const NAV_GROUPS: NavGroup[] = [
 
 const Sidebar = () => {
   const [collapsed, setCollapsed] = useState(false);
+  const usuario = currentUser();
   const location = useLocation();
 
   return (
@@ -113,6 +115,25 @@ const Sidebar = () => {
           </div>
         ))}
       </nav>
+
+      {/* Quem está logado + saída. Com login obrigatório, sem isto a única forma
+          de trocar de sessão seria limpar o storage do navegador na mão. */}
+      {usuario && (
+        <button
+          className="neo-sidebar-user"
+          onClick={() => logout()}
+          style={collapsed ? { justifyContent: 'center' } : undefined}
+          title={`Sair (${usuario.display_name || usuario.username || 'usuário'})`}
+        >
+          <Icon name="key" />
+          {!collapsed && (
+            <span className="neo-sidebar-user-name">
+              {usuario.display_name || usuario.username}
+            </span>
+          )}
+          {!collapsed && <span className="neo-sidebar-user-exit">sair</span>}
+        </button>
+      )}
 
       <button
         className="neo-collapse"

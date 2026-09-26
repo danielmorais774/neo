@@ -1,5 +1,14 @@
+import { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import './ui/neo-ui.css';
+import LoginScreen from './LoginScreen';
+import {
+  LEGACY_PANEL_TOKEN,
+  fetchAuthMode,
+  isAuthenticated,
+  subscribe,
+  type AuthMode,
+} from './lib/auth';
 import ChatScreen from './screens/ChatScreen';
 import ComunicacaoScreen from './screens/ComunicacaoScreen';
 import MemoriaScreen from './screens/MemoriaScreen';
@@ -16,13 +25,64 @@ import WakeTrainingPanel from './WakeTrainingPanel';
 import FilesPanel from './FilesPanel';
 import SpotifyPanel from './SpotifyPanel';
 import SirenePanel from './SirenePanel';
-import LettaPanel from './LettaPanel';
 import DadosPanel from './DadosPanel';
 import Sidebar from './Sidebar';
 import { ToastContainer, useToast } from './ToastNotification';
 
 function App() {
   const { toasts, removeToast } = useToast();
+  const [logado, setLogado] = useState(isAuthenticated);
+  const [modo, setModo] = useState<AuthMode | null>(null);
+  const [aviso, setAviso] = useState<string | null>(null);
+
+  // A sessão pode cair no meio do uso (token vencido e refresh queimado): o
+  // wrapper de fetch limpa o estado e este subscribe traz a tela de login de
+  // volta, em vez de deixar o painel mostrando telas vazias sem motivo.
+  useEffect(() => subscribe(() => setLogado(isAuthenticated())), []);
+
+  // **Sem token, tela de login** — independente do degrau do portão.
+  //
+  // A primeira versão disto perguntava ao core se login era obrigatório
+  // (`login_required`, ou seja, `enforce`/`strict`) e, em `shadow`, deixava o
+  // painel entrar direto. Estava errado: o token estático saiu do fonte, então
+  // "entrar direto" significava entrar SEM CREDENCIAL NENHUMA — e as telas de
+  // administração passam por `require_panel_jwt`, que recusa a ausência de token
+  // em qualquer modo. O painel abria e cada tela morria em 401, sem dizer por quê.
+  //
+  // `LEGACY_PANEL_TOKEN` (VITE_PANEL_TOKEN) é a única dispensa: quem passou um
+  // token por ambiente já tem credencial.
+  const precisaLogin = !logado && !LEGACY_PANEL_TOKEN;
+
+  // O modo não decide se a tela aparece; serve para EXPLICAR a situação na tela
+  // (e para avisar, no `strict`, que o token antigo morreu de vez).
+  useEffect(() => {
+    let vivo = true;
+    fetchAuthMode()
+      .then((m) => vivo && setModo(m))
+      .catch(() => vivo && setModo(null));
+    return () => {
+      vivo = false;
+    };
+  }, [logado]);
+
+  useEffect(() => {
+    if (!precisaLogin) {
+      setAviso(null);
+    } else if (modo?.mode === 'strict') {
+      setAviso('Este core está em modo strict: só login de usuário é aceito.');
+    } else if (modo && !modo.login_required) {
+      setAviso(
+        `O portão está em "${modo.mode}", mas as telas de administração pedem ` +
+          'credencial de qualquer jeito. Entre com seu usuário.',
+      );
+    } else {
+      setAviso(null);
+    }
+  }, [precisaLogin, modo]);
+
+  if (precisaLogin) {
+    return <LoginScreen aviso={aviso} onEntrou={() => setLogado(true)} />;
+  }
 
   return (
     <BrowserRouter>
@@ -78,13 +138,6 @@ function App() {
             <Route path="/research" element={<Navigate to="/pesquisas" replace />} />
             <Route path="/affect" element={<Navigate to="/emocoes" replace />} />
             <Route path="/spotify" element={<Navigate to="/musica" replace />} />
-
-            {/*
-              Letta saiu da sidebar (runtime descartado na decisão da Memória
-              Semântica v3). A rota fica de pé pra não apagar acesso a algo que
-              ainda responde — se confirmar que morreu, some com o painel todo.
-            */}
-            <Route path="/letta" element={<LettaPanel />} />
 
             <Route path="*" element={<Navigate to="/comunicacao" replace />} />
           </Routes>

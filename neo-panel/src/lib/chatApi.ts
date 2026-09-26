@@ -6,11 +6,14 @@
 // tool_request (execução de mídia/shell no lado do cliente) não é suportado: só
 // o neo-desktop-tauri tem acesso ao SO local para rodar isso.
 
-export const CORE_BASE = 'http://127.0.0.1:8000';
+export { CORE_BASE } from '../lib/auth';
+import { CORE_BASE, currentUserId } from '../lib/auth';
 
-// Único usuário deste sistema pessoal — mesmo default usado pelo
-// neo-desktop-tauri (NEO_USER_ID) e pelo DebugPanel do painel.
-export const DEFAULT_USER_ID = '5a998544-c3f3-423f-bebb-1cc42fca6063';
+// O `user_id` saiu daqui. Era um UUID fixo no fonte, e o core o aceitava como
+// verdade: qualquer pedido podia se dizer dono da memória de qualquer um
+// (neo-core/docs/api-auth-plan.md §1.1). Agora quem manda é a credencial, e o
+// campo só viaja quando há usuário logado — para o core casar e recusar se
+// divergir, em vez de aceitar em silêncio.
 
 export interface StoredFileMeta {
   id: string;
@@ -88,7 +91,7 @@ export function streamChat(
       type: 'user_input',
       user_message: params.message,
       session_id: params.sessionId,
-      user_id: DEFAULT_USER_ID,
+      user_id: currentUserId() ?? undefined,
       provider: params.provider,
       model: params.model,
       attachments: params.attachments?.length ? params.attachments : undefined,
@@ -129,7 +132,8 @@ export async function uploadAttachment(file: File, sessionId: string): Promise<S
   form.append('retention', 'temp');
   form.append('origin', 'upload-panel');
   form.append('session_id', sessionId);
-  form.append('user_id', DEFAULT_USER_ID);
+  const dono = currentUserId();
+  if (dono) form.append('user_id', dono);
 
   const res = await fetch(`${CORE_BASE}/api/v1/files`, { method: 'POST', body: form });
   if (!res.ok) {

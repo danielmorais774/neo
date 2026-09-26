@@ -2,8 +2,6 @@ import { useEffect, useState } from 'react'
 import WhatsAppModal from './WhatsAppModal'
 
 const REST_URL = 'http://127.0.0.1:8000/api/v1/whatsapp'
-const PANEL_JWT =
-  '***REMOVED***'
 
 interface QrStatus {
   qr: string | null
@@ -69,9 +67,7 @@ export default function SessionsTab() {
     let mounted = true
 
     const fetchStatus = () => {
-      fetch(`${REST_URL}/qr-status`, {
-        headers: { Authorization: `Bearer ${PANEL_JWT}` },
-      })
+      fetch(`${REST_URL}/qr-status`)
         .then(r => r.json())
         .then((data: QrStatus) => { if (mounted) setWhatsappStatus(data.state) })
         .catch(() => { if (mounted) setWhatsappStatus('unreachable') })
