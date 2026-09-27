@@ -28,6 +28,21 @@ fn should_show_notification(app_handle: &AppHandle) -> bool {
 }
 
 /// WebSocket manager for device online/offline signaling, notifications and control
+/// A URL sem a credencial, para log.
+///
+/// Os canais de device recebem o token na QUERY, e estas URLs eram logadas
+/// inteiras em nível INFO — ou seja, a credencial ia para o terminal, para o
+/// `app.log` em disco e para qualquer screenshot do log. Queimou em 2026-09-27.
+///
+/// Corta em `token=` e mantém o resto: o que se quer ver no log é o host, o
+/// caminho e o `device_id`, nunca o segredo.
+fn sem_token(url: &str) -> String {
+    match url.find("token=") {
+        Some(i) => format!("{}token=<oculto>", &url[..i]),
+        None => url.to_string(),
+    }
+}
+
 pub struct DeviceWsManager {
     device_id: String,
     api_url: String,
@@ -81,7 +96,7 @@ impl DeviceWsManager {
             urlencoding::encode(&device_id),
             token_qs
         );
-        info!("[DeviceWS] Online URL: {}", online_url);
+        info!("[DeviceWS] Online URL: {}", sem_token(&online_url));
 
         let online_task = tokio::spawn(async move {
             Self::connect_online_ws(&online_url).await;
@@ -97,7 +112,7 @@ impl DeviceWsManager {
             // query string própria.
             token_qs.replacen('&', "?", 1)
         );
-        info!("[DeviceWS] Notifications URL: {}", notif_url);
+        info!("[DeviceWS] Notifications URL: {}", sem_token(&notif_url));
 
         let notif_task = tokio::spawn(async move {
             Self::connect_notifications_ws(&notif_url, app_handle).await;
@@ -385,5 +400,35 @@ impl DeviceWsManager {
         }
 
         info!("[DeviceWS] All connections stopped");
+    }
+}
+
+#[cfg(test)]
+mod log_sem_credencial_tests {
+    use super::sem_token;
+
+    /// Os canais de device recebem o token na QUERY, e estas URLs iam para o log
+    /// em nível INFO — terminal, `app.log` em disco, e qualquer screenshot.
+    /// Queimou em 2026-09-27, junto com o vazamento pela mensagem de erro.
+    #[test]
+    fn a_url_logada_nao_carrega_o_token() {
+        let com = "ws://127.0.0.1:8000/api/v1/ws/devices/online?device_id=abc&token=SEGREDO";
+        let limpo = sem_token(com);
+        assert!(!limpo.contains("SEGREDO"));
+        // O que serve para diagnosticar CONTINUA no log.
+        assert!(limpo.contains("device_id=abc"));
+        assert!(limpo.contains("/ws/devices/online"));
+    }
+
+    #[test]
+    fn token_como_primeiro_parametro_tambem_e_cortado() {
+        let com = "ws://127.0.0.1:8000/api/v1/ws/devices/notifications/abc?token=SEGREDO";
+        assert!(!sem_token(com).contains("SEGREDO"));
+    }
+
+    #[test]
+    fn url_sem_token_passa_intacta() {
+        let sem = "ws://127.0.0.1:8000/api/v1/ws/devices/online?device_id=abc";
+        assert_eq!(sem_token(sem), sem);
     }
 }
