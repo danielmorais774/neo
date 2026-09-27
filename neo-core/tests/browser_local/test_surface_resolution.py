@@ -348,3 +348,43 @@ async def test_derivada_nao_usada_quando_falta_a_primitiva(monkeypatch):
     )
     with pytest.raises(mod.AcaoIndisponivel):
         await mod.dispatch(s, act, "browser.click", {"reference": 7}, 10)
+
+
+# ── Continuidade de aba chaveada pelo NAVEGADOR (§12.5) ──────────────────────
+#
+# O `browser_session` carrega o `pending`: a chave que autoriza AQUELE clique
+# depois da aprovação de liberação. Chaveá-lo pelo transporte (`device_id`) faria
+# a troca de via perder uma autorização já dada, que não pode ser reemitida.
+
+
+def test_chave_do_navegador_e_a_maquina_nao_o_transporte():
+    from core.jobs.runner_browser_local import chave_do_navegador
+
+    desktop = SurfaceMatch(
+        device_id="dev-mac", label="macbook", provider=PROVIDER_DESKTOP,
+        host_device_id=None, is_online=True, primitives={"native_actions": True},
+    )
+    extensao = SurfaceMatch(
+        device_id="surf-edge", label="Edge do macbook", provider=PROVIDER_EXTENSION,
+        host_device_id="dev-mac", is_online=True, primitives={"eval": True},
+    )
+
+    # As duas vias do MESMO Mac colidem de propósito: é o mesmo Edge, e a aba
+    # (com o clique autorizado) precisa ser a mesma.
+    assert chave_do_navegador(desktop, "dev-mac") == "dev-mac"
+    assert chave_do_navegador(extensao, "surf-edge") == "dev-mac"
+
+    # Sem superfície resolvida, o device_id vale como chave — comportamento
+    # histórico, para não invalidar sessão gravada antes disto existir.
+    assert chave_do_navegador(None, "dev-mac") == "dev-mac"
+
+
+def test_superficie_sem_hospedeiro_usa_o_proprio_id():
+    """Extensão pareada antes da coluna existir não vira chave vazia."""
+    from core.jobs.runner_browser_local import chave_do_navegador
+
+    orfa = SurfaceMatch(
+        device_id="surf-solta", label="Chrome", provider=PROVIDER_EXTENSION,
+        host_device_id=None, is_online=True, primitives={"eval": True},
+    )
+    assert chave_do_navegador(orfa, "surf-solta") == "surf-solta"

@@ -79,6 +79,12 @@ async def list_devices_with_status(
             # tem chance de funcionar.
             "controllable": control.is_connected(dev.device_id),
             "capabilities": getattr(dev, "capabilities", None) or {},
+            # A MÁQUINA onde esta linha roda, quando ela é uma superfície de
+            # navegador (docs/browser-surface-plan.md §3). É por este campo que a
+            # tela de dispositivos mostra o navegador ANINHADO no computador em
+            # vez de como um aparelho solto — e é a tela onde se revoga
+            # credencial, então "solto" ali é convite a revogar a linha errada.
+            "host_device_id": getattr(dev, "host_device_id", None),
             "ws_connection_id": dev.ws_connection_id,
         })
 

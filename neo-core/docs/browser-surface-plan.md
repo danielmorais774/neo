@@ -1,10 +1,11 @@
 # Plano: Superfície de Navegador como dispositivo
 
 **Data:** 2026-09-26
-**Status:** **F0, F1 (lado do core), F2 e F4 IMPLEMENTADAS.** F3 tem o MECANISMO
-pronto (a escada) e o CONTEÚDO vazio de propósito — ver §14. Falta o cliente: a
-extensão ainda não pareia nem abre o canal, então nada disso tem efeito visível
-ainda. Estado detalhado no §14.
+**Status:** **F0, F1, F2, F4 e F5 IMPLEMENTADAS**, incluindo o **cliente**: a
+`neo-music-ext` v1.4.0 pareia com consentimento nativo e abre o canal do core.
+F3 tem o MECANISMO pronto (a escada) e o CONTEÚDO (`DERIVADAS`) vazio de propósito
+— a superfície declara só `tabs` e recusa ação de navegação com mensagem própria.
+Estado detalhado no §14; **falta validar ponta a ponta** (§14.4).
 **Objetivo:** o navegador do usuário deixa de ser um apêndice do desktop e passa a
 ser um **dispositivo registrado** — pareado, autenticado, endereçável por nome e
 alcançável a partir de qualquer canal (desktop, painel, celular, agenda), sem
@@ -587,20 +588,64 @@ primitiva falta. Portar passa a ser *acrescentar uma entrada com seu par de
 testes*, uma por vez, quando houver uma superfície para provar contra — e
 `test_a_escada_nao_nasce_com_derivada_nao_testada` recusa entrada sem prova.
 
-### O que falta para ter efeito visível
+### 14.1 O cliente (feito) — `neo-music-ext` v1.4.0
 
-1. **O cliente.** A extensão precisa: pedir o código (`/devices/extension-code`),
-   parear (`/devices/pair` com `device_type="neo-browser-ext"`), guardar o token no
-   `chrome.storage.local`, abrir `ws://…/ws/devices/control/{device_id}?token=`,
-   mandar o `hello` e responder o vocabulário. **Nada disso existe ainda** — é o
-   maior pedaço restante, e é nas duas extensões (`neo-music-ext` e
-   `neo-browser-local`), que hoje não falam com o core.
-2. **Re-chavear `browser_session` pela superfície** (§12.5/F1). A continuidade de
-   aba e o `pending` da retomada de liberação seguem chaveados por `device_id`;
-   enquanto a superfície direta não existe, isso não quebra nada, mas precisa entrar
-   antes dela.
-3. **Diálogo nativo de consentimento** no desktop (a UX de um clique do §4).
-4. **Aninhamento visual** da superfície no hospedeiro, na aba Dispositivos.
+A primeira superfície existe, e é de LEITURA: declara `tabs` e nada mais.
+
+- **Pareamento de um clique, consentimento nativo.** O popup manda `pair_request`
+  pela ponte; o desktop abre um **diálogo do sistema** (`confirmar_pareamento` em
+  `ext_bridge.rs`) e, ao autorizar, chama `POST /devices/extension-code` com o
+  token dele — o código já sai estampado com a máquina. A extensão troca o código
+  em `/devices/pair` e guarda o token em `chrome.storage.local`.
+- **Nenhum listener HTTP novo.** A objeção ao redirect estilo OAuth era justamente
+  a superfície de ataque; a ponte já existe e já é autenticada, então o fluxo de
+  consentimento não acrescenta porta nenhuma.
+- **Canal próprio:** `ws://…/api/v1/ws/devices/control/{device_id}?token=`, com
+  `hello` na abertura e o snapshot de abas empurrado no mesmo ciclo que já
+  alimentava o desktop (uma varredura, duas pontas). O keepalive de 0,4 min cuida
+  dos dois canais, porque o service worker MV3 recicla os dois igual.
+- **4401 desapareia local.** Token que o core não reconhece mais (device removido)
+  apaga o estado em vez de virar reconexão infinita.
+- Ação de navegação chega e é respondida com `ok:false` + motivo. Rede de
+  segurança: o core já recusa antes, pela declaração.
+
+### 14.2 O resto do que estava pendente (feito)
+
+- **`browser_session` re-chaveada pelo NAVEGADOR** (`chave_do_navegador`): a chave
+  é a máquina (o hospedeiro da superfície, ou o próprio desktop), não o transporte.
+  Era o item mais perigoso da lista — o `pending` que autoriza *aquele* clique
+  depois da sua aprovação de liberação ficaria órfão na troca de via. Aba do
+  headless (ref negativa) continua exigindo o mesmo `device_id`: aquele navegador é
+  do desktop e não existe para a extensão.
+- **Aninhamento visual** na aba Dispositivos: o navegador aparece dentro da máquina
+  dele (`host_device_id` passou a sair na listagem), com remoção própria. É a tela
+  onde se revoga, e um navegador solto ao lado do computador convida a revogar a
+  linha errada.
+
+### 14.3 O que segue de fora, e por quê
+
+- **`DERIVADAS` vazio** (o porte dos `js_*`): ver a seção acima. Agora existe uma
+  superfície para provar contra, mas ela declara `tabs` — para exercitar as
+  derivadas seria preciso uma superfície com `eval`/`cdp`, que é a
+  `neo-browser-local` (item seguinte).
+- **`neo-browser-local` como superfície direta.** Ela é o cano de CDP; virar
+  superfície exige declarar `eval`/`cdp` E ter as derivadas portadas. É o próximo
+  passo natural, e o primeiro que vai exercitar o degrau 2.
+- **Entrada pública autenticada** para o core (hoje o canal é o túnel). Decisão
+  dele: o túnel é intencional, no espírito de homelab.
+
+### 14.4 Validação pendente (importante)
+
+Nada do caminho novo foi exercitado contra um navegador de verdade: **não reiniciei
+o `tauri dev` nem recarreguei a extensão** (deploy manual, `edge://extensions`), e
+o túnel estava fora no fim. O que foi verificado: 3317 testes no core, 81 no Rust,
+`tsc` limpo, migração aplicada em produção, e `POST /devices/extension-code`
+respondendo 401 a token falso (medido de dentro da VPS).
+
+O primeiro teste ponta a ponta é curto: reiniciar o desktop, recarregar a extensão,
+clicar em *Parear este navegador com o Neo*, autorizar no diálogo — e a superfície
+tem que aparecer aninhada na aba Dispositivos. Depois disso, "o que está tocando?"
+pelo painel deve enxergar as abas sem o desktop no canal.
 
 ### Invariante que guiou a implementação
 

@@ -109,21 +109,46 @@ async def _resolve_models(
 _ABA_VALIDA_POR = timedelta(minutes=15)
 
 
-async def _resolver_aba(db: Any, job: AgentJob, device_id: str, spec: dict) -> int | None:
+def chave_do_navegador(superficie: Any, device_id: str) -> str:
+    """Que NAVEGADOR é este, independente de por onde chegamos nele.
+
+    docs/browser-surface-plan.md §12.5. A continuidade de aba era chaveada pelo
+    ``device_id``, ou seja, pelo **transporte**. Com duas vias para o mesmo
+    navegador (o desktop via ``obu``, e a extensão direta), a mesma aba passaria a
+    ter duas chaves — e o que se perde aí não é só conveniência: o
+    ``browser_session`` carrega o ``pending``, a chave que autoriza *aquele*
+    clique depois da sua aprovação de liberação. Trocar de via no meio perderia
+    uma autorização **já dada**, que não pode ser reemitida.
+
+    A chave é a MÁQUINA: para uma superfície direta, o hospedeiro; para o desktop,
+    ele mesmo. As duas vias do mesmo Mac colidem de propósito — é o mesmo Edge.
+    """
+    if superficie is not None:
+        return str(getattr(superficie, "host_device_id", None) or superficie.device_id)
+    return str(device_id or "")
+
+
+async def _resolver_aba(
+    db: Any, job: AgentJob, device_id: str, spec: dict, chave: str | None = None
+) -> int | None:
     """Qual aba esta tarefa deve reivindicar. ``None`` = abre uma nova.
 
     Duas fontes, nesta ordem:
 
     1. ``spec["tab_ref"]`` — o cérebro pediu continuidade explicitamente.
-    2. a aba que a última tarefa deste MESMO device deixou aberta, se recente.
+    2. a aba que a última tarefa no MESMO NAVEGADOR deixou aberta, se recente.
 
-    O device é o critério (não a sessão de conversa) pelo mesmo motivo da trava
+    O navegador é o critério (não a sessão de conversa) pelo mesmo motivo da trava
     de reentrância: a aba é uma por máquina. O driver ainda confere se ela
     existe antes de usar, então um palpite errado aqui custa nada — cai para
     aba nova.
 
+    ``chave`` é a chave do navegador (ver ``chave_do_navegador``); sem ela, o
+    ``device_id`` vale como chave, que é o comportamento histórico.
+
     Nunca levanta: sem banco, abre aba nova, que é o comportamento de sempre.
     """
+    chave = chave or device_id
     try:
         pedida = spec.get("tab_ref")
         if pedida is not None:
@@ -142,19 +167,31 @@ async def _resolver_aba(db: Any, job: AgentJob, device_id: str, spec: dict) -> i
         if anterior.id == job.id or anterior.kind != "browser_local":
             continue
         sessao = (anterior.extra_metadata or {}).get("browser_session") or {}
-        if sessao.get("device_id") != device_id or not sessao.get("tab_ref"):
+        if not sessao.get("tab_ref"):
+            continue
+        # Linha antiga não tem `browser_key`: cai no `device_id`, como antes.
+        anterior_chave = str(sessao.get("browser_key") or sessao.get("device_id") or "")
+        if anterior_chave != chave:
+            continue
+        try:
+            tab_ref = int(sessao["tab_ref"])
+        except (TypeError, ValueError):
+            return None
+        # Aba do HEADLESS (ref negativa) é de um navegador que o desktop iniciou:
+        # ela não existe para a extensão, e reivindicá-la de outra via daria
+        # "Debugger unattached" no meio do primeiro passo.
+        if tab_ref < 0 and str(sessao.get("device_id") or "") != str(device_id):
             continue
         fim = getattr(anterior, "finished_at", None)
         if fim is not None and fim < corte:
             return None  # a mais recente já é velha: as outras também são
-        try:
-            return int(sessao["tab_ref"])
-        except (TypeError, ValueError):
-            return None
+        return tab_ref
     return None
 
 
-async def _gravar_sessao(db: Any, job: AgentJob, device_id: str, outcome: Any) -> None:
+async def _gravar_sessao(
+    db: Any, job: AgentJob, device_id: str, outcome: Any, chave: str | None = None
+) -> None:
     """Deixa registrado onde a tarefa parou, para a próxima continuar dali.
 
     `browser.release` DETACHA mas não fecha a aba — ela fica aberta na página. O
@@ -171,6 +208,9 @@ async def _gravar_sessao(db: Any, job: AgentJob, device_id: str, outcome: Any) -
                 **(job.extra_metadata or {}),
                 "browser_session": {
                     "device_id": device_id,
+                    # A chave do NAVEGADOR (a máquina), que é o que sobrevive à
+                    # troca de via — ver `chave_do_navegador`.
+                    "browser_key": chave or device_id,
                     "tab_ref": int(outcome.tab_ref),
                     "url": (outcome.url or "")[:500],
                     # Só existe quando a tarefa PAROU para perguntar. É a chave
@@ -388,7 +428,8 @@ def build_browser_local_runner(
 
         # Em qual aba. O `spec` manda quando o cérebro pediu continuidade; sem
         # ele, a aba que a última tarefa deste device deixou aberta.
-        aba = await _resolver_aba(db, job, device_id, spec)
+        chave_navegador = chave_do_navegador(superficie, device_id)
+        aba = await _resolver_aba(db, job, device_id, spec, chave_navegador)
 
         # Diário de bordo da tarefa (core/browser_local/trace.py). Nasce ANTES do
         # driver para pegar também o cabeçalho e qualquer falha de partida.
@@ -460,7 +501,7 @@ def build_browser_local_runner(
 
         # Onde a aba parou fica registrado ANTES de montar o resumo: é o que a
         # próxima tarefa lê para continuar dali em vez de abrir aba nova.
-        await _gravar_sessao(db, job, device_id, outcome)
+        await _gravar_sessao(db, job, device_id, outcome, chave_navegador)
 
         # O aviso de passos falhos já vem do driver (_honest) — aqui só o lugar
         # onde a aba parou, que é o que permite continuar de lá.
