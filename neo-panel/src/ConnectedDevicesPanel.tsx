@@ -904,11 +904,21 @@ export default function ConnectedDevicesPanel() {
         const data = await response.json();
         setDevices(data.devices || []);
         setError(null);
+      } else if (response.status === 401 || response.status === 403) {
+        // Dizer a verdade aqui importa: com o portão de autenticação
+        // (neo-core/docs/api-auth-plan.md), 401 é o caso NORMAL de sessão vencida,
+        // e chamá-lo de "Endpoint em desenvolvimento" mandava procurar o problema
+        // no lugar errado.
+        setError('Sessão expirada ou sem permissão — entre de novo no painel.');
       } else {
-        setError('Endpoint em desenvolvimento');
+        setError(`O neo-core respondeu ${response.status}`);
       }
-    } catch {
-      setError('neo-core offline');
+    } catch (e) {
+      // Falha de REDE (túnel caído, core fora do ar) — distinta de resposta com
+      // erro, e com ação diferente.
+      setError(
+        `Não alcancei o neo-core: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setLoading(false);
     }
