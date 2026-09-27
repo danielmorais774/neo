@@ -312,7 +312,16 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
         if (cancelled) return;
         setDevices(result || []);
       } catch (err: any) {
-        if (!cancelled) setError(err?.message || 'Falha ao carregar dispositivos');
+        // O Tauri rejeita `invoke` com uma STRING, não com Error — então
+        // `err.message` era sempre undefined e TODA falha virava o genérico
+        // "Falha ao carregar dispositivos". O Rust já produz a causa exata
+        // ("… respondeu 401", "não alcancei o neo-core: …") e a UI a jogava fora,
+        // transformando "o túnel caiu" e "o token não vale mais" na mesma tela.
+        if (!cancelled) {
+          const motivo =
+            typeof err === 'string' ? err : err?.message || 'Falha ao carregar dispositivos';
+          setError(motivo);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
