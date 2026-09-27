@@ -153,6 +153,20 @@ pub fn ext_bridge_token() -> Result<String, String> {
     Ok(token)
 }
 
+/// Erro de rede SEM a URL — porque a URL carrega o token.
+///
+/// O `Display` de um `reqwest::Error` inclui a URL da requisição, e várias
+/// chamadas ao core levam a credencial na QUERY (`?token=…`, que é como as rotas
+/// de device a recebem). Repassar esse texto para a UI põe a credencial na tela —
+/// aconteceu em 2026-09-27: o erro de "não alcancei o core" foi renderizado na
+/// aba Dispositivos com o token inteiro dentro, e foi parar num screenshot.
+///
+/// `without_url()` tira a URL e preserva a causa ("error sending request",
+/// "operation timed out"), que é o que interessa para diagnosticar.
+pub fn erro_sem_url(e: reqwest::Error) -> String {
+    e.without_url().to_string()
+}
+
 /// Apaga o token local — usado quando ESTE device é removido da conta.
 ///
 /// Sem isto o aparelho ficaria com um token que o core já não reconhece, e o

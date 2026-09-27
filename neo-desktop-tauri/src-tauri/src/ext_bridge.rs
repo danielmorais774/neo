@@ -551,7 +551,7 @@ impl ExtBridge {
                 warn!("[ExtBridge] não alcancei o core: {}", e);
                 self.push_message(serde_json::json!({
                     "type": "pair_denied",
-                    "reason": format!("não alcancei o neo-core: {}", e),
+                    "reason": format!("não alcancei o neo-core: {}", crate::erro_sem_url(e)),
                 }));
             }
         }
@@ -1210,4 +1210,38 @@ async fn confirmar_pareamento(app: &tauri::AppHandle, navegador: &str) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod erro_sem_credencial_tests {
+    /// O `Display` de um erro do reqwest inclui a URL — e a URL carrega o token.
+    ///
+    /// Em 2026-09-27 a aba Dispositivos renderizou "error sending request for url
+    /// (http://…/devices/mine?token=<credencial>)" e a credencial foi parar num
+    /// screenshot. Este teste trava o formato: o que vai para a UI não pode ter
+    /// `token=`.
+    #[tokio::test]
+    async fn mensagem_de_rede_nao_carrega_o_token() {
+        // Porta fechada de propósito: queremos o erro de transporte, que é o que
+        // aconteceu (túnel SSH fora do ar).
+        let cliente = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(400))
+            .build()
+            .expect("cliente");
+        let erro = cliente
+            .get("http://127.0.0.1:9/api/v1/devices/mine")
+            .query(&[("token", "CREDENCIAL-SECRETA-DE-TESTE")])
+            .send()
+            .await
+            .expect_err("a porta 9 tem que recusar");
+
+        let cru = erro.to_string();
+        let limpo = crate::erro_sem_url(erro);
+
+        assert!(cru.contains("CREDENCIAL-SECRETA-DE-TESTE"), "o erro cru vaza (é o ponto)");
+        assert!(!limpo.contains("CREDENCIAL-SECRETA-DE-TESTE"));
+        assert!(!limpo.contains("token="));
+        // E continua dizendo o que houve — redigir não pode virar mudez.
+        assert!(!limpo.trim().is_empty());
+    }
 }

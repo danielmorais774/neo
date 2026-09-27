@@ -1887,7 +1887,7 @@ pub async fn process_notification_action(
             }))
             .send()
             .await
-            .map_err(|e| format!("Falha ao registrar a decisão: {}", e))?;
+            .map_err(|e| format!("Falha ao registrar a decisão: {}", crate::erro_sem_url(e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1969,7 +1969,7 @@ pub async fn list_connected_devices() -> Result<Vec<serde_json::Value>, String> 
         .query(&[("token", token.as_str())])
         .send()
         .await
-        .map_err(|e| format!("Falha ao listar dispositivos: {}", e))?;
+        .map_err(|e| format!("Falha ao listar dispositivos: {}", crate::erro_sem_url(e)))?;
 
     if !response.status().is_success() {
         return Err(format!("Falha ao listar dispositivos: {}", response.status()));
@@ -2013,7 +2013,7 @@ pub async fn rename_device(
         .json(&serde_json::json!({ "display_name": display_name }))
         .send()
         .await
-        .map_err(|e| format!("Falha ao renomear: {}", e))?;
+        .map_err(|e| format!("Falha ao renomear: {}", crate::erro_sem_url(e)))?;
 
     if !response.status().is_success() {
         return Err(format!("Falha ao renomear: {}", response.status()));
@@ -2693,7 +2693,7 @@ pub async fn remove_device(
         .query(&[("token", token.as_str())])
         .send()
         .await
-        .map_err(|e| format!("Falha ao remover: {}", e))?;
+        .map_err(|e| format!("Falha ao remover: {}", crate::erro_sem_url(e)))?;
 
     if !response.status().is_success() {
         return Err(format!("Falha ao remover: {}", response.status()));
