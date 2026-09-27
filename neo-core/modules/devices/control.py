@@ -56,6 +56,11 @@ POWER_ACTIONS: frozenset[str] = frozenset({"suspend", "shutdown", "restart"})
 # Ações que exigem um nível 0-100.
 _NEEDS_LEVEL: frozenset[str] = frozenset({"volume_set"})
 
+#: ``device_type`` de uma superfície de navegador (docs/browser-surface-plan.md).
+#: Ela é uma linha em ``connected_device`` como qualquer device — o que a separa
+#: é a capability, não o tipo. O tipo serve para a UI e para log.
+BROWSER_SURFACE_TYPE = "neo-browser-ext"
+
 # Qual capability cada ação exige. Sem isso o cérebro oferece `shutdown` num
 # device que não implementa e a tool falha DEPOIS de prometer.
 _CAPABILITY_FOR: dict[str, str] = {
@@ -81,6 +86,14 @@ class DeviceMatch:
     os_platform: str
     is_online: bool
     capabilities: dict = field(default_factory=dict)
+    #: Só para rótulo e log — quem decide o que o device faz é a capability.
+    device_type: str = ""
+
+    @property
+    def is_browser_surface(self) -> bool:
+        return self.device_type == BROWSER_SURFACE_TYPE or bool(
+            self.capabilities.get("browser")
+        )
 
     @property
     def label(self) -> str:
@@ -97,16 +110,27 @@ class DeviceResolutionError(Exception):
         self.candidates = candidates or []
 
 
-async def _load_devices(db: Any, user_id: UUID) -> list[DeviceMatch]:
+async def _load_devices(
+    db: Any, user_id: UUID, *, action: str | None = None
+) -> list[DeviceMatch]:
     """Devices do usuário, com o online vindo do canal de controle.
 
     O ``is_online`` daqui é mais estrito do que o de ``list_connected_devices``:
     lá vale o WS de presença (ou o último estado do banco); aqui só vale ter o
     canal de CONTROLE aberto — é o único que consegue executar alguma coisa.
+
+    **``action`` filtra os candidatos ANTES da resolução**, e isso não é
+    otimização: é o que impede uma regressão quando existir mais de um tipo de
+    device na conta. Uma superfície de navegador
+    (docs/browser-surface-plan.md) é uma linha aqui como qualquer outra; sem o
+    filtro, ela entraria na regra "sem nome, exatamente um online" e
+    "abaixa o volume" passaria a **perguntar qual dispositivo** numa conta que
+    hoje responde direto. O ``_supports`` no fim de ``execute_device_action``
+    não resolve isso — ele roda depois de a ambiguidade já ter acontecido.
     """
     broadcaster = get_device_control_broadcaster()
     records = await db.get_connected_devices(user_id) if db else []
-    return [
+    devices = [
         DeviceMatch(
             device_id=r.device_id,
             display_name=getattr(r, "display_name", None),
@@ -114,9 +138,13 @@ async def _load_devices(db: Any, user_id: UUID) -> list[DeviceMatch]:
             os_platform=r.os_platform,
             is_online=broadcaster.is_connected(r.device_id),
             capabilities=getattr(r, "capabilities", None) or {},
+            device_type=getattr(r, "device_type", "") or "",
         )
         for r in records
     ]
+    if action:
+        devices = [d for d in devices if _supports(d, action)]
+    return devices
 
 
 def _match_by_name(devices: list[DeviceMatch], name: str) -> list[DeviceMatch]:
@@ -152,10 +180,35 @@ async def resolve_device(
     name: str | None,
     *,
     current_device_id: str | None = None,
+    action: str | None = None,
 ) -> DeviceMatch:
-    """Resolve o device alvo. Levanta ``DeviceResolutionError`` com texto pronto."""
-    devices = await _load_devices(db, user_id)
+    """Resolve o device alvo. Levanta ``DeviceResolutionError`` com texto pronto.
+
+    ``action`` restringe os candidatos a quem sabe executá-la (ver
+    ``_load_devices``). Passe sempre que souber a ação: sem isso, device de
+    outro tipo na mesma conta vira ambiguidade onde não havia.
+    """
+    devices = await _load_devices(db, user_id, action=action)
+    # O conjunto SEM filtro serve só para mensagem: filtrar melhora a resolução,
+    # mas não pode piorar o que o usuário lê. Pedir `shutdown` no "Tablet" tem que
+    # continuar respondendo "'Tablet' não suporta 'shutdown'", e não o genérico
+    # "não achei nenhum dispositivo chamado Tablet".
+    todos = devices if not action else await _load_devices(db, user_id)
+    capazes = {d.device_id for d in devices}
+
     if not devices:
+        if action and todos:
+            # Com nome na mão, nomear o device é sempre melhor que o genérico.
+            nomeados = _match_by_name(todos, name or "")
+            if len(nomeados) == 1:
+                raise DeviceResolutionError(
+                    f"'{nomeados[0].label}' não suporta '{action}'.",
+                    candidates=[d.label for d in todos],
+                )
+            raise DeviceResolutionError(
+                f"Nenhum dos seus dispositivos sabe fazer '{action}'.",
+                candidates=[d.label for d in todos],
+            )
         raise DeviceResolutionError("Nenhum dispositivo registrado nesta conta.")
 
     if not (name or "").strip():
@@ -178,6 +231,13 @@ async def resolve_device(
 
     matches = _match_by_name(devices, name)
     if not matches:
+        # O nome pode casar com um device que EXISTE e só não faz isto.
+        incapazes = _match_by_name([d for d in todos if d.device_id not in capazes], name)
+        if action and len(incapazes) == 1:
+            raise DeviceResolutionError(
+                f"'{incapazes[0].label}' não suporta '{action}'.",
+                candidates=[d.label for d in devices],
+            )
         raise DeviceResolutionError(
             f"Não achei nenhum dispositivo chamado '{name}'.",
             candidates=[d.label for d in devices],
@@ -250,13 +310,20 @@ async def execute_device_action(
 
     try:
         device = await resolve_device(
-            db, user_id, device_name, current_device_id=current_device_id
+            db, user_id, device_name,
+            current_device_id=current_device_id,
+            # A ação entra na resolução, não só na checagem do fim: é ela que
+            # mantém a conta com superfície de navegador respondendo "abaixa o
+            # volume" sem perguntar qual dispositivo.
+            action=action,
         )
     except DeviceResolutionError as e:
         return {"ok": False, "error": e.message, "candidates": e.candidates}
 
     if not device.is_online:
-        online = [d.label for d in await _load_devices(db, user_id) if d.is_online]
+        online = [
+            d.label for d in await _load_devices(db, user_id, action=action) if d.is_online
+        ]
         return {
             "ok": False,
             "error": (

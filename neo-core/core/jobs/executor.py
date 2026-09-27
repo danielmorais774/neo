@@ -684,20 +684,69 @@ class JobToolExecutor:
         settings = get_settings()
         if not getattr(settings, "browser_local_enabled", False):
             return {"ok": False, "error": "o navegador local está desligado na config."}
-        if not self.device_id:
-            # Sem desktop (pedido veio pelo neo-panel, por exemplo) o navegador
-            # local não existe — mas DESISTIR aqui era pior que o problema: o
-            # trabalho simplesmente não acontecia. O navegador do servidor faz a
-            # mesma coisa, só que de uma origem que parte da web recusa. Tentar
-            # lá e dizer a verdade se apanhar é melhor que não tentar.
-            logger.info("[browser-local] sem device — caindo para o navegador do servidor")
+        # ── Em qual navegador? ───────────────────────────────────────────────
+        #
+        # Antes esta pergunta era "tem desktop neste canal?", e um pedido vindo do
+        # painel/celular **degradava em silêncio** para o navegador do SERVIDOR —
+        # que sai por datacenter e leva 403/CAPTCHA em loja brasileira. O usuário
+        # recebia "o site recusou a origem" sem saber que o navegador dele estava
+        # aberto do outro lado.
+        #
+        # Agora a pergunta é "consigo resolver uma superfície?"
+        # (docs/browser-surface-plan.md §5): o navegador pode ser o desta máquina
+        # (herdado do canal) ou o de outra, citado por nome. A queda para o
+        # servidor continua existindo — só deixou de ser o primeiro recurso.
+        # A mudança é ADITIVA por construção: ela só pode ACRESCENTAR um caminho
+        # (a superfície de outra máquina), nunca remover o que já funciona. Por
+        # isso, resolução que falha com um device no canal cai **nesse device** —
+        # cair no servidor aí seria trocar o navegador dele pelo do datacenter,
+        # que é exatamente a regressão que este plano existe para evitar.
+        superficie = None
+        alvo_id = self.device_id
+        provider = None
+        try:
+            from core.browser_local.surfaces import (
+                PROVIDER_DESKTOP,
+                resolve_browser_surface,
+            )
+            from modules.devices.control import DeviceResolutionError
+
+            superficie = await resolve_browser_surface(
+                self.db,
+                self.user_id,
+                str(args.get("browser") or args.get("device") or "").strip() or None,
+                turn_device_id=self.device_id,
+            )
+            alvo_id = superficie.device_id
+            provider = superficie.provider
+        except DeviceResolutionError as erro:
+            # Ambiguidade PERGUNTA — abrir a aba errada na tela dele é pior que
+            # perguntar. Isso vale mesmo havendo device no canal: o usuário NOMEOU
+            # um navegador, e chutar outro é desobedecer.
+            if erro.candidates:
+                return {
+                    "ok": False,
+                    "error": erro.message,
+                    "candidates": erro.candidates,
+                }
+            logger.info("[browser-local] sem superfície: %s", erro.message)
+        except Exception as exc:  # noqa: BLE001 — resolução nunca derruba o turno
+            logger.warning("[browser-local] resolução indisponível: %s", exc)
+
+        if superficie is None and alvo_id:
+            logger.info(
+                "[browser-local] usando o device do canal (%s) sem resolver superfície",
+                alvo_id,
+            )
+
+        if superficie is None and not alvo_id:
             resultado = await self._browser_task(args)
             if isinstance(resultado, dict) and resultado.get("ok"):
                 resultado["note"] = (
-                    "Feito pelo navegador do SERVIDOR: este canal não identifica "
-                    "uma máquina do usuário, então o navegador local dele não "
-                    "estava disponível. Se o site recusar a origem (403/CAPTCHA), "
-                    "o caminho é o usuário pedir de novo pelo desktop."
+                    "Feito pelo navegador do SERVIDOR: não havia navegador do "
+                    "usuário disponível (nem nesta máquina, nem pareado em outra). "
+                    "Se o site recusar a origem (403/CAPTCHA), o caminho é abrir o "
+                    "navegador com a extensão do Neo, ou pedir pelo desktop."
                 ) + (" " + str(resultado.get("note") or ""))
             return resultado
         # Retomada explícita: herda a tarefa, a aba e a permissão DO CLIQUE que
@@ -731,11 +780,29 @@ class JobToolExecutor:
             args.get("visible")
         )
         headless = not quer_ver
+        # O `device_id` do spec é o da SUPERFÍCIE resolvida, que pode não ser o
+        # device do canal (pedido pelo celular apontando o navegador do macbook).
+        # O `act` do runner é `broadcaster.request(device_id, …)`, então apontar
+        # para outra superfície é trocar este valor — o driver não muda.
         spec: dict[str, Any] = {
             "task": task,
-            "device_id": self.device_id,
+            "device_id": alvo_id,
             "headless": headless,
         }
+        if provider:
+            spec["surface_provider"] = provider
+        # Headless é da MÁQUINA, não da superfície: extensão não inicia navegador.
+        # Sem ele, cair para a aba visível é melhor que falhar — mesma escada de
+        # sempre (fetch → headless → tela), só que agora escolhida por capacidade
+        # declarada em vez de por tentativa e erro.
+        if headless and superficie is not None and not superficie.pode("headless"):
+            logger.info(
+                "[browser-local] %s não tem headless — usando a aba visível",
+                superficie.label,
+            )
+            headless = False
+            spec["headless"] = False
+            spec["headless_indisponivel"] = True
         context = str(args.get("context") or "").strip()
         if context:
             spec["context"] = context[:2000]

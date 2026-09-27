@@ -67,6 +67,19 @@ class ConnectedDevice(SQLModel, table=True):
         default=None,
         sa_column=Column("capabilities", JSONB, nullable=True, default=None),
     )
+    # ── Superfície de navegador (docs/browser-surface-plan.md §3) ────────
+    # `device_id` da MÁQUINA onde esta linha roda. Preenchido só em superfície de
+    # navegador (a extensão), e preenchido pelo PAREAMENTO — nunca pelo que o
+    # cliente declara: se a extensão pudesse dizer "sou do macbook", o vínculo
+    # não valeria nada. Quem tem como provar a máquina é o desktop, que emite o
+    # código com o próprio device_id estampado.
+    #
+    # É este campo que responde "qual extensão está na máquina que o usuário
+    # chamou de macbook" quando o pedido vem do celular, sem desktop no canal.
+    host_device_id: str | None = Field(
+        default=None,
+        sa_column=Column("host_device_id", String(256), nullable=True, default=None, index=True),
+    )
     created_at: datetime = Field(
         default_factory=datetime.utcnow,
         sa_column=Column("created_at", nullable=False),

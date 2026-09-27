@@ -1801,7 +1801,16 @@ class AsyncPostgresClient:
         user_id: UUID,
         hardware_id: str,
     ) -> ConnectedDevice | None:
-        """Get the most recent device for a user/hardware_id pair."""
+        """O device mais recente de um par (user, hardware_id).
+
+        ``hardware_id`` vazio NUNCA casa: superfície de navegador não tem acesso ao
+        hardware da máquina e é pareada com esse campo em branco
+        (docs/browser-surface-plan.md §3). Sem esta guarda, o desktop pedindo
+        "qual é o meu device_id?" podia receber a linha de uma extensão — e passar
+        a se registrar como ela.
+        """
+        if not (hardware_id or "").strip():
+            return None
         async with self.get_session() as db:
             stmt = (
                 select(ConnectedDevice)
@@ -1864,6 +1873,7 @@ class AsyncPostgresClient:
         client_version: str = "",
         display_name: str | None = None,
         capabilities: dict | None = None,
+        host_device_id: str | None = None,
     ) -> ConnectedDevice:
         """Cria/atualiza o device e grava o vínculo de dono (hash do token).
 
@@ -1903,6 +1913,11 @@ class AsyncPostgresClient:
             device.pairing_token_hash = pairing_token_hash
             device.paired_at = _dt.utcnow()
             device.capabilities = capabilities
+            # O hospedeiro vem do CÓDIGO de pareamento, não do cliente. `None`
+            # não apaga o que já existe: re-parear a extensão no mesmo Mac não
+            # pode desfazer o vínculo por omissão.
+            if host_device_id:
+                device.host_device_id = host_device_id
             # Nome só é sobrescrito quando vem um novo — o pareamento não pode
             # apagar o "PC da sala" que o usuário já batizou.
             if display_name is not None:
@@ -1957,6 +1972,15 @@ class AsyncPostgresClient:
             await db.commit()
             await db.refresh(device)
             return device
+
+    async def get_connected_device(self, device_id: str) -> ConnectedDevice | None:
+        """Um device pelo `device_id`. Usado pelo `hello` da superfície, que precisa
+        MESCLAR capabilities em vez de sobrescrever o que o pareamento gravou."""
+        if not device_id:
+            return None
+        async with self.get_session() as db:
+            stmt = select(ConnectedDevice).where(ConnectedDevice.device_id == device_id)
+            return (await db.execute(stmt)).scalars().first()
 
     async def set_device_capabilities(
         self, device_id: str, capabilities: dict | None

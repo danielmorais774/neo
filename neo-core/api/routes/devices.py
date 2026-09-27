@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 
 from db.async_client import AsyncPostgresClient
 
+from core.browser_local.surfaces import get_surface_registry
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["devices"])          # HTTP — requer panel JWT
@@ -146,6 +148,8 @@ class PairResponse(BaseModel):
     device_token: str
     user_id: str
     display_name: str | None
+    #: Preenchido quando o código veio de um desktop (superfície de navegador).
+    host_device_id: str | None = None
 
 
 class RenameRequest(BaseModel):
@@ -189,6 +193,40 @@ async def create_pairing_code(user_id: str | None = None) -> PairingCodeResponse
     return PairingCodeResponse(code=code, expires_in_s=ttl)
 
 
+class ExtensionCodeResponse(BaseModel):
+    code: str
+    expires_in_s: int
+    host_device_id: str
+
+
+@ws_router.post("/devices/extension-code", response_model=ExtensionCodeResponse)
+async def create_extension_code(token: str = Query(...)) -> ExtensionCodeResponse:
+    """Código de pareamento para uma SUPERFÍCIE na máquina de quem chamou.
+
+    Autenticada pelo **token do aparelho**, não pelo JWT do painel, e isso é o
+    desenho, não conveniência (docs/browser-surface-plan.md §4):
+
+    * a extensão não pode se declarar "do macbook" — se pudesse, o vínculo não
+      valeria nada. Quem sabe qual máquina é, e pode provar, é o desktop;
+    * a autoridade fica no MÍNIMO necessário. O código do painel
+      (``/devices/pairing-code``) liga qualquer aparelho a qualquer conta; este
+      só consegue dizer "uma superfície na MINHA máquina, do MEU usuário".
+
+    O ``host_device_id`` sai do token, nunca do corpo do pedido.
+    """
+    from modules.devices.pairing import generate_pairing_code
+
+    device = await _device_from_token(token)
+    code, ttl = generate_pairing_code(device.user_id, host_device_id=device.device_id)
+    logger.info(
+        "[pair] código de extensão gerado para host=%s (user=%s)",
+        device.device_id, device.user_id,
+    )
+    return ExtensionCodeResponse(
+        code=code, expires_in_s=ttl, host_device_id=device.device_id
+    )
+
+
 @ws_router.post("/devices/pair", response_model=PairResponse)
 async def pair_device(payload: PairRequest) -> PairResponse:
     """Troca um código de pareamento por um token permanente do device.
@@ -197,7 +235,7 @@ async def pair_device(payload: PairRequest) -> PairResponse:
     desktop, que não tem — e nunca teve — credencial. A autorização é o código
     de uso único, emitido por quem TEM credencial.
     """
-    from modules.devices.pairing import consume_pairing_code, issue_device_token
+    from modules.devices.pairing import consume_pairing_code_full, issue_device_token
 
     if not _db:
         raise HTTPException(status_code=503, detail="DB unavailable")
@@ -206,9 +244,10 @@ async def pair_device(payload: PairRequest) -> PairResponse:
     if not device_id:
         raise HTTPException(status_code=400, detail="device_id is required")
 
-    user_id = consume_pairing_code(payload.code)
-    if user_id is None:
+    consumido = consume_pairing_code_full(payload.code)
+    if consumido is None:
         raise HTTPException(status_code=403, detail="Código inválido ou expirado")
+    user_id, host_device_id = consumido
 
     token, token_hash = issue_device_token()
     device = await _db.pair_device(
@@ -223,6 +262,8 @@ async def pair_device(payload: PairRequest) -> PairResponse:
         client_version=payload.client_version,
         display_name=payload.display_name,
         capabilities=payload.capabilities,
+        # Vem do CÓDIGO (ou seja, de quem provou a máquina), não do corpo.
+        host_device_id=host_device_id,
     )
 
     logger.info("[pair] device %s pareado com user %s", device_id, user_id)
@@ -232,6 +273,7 @@ async def pair_device(payload: PairRequest) -> PairResponse:
         device_token=token,
         user_id=str(device.user_id),
         display_name=device.display_name,
+        host_device_id=getattr(device, "host_device_id", None),
     )
 
 
@@ -459,6 +501,55 @@ async def ws_device_notifications(
         pass
 
 
+async def _registrar_hello(device_id: str, payload: dict) -> None:
+    """Guarda o que a superfície declarou, e grava a capability no banco.
+
+    Duas gravações, de propósito: as **primitivas** ficam em memória (é estado de
+    conexão), e a **capability** vai para `connected_device.capabilities` porque é
+    ela que a resolução de device lê — sem isso, a superfície não entraria (nem
+    seria excluída) das listas de candidatos depois de um restart do core.
+    """
+    from core.browser_local.surfaces import (
+        BROWSER_CAPABILITY,
+        PRIMITIVAS_MINIMAS,
+        PROVIDER_EXTENSION,
+    )
+
+    superficie = payload.get("surface") or {}
+    provider = str(superficie.get("provider") or PROVIDER_EXTENSION)
+    engine = str(superficie.get("engine") or "")
+    primitivas = superficie.get("primitives") or {}
+
+    registro = get_surface_registry().declare(
+        device_id, provider=provider, engine=engine, primitives=primitivas
+    )
+
+    faltando = [p for p in PRIMITIVAS_MINIMAS if not registro.primitives.get(p)]
+    if faltando and provider == PROVIDER_EXTENSION:
+        # Não derruba o canal: a superfície ainda serve para empurrar abas, que é
+        # leitura. O que ela não vai receber é AÇÃO — e a recusa vem na resolução,
+        # com mensagem própria, em vez de uma ação que falha no meio.
+        logger.warning(
+            "[surface] %s declarou sem %s — não vai receber ação",
+            device_id, ", ".join(faltando),
+        )
+
+    if not _db:
+        return
+    try:
+        device = await _db.get_connected_device(device_id)
+    except Exception:  # noqa: BLE001 — sem o registro, mescla sobre vazio
+        device = None
+    caps = dict((getattr(device, "capabilities", None) or {}) if device else {})
+    caps[BROWSER_CAPABILITY] = bool(registro.primitives.get("eval") or registro.primitives.get("cdp"))
+    caps["primitives"] = registro.primitives
+    caps["provider"] = provider
+    try:
+        await _db.set_device_capabilities(device_id, caps)
+    except Exception as exc:  # noqa: BLE001 — declaração não pode derrubar o canal
+        logger.warning("[surface] não consegui gravar capabilities de %s: %s", device_id, exc)
+
+
 @ws_router.websocket("/ws/devices/control/{device_id}")
 async def ws_device_control(
     websocket: WebSocket,
@@ -503,6 +594,16 @@ async def ws_device_control(
     try:
         while True:
             payload = await websocket.receive_json()
+            # Duas mensagens NÃO solicitadas cabem neste canal
+            # (docs/browser-surface-plan.md §13.2 e §7); todo o resto é resposta
+            # correlacionada a um comando nosso.
+            tipo = payload.get("type") if isinstance(payload, dict) else None
+            if tipo == "hello":
+                await _registrar_hello(device_id, payload)
+                continue
+            if tipo == "tabs":
+                get_surface_registry().set_tabs(device_id, payload.get("tabs") or [])
+                continue
             await broadcaster.resolve(device_id, payload)
     except WebSocketDisconnect:
         pass
@@ -510,6 +611,9 @@ async def ws_device_control(
         logger.warning("[control] erro no canal de %s: %s", device_id, e)
     finally:
         outbound.cancel()
+        # A declaração é estado de CONEXÃO: mantê-la depois da queda faria o core
+        # prometer uma capacidade que ninguém está segurando.
+        get_surface_registry().forget(device_id)
         try:
             await outbound
         except (asyncio.CancelledError, Exception):  # noqa: BLE001

@@ -254,13 +254,40 @@ def build_browser_local_runner(
 
         broadcaster = get_device_control_broadcaster()
 
-        async def act(action: str, args: dict, timeout: float) -> dict:
+        async def _cru(action: str, args: dict, timeout: float) -> dict:
             """Um passo no device. Traduz o envelope do canal em resultado/erro."""
             payload = await broadcaster.request(device_id, action, args, timeout=timeout)
             if payload.get("ok") is True:
                 result = payload.get("result")
                 return result if isinstance(result, dict) else {"ok": True}
             raise RuntimeError(str(payload.get("error") or "o navegador recusou a ação"))
+
+        # A ESCADA fica entre o driver e o transporte
+        # (docs/browser-surface-plan.md §13.3): com o desktop na frente, ela cai no
+        # degrau 1 (implementação nativa) e o comportamento é idêntico ao de antes.
+        # Superfície que não tem a ação nativa recebe a derivada, ou uma recusa que
+        # diz o que falta — em vez de um "o navegador recusou a ação" genérico.
+        #
+        # Superfície desconhecida (registro sumiu, core reiniciado no meio) cai no
+        # transporte cru: preservar o caminho que funciona é mais importante que
+        # aplicar a escada.
+        from core.browser_local.surfaces import AcaoIndisponivel, dispatch, get_surface
+
+        superficie = None
+        try:
+            superficie = await get_surface(db, job.user_id, device_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[browser-local] superfície de %s indisponível: %s", device_id, exc)
+
+        async def act(action: str, args: dict, timeout: float) -> dict:
+            if superficie is None:
+                return await _cru(action, args, timeout)
+            try:
+                return await dispatch(superficie, _cru, action, args, timeout)
+            except AcaoIndisponivel as erro:
+                # Vira RuntimeError porque é o que o driver entende — mas com o
+                # texto que ensina, que é o ponto da escada.
+                raise RuntimeError(erro.message) from erro
 
         async def registrar(items: list[dict], *, nota: str | None = None) -> None:
             """Grava os arquivos no registro de artefatos do caderno.

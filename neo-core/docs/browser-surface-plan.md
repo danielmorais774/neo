@@ -1,7 +1,10 @@
 # Plano: Superfície de Navegador como dispositivo
 
 **Data:** 2026-09-26
-**Status:** **PLANO** — nada implementado.
+**Status:** **F0, F1 (lado do core), F2 e F4 IMPLEMENTADAS.** F3 tem o MECANISMO
+pronto (a escada) e o CONTEÚDO vazio de propósito — ver §14. Falta o cliente: a
+extensão ainda não pareia nem abre o canal, então nada disso tem efeito visível
+ainda. Estado detalhado no §14.
 **Objetivo:** o navegador do usuário deixa de ser um apêndice do desktop e passa a
 ser um **dispositivo registrado** — pareado, autenticado, endereçável por nome e
 alcançável a partir de qualquer canal (desktop, painel, celular, agenda), sem
@@ -543,3 +546,67 @@ Para **cada** ação do vocabulário, dois testes: um com superfície capaz (usa
 nativa) e um com superfície pobre (degrada pela escada, e a mensagem diz o que
 falta). Mais dois de fronteira: o que garante que `eval`/`cdp` não estão no catálogo
 do cérebro, e o que garante que superfície sem declaração é tratada como pobre.
+
+---
+
+## 14. Estado da implementação (2026-09-26)
+
+### O que entrou
+
+| Fase | Estado | Onde |
+|---|---|---|
+| **F0** modelo e vínculo | ✅ | coluna `host_device_id` (migração `h1i2j3k4l5m7`, **aplicada em produção**); `BROWSER_SURFACE_TYPE`; `POST /devices/extension-code` (token de aparelho); `consume_pairing_code_full` devolvendo `(user_id, host_device_id)`; `pair_device` gravando o vínculo |
+| **F0** (pré-requisito do §12.5) filtro de capacidade | ✅ | `_load_devices(action=…)` filtra candidatos **antes** da resolução; `resolve_device(action=…)`; guarda no `get_device_by_hardware_id` contra `hardware_id` vazio |
+| **F1** lado do core | ✅ | `hello` e `tabs` tratados no canal (`/ws/devices/control`), `SurfaceRegistry` em memória, capability mesclada no banco, `forget` na queda |
+| **F2** resolução | ✅ | `core/browser_local/surfaces.py`: `resolve_browser_surface` com as 5 regras; `_browser_local_task` resolve superfície em vez de exigir desktop no canal |
+| **F3** mecanismo | ✅ | `dispatch()` com a escada nativa→derivada→ausente, `AcaoIndisponivel` com texto que ensina, `DEGRADA_SEM_DISCO`, e a escada **no caminho** do runner |
+| **F3** conteúdo (payloads `js_*`) | ⬜ | **deliberadamente vazio** — ver abaixo |
+| **F3** snapshot no core | ✅ | `abas_conhecidas()` + `_media_context_completo()`: o `media_context` do turno passa a somar o que as superfícies empurraram |
+| **F4** rótulo/revogação | parcial | `DevicesTab` com rótulo próprio por tipo (era "Neo Desktop" para tudo que não fosse mobile — e é a tela onde se revoga). Falta o aninhamento visual no hospedeiro |
+| **F5** duas vias | ✅ (por construção) | a resolução prefere a completa; a via desktop nunca sai do caminho |
+
+Testes: `tests/browser_local/test_surface_resolution.py` (18), incluindo as duas
+histórias do §5, "empate pergunta", e a escada;
+`tests/browser_local/test_vocabulario_nao_vaza.py` (3), a trava do §13.1; e quatro
+casos novos em `tests/test_device_control.py` para a regressão do §12.2. Suíte:
+**3315 passando**.
+
+### Por que `DERIVADAS` está vazio
+
+O §13.4 prevê a biblioteca de `js_*` migrada do Rust para o core. Ela **não** foi
+escrita, e a razão é a mesma que está no código: **nenhuma superfície direta existe
+ainda**. Traduzir ~1.000 linhas de JavaScript sem cliente que as exercite produz
+código não executado que afirma funcionar — e o §13.7 exige o par de testes (capaz
+usa a nativa, pobre degrada) para cada ação, que sem superfície não se pode
+escrever de verdade.
+
+O que entrou no lugar é o **mecanismo**: `DERIVADAS` é um dicionário
+`acao -> (primitiva, construtor)`, com teste provando que o degrau 2 funciona
+(`test_derivada_usa_a_primitiva_declarada`) e que ele não é usado quando a
+primitiva falta. Portar passa a ser *acrescentar uma entrada com seu par de
+testes*, uma por vez, quando houver uma superfície para provar contra — e
+`test_a_escada_nao_nasce_com_derivada_nao_testada` recusa entrada sem prova.
+
+### O que falta para ter efeito visível
+
+1. **O cliente.** A extensão precisa: pedir o código (`/devices/extension-code`),
+   parear (`/devices/pair` com `device_type="neo-browser-ext"`), guardar o token no
+   `chrome.storage.local`, abrir `ws://…/ws/devices/control/{device_id}?token=`,
+   mandar o `hello` e responder o vocabulário. **Nada disso existe ainda** — é o
+   maior pedaço restante, e é nas duas extensões (`neo-music-ext` e
+   `neo-browser-local`), que hoje não falam com o core.
+2. **Re-chavear `browser_session` pela superfície** (§12.5/F1). A continuidade de
+   aba e o `pending` da retomada de liberação seguem chaveados por `device_id`;
+   enquanto a superfície direta não existe, isso não quebra nada, mas precisa entrar
+   antes dela.
+3. **Diálogo nativo de consentimento** no desktop (a UX de um clique do §4).
+4. **Aninhamento visual** da superfície no hospedeiro, na aba Dispositivos.
+
+### Invariante que guiou a implementação
+
+Cada mudança é **aditiva**: nada que funcionava hoje passa por caminho novo. Em
+particular, quando a resolução de superfície falha por qualquer motivo e existe um
+device no canal, o job vai **para esse device** — o mesmo comportamento de antes.
+Cair no navegador do servidor por causa de uma falha de resolução seria trocar o
+navegador dele pelo do datacenter, que é exatamente a regressão que este plano
+existe para evitar.

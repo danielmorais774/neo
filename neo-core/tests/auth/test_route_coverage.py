@@ -52,6 +52,10 @@ SEM_GUARDA_POR_DESIGN: dict[str, str] = {
     "PATCH /api/v1/devices/mine/{target_device_id}": "token de aparelho no handler",
     "DELETE /api/v1/devices/mine/{target_device_id}": "token de aparelho no handler",
     "GET /api/v1/devices/resolve": "token de aparelho obrigatório no handler",
+    "POST /api/v1/devices/extension-code": (
+        "token de aparelho obrigatório no handler — é DELE que sai o host_device_id "
+        "(docs/browser-surface-plan.md §4)"
+    ),
 }
 
 

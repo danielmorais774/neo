@@ -1918,6 +1918,43 @@ def _media_context_of(metadata: dict[str, Any] | None) -> dict[str, Any]:
         return {}
 
 
+async def _media_context_completo(
+    db: Any, user_id: Any, metadata: dict[str, Any] | None
+) -> dict[str, Any]:
+    """`media_context` do turno MAIS o que as superfícies empurraram.
+
+    Duas fontes, de propósito (docs/browser-surface-plan.md §7):
+
+    * o carona no turno do desktop, que é o caminho de hoje e continua valendo;
+    * o que as superfícies de navegador empurraram pelo canal de controle, que é o
+      único que existe quando o pedido vem do painel ou do celular.
+
+    Quando as duas trazem a mesma aba, a do turno ganha: ela é mais nova (foi lida
+    no instante do pedido) e é a que o desktop acabou de confirmar.
+    """
+    contexto = dict(_media_context_of(metadata))
+    if db is None or user_id is None:
+        return contexto
+    try:
+        from core.browser_local.surfaces import abas_conhecidas
+
+        empurradas = await abas_conhecidas(db, user_id)
+    except Exception:  # noqa: BLE001
+        return contexto
+    if not empurradas:
+        return contexto
+
+    do_turno = list(contexto.get("browser_tabs") or [])
+    vistas = {(t.get("site"), t.get("tabId")) for t in do_turno}
+    for aba in empurradas:
+        chave = (aba.get("site"), aba.get("tabId"))
+        if chave not in vistas:
+            do_turno.append(aba)
+            vistas.add(chave)
+    contexto["browser_tabs"] = do_turno
+    return contexto
+
+
 # A ÚNICA tool pela qual o núcleo cognitivo mexe no navegador que o usuário está
 # olhando. `browser_task` não entra: roda escondida no servidor e não abre aba
 # nenhuma na tela dele. Existe para a guarda de dupla atuação da música (sessão
@@ -5214,7 +5251,8 @@ class AIService:
         # media is open, so the brain can control it ("pausa", "próxima") AND answer
         # status questions ("o que tá tocando?", "como tá o YouTube?") that don't route
         # to the music skill. Empty when nothing is open. See neo-music-feature.
-        _media_note = self._build_media_context_note(metadata)
+        _contexto_midia = await _media_context_completo(self.db, user_id, metadata)
+        _media_note = self._build_media_context_note(metadata, _contexto_midia)
         if _media_note:
             messages.append(Message(role=MessageRole.SYSTEM, content=_media_note))
 
@@ -7574,12 +7612,19 @@ class AIService:
         return None
 
     @staticmethod
-    def _build_media_context_note(metadata: dict | None) -> str | None:
+    def _build_media_context_note(
+        metadata: dict | None, contexto: dict | None = None
+    ) -> str | None:
         """Summarize the browser media tabs (from the extension) for the brain.
 
         Reads ``metadata['media_context']['browser_tabs']`` (the snapshot the desktop
         sends every turn) into a short, readable note so the cognitive core knows what
         is open/playing and can control it or answer "o que tá tocando?".
+
+        ``contexto`` permite passar o contexto JÁ MESCLADO com o que as superfícies
+        de navegador empurraram pelo canal (docs/browser-surface-plan.md §7) — que é
+        a única fonte quando o pedido vem do painel ou do celular, onde não há
+        desktop para dar a carona.
         """
         from core.skills.music.service import (
             describe_tabs,
@@ -7587,7 +7632,9 @@ class AIService:
             tab_has_media,
         )
 
-        tabs = (parse_media_context(metadata) or {}).get("browser_tabs") or []
+        if contexto is None:
+            contexto = parse_media_context(metadata) or {}
+        tabs = (contexto or {}).get("browser_tabs") or []
         lines = [f"- {linha}" for linha in describe_tabs(tabs)]
         if not lines:
             return None

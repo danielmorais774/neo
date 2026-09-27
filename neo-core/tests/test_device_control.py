@@ -46,12 +46,14 @@ class _FakeDevice:
         model: str = "MacBookPro18,3",
         os_platform: str = "darwin",
         capabilities: dict | None = None,
+        device_type: str = "neo-desktop",
     ):
         self.device_id = device_id
         self.display_name = display_name
         self.model = model
         self.os_platform = os_platform
         self.capabilities = capabilities
+        self.device_type = device_type
 
 
 class _FakeDB:
@@ -495,3 +497,82 @@ async def test_remover_device_derruba_o_canal_aberto():
 async def test_kick_em_device_sem_canal_nao_explode():
     b = DeviceControlBroadcaster()
     assert await b.kick("fantasma") is False
+
+
+# ── Superfície de navegador não polui a resolução ────────────────────────────
+#
+# docs/browser-surface-plan.md §12.2: quando a extensão de navegador virar uma
+# linha em `connected_device`, ela entra na MESMA lista que o desktop. Sem filtro
+# por capacidade antes da resolução, "abaixa o volume" passa a perguntar qual
+# dispositivo numa conta que hoje responde direto — regressão silenciosa numa
+# feature que funciona. Estes testes existem para ela não voltar.
+
+
+def _superficie(device_id: str, nome: str):
+    from modules.devices.control import BROWSER_SURFACE_TYPE
+
+    return _FakeDevice(
+        device_id,
+        nome,
+        model="Edge",
+        os_platform="darwin",
+        device_type=BROWSER_SURFACE_TYPE,
+        capabilities={"browser": True, "volume": False, "media": False, "power": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_superficie_de_navegador_nao_cria_ambiguidade_sem_nome(monkeypatch):
+    """Desktop + superfície online, e "abaixa o volume" sem nome: NÃO pergunta."""
+    b = DeviceControlBroadcaster()
+    _patch_broadcaster(monkeypatch, b)
+    db = _FakeDB([
+        _FakeDevice("dev-mac", "macbook", capabilities={"volume": True}),
+        _superficie("surf-edge", "Edge do macbook"),
+    ])
+    t1 = asyncio.create_task(_fake_device_loop(b, "dev-mac", lambda cmd: {"level": 30}))
+    t2 = asyncio.create_task(_fake_device_loop(b, "surf-edge", lambda cmd: None))
+    await asyncio.sleep(0.01)
+
+    match = await resolve_device(db, uuid4(), None, action="volume_set")
+    assert match.device_id == "dev-mac"
+    t1.cancel()
+    t2.cancel()
+
+
+@pytest.mark.asyncio
+async def test_nome_do_hospedeiro_nao_casa_a_superficie_para_volume(monkeypatch):
+    """"macbook" casaria por substring com "Edge do macbook" — não pode."""
+    b = DeviceControlBroadcaster()
+    _patch_broadcaster(monkeypatch, b)
+    db = _FakeDB([
+        _FakeDevice("dev-mac", "macbook", capabilities={"volume": True}),
+        _superficie("surf-edge", "Edge do macbook"),
+    ])
+
+    match = await resolve_device(db, uuid4(), "macbook", action="volume_set")
+    assert match.device_id == "dev-mac"
+
+
+@pytest.mark.asyncio
+async def test_power_nunca_mira_um_navegador(monkeypatch):
+    """`shutdown` é irreversível: o navegador não pode nem aparecer na lista."""
+    b = DeviceControlBroadcaster()
+    _patch_broadcaster(monkeypatch, b)
+    db = _FakeDB([_superficie("surf-edge", "Edge do macbook")])
+
+    with pytest.raises(DeviceResolutionError) as erro:
+        await resolve_device(db, uuid4(), "Edge do macbook", action="shutdown")
+    assert "não suporta" in erro.value.message
+
+
+@pytest.mark.asyncio
+async def test_sem_acao_o_comportamento_antigo_continua(monkeypatch):
+    """Quem chamar sem `action` não é filtrado — compatibilidade."""
+    b = DeviceControlBroadcaster()
+    _patch_broadcaster(monkeypatch, b)
+    db = _FakeDB([_superficie("surf-edge", "Edge do macbook")])
+
+    match = await resolve_device(db, uuid4(), "Edge do macbook")
+    assert match.device_id == "surf-edge"
+    assert match.is_browser_surface
