@@ -60,7 +60,13 @@ export interface DeviceInfo {
   is_online?: boolean;
   /** Canal de controle aberto — mais estrito que is_online (presença). */
   controllable?: boolean;
-  capabilities?: Record<string, boolean>;
+  capabilities?: Record<string, boolean | Record<string, boolean>>;
+  /**
+   * A MÁQUINA onde esta linha roda, quando ela é uma superfície de navegador
+   * (neo-core/docs/browser-surface-plan.md). Preenchido no pareamento, pelo
+   * desktop — a extensão não pode se declarar "do macbook".
+   */
+  host_device_id?: string | null;
 }
 
 export interface NotificationAction {

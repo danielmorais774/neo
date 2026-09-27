@@ -127,6 +127,11 @@ struct Inner {
 #[derive(Clone)]
 pub struct ExtBridge {
     inner: Arc<Mutex<Inner>>,
+    /// Só para o DIÁLOGO NATIVO de pareamento (`pair_request`). A ponte não usa
+    /// o app para nada além disso — e o diálogo é justamente o que não pode ser
+    /// uma página web: um endpoint local que emite credencial é alcançável por
+    /// qualquer aba, então a aprovação tem que acontecer FORA do navegador.
+    app: Arc<Mutex<Option<tauri::AppHandle>>>,
 }
 
 impl Default for ExtBridge {
@@ -139,7 +144,19 @@ impl ExtBridge {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
+            app: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Guarda o handle do app (chamado uma vez, no `setup`).
+    pub fn set_app(&self, app: tauri::AppHandle) {
+        if let Ok(mut g) = self.app.lock() {
+            *g = Some(app);
+        }
+    }
+
+    fn app_handle(&self) -> Option<tauri::AppHandle> {
+        self.app.lock().ok().and_then(|g| g.clone())
     }
 
     /// Current open music tabs (empty if no extension is connected).
@@ -462,6 +479,84 @@ impl ExtBridge {
         }
     }
 
+    /// Diálogo nativo → código de pareamento → devolve para a extensão.
+    async fn atender_pair_request(&self, navegador: String) {
+        let Some(app) = self.app_handle() else {
+            warn!("[ExtBridge] pair_request sem app handle — ignorando");
+            self.push_message(serde_json::json!({
+                "type": "pair_denied",
+                "reason": "o Neo Desktop não está pronto",
+            }));
+            return;
+        };
+
+        if !confirmar_pareamento(&app, &navegador).await {
+            info!("[ExtBridge] pareamento de {} recusado por você", navegador);
+            self.push_message(serde_json::json!({
+                "type": "pair_denied",
+                "reason": "você não autorizou",
+            }));
+            return;
+        }
+
+        let Some(token) = crate::device_token() else {
+            self.push_message(serde_json::json!({
+                "type": "pair_denied",
+                "reason": "este Mac não está pareado com o Neo — pareie o desktop primeiro",
+            }));
+            return;
+        };
+
+        let url = format!("{}/api/v1/devices/extension-code", neo_core_http_url());
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_message(serde_json::json!({
+                    "type": "pair_denied",
+                    "reason": format!("cliente HTTP indisponível: {}", e),
+                }));
+                return;
+            }
+        };
+
+        let resposta = client
+            .post(&url)
+            .query(&[("token", token.as_str())])
+            .send()
+            .await;
+        match resposta {
+            Ok(r) if r.status().is_success() => {
+                let corpo: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+                info!("[ExtBridge] código de pareamento emitido para {}", navegador);
+                self.push_message(serde_json::json!({
+                    "type": "pair_code",
+                    "code": corpo.get("code").and_then(|v| v.as_str()).unwrap_or(""),
+                    "expires_in_s": corpo.get("expires_in_s").and_then(|v| v.as_i64()).unwrap_or(0),
+                    "core_url": neo_core_http_url(),
+                    "sugestao_nome": navegador,
+                }));
+            }
+            Ok(r) => {
+                let status = r.status();
+                warn!("[ExtBridge] core recusou o código: {}", status);
+                self.push_message(serde_json::json!({
+                    "type": "pair_denied",
+                    "reason": format!("o neo-core respondeu {}", status),
+                }));
+            }
+            Err(e) => {
+                warn!("[ExtBridge] não alcancei o core: {}", e);
+                self.push_message(serde_json::json!({
+                    "type": "pair_denied",
+                    "reason": format!("não alcancei o neo-core: {}", e),
+                }));
+            }
+        }
+    }
+
     fn on_message(&self, txt: &str) {
         let parsed: serde_json::Value = match serde_json::from_str(txt) {
             Ok(v) => v,
@@ -489,6 +584,29 @@ impl ExtBridge {
             }
             // A extensão viu o player: começou, está acabando, acabou. É o
             // caminho BOM (ela enxerga o <video>); o snapshot vira só reserva.
+            // Pareamento de UM CLIQUE (neo-core/docs/browser-surface-plan.md §4).
+            //
+            // A extensão pede; o DESKTOP decide, num diálogo nativo; e o que ele
+            // emite é um código de pareamento estampado com a própria máquina —
+            // `POST /devices/extension-code`, autenticado pelo token do aparelho.
+            // A extensão não pode se declarar "do macbook": se pudesse, o vínculo
+            // não valeria nada. Quem sabe qual máquina é, e pode provar, é este
+            // processo.
+            //
+            // Sem listener HTTP novo: a ponte já existe e já é autenticada, então
+            // o fluxo de consentimento não acrescenta superfície de ataque — que
+            // era a objeção ao redirect estilo OAuth.
+            Some("pair_request") => {
+                let navegador = parsed
+                    .get("browser")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("navegador")
+                    .to_string();
+                let bridge = self.clone();
+                tokio::spawn(async move {
+                    bridge.atender_pair_request(navegador).await;
+                });
+            }
             Some("media_event") => {
                 let event = parsed
                     .get("event")
@@ -1064,4 +1182,32 @@ mod handshake_auth_tests {
         assert!(!tokens_iguais(&format!("{}b", "a".repeat(63)), &real));
         assert!(tokens_iguais(&real, &real));
     }
+}
+
+/// Diálogo nativo de autorização do pareamento da extensão.
+///
+/// Nativo, e não uma página: o consentimento é a única coisa que separa
+/// "a extensão pediu" de "qualquer aba pediu". Molde igual ao
+/// `confirm_power_action` do `websocket.rs` — `blocking_show` numa thread
+/// separada, porque na principal ele trava.
+async fn confirmar_pareamento(app: &tauri::AppHandle, navegador: &str) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    let corpo = format!(
+        "Autorizar o {} a agir como navegador do Neo nesta máquina?\n\nEle vai poder          contar ao Neo quais abas estão abertas e receber comandos de navegação.",
+        navegador
+    );
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .message(corpo)
+            .title("Parear navegador com o Neo")
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Autorizar".to_string(),
+                "Não autorizar".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
 }

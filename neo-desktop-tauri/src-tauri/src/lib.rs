@@ -422,6 +422,12 @@ pub fn run() {
             // Start the local WebSocket bridge for the browser extension
             // (music tabs + play commands, Etapa 3). Must use the Tauri async
             // runtime — a bare tokio::spawn here panics (no runtime in setup).
+            // O handle vai para a ponte porque o pareamento da extensão pede um
+            // DIÁLOGO NATIVO (ver `confirmar_pareamento`): consentimento em página
+            // web seria alcançável por qualquer aba.
+            app.state::<AppState>()
+                .ext_bridge
+                .set_app(app.handle().clone());
             tauri::async_runtime::spawn(ext_bridge::run(
                 app.state::<AppState>().ext_bridge.clone(),
             ));

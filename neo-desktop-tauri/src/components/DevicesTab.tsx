@@ -368,10 +368,31 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
     );
   }
 
+  // Navegador pareado aparece ANINHADO na máquina dele, não como aparelho solto.
+  // Não é enfeite: esta é a tela onde se revoga credencial, e um navegador solto
+  // ao lado do computador convida a revogar a linha errada — o que tira o Neo do
+  // ar na máquina em vez de tirar a extensão.
+  // Ver neo-core/docs/browser-surface-plan.md §12.2 (item 6).
+  const superficiesPorHost = new Map<string, DeviceInfo[]>();
+  for (const d of devices) {
+    if (d.host_device_id) {
+      const lista = superficiesPorHost.get(d.host_device_id) ?? [];
+      lista.push(d);
+      superficiesPorHost.set(d.host_device_id, lista);
+    }
+  }
+  // Superfície órfã (hospedeiro removido, ou pareada antes do vínculo existir)
+  // continua na lista de cima: esconder um aparelho que EXISTE é pior que
+  // mostrá-lo fora de lugar.
+  const hostsPresentes = new Set(devices.map((d) => d.device_id));
+  const raiz = devices.filter(
+    (d) => !d.host_device_id || !hostsPresentes.has(d.host_device_id),
+  );
+
   return (
     <div className="devices-list">
       <ExtBridgeTokenCard />
-      {devices.map((device) => (
+      {raiz.map((device) => (
         <div
           key={device.device_id}
           className={`device-card ${device.is_current_device ? 'current' : ''}`}
@@ -410,6 +431,27 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
                 reload();
               }}
             />
+
+            {/* Os navegadores desta máquina. Revogar um deles não toca no
+                computador — são linhas separadas no registro. */}
+            {(superficiesPorHost.get(device.device_id) ?? []).map((surface) => (
+              <div key={surface.device_id} className="device-surface">
+                <div className="device-surface-head">
+                  <span className="device-surface-tipo">
+                    {tipoLegivel(surface.device_type)}
+                  </span>
+                  <DeviceName device={surface} onRenamed={reload} />
+                  {surface.controllable && (
+                    <span className="device-badge device-badge-control">conectado</span>
+                  )}
+                </div>
+                <div className="device-meta">
+                  <span>{surface.model}</span>
+                  {surface.client_version && <span>v{surface.client_version}</span>}
+                </div>
+                <RemoveButton device={surface} onRemoved={() => reload()} />
+              </div>
+            ))}
           </div>
         </div>
       ))}

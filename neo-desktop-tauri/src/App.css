@@ -860,3 +860,30 @@
 .ext-token-error {
   color: #fca5a5;
 }
+
+/* ── Navegador aninhado na máquina (aba Dispositivos) ───────────────────────
+   Superfície de navegador é uma linha própria no registro de dispositivos, mas
+   mostrá-la solta ao lado do computador convida a revogar a errada — e revogar o
+   computador tira o Neo do ar na máquina. Ver browser-surface-plan.md §12.2.  */
+.device-surface {
+  margin-top: 10px;
+  margin-left: 14px;
+  padding: 8px 10px;
+  border-left: 2px solid rgba(139, 92, 246, 0.35);
+  border-radius: 0 6px 6px 0;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.device-surface-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-surface-tipo {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #a78bfa;
+}
