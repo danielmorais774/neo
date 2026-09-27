@@ -239,6 +239,29 @@ function ExtBridgeTokenCard() {
   );
 }
 
+/**
+ * Como o tipo de device aparece na lista.
+ *
+ * Era `device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop'` — ou seja,
+ * TODO o resto mentia chamando-se de desktop. Com superfície de navegador
+ * (neo-core/docs/browser-surface-plan.md) isso deixa de ser cosmético: esta é a
+ * tela onde você revoga uma credencial, e revogar a linha errada tira o Neo do ar
+ * na máquina em vez de tirar a extensão.
+ */
+function tipoLegivel(tipo: string | undefined): string {
+  switch (tipo) {
+    case 'neo-mobile':
+      return 'Neo Mobile';
+    case 'neo-browser-ext':
+      return 'Navegador';
+    case 'neo-desktop':
+    case 'neo-desktop-tauri':
+      return 'Neo Desktop';
+    default:
+      return tipo || 'Dispositivo';
+  }
+}
+
 function formatTimestamp(unix: number): string {
   if (!unix) return '—';
   const d = new Date(unix * 1000);
@@ -358,9 +381,7 @@ export const DevicesTab = ({ currentDeviceId }: Props) => {
           </div>
           <div className="device-info">
             <div className="device-header">
-              <span className="device-type">
-                {device.device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop'}
-              </span>
+              <span className="device-type">{tipoLegivel(device.device_type)}</span>
               {device.is_current_device && (
                 <span className="device-badge">este dispositivo</span>
               )}
