@@ -6,7 +6,13 @@ interface DeviceInfo {
   name?: string;
   display_name?: string | null;
   controllable?: boolean;
-  capabilities?: Record<string, boolean>;
+  capabilities?: Record<string, boolean | Record<string, boolean>>;
+  /**
+   * A MÁQUINA onde esta linha roda, quando ela é uma superfície de navegador
+   * (neo-core/docs/browser-surface-plan.md). Preenchido no pareamento, pelo
+   * desktop — a extensão não pode se declarar "do macbook".
+   */
+  host_device_id?: string | null;
   device_type: string;
   model: string;
   hardware_id: string;
@@ -20,7 +26,126 @@ interface DeviceInfo {
   ws_connection_id: string | null;
 }
 
+/** Como o tipo aparece na lista. Era `neo-mobile ? : 'Neo Desktop'` — todo o
+ *  resto mentia chamando-se de desktop, inclusive um navegador pareado. */
+function tipoLegivel(tipo: string | undefined): string {
+  switch (tipo) {
+    case 'neo-mobile':
+      return 'Neo Mobile';
+    case 'neo-browser-ext':
+      return 'Navegador';
+    case 'neo-desktop':
+    case 'neo-desktop-tauri':
+      return 'Neo Desktop';
+    default:
+      return tipo || 'Dispositivo';
+  }
+}
+
+function ehSuperficie(d: DeviceInfo): boolean {
+  return d.device_type === 'neo-browser-ext' || !!d.host_device_id;
+}
+
+/**
+ * Os CANAIS de um dispositivo, e por que são dois e não um.
+ *
+ * `is_online` é presença (o WS de online/notificações); `controllable` é o canal
+ * de CONTROLE aberto — o único que consegue executar alguma coisa. A lista
+ * mostrava só "Online via WebSocket", que juntava os dois numa frase e escondia
+ * justamente a diferença que importa: um aparelho "online" sem canal de controle
+ * não obedece a "abaixa o volume", e descobrir isso na hora do comando custa uma
+ * caça ao erro. Ver neo-core/docs/device-control-plan.md §2.3.
+ */
+function canais(d: DeviceInfo): { nome: string; ativo: boolean; dica: string }[] {
+  const superficie = ehSuperficie(d);
+  return [
+    {
+      nome: 'presença',
+      ativo: !!d.is_online,
+      dica: 'o aparelho avisou que está de pé (WS de presença/notificações)',
+    },
+    {
+      nome: superficie ? 'canal do navegador' : 'controle',
+      ativo: !!d.controllable,
+      dica: superficie
+        ? 'a extensão está com o canal do neo-core aberto — é por ele que ela reporta abas e recebe navegação'
+        : 'canal de controle aberto — é o único que executa volume, mídia e energia',
+    },
+  ];
+}
+
+/** O que este dispositivo declarou saber fazer, em português. */
+function capacidadesLegiveis(d: DeviceInfo): string[] {
+  const caps = d.capabilities || {};
+  const rotulos: [string, string][] = [
+    ['volume', 'volume'],
+    ['media', 'mídia'],
+    ['lock', 'bloquear'],
+    ['power', 'energia'],
+    ['browser_local', 'navegador'],
+    ['browser_headless', 'headless'],
+  ];
+  const saida = rotulos.filter(([k]) => caps[k] === true).map(([, rotulo]) => rotulo);
+  // As primitivas da superfície vêm aninhadas (o `hello` do canal).
+  const prim = caps.primitives;
+  if (prim && typeof prim === 'object') {
+    for (const [k, v] of Object.entries(prim)) {
+      if (v === true) saida.push(k);
+    }
+  }
+  return saida;
+}
+
+function Pill({
+  texto,
+  ativo,
+  dica,
+}: {
+  texto: string;
+  ativo: boolean;
+  dica?: string;
+}) {
+  return (
+    <span
+      title={dica}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        fontSize: 10,
+        padding: '2px 6px',
+        borderRadius: 8,
+        background: ativo ? 'rgba(34, 197, 94, 0.15)' : 'rgba(100, 116, 139, 0.12)',
+        border: `1px solid ${ativo ? 'rgba(34, 197, 94, 0.3)' : 'rgba(100, 116, 139, 0.25)'}`,
+        color: ativo ? '#4ade80' : '#64748b',
+      }}
+    >
+      <span
+        style={{
+          width: 6,
+          height: 6,
+          borderRadius: '50%',
+          background: ativo ? '#4ade80' : '#475569',
+        }}
+      />
+      {texto}
+    </span>
+  );
+}
+
+function BrowserIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 9h18M3 15h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" />
+    </svg>
+  );
+}
+
 function DeviceIcon({ type }: { type: string }) {
+  if (type === 'neo-browser-ext') {
+    return <BrowserIcon />;
+  }
   if (type === 'neo-mobile') {
     return (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -180,7 +305,7 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
           </div>
           <div>
             <h3 style={{ margin: 0, fontSize: 16 }}>
-              {device.device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop'}
+              {device.name || tipoLegivel(device.device_type)}
             </h3>
             <p style={{ margin: 0, fontSize: 12, color: '#64748b' }}>{device.model}</p>
           </div>
@@ -196,9 +321,39 @@ function DeviceModal({ device, onClose }: { device: DeviceInfo; onClose: () => v
           <InfoRow label="Platform" value={`${device.os_platform} ${device.os_version}`} />
           <InfoRow label="Client" value={device.client_version || '-'} />
           <InfoRow label="IP" value={device.ip_address || '-'} />
-          <InfoRow label="Online" value={device.is_online ? 'Sim' : 'Não'} />
+          <InfoRow label="Presença" value={device.is_online ? 'Sim' : 'Não'} />
+          {/* Dois canais, duas linhas: presença não é controle. Um aparelho
+              presente sem canal de controle não obedece a comando, e ver isso
+              aqui evita a caça ao erro na hora do "abaixa o volume". */}
+          <InfoRow
+            label={ehSuperficie(device) ? 'Canal do navegador' : 'Canal de controle'}
+            value={device.controllable ? 'Aberto' : 'Fechado'}
+          />
+          {device.host_device_id && (
+            <InfoRow label="Roda na máquina" value={device.host_device_id} mono />
+          )}
+          <InfoRow label="Sabe fazer" value={capacidadesLegiveis(device).join(' · ') || '-'} />
           <InfoRow label="WS Connection" value={device.ws_connection_id || '-'} mono />
         </div>
+
+        {ehSuperficie(device) && (
+          <div
+            style={{
+              marginBottom: 16,
+              padding: '9px 11px',
+              borderRadius: 8,
+              border: '1px solid rgba(139, 92, 246, 0.3)',
+              background: 'rgba(139, 92, 246, 0.08)',
+              fontSize: 12,
+              color: '#c4b5fd',
+              lineHeight: 1.45,
+            }}
+          >
+            Esta é uma <b>superfície de navegador</b>: ela reporta abas e recebe
+            navegação, e <b>não mostra notificação</b>. O teste abaixo é do
+            aparelho, não dela — mandar para cá não vai aparecer em lugar nenhum.
+          </div>
+        )}
 
         <div style={{ marginBottom: 16 }}>
           <label style={{ fontSize: 11, color: '#64748b', fontWeight: 600, display: 'block', marginBottom: 6 }}>
@@ -799,15 +954,45 @@ export default function ConnectedDevicesPanel() {
     );
   }
 
+  // Navegador pareado aparece DENTRO da máquina dele, não como aparelho solto.
+  // Esta é a tela onde se revoga credencial: um navegador solto ao lado do
+  // computador convida a revogar a linha errada, e revogar o computador tira o Neo
+  // do ar na máquina em vez de tirar a extensão.
+  // Ver neo-core/docs/browser-surface-plan.md §12.2 (item 6).
+  const superficiesPorHost = new Map<string, DeviceInfo[]>();
+  for (const d of devices) {
+    if (d.host_device_id) {
+      const lista = superficiesPorHost.get(d.host_device_id) ?? [];
+      lista.push(d);
+      superficiesPorHost.set(d.host_device_id, lista);
+    }
+  }
+  // Superfície órfã (hospedeiro removido, ou pareada antes do vínculo existir)
+  // fica na raiz: esconder um aparelho que EXISTE é pior que mostrá-lo fora de
+  // lugar — e é dele que você precisa para revogar.
+  const idsPresentes = new Set(devices.map((d) => d.device_id));
+  const raiz = devices.filter(
+    (d) => !d.host_device_id || !idsPresentes.has(d.host_device_id),
+  );
+  const totalSuperficies = devices.length - raiz.length;
+  const ativos = devices.filter((d) => d.is_online || d.controllable).length;
+
   return (
     <>
       {selectedDevice && <DeviceModal device={selectedDevice} onClose={() => setSelectedDevice(null)} />}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 24, overflow: 'auto', flex: 1 }}>
         <PairingCodeCard devices={devices} />
         <div style={{ fontSize: 13, color: '#475569', marginBottom: 8 }}>
-          {devices.length} dispositivo{devices.length !== 1 ? 's' : ''} conectado{devices.length !== 1 ? 's' : ''}
+          {devices.length} dispositivo{devices.length !== 1 ? 's' : ''}
+          {totalSuperficies > 0 && (
+            <> · {totalSuperficies} navegador{totalSuperficies !== 1 ? 'es' : ''} pareado{totalSuperficies !== 1 ? 's' : ''}</>
+          )}
+          {' · '}
+          <span style={{ color: ativos > 0 ? '#4ade80' : '#64748b' }}>
+            {ativos} com conexão ativa
+          </span>
         </div>
-        {devices.map((device) => (
+        {raiz.map((device) => (
           <div
             key={device.device_id}
             onClick={() => setSelectedDevice(device)}
@@ -836,13 +1021,11 @@ export default function ConnectedDevicesPanel() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0, flex: 1 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>
-                  {device.name || (device.device_type === 'neo-mobile' ? 'Neo Mobile' : 'Neo Desktop')}
+                  {device.name || tipoLegivel(device.device_type)}
                 </span>
-                {device.controllable && (
-                  <span style={{ fontSize: 10, padding: '2px 6px', background: 'rgba(59, 130, 246, 0.15)', border: '1px solid rgba(59, 130, 246, 0.35)', borderRadius: 8, color: '#93c5fd' }}>
-                    controlável
-                  </span>
-                )}
+                <span style={{ fontSize: 10, color: '#64748b' }}>
+                  {tipoLegivel(device.device_type)}
+                </span>
                 {device.is_current_device && (
                   <span style={{ fontSize: 10, padding: '2px 6px', background: 'rgba(34, 197, 94, 0.15)', border: '1px solid rgba(34, 197, 94, 0.3)', borderRadius: 8, color: '#4ade80' }}>
                     este
@@ -871,12 +1054,73 @@ export default function ConnectedDevicesPanel() {
                 <span>{device.os_platform} {device.os_version}</span>
                 {device.client_version && <span>v{device.client_version}</span>}
               </div>
-              <div style={{ fontSize: 10, color: '#334155', marginTop: 4 }}>
-                {device.is_online ? 'Online via WebSocket' : 'Offline'}
+              {/* Os CANAIS, separados. "Online via WebSocket" juntava presença e
+                  controle numa frase e escondia a diferença que importa: um
+                  aparelho presente sem canal de controle não obedece a comando. */}
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                {canais(device).map((c) => (
+                  <Pill key={c.nome} texto={c.nome} ativo={c.ativo} dica={c.dica} />
+                ))}
               </div>
+              {capacidadesLegiveis(device).length > 0 && (
+                <div
+                  style={{ fontSize: 10, color: '#475569', marginTop: 4 }}
+                  title="O que este dispositivo DECLAROU saber fazer. O Neo só oferece o que está aqui."
+                >
+                  sabe: {capacidadesLegiveis(device).join(' · ')}
+                </div>
+              )}
               <div style={{ marginTop: 8 }}>
                 <RemoveDeviceButton device={device} onRemoved={fetchDevices} />
               </div>
+
+              {/* Os navegadores desta máquina. Revogar um deles não toca no
+                  computador — são linhas separadas no registro de dispositivos. */}
+              {(superficiesPorHost.get(device.device_id) ?? []).map((surface) => (
+                <div
+                  key={surface.device_id}
+                  onClick={(e) => {
+                    // O cartão de cima abre o modal do COMPUTADOR; clicar no
+                    // navegador tem que abrir o dele, não o do hospedeiro.
+                    e.stopPropagation();
+                    setSelectedDevice(surface);
+                  }}
+                  style={{
+                    marginTop: 10,
+                    marginLeft: 4,
+                    padding: '8px 10px',
+                    borderLeft: '2px solid rgba(139, 92, 246, 0.4)',
+                    borderRadius: '0 8px 8px 0',
+                    background: 'rgba(255, 255, 255, 0.03)',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ color: '#a78bfa', display: 'flex' }}>
+                      <BrowserIcon />
+                    </span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: '#e2e8f0' }}>
+                      {surface.name || surface.model || 'Navegador'}
+                    </span>
+                    <span style={{ fontSize: 10, color: '#64748b' }}>
+                      {tipoLegivel(surface.device_type)}
+                    </span>
+                    {canais(surface).map((c) => (
+                      <Pill key={c.nome} texto={c.nome} ativo={c.ativo} dica={c.dica} />
+                    ))}
+                  </div>
+                  {capacidadesLegiveis(surface).length > 0 && (
+                    <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>
+                      sabe: {capacidadesLegiveis(surface).join(' · ')}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 10, color: '#334155', marginTop: 4 }}>
+                    roda nesta máquina · v{surface.client_version || '?'}
+                  </div>
+                  <div style={{ marginTop: 6 }}>
+                    <RemoveDeviceButton device={surface} onRemoved={fetchDevices} />
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         ))}
