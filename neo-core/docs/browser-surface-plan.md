@@ -588,7 +588,22 @@ primitiva falta. Portar passa a ser *acrescentar uma entrada com seu par de
 testes*, uma por vez, quando houver uma superfície para provar contra — e
 `test_a_escada_nao_nasce_com_derivada_nao_testada` recusa entrada sem prova.
 
-### 14.1 O cliente (feito) — `neo-music-ext` v1.4.0
+### 14.1 Os clientes (feitos) — `neo-music-ext` v1.4.0 e `neo-browser-local` v0.2.0
+
+**Dois caminhos de pareamento, e a diferença é quem prova a máquina:**
+
+| extensão | código vem de | vínculo | consentimento |
+|---|---|---|---|
+| `neo-music-ext` | o **desktop**, pela ponte (`pair_request`) | `host_device_id` automático | **diálogo nativo** do desktop |
+| `neo-browser-local` | o **painel** (digitado no popup) | órfã — o nome carrega a máquina | o próprio painel, que exige login |
+
+O segundo existe porque `neo-browser-local` **não está na ponte** (fala por native
+messaging com o `obu`), e porque é o caminho de quem **não tem desktop** na máquina.
+A contrapartida é honesta e está na UI: sem `host_device_id`, quem endereça é o
+NOME — daí o campo pedir "Edge do macbook" em vez de só "Edge". A cascata de nomes
+casa por trecho, então "macbook" ainda encontra.
+
+
 
 A primeira superfície existe, e é de LEITURA: declara `tabs` e nada mais.
 
@@ -628,9 +643,13 @@ A primeira superfície existe, e é de LEITURA: declara `tabs` e nada mais.
   superfície para provar contra, mas ela declara `tabs` — para exercitar as
   derivadas seria preciso uma superfície com `eval`/`cdp`, que é a
   `neo-browser-local` (item seguinte).
-- **`neo-browser-local` como superfície direta.** Ela é o cano de CDP; virar
-  superfície exige declarar `eval`/`cdp` E ter as derivadas portadas. É o próximo
-  passo natural, e o primeiro que vai exercitar o degrau 2.
+- ~~**`neo-browser-local` como superfície direta**~~ — **PAREIA desde a v0.2.0**
+  (2026-09-27), pelo caminho SEM desktop: código do painel digitado no popup
+  (seção *Conta do Neo*). Ela declara só `tabs`, e mesmo isso **opt-in**
+  (`<all_urls>` faz de "reportar abas" uma decisão dele, não um default). Ação de
+  navegação **continua indo pelo desktop** — declarar `eval`/`cdp` acontece junto
+  com portar as derivadas, nunca antes. É esse passo que ainda falta para o
+  degrau 2 existir de verdade.
 - **Entrada pública autenticada** para o core (hoje o canal é o túnel). Decisão
   dele: o túnel é intencional, no espírito de homelab.
 
