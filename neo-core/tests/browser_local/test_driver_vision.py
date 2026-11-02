@@ -385,10 +385,24 @@ async def test_olhar_nao_gasta_o_orcamento_de_passos():
 
 
 @pytest.mark.asyncio
-async def test_sem_visao_nao_tira_print_nem_manda_imagem():
+async def test_sem_visao_o_modelo_fica_cego_mas_o_usuario_nao():
+    """Cegueira é do MODELO, e parava de ser do usuário junto — não é mais.
+
+    Durante a tarefa o driver não gasta print nenhum: a imagem não tem para
+    quem ir, e o prompt avisa "SEM VISÃO" em vez de deixá-lo queimar um passo
+    pedindo `look` para ouvir "não deu". No FIM ele fotografa uma vez, porque
+    quem lê aquele print é uma pessoa — e "dois jobs inteiros rodaram cegos sem
+    ninguém saber" é exatamente o que a visão opcional custou uma vez.
+    """
     driver = _driver([{"action": "done", "args": {"answer": "pronto"}}])
-    await driver.run("baixa a pasta Print")
-    assert not any(a == "browser.screenshot" for a, _ in driver._acted)
+    result = await driver.run("baixa a pasta Print")
+
+    fotos = [args for a, args in driver._acted if a == "browser.screenshot"]
+    assert len(fotos) == 1, "um print, no fim — nenhum durante a tarefa"
+    assert fotos[0].get("marks") is False, "o print de quem lê não leva os números"
+    assert result.screenshots, "job cego ainda mostra onde parou"
+    assert result.screenshot_captions[0] == "a tela quando terminei"
+
     call = driver._provider.calls[0]
     assert call["model"] == "texto"
     assert call["messages"][-1].images is None
@@ -837,7 +851,7 @@ async def test_recusa_por_repeticao_lista_os_itens_do_menu_aberto():
     assert "menu já está ABERTO" in recusa.detail
     assert '[88] "Baixar"' in recusa.detail
     # E o clique certo, sugerido pela própria recusa, passa.
-    assert ("browser.click", {"ref": 88, "tab_ref": 42}) in driver._acted
+    assert any(a == "browser.click" and args.get("ref") == 88 for a, args in driver._acted)
 
 
 @pytest.mark.asyncio

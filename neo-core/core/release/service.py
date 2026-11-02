@@ -71,6 +71,42 @@ def payload_fingerprint(payload: Any) -> str:
     return hashlib.sha256(normalizado.encode("utf-8")).hexdigest()
 
 
+def motivos_de_origem(
+    principal: str,
+    principal_ref: str | None = None,
+    taint_sources: list[str] | None = None,
+    tainted: bool | None = None,
+) -> list[str]:
+    """Os ``risco_motivos`` que dizem de onde partiu o pedido.
+
+    Duas portas criam pedido — a tool ``solicitar_dado``, dentro do turno, e o
+    job do navegador, que para no campo e pede sozinho, FORA do turno. As duas
+    escrevem as mesmas frases, porque é delas que ``nasceu_de_terceiro`` e o card
+    tiram o aviso "⚠️ nasceu de conteúdo de terceiro".
+    """
+    motivos: list[str] = []
+    if principal == "externo":
+        motivos.append(f"o pedido veio de {principal_ref or 'origem externa'}, não de você")
+    elif principal == "agenda":
+        motivos.append("disparo da agenda, sem ninguém na frente")
+    fontes = [str(f) for f in (taint_sources or []) if str(f).strip()]
+    if fontes if tainted is None else tainted:
+        motivos.append(f"o turno leu conteúdo de terceiro ({', '.join(fontes[:3])})")
+    return motivos
+
+
+def nasceu_de_terceiro(row: ReleaseRequest) -> bool:
+    """O pedido veio de conteúdo que entrou no turno, e não da fala dele?
+
+    ``origem`` responde "quem mandou a mensagem"; isto responde "quem escreveu o
+    pedido". São diferentes quando ele cola um texto, abre uma página ou manda o
+    Neo ler um e-mail: a mensagem é dele, o pedido é de quem escreveu o conteúdo.
+    Uma definição só — o card do aparelho (``notify.py``) e a tela do painel
+    mostram o MESMO aviso.
+    """
+    return any("terceiro" in str(m).lower() for m in (row.risco_motivos or []))
+
+
 @dataclass
 class ReleaseView:
     """Vista de um pedido — o que vai para o card, o painel e o log."""
@@ -89,6 +125,10 @@ class ReleaseView:
     evidencia: str
     criado_em: str | None
     expira_em: str | None
+    #: O pedido nasceu de conteúdo de terceiro (colagem, página, e-mail, PDF)?
+    nasceu_de_terceiro: bool = False
+    decidido_em: str | None = None
+    usado_em: str | None = None
 
     @classmethod
     def of(cls, row: ReleaseRequest) -> "ReleaseView":
@@ -107,6 +147,9 @@ class ReleaseView:
             evidencia=row.origem_evidencia or "",
             criado_em=row.created_at.isoformat() if row.created_at else None,
             expira_em=row.expires_at.isoformat() if row.expires_at else None,
+            nasceu_de_terceiro=nasceu_de_terceiro(row),
+            decidido_em=row.decided_at.isoformat() if row.decided_at else None,
+            usado_em=row.used_at.isoformat() if row.used_at else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,6 +168,9 @@ class ReleaseView:
             "evidencia": self.evidencia,
             "criado_em": self.criado_em,
             "expira_em": self.expira_em,
+            "nasceu_de_terceiro": self.nasceu_de_terceiro,
+            "decidido_em": self.decidido_em,
+            "usado_em": self.usado_em,
         }
 
 
@@ -267,6 +313,69 @@ class ReleaseService:
             if mudou:
                 await session.commit()
             return vivos
+
+    async def list_recent(self, user_id: UUID, limit: int = 60) -> list[ReleaseRequest]:
+        """TODOS os pedidos do dono, recentes primeiro — a tela de histórico.
+
+        Varre o prazo como o ``list_pending``: um pendente vencido aparecendo como
+        "pendente" numa lista de histórico seria mentira, e é a linha que faz
+        alguém esperar por um card que não existe mais.
+        """
+        async with self._db.get_session() as session:
+            stmt = (
+                select(ReleaseRequest)
+                .where(ReleaseRequest.user_id == user_id)
+                .order_by(ReleaseRequest.created_at.desc())
+                .limit(max(1, min(int(limit or 60), 300)))
+            )
+            rows = list((await session.execute(stmt)).scalars().all())
+            mudou = False
+            for row in rows:
+                if row.status == STATUS_PENDENTE and self._is_expired(row):
+                    row.status = STATUS_EXPIRADA
+                    session.add(row)
+                    mudou = True
+            if mudou:
+                await session.commit()
+            return rows
+
+    async def cards_of(self, rows: list[ReleaseRequest]) -> dict[str, dict[str, str]]:
+        """Texto EXATO do card de cada pedido, por ``release_id``.
+
+        Vem da NOTIFICAÇÃO, não do pedido: o ``preview`` — o texto que vai sair —
+        mora lá de propósito, porque a ``release_request`` guarda só o
+        ``payload_hash`` (§6.2 do plano: o que se aprova é o texto, e o hash é o
+        que amarra a aprovação a ele). Para a tela mostrar o MESMO card que chegou
+        no aparelho, é de lá que se lê — reconstruir aqui daria dois textos que
+        divergem no primeiro ajuste de redação.
+
+        Uma query para a lista toda. Pedido sem notificação (push falhou) sai de
+        fora em vez de virar erro.
+        """
+        ids = {row.notification_id: str(row.id) for row in rows if row.notification_id}
+        if not ids:
+            return {}
+        from db.models.user_notification import UserNotification
+
+        try:
+            async with self._db.get_session() as session:
+                stmt = select(UserNotification).where(UserNotification.id.in_(list(ids)))
+                achadas = list((await session.execute(stmt)).scalars().all())
+        except Exception:  # noqa: BLE001 — tela sem o texto ainda é útil
+            logger.exception("[release] falha ao ler o card das notificações")
+            return {}
+        cards: dict[str, dict[str, str]] = {}
+        for notif in achadas:
+            release_id = ids.get(notif.id)
+            if not release_id:
+                continue
+            payload = notif.payload if isinstance(notif.payload, dict) else {}
+            cards[release_id] = {
+                "titulo": notif.title or "",
+                "corpo": notif.body or "",
+                "preview": str(payload.get("preview") or ""),
+            }
+        return cards
 
     async def list_approved(self, user_id: UUID) -> list[ReleaseRequest]:
         """Aprovadas e ainda não usadas — a autorização que o preenchimento lê.

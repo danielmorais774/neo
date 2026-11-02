@@ -335,6 +335,8 @@ def render_job_entry(
         "failed": "FALHOU",
         "stopped": "foi interrompido",
         "cancelled": "foi cancelado",
+        "waiting": "PAROU esperando o Daniel",
+        "continued": "continuou em outro job",
     }.get(status, status)
 
     linhas = [

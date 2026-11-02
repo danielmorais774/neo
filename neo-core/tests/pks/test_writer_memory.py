@@ -391,3 +391,20 @@ def test_extract_entertainment_habit_ignores_transient_series_activity():
     writer = object.__new__(PKSWriter)
 
     assert writer._extract_entertainment_habit("estou assistindo serie nesse exato momento") is None
+
+
+def test_salva_isso_nao_grava_a_fala_do_neo_no_world_state():
+    """session-89b9aa31 → session-8f2febfa: a RECUSA do Neo ("Não. E o motivo é o
+    mesmo que já te dei…") foi gravada em `neo-world-state.recent_events` por um
+    "salva isso", e passou a entrar em todo prompt como evento recente."""
+    writer = object.__new__(PKSWriter)
+    for resposta in (
+        "Não. E o motivo é o mesmo que já te dei: esse número não é seu CEP.",
+        "Haha, se vc me transformar em aspirador eu aspiro a casa toda.",
+    ):
+        updates = writer._build_system_updates(
+            user_message="salva isso",
+            assistant_response=resposta,
+            allow_confirmation_fallback=True,
+        )
+        assert not any(u["name"] == "neo-world-state" for u in updates), updates

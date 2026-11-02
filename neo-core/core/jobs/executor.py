@@ -82,6 +82,28 @@ def _urls_of(*texts: Any) -> set[str]:
     return found
 
 
+def _autoridade_do_turno() -> dict[str, Any] | None:
+    """O que a autoridade do turno diz sobre quem pediu — serializável, para o spec.
+
+    ``None`` fora de turno (agenda sem autoridade instalada, teste): aí o pedido
+    que o job vier a fazer sai como do Daniel, que é o comportamento de sempre.
+    """
+    try:
+        from core.authority import current_authority
+
+        autoridade = current_authority()
+    except Exception:  # noqa: BLE001
+        return None
+    if autoridade is None:
+        return None
+    return {
+        "principal": autoridade.principal,
+        "principal_ref": autoridade.principal_ref,
+        "tainted": bool(autoridade.tainted),
+        "taint_sources": list(autoridade.taint_sources or [])[:5],
+    }
+
+
 class JobToolExecutor:
     """Executor por-request das tools de jobs em background."""
 
@@ -296,6 +318,34 @@ class JobToolExecutor:
         task = str(args.get("task") or "").strip()
         if not task:
             return {"ok": False, "error": "task vazia."}
+        # O navegador do SERVIDOR não tem preenchimento escopado: um `«pks:cep»`
+        # seria digitado como texto e enviado assim. Dado pessoal em formulário é
+        # trabalho do navegador dele, que troca o marcador na hora de digitar e
+        # pede a liberação sozinho.
+        from core.release.fill import campos_do_texto
+
+        marcados = campos_do_texto(f"{task}\n{args.get('context') or ''}")
+        if marcados:
+            return {
+                "ok": False,
+                "error": (
+                    "o navegador do servidor não preenche dado pessoal: ele digitaria "
+                    f"{', '.join(f'«pks:{c}»' for c in marcados)} como texto. Mande a "
+                    "MESMA tarefa pelo `browser_local_task` — é ele que troca o marcador "
+                    "pelo valor e, sem liberação, para no campo, pede ao Daniel e "
+                    "continua sozinho quando ele aprovar."
+                ),
+            }
+        # Mesma trava do local: o navegador do servidor digita em formulário de
+        # terceiro igual, e sair pela porta de fora não torna o documento menos
+        # inventado.
+        recusa = self._recusar_dado_literal(
+            task,
+            str(args.get("context") or ""),
+            str(args.get("start_url") or ""),
+        )
+        if recusa:
+            return recusa
         title = str(args.get("title") or "Tarefa no browser").strip()[:256]
         session = str(args.get("session") or settings.browser_default_session).strip()
         # Nome de sessão vira diretório de perfil no container — sanear.
@@ -614,6 +664,8 @@ class JobToolExecutor:
             return {"ok": False, "error": f"não achei o job {job_id} para continuar."}
         sessao = (anterior.extra_metadata or {}).get("browser_session") or {}
         pendente = str(sessao.get("pending") or "")
+        if not pendente and sessao.get("release_pending"):
+            return await self._retomada_por_liberacao(anterior, str(sessao["release_pending"]))
         if not pendente:
             return {
                 "ok": False,
@@ -630,9 +682,18 @@ class JobToolExecutor:
             "max_steps": antigo.get("max_steps"),
             "resume_pending": pendente,
             "confirm_sensitive_ok": True,
+            "pedido": antigo.get("pedido"),
+            "autoridade": antigo.get("autoridade"),
         }
+        # Parou para o Daniel CONFERIR o formulário: o que ele viu é o que vai.
+        # Sem isto a retomada consultaria a memória de novo, e uma segunda
+        # redação poderia trocar o texto que ele aprovou.
+        if sessao.get("respostas_memoria"):
+            spec["respostas_memoria"] = sessao["respostas_memoria"]
         if sessao.get("tab_ref"):
             spec["tab_ref"] = sessao["tab_ref"]
+        # Se a aba sumiu, é este endereço que se reabre — e não about:blank.
+        spec["reabrir_url"] = sessao.get("url") or ""
         spec = {k: v for k, v in spec.items() if v not in (None, "")}
 
         emcurso = await self._browser_local_em_curso()
@@ -656,6 +717,12 @@ class JobToolExecutor:
             notify_policy="chat",
         )
         job = await self.db.create_agent_job(job)
+        # A parada deixou de esperar: na janela de tarefas ela some de "esperando
+        # você" e aponta para quem continuou.
+        try:
+            await self.db.update_agent_job(anterior.id, status="continued")
+        except Exception as exc:  # noqa: BLE001 — a continuação já existe
+            logger.warning("[browser-local] não marquei %s como continuada: %s", anterior.id, exc)
         try:
             self.jm.poke()
         except Exception:  # noqa: BLE001
@@ -676,6 +743,170 @@ class JobToolExecutor:
                 "parar e perguntar de novo."
             ),
         }
+
+    async def _retomada_por_liberacao(
+        self, anterior: AgentJob, release_id: str
+    ) -> dict[str, Any]:
+        """``continue_job`` de uma tarefa que parou esperando LIBERAÇÃO de dado.
+
+        O caminho normal nem passa por aqui: aprovar o card já continua a tarefa
+        sozinho (``core/jobs/release_resume.py``). Isto cobre o resto — o
+        navegador estava ocupado na hora da aprovação, o core reiniciou — e
+        principalmente diz a verdade quando a aprovação NÃO aconteceu: "sim" no
+        chat não aprova nada, e continuar sem liberação só pararia de novo no
+        mesmo campo.
+        """
+        from core.jobs.release_resume import continuar, navegador_ocupado
+        from core.release import ReleaseService
+
+        try:
+            row = await ReleaseService(self.db).get(release_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"não consegui ler a liberação {release_id}: {exc}"}
+        if row is None:
+            return {"ok": False, "error": f"a liberação {release_id} não existe mais."}
+        sessao = (anterior.extra_metadata or {}).get("browser_session") or {}
+        if sessao.get("release_resumed"):
+            return {
+                "ok": True,
+                "job_id": str(sessao["release_resumed"]),
+                "status": "queued",
+                "reused": True,
+                "note": (
+                    "Essa tarefa JÁ continuou quando o Daniel aprovou — é este job. "
+                    "O resultado chega sozinho no chat."
+                ),
+            }
+        if row.status == "pendente":
+            return {
+                "ok": False,
+                "error": (
+                    "a liberação ainda NÃO foi aprovada. O aviso está nos aparelhos do "
+                    "Daniel — é lá que ele aprova (o \"sim\" no chat não vale como "
+                    "aprovação). Quando ele aprovar, a tarefa continua sozinha; não "
+                    "chame solicitar_dado de novo."
+                ),
+            }
+        if row.status != "aprovada":
+            return {
+                "ok": False,
+                "error": (
+                    f"a liberação está '{row.status}' — não há o que continuar com ela. "
+                    "Se ele ainda quer preencher, mande a tarefa de novo com os «pks:…»: "
+                    "ela para no campo e pede outra liberação."
+                ),
+            }
+        device = str(sessao.get("device_id") or self.device_id or "")
+        ocupado = await navegador_ocupado(self.db, self.user_id, device)
+        if ocupado is not None:
+            return {
+                "ok": True,
+                "job_id": str(ocupado.id),
+                "title": ocupado.title,
+                "status": ocupado.status,
+                "reused": True,
+                "note": "Já existe uma tarefa rodando neste navegador — espere ela terminar.",
+            }
+        novo = await continuar(self.db, self.jm, anterior, row)
+        return {
+            "ok": True,
+            "job_id": str(novo.id),
+            "title": novo.title,
+            "status": "queued",
+            "resumed_from": str(anterior.id),
+            "note": "Continuando de onde parou, na mesma aba, com o que o Daniel liberou.",
+        }
+
+    @staticmethod
+    def _recusar_dado_literal(
+        task: str, context: str = "", start_url: str = ""
+    ) -> dict[str, Any] | None:
+        """Documento escrito à mão dentro da tarefa do navegador. ``None`` = ok.
+
+        A trava de preenchimento mora no driver e olha cada `fill`. Ela não vê,
+        porém, o dado que chega UMA CAMADA ACIMA: na sessão e0905aae o cérebro
+        escreveu "preencha o CPF do destinatário com 00000000000 (se o campo
+        validar CPF e recusar esse valor, use 11144477735)" dentro do próprio
+        `task`. Para o agente do navegador aquilo não é mais dado pessoal a
+        buscar — é parâmetro recebido. A decisão sobre documento acabou tomada
+        por quem não tem como pedir aprovação, e com um número inventado.
+
+        Recusar aqui é barato e honesto: o cérebro ainda não gastou o navegador
+        do usuário, e a frase já diz o caminho certo.
+
+        **Um veredito por tarefa, não um por rodada** (consertado em 2026-10-18).
+        Antes isto nomeava só o que a FORMA do número denunciava, e entregava uma
+        recusa de cada vez. No teste do §24 a tarefa trazia CEP *e* CPF; saiu "a
+        tarefa traz CEP escrito por extenso", e o CPF — ``00000000000``, cujo
+        dígito verificador não fecha — nunca chegou a ser visto. O Daniel leu no
+        chat que o CPF tinha sido barrado, mas a tabela de necessidade não havia
+        rodado nele uma única vez: o bloqueio era retórica do modelo, repetindo o
+        exemplo que a própria frase de recusa dava. Agora a varredura acha todos
+        os campos, a tabela julga todos, e a recusa volta com as duas listas
+        prontas — o que vai por «pks:…», e o que não se pede.
+
+        **Quem pede a liberação é a TAREFA, não o cérebro** (2026-11-01). A frase
+        mandava chamar ``solicitar_dado`` antes de despachar; na sessão 1a605544
+        quem leu foi o agente do SERVER_TOOL, que não tinha a tool, e ele
+        respondeu "ficou esperando aprovação" sem pedido nenhum. Agora o job do
+        navegador para no campo, cria o card e continua sozinho depois da
+        aprovação — então o caminho certo cabe numa frase que não depende de
+        tool nenhuma: reescrever com os marcadores e despachar.
+        """
+        try:
+            from core.release.fill import host_of
+            from core.release.necessity import (
+                campos_desnecessarios,
+                explicar,
+                finalidade_conhecida,
+            )
+            from core.release.sensitive import campos_pessoais_no_texto, humano
+        except Exception:  # noqa: BLE001 — a trava nunca derruba o turno
+            return None
+        achados = campos_pessoais_no_texto(f"{task}\n{context}")
+        if not achados:
+            return None
+
+        # A finalidade sai da TAREFA, não do contexto: é a tarefa que diz o que
+        # se foi fazer ali. Finalidade que a tabela não conhece não reprova nada
+        # (necessity.py) — aí tudo vira card e quem julga é o Daniel.
+        finalidade = finalidade_conhecida(task) or ""
+        barrados = campos_desnecessarios(finalidade, achados) if finalidade else []
+        pedir = [c for c in achados if c not in barrados]
+
+        destino = host_of(start_url)
+        linhas = [
+            "Não despachei: a tarefa traz dado pessoal escrito por extenso "
+            f"({', '.join(humano(c) for c in achados)}). Dado pessoal não vai no "
+            "texto da tarefa — nem o real do Daniel, nem um que você componha para "
+            "destravar o formulário (um CPF inventado cadastra outra pessoa)."
+        ]
+        if pedir:
+            marcas = ", ".join(f"«pks:{c}»" for c in pedir)
+            onde = f" para {destino}" if destino else ""
+            linhas.append(
+                "Reescreva a tarefa SEM valor nenhum e despache pelo "
+                "`browser_local_task` (o navegador dele — o do servidor não troca o "
+                f"marcador), mandando preencher cada campo com {marcas}. O valor real "
+                "entra na hora de digitar, e só no site liberado. Se ainda não houver "
+                f"liberação, a própria tarefa para no campo, manda o pedido ao Daniel{onde} "
+                "e CONTINUA SOZINHA quando ele aprovar. Não chame `solicitar_dado` para "
+                "isso e não diga que já pediu: quem pede é a tarefa."
+            )
+        if barrados:
+            linhas.append(
+                explicar(finalidade, barrados).strip()
+                or f"Não peça liberação de {', '.join(humano(c) for c in barrados)}."
+            )
+            linhas.append(
+                "Conte ao Daniel o que você barrou e por quê — a página pediu, não "
+                "foi ele."
+            )
+        logger.info(
+            "[release] tarefa de navegador recusada: literal=%s pedir=%s barrado=%s",
+            ",".join(achados), ",".join(pedir) or "-", ",".join(barrados) or "-",
+        )
+        return {"ok": False, "error": " ".join(linhas)}
 
     async def _browser_local_task(self, args: dict[str, Any]) -> dict[str, Any]:
         """Cria agent_job(kind=browser_local) — o navegador do próprio usuário."""
@@ -740,6 +971,20 @@ class JobToolExecutor:
             )
 
         if superficie is None and not alvo_id:
+            # Formulário com dado pessoal não cai para o servidor: lá não há
+            # preenchimento escopado, e a recusa de `_browser_task` mandaria
+            # voltar para cá — um laço sem saída.
+            from core.release.fill import campos_do_texto
+
+            if campos_do_texto(f"{args.get('task') or ''}\n{args.get('context') or ''}"):
+                return {
+                    "ok": False,
+                    "error": (
+                        "não há navegador do Daniel disponível agora (desktop fechado "
+                        "ou extensão desligada), e dado pessoal só entra pelo navegador "
+                        "dele. Diga isso a ele: com o navegador aberto, é só pedir de novo."
+                    ),
+                }
             resultado = await self._browser_task(args)
             if isinstance(resultado, dict) and resultado.get("ok"):
                 resultado["note"] = (
@@ -762,6 +1007,13 @@ class JobToolExecutor:
         task = str(args.get("task") or "").strip()
         if not task:
             return {"ok": False, "error": "task vazia."}
+        recusa = self._recusar_dado_literal(
+            task,
+            str(args.get("context") or ""),
+            str(args.get("start_url") or ""),
+        )
+        if recusa:
+            return recusa
         title = str(args.get("title") or "Tarefa no seu navegador").strip()[:256]
         # ── Com janela ou sem? ───────────────────────────────────────────────
         #
@@ -791,6 +1043,18 @@ class JobToolExecutor:
         }
         if provider:
             spec["surface_provider"] = provider
+        # Quem pediu, gravado AGORA: o job roda fora do turno, e se ele parar num
+        # campo e pedir liberação sozinho, o card precisa dizer se o pedido
+        # nasceu de conteúdo de terceiro — que é o que só o turno sabe.
+        autoridade = _autoridade_do_turno()
+        if autoridade:
+            spec["autoridade"] = autoridade
+        # O pedido nas palavras DELE: é a finalidade que a tabela de necessidade
+        # julga se a tarefa parar num campo (`_finalidade_declarada` no runner).
+        # O `task` é instrução do cérebro e traz palavra solta.
+        pedido = (self.user_message or "").strip()
+        if pedido:
+            spec["pedido"] = pedido[:500]
         # Headless é da MÁQUINA, não da superfície: extensão não inicia navegador.
         # Sem ele, cair para a aba visível é melhor que falhar — mesma escada de
         # sempre (fetch → headless → tela), só que agora escolhida por capacidade

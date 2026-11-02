@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from core.pks.ontology import normalize_token
+from core.pks.ontology import field_keys_for_term, normalize_token
 from core.pks.schemas import (
     EntityRecord,
     FieldRecord,
@@ -37,6 +37,31 @@ def build_search_text(name: str, aliases: list[str] | None = None, metadata: dic
             if isinstance(value, (str, int, float, bool)):
                 parts.append(str(value))
     return normalize_token(" ".join(parts))
+
+
+#: Nota de quem casou pela CHAVE de um campo. Fica abaixo de nome (1.0) e
+#: apelido (0.95) — a chave nomeia um pedaço da entidade, não ela — e bem acima
+#: do `context_relevance_threshold` (0.25), porque "qual meu cep" tem UMA
+#: resposta certa e ela não pode ficar de fora do prompt por meio décimo.
+_FIELD_KEY_SCORE = 0.75
+
+
+def _field_keys_for_query(qnorm: str) -> list[str]:
+    """Chaves da `pks_entity_field` que os termos da consulta podem nomear.
+
+    Credencial fica fora: "senha" não deve nem localizar a entidade que guarda
+    uma — o lugar dela é o cofre (ver `core/pks/sensitivity.py`).
+    """
+    from core.pks.sensitivity import SECRET, classify_key
+
+    chaves: list[str] = []
+    for termo in qnorm.split():
+        if classify_key(termo) == SECRET:
+            continue
+        for chave in field_keys_for_term(termo):
+            if chave not in chaves:
+                chaves.append(chave)
+    return chaves
 
 
 def _as_float(value: Any, default: float = 1.0) -> float:
@@ -533,41 +558,73 @@ class PKSRepository:
     ) -> list[tuple[EntityRecord, float, str]]:
         if not query.strip():
             return []
+        qnorm = normalize_token(query)
         params: dict[str, Any] = {
             "workspace_id": workspace_id,
             "query": query,
-            "qnorm": normalize_token(query),
+            "qnorm": qnorm,
             "limit": limit,
         }
         type_filter = ""
         if entity_types:
-            type_filter = "AND type = ANY(CAST(:types AS text[]))"
+            type_filter = "AND e.type = ANY(CAST(:types AS text[]))"
             params["types"] = entity_types
+
+        # Casar pela CHAVE do campo. Sem isto, o fato guardado em
+        # `pks_entity_field` é invisível para a palavra que o nomeia: o
+        # `search_text` é nome + apelidos + metadata, então "cep" nunca
+        # encontrava `Daniel Morais.cep` (sessão 369d812c).
+        field_keys = _field_keys_for_query(qnorm)
+        field_join = field_score = field_matched = field_where = ""
+        if field_keys:
+            params["field_keys"] = field_keys
+            field_join = """
+                LEFT JOIN LATERAL (
+                    SELECT 1 AS hit
+                    FROM pks_entity_field f
+                    WHERE f.entity_id = e.id
+                      AND f.deleted_at IS NULL
+                      AND f.sensitivity <> 'secret'
+                      AND lower(f.key) = ANY(CAST(:field_keys AS text[]))
+                    LIMIT 1
+                ) fk ON TRUE"""
+            field_score = f"WHEN fk.hit IS NOT NULL THEN {_FIELD_KEY_SCORE}"
+            field_matched = "WHEN fk.hit IS NOT NULL THEN 'field_key'"
+            field_where = "OR fk.hit IS NOT NULL"
+
         result = await session.execute(
             text(
                 f"""
-                SELECT *,
+                SELECT e.*,
                        CASE
-                         WHEN lower(name) = lower(:query) THEN 1.0
-                         WHEN lower(:query) = ANY(SELECT lower(unnest(aliases))) THEN 0.95
-                         ELSE GREATEST(similarity(search_text, :qnorm), 0)
+                         WHEN lower(e.name) = lower(:query) THEN 1.0
+                         WHEN lower(:query) = ANY(SELECT lower(unnest(e.aliases))) THEN 0.95
+                         {field_score}
+                         ELSE GREATEST(similarity(e.search_text, :qnorm), 0)
                        END AS match_score,
                        CASE
-                         WHEN lower(name) = lower(:query) THEN 'name'
-                         WHEN lower(:query) = ANY(SELECT lower(unnest(aliases))) THEN 'alias'
+                         WHEN lower(e.name) = lower(:query) THEN 'name'
+                         WHEN lower(:query) = ANY(SELECT lower(unnest(e.aliases))) THEN 'alias'
+                         {field_matched}
                          ELSE 'trigram'
                        END AS matched_by
-                FROM pks_entity
-                WHERE workspace_id = :workspace_id
-                  AND deleted_at IS NULL
+                FROM pks_entity e{field_join}
+                WHERE e.workspace_id = :workspace_id
+                  AND e.deleted_at IS NULL
                   {type_filter}
                   AND (
-                    lower(name) = lower(:query)
-                    OR lower(:query) = ANY(SELECT lower(unnest(aliases)))
-                    OR search_text % :qnorm
-                    OR search_text LIKE '%' || :qnorm || '%'
+                    lower(e.name) = lower(:query)
+                    OR lower(:query) = ANY(SELECT lower(unnest(e.aliases)))
+                    {field_where}
+                    OR e.search_text % :qnorm
+                    -- Substring presa ao INÍCIO de uma palavra. Solta
+                    -- (`LIKE '%cep%'`) ela casava "trí-cep-s" e as três vagas
+                    -- do resolver iam para exercício, deixando a entidade
+                    -- certa de fora; "mac" continua achando "macbook air m4".
+                    OR e.search_text LIKE :qnorm || '%'
+                    OR e.search_text LIKE '% ' || :qnorm || '%'
                   )
-                ORDER BY match_score DESC, last_used_at DESC NULLS LAST, confidence DESC
+                ORDER BY match_score DESC, e.last_used_at DESC NULLS LAST, e.confidence DESC
                 LIMIT :limit
                 """
             ),

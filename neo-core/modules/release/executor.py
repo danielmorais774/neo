@@ -33,6 +33,36 @@ class ReleaseToolExecutor:
         self._user_id = user_id
         self._session_id = session_id
 
+    async def execute_tool_call(self, tool_call: Any) -> Any:
+        """O dialeto do agente do SERVER_TOOL (``ToolCall`` → ``ToolResult``).
+
+        Ali não existe o despacho inline do cognitivo, e a tool faltava por isso:
+        na sessão 1a605544 a recusa mandava "chame solicitar_dado", o agente não
+        a tinha, e respondeu "ficou esperando aprovação" sem pedido nenhum
+        criado.
+        """
+        import time
+
+        from shared import ToolResult
+
+        inicio = time.monotonic()
+        try:
+            resultado = await self.execute(tool_call.name, tool_call.arguments or {})
+        except Exception as exc:  # noqa: BLE001 — erro volta como dado para o agente
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                result=None,
+                error=str(exc),
+                execution_time=time.monotonic() - inicio,
+            )
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_call.name,
+            result=resultado,
+            execution_time=time.monotonic() - inicio,
+        )
+
     async def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "solicitar_dado":
             raise ValueError(f"Unknown release tool: {tool_name}")
@@ -122,14 +152,12 @@ class ReleaseToolExecutor:
         if authority is None:
             return "admin", None, [], ""
 
-        motivos: list[str] = []
-        if authority.principal == "externo":
-            motivos.append(
-                f"o pedido veio de {authority.principal_ref or 'origem externa'}, não de você"
-            )
-        elif authority.principal == "agenda":
-            motivos.append("disparo da agenda, sem ninguém na frente")
-        if authority.tainted:
-            fontes = ", ".join(authority.taint_sources[:3])
-            motivos.append(f"o turno leu conteúdo de terceiro ({fontes})")
+        from core.release import motivos_de_origem
+
+        motivos = motivos_de_origem(
+            authority.principal,
+            authority.principal_ref,
+            list(authority.taint_sources or []),
+            tainted=bool(authority.tainted),
+        )
         return authority.principal, authority.principal_ref, motivos, ""

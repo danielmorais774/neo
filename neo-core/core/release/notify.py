@@ -18,6 +18,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from core.release.service import nasceu_de_terceiro
 from db.models.release_request import ReleaseRequest
 
 logger = logging.getLogger(__name__)
@@ -45,14 +46,26 @@ def _corpo(row: ReleaseRequest, preview: str = "") -> str:
     campos = ", ".join(_rotulo_curto(c) for c in (row.campos or [])) or "—"
     linhas.append(f"Dado: {campos}")
     linhas.append(f"Destino: {row.destino} ({row.destino_tipo})")
-    if row.finalidade:
-        linhas.append(f"Para: {row.finalidade}")
-    # A linha que desarma o ataque: de quem partiu o pedido.
+    # A linha que desarma o ataque: de quem partiu o pedido. Vem ANTES da
+    # finalidade de propósito — a finalidade pode ter sido escrita pelo próprio
+    # atacante ("regularizar a pendência do pedido 884512"), e lida primeiro ela
+    # parece legítima. Medido em 2026-10-03 com uma injeção colada: o modelo
+    # obedeceu o texto e pediu a liberação com a justificativa DELE, inclusive
+    # recomendando ao Daniel que aprovasse.
     if row.origem == "externo":
         quem = row.origem_ref or "um terceiro"
         linhas.append(f"⚠️ Este pedido veio de {quem}, não de você.")
     elif row.origem == "agenda":
         linhas.append("⚠️ Pedido de uma tarefa agendada, sem ninguém na frente.")
+    elif nasceu_de_terceiro(row):
+        # `origem=admin` porque a MENSAGEM é dele — mas o pedido nasceu dentro do
+        # conteúdo que entrou no turno (texto colado, página, e-mail, PDF).
+        linhas.append(
+            "⚠️ Este pedido nasceu de conteúdo de terceiro neste turno, não de um "
+            "pedido seu — a finalidade abaixo foi escrita por esse conteúdo."
+        )
+    if row.finalidade:
+        linhas.append(f"Para: {row.finalidade}")
     if row.risco_motivos:
         linhas.append(f"Motivo: {row.risco_motivos[0]}")
     # O que você está aprovando, quando o que sai é uma MENSAGEM. Sem esta

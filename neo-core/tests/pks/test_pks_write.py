@@ -6,7 +6,11 @@ que foi (ou não foi) salvo.
 """
 
 import asyncio
+import time
 
+from core.liveness import TurnLiveness, bind_liveness
+from core.liveness import _current as _liveness_current
+from core.pks import memory_planner
 from core.pks.memory_planner import PKSMemoryPlanner
 from modules.pks_write.executor import _format_echo, _format_forget_echo
 
@@ -180,3 +184,67 @@ def test_parse_falls_back_to_salvage_on_truncation():
     ops = planner._parse(truncated, max_operations=40)
     assert len(ops) == 1
     assert ops[0].entity["name"] == "Suco de uva"
+
+
+# --- Regressão 2026-09-28: o planner não pode derrubar o turno -----------------
+#
+# Três chamadas a `deepseek-v4-flash@baidu` penduraram (POST enviado, resposta
+# nunca recebida) e mataram turnos inteiros do desktop: 303s e 323s, com o
+# usuário vendo "Neo Core ficou 90s sem dar sinal de progresso". A janela de vida
+# do turno é 240s (keepalive do gRPC) + 90s (paciência do cliente) = 330s, mas o
+# SDK da OpenAI, sem timeout explícito, só desistia aos 600s.
+
+
+class _ProviderQueTrava(_FakeProvider):
+    """Modelo que aceita a chamada e nunca responde."""
+
+    async def complete(self, *, messages, temperature, max_tokens, model=None, tools=None):
+        await asyncio.sleep(3600)
+        raise AssertionError("não deveria chegar aqui")
+
+
+def test_planner_desiste_no_timeout_em_vez_de_segurar_o_turno(monkeypatch):
+    monkeypatch.setattr(memory_planner, "_PLANNER_TIMEOUT_S", 0.05)
+    planner = PKSMemoryPlanner(_FakeRouter(_ProviderQueTrava()))
+
+    inicio = time.monotonic()
+    ops = _run(
+        planner.plan(
+            user_message="salva isto na memória",
+            assistant_response="qualquer coisa",
+            pks_context="",
+            recent_history="",
+            confirmed_save=True,
+        )
+    )
+    decorrido = time.monotonic() - inicio
+
+    # Memória é acessória: sem ela o turno segue, com ela morto o turno morre.
+    assert ops == []
+    assert decorrido < 2.0, f"segurou o turno por {decorrido:.1f}s"
+
+
+def test_planner_sinaliza_progresso_para_o_keepalive_nao_envelhecer():
+    relogio = {"t": 1000.0}
+    liveness = TurnLiveness(clock=lambda: relogio["t"])
+    token = bind_liveness(liveness)
+    try:
+        # 300s sem avanço: o keepalive do gRPC (janela de 240s) já teria parado
+        # e o desktop estaria contando os 90s dele para matar a conversa.
+        relogio["t"] = 1300.0
+        assert liveness.idle_seconds() == 300.0
+
+        _run(
+            PKSMemoryPlanner(_FakeRouter(_FakeProvider())).plan(
+                user_message="salva isto na memória",
+                assistant_response="qualquer coisa",
+                pks_context="",
+                recent_history="",
+                confirmed_save=True,
+            )
+        )
+
+        # O planner avisou que estava trabalhando de verdade.
+        assert liveness.idle_seconds() == 0.0
+    finally:
+        _liveness_current.reset(token)

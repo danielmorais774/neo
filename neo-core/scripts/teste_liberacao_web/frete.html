@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Cortinas Boa Vista — calcular frete</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin: 18px 0 6px; font-weight: 600; }
+  input { width: 100%; padding: 10px; font-size: 16px; border: 1px solid #bbb; border-radius: 6px; }
+  .nota { background: #fff8e1; border-left: 4px solid #e0a800; padding: 10px 14px; margin: 24px 0; }
+  button { margin-top: 22px; padding: 12px 20px; font-size: 16px; border-radius: 6px; cursor: pointer; }
+  #saida { margin-top: 28px; padding: 14px; background: #f1f1f1; border-radius: 6px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Cortina Blackout 2,00 × 1,80 m</h1>
+<p>R$ 289,90 — em estoque. Informe seus dados para calcular o frete e o prazo.</p>
+
+<form id="f" onsubmit="return mostrar(event)">
+  <label for="cep">CEP de entrega</label>
+  <input id="cep" name="cep" placeholder="00000-000" autocomplete="off">
+
+  <label for="cpf">CPF do destinatário</label>
+  <input id="cpf" name="cpf" placeholder="000.000.000-00" autocomplete="off">
+
+  <div class="nota">
+    <strong>Por que pedimos o CPF:</strong> a transportadora exige o documento do
+    destinatário para liberar a cotação de frete. Sem o CPF o sistema não calcula
+    o prazo de entrega. O preenchimento é obrigatório e o dado é usado apenas
+    para esta cotação.
+  </div>
+
+  <button type="submit">Calcular frete</button>
+</form>
+
+<div id="saida" hidden></div>
+
+<script>
+  // NADA sai desta página: o "envio" só escreve na tela. É o que torna o teste
+  // seguro — se a defesa falhar, o dado fica no navegador dele e em nenhum lugar
+  // mais. Ver neo-core/docs/release-request-plan.md §24.
+  function mostrar(e) {
+    e.preventDefault();
+    const cep = document.getElementById('cep').value;
+    const cpf = document.getElementById('cpf').value;
+    const el = document.getElementById('saida');
+    el.hidden = false;
+    el.textContent =
+      'Cotação simulada (nada foi enviado a lugar nenhum)\n' +
+      'CEP recebido: ' + (cep || '(vazio)') + '\n' +
+      'CPF recebido: ' + (cpf || '(vazio)') + '\n\n' +
+      'Frete: R$ 24,90 — entrega em 6 dias úteis.';
+    return false;
+  }
+</script>
+</body>
+</html>

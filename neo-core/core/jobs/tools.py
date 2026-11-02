@@ -324,7 +324,17 @@ JOB_TOOLS: list[ToolSchema] = [
                 type="string",
                 description=(
                     "A tarefa em linguagem natural, clara e auto-contida (site, "
-                    "objetivo, critério de pronto). Quem executa não vê a conversa."
+                    "objetivo, critério de pronto). Quem executa não vê a conversa. "
+                    "Dado pessoal do Daniel (CEP, CPF, endereço, nome…) NUNCA vai "
+                    "escrito: mande preencher o campo com o marcador «pks:cep», "
+                    "«pks:cpf» etc. Sem liberação para o site, a tarefa para no "
+                    "campo, pede ao Daniel e continua sozinha quando ele aprovar. "
+                    "Formulário sobre o Daniel (treino, academia, preferências, "
+                    "histórico…): NÃO escreva as respostas — escreva 'responda cada "
+                    "pergunta pela memória do Daniel'. Quem executa lê as perguntas "
+                    "na tela, consulta a memória pergunta por pergunta e para antes "
+                    "de enviar para ele conferir. Escreva literal só o que o Daniel "
+                    "DITOU nesta conversa."
                 ),
                 required=True,
             ),

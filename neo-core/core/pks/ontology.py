@@ -68,6 +68,115 @@ def normalize_token(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# ── Busca pela CHAVE do campo ────────────────────────────────────────────────
+# Medido em 2026-10-22 (sessão 369d812c): "ta lembrado do meu cep?" não achava
+# `Daniel Morais.cep` porque NADA no índice associa a palavra "cep" à entidade —
+# o `search_text` é nome + apelidos + metadata, e o ranking v2 indexa só o VALOR
+# do campo. A única coisa que a palavra "cep" encontrava era "trí-cep-s".
+# Daqui saem os dois sentidos da correção: que palavras indexar por causa de uma
+# chave, e que chaves procurar por causa de uma palavra.
+
+#: Escrituração da máquina, não conhecimento do usuário. Mora num campo do PKS
+#: por conveniência de armazenamento e tem o próprio caminho até o prompt —
+#: repetir o JSON cru no bloco de conhecimento é duplicata cara: sozinho, o
+#: `neo_affect` ocupava 2152 caracteres (~900 tokens) e estourava o orçamento
+#: de 900, derrubando o bloco INTEIRO, CEP junto.
+INTERNAL_FIELD_KEYS = frozenset({"neo_affect"})
+
+#: Chave genérica demais para IDENTIFICAR uma entidade. Perguntar "descrição"
+#: não nomeia um fato — e traria as 11 entidades que têm uma.
+GENERIC_FIELD_KEYS = frozenset({
+    "description", "descricao", "content", "conteudo", "label", "rotulo",
+    "note", "notes", "nota", "notas", "observacao", "obs", "comment",
+    "properties", "propriedades", "metadata", "value", "valor",
+    "type", "tipo", "name", "nome", "full_name", "title", "titulo",
+    "id", "key", "chave", "status", "source", "fonte", "date", "data",
+    "summary", "resumo", "text", "texto", "info",
+    # `os` é artigo em português antes de ser sistema operacional: "quais OS
+    # meus treinos" traria todo aparelho que tem o campo. Quem pergunta de
+    # verdade diz "sistema operacional", que não é um token só.
+    "os",
+})
+
+#: Como o usuário PERGUNTA por um campo, além do nome da chave em si. À
+#: esquerda a chave canônica (como está na `pks_entity_field`), à direita as
+#: palavras da frase dele. Lista curta de propósito: termo genérico aqui faz a
+#: entidade casar com qualquer pergunta — "documento" ficou de fora de `cpf`
+#: justamente por ser também um tipo de entidade.
+FIELD_KEY_TERMS: dict[str, tuple[str, ...]] = {
+    "cep": ("cep", "endereco", "postal"),
+    "address": ("address", "endereco", "logradouro"),
+    "endereco": ("endereco", "address", "logradouro", "cep"),
+    "bairro": ("bairro",),
+    "cidade": ("cidade", "city"),
+    "cpf": ("cpf",),
+    "cnpj": ("cnpj",),
+    "rg": ("rg",),
+    "email": ("email",),
+    "phone": ("phone", "telefone", "celular", "fone"),
+    "telefone": ("telefone", "phone", "celular", "fone"),
+    "celular": ("celular", "telefone", "phone", "fone"),
+    "whatsapp": ("whatsapp", "zap"),
+    "birthday": ("birthday", "aniversario", "nascimento"),
+    "cpu": ("cpu", "processador"),
+    "gpu": ("gpu", "placa de video"),
+    # "memoria" NÃO entra: nesta casa a palavra quase sempre quer dizer a
+    # memória do Neo, e ela fazia "lembra do meu cep?" puxar os computadores
+    # que têm RAM. "ram" sozinho não é ambíguo.
+    "memory": ("memory", "ram"),
+    "ram_gb": ("ram_gb", "ram"),
+    "weight": ("weight", "peso"),
+    "weight_kg": ("weight_kg", "peso"),
+    "height": ("height", "altura"),
+    "schedule": ("schedule", "horario"),
+    "frequency": ("frequency", "frequencia"),
+    "sets": ("sets", "series"),
+    "reps": ("reps", "repeticoes"),
+}
+
+
+def field_key_terms(key: str | None) -> tuple[str, ...]:
+    """Palavras que devem ACHAR a entidade por ela ter este campo.
+
+    Vazio para chave genérica: `description` não identifica ninguém.
+    """
+    norm = normalize_token(key)
+    if not norm or norm in GENERIC_FIELD_KEYS or norm in INTERNAL_FIELD_KEYS:
+        return ()
+    termos = [norm, *FIELD_KEY_TERMS.get(norm, ())]
+    return tuple(dict.fromkeys(t for t in termos if t))
+
+
+def _build_term_index() -> dict[str, tuple[str, ...]]:
+    """Inverso de `FIELD_KEY_TERMS`: palavra do usuário → chaves que ela nomeia."""
+    idx: dict[str, list[str]] = {}
+    for chave in FIELD_KEY_TERMS:
+        for termo in field_key_terms(chave):
+            alvos = idx.setdefault(termo, [])
+            if chave not in alvos:
+                alvos.append(chave)
+    return {termo: tuple(chaves) for termo, chaves in idx.items()}
+
+
+_TERM_TO_FIELD_KEYS = _build_term_index()
+
+
+def field_keys_for_term(term: str | None) -> tuple[str, ...]:
+    """Chaves da `pks_entity_field` que esta palavra pode estar nomeando.
+
+    Palavra fora do mapa vale por si mesma (`headquarters` acha `headquarters`);
+    palavra genérica não vale nada. Termo de 1–2 letras também não: "os" já é
+    tratado pelo mapa, o resto seria ruído.
+    """
+    norm = normalize_token(term)
+    if not norm or norm in GENERIC_FIELD_KEYS or norm in INTERNAL_FIELD_KEYS:
+        return ()
+    conhecidas = _TERM_TO_FIELD_KEYS.get(norm)
+    if conhecidas:
+        return conhecidas
+    return (norm,) if len(norm) >= 3 else ()
+
+
 class OntologyResolver:
     """Maps natural-language labels to canonical ontology values."""
 

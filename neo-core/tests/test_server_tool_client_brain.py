@@ -60,7 +60,7 @@ def _svc() -> tuple[AIService, _Agent]:
     svc.sessions = _Sessions()
     svc._voice_input_sessions = set()
     svc.build_request_executor = lambda **_kw: object()
-    svc._server_tool_toolset = lambda: []
+    svc._server_tool_toolset = lambda escolhida=None: []
     svc._build_server_tool_memory = lambda *_a, **_kw: None
     return svc, svc.agent
 

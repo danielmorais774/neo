@@ -323,12 +323,29 @@ def test_texto_do_corpo_nao_repete_o_conteudo_principal():
     assert "Extensão" in depois
 
 
-def test_dedup_nao_esvazia_o_texto_do_corpo():
-    """Se o principal é quase a página toda, o corpo volta inteiro."""
+def test_dedup_nao_faz_linha_desaparecer_do_prompt():
+    """A invariante é "cada linha aparece, uma vez só" — não "a seção existe".
+
+    Este teste afirmava que o corpo "volta inteiro" quando o principal é quase a
+    página toda. Isso era o piso de 200 caracteres, e o que o piso fazia na
+    prática era RESTAURAR o duplicado: no job 29c739d4 a extensão pré-cortava o
+    corpo em 1500 caracteres que eram subconjunto dos 2200 do principal, a
+    subtração vinha vazia, e a mesma moldura da Amazon ia DUAS VEZES no mesmo
+    prompt — 3700 caracteres de orçamento rendendo ~2400 únicos, nenhum útil.
+
+    A invariante que importa (nada SOME do prompt) continua valendo sem o piso,
+    porque o corpo só fica vazio quando tudo nele já está no principal. É isso
+    que se afirma aqui.
+    """
     render = BrowserLocalDriver._render(
         _snapshot(main={"label": "Tudo", "text": "linha A\nlinha B"}, text="linha A\nlinha B")
     )
-    assert "linha A" in render.split("Texto da página:")[1]
+    # Cada linha está no prompt...
+    assert "linha A" in render
+    assert "linha B" in render
+    # ...uma vez só, e não numa segunda seção que repetiria o principal.
+    assert render.count("linha A") == 1
+    assert "Texto da página:" not in render
 
 
 # ── a janela entre o deploy do core e o restart do desktop ──────────────────

@@ -59,30 +59,87 @@ SEM_GUARDA_POR_DESIGN: dict[str, str] = {
 }
 
 
-def _rotas_reais() -> list[tuple[str, APIRoute]]:
-    saida = []
-    for rota in app.routes:
-        if not isinstance(rota, APIRoute):
-            continue  # WebSocket e estáticos têm outra história
-        for metodo in sorted(rota.methods or []):
-            if metodo in ("HEAD", "OPTIONS"):
-                continue
-            saida.append((f"{metodo} {rota.path}", rota))
+try:  # FastAPI ≥ 0.141: `include_router` virou PREGUIÇOSO.
+    from fastapi.routing import _IncludedRouter
+except ImportError:  # versões antigas copiavam as rotas na hora
+    _IncludedRouter = ()  # type: ignore[assignment,misc]
+
+
+def _achatar(rotas, prefixo: str = "", herdadas: tuple = ()) -> list[tuple[str, APIRoute, tuple]]:
+    """Todas as `APIRoute` do app, com prefixo e dependências de inclusão juntos.
+
+    Por que isto existe: a partir do FastAPI 0.141 ``app.include_router`` não
+    copia mais as rotas para ``app.routes`` — ele guarda um ``_IncludedRouter``
+    preguiçoso, e o ``prefix`` e as ``dependencies`` da inclusão ficam no
+    ``include_context`` em vez de serem fundidos em cada rota.
+
+    O efeito disso aqui foi pior que uma falha: `isinstance(rota, APIRoute)`
+    parou de casar com QUALQUER rota do app, e a varredura passou a rodar sobre
+    uma lista vazia. `test_toda_rota_tem_guarda_ou_motivo` — o teste que existe
+    para falhar no futuro, quando alguém subir rota nova sem auth — passou a
+    aprovar tudo sem olhar nada. Quem denunciou foi o teste irmão, de rota
+    fantasma, que falhou dizendo que TODAS as exceções tinham sumido.
+
+    Varredura que silencia quando a biblioteca muda é pior que não ter
+    varredura: ela continua dando o selo. Daí o achatamento explícito, que
+    funciona nas duas versões.
+    """
+    saida: list[tuple[str, APIRoute, tuple]] = []
+    for rota in rotas:
+        if _IncludedRouter and isinstance(rota, _IncludedRouter):
+            ctx = rota.include_context
+            saida += _achatar(
+                rota.original_router.routes,
+                prefixo + (getattr(ctx, "prefix", "") or ""),
+                tuple(herdadas) + tuple(getattr(ctx, "dependencies", ()) or ()),
+            )
+        elif isinstance(rota, APIRoute):
+            saida.append((prefixo + rota.path, rota, tuple(herdadas)))
+        # WebSocket e estáticos têm outra história.
     return saida
 
 
-def _tem_guarda(rota: APIRoute) -> bool:
-    return any(
-        getattr(dep, "call", None) in GUARDAS
-        for dep in rota.dependant.dependencies
-    ) or any(getattr(d, "dependency", None) in GUARDAS for d in (rota.dependencies or []))
+def _rotas_reais() -> list[tuple[str, APIRoute, tuple]]:
+    saida = []
+    for caminho, rota, herdadas in _achatar(app.routes):
+        for metodo in sorted(rota.methods or []):
+            if metodo in ("HEAD", "OPTIONS"):
+                continue
+            saida.append((f"{metodo} {caminho}", rota, herdadas))
+    return saida
+
+
+def _por_caminho(caminho: str) -> list[tuple[APIRoute, tuple]]:
+    return [(r, h) for c, r, h in _achatar(app.routes) if c == caminho]
+
+
+def _guardas_de(rota: APIRoute, herdadas: tuple = ()) -> set:
+    """Tudo que guarda esta rota: o que veio no decorator e o que veio no include."""
+    achados = {getattr(dep, "call", None) for dep in rota.dependant.dependencies}
+    achados |= {getattr(d, "dependency", None) for d in (rota.dependencies or [])}
+    achados |= {getattr(d, "dependency", None) for d in herdadas}
+    return achados
+
+
+def _tem_guarda(rota: APIRoute, herdadas: tuple = ()) -> bool:
+    return bool(_guardas_de(rota, herdadas) & GUARDAS)
+
+
+def test_a_varredura_enxerga_o_app():
+    """Rede que esvazia em silêncio continua dando o selo — ver `_achatar`."""
+    rotas = _rotas_reais()
+    assert len(rotas) > 50, (
+        f"a varredura só achou {len(rotas)} rotas: ela parou de enxergar o app "
+        "(o FastAPI mudou como `include_router` guarda as rotas?). Enquanto isso, "
+        "`test_toda_rota_tem_guarda_ou_motivo` aprova qualquer coisa."
+    )
 
 
 def test_toda_rota_tem_guarda_ou_motivo():
     nuas = [
         nome
-        for nome, rota in _rotas_reais()
-        if not _tem_guarda(rota) and nome not in SEM_GUARDA_POR_DESIGN
+        for nome, rota, herdadas in _rotas_reais()
+        if not _tem_guarda(rota, herdadas) and nome not in SEM_GUARDA_POR_DESIGN
     ]
     assert not nuas, (
         "rotas sem guarda de autenticação:\n  - "
@@ -95,7 +152,7 @@ def test_toda_rota_tem_guarda_ou_motivo():
 
 def test_a_lista_de_excecoes_nao_envelhece():
     """Exceção para rota que não existe mais vira permissão esquecida."""
-    existentes = {nome for nome, _ in _rotas_reais()}
+    existentes = {nome for nome, _, _ in _rotas_reais()}
     fantasmas = sorted(set(SEM_GUARDA_POR_DESIGN) - existentes)
     assert not fantasmas, (
         "SEM_GUARDA_POR_DESIGN cita rotas que não existem mais: " + ", ".join(fantasmas)
@@ -119,30 +176,25 @@ def test_rotas_de_dado_pessoal_exigem_dono():
     )
     faltando = []
     for caminho in exigem_dono:
-        rotas = [r for r in app.routes if isinstance(r, APIRoute) and r.path == caminho]
+        rotas = _por_caminho(caminho)
         assert rotas, f"rota {caminho} desapareceu do app"
-        for rota in rotas:
-            tem = any(
-                getattr(dep, "call", None) is require_owner
-                for dep in rota.dependant.dependencies
-            )
-            if not tem:
+        for rota, herdadas in rotas:
+            if require_owner not in _guardas_de(rota, herdadas):
                 faltando.append(f"{sorted(rota.methods)} {caminho}")
     assert not faltando, "rotas de dado pessoal sem require_owner: " + ", ".join(faltando)
 
 
 def test_letta_saiu_do_ar():
     """Proxy catch-all sem auth para um runtime descartado — F5 do plano."""
-    caminhos = [r.path for r in app.routes if isinstance(r, APIRoute)]
+    caminhos = [c for c, _, _ in _achatar(app.routes)]
     assert not [c for c in caminhos if "letta" in c]
 
 
 def test_sessions_nao_tem_rota_duplicada():
     """Havia dois `GET /desktop/sessions`; o segundo era código morto."""
     duplicadas = [
-        r for r in app.routes
-        if isinstance(r, APIRoute)
-        and r.path == "/api/v1/desktop/sessions"
-        and "GET" in (r.methods or set())
+        r
+        for r, _ in _por_caminho("/api/v1/desktop/sessions")
+        if "GET" in (r.methods or set())
     ]
     assert len(duplicadas) == 1

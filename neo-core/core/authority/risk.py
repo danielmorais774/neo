@@ -185,6 +185,17 @@ def is_sink(tool_name: str) -> bool:
     return REVELACAO in classes or ATUACAO in classes
 
 
+def is_actuation(tool_name: str) -> bool:
+    """Esta tool MUDA algo (disco, casa, agenda, memória, dinheiro)?
+
+    Usado fora do portão para responder "esta skill tem onde GUARDAR o fato?":
+    uma skill cujas tools são todas de leitura não é dona do dado, e suprimir a
+    escrita do PKS por causa dela perde a mensagem (ver ``skill_owns_data`` em
+    ``modules/desktop/ai_service.py``).
+    """
+    return ATUACAO in classes_of(tool_name)
+
+
 def known(tool_name: str) -> bool:
     """A tabela conhece este nome de verdade (não caiu no fail-safe)?"""
     nome = (tool_name or "").strip()

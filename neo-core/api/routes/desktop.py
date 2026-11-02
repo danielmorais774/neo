@@ -415,6 +415,8 @@ async def handle_desktop_chat_message(
         metadata["provider"] = request.provider
     if request.model:
         metadata["model"] = request.model
+    if request.pasted_chars:
+        metadata["pasted_chars"] = str(request.pasted_chars)
 
     async for resp in ai_service.process_user_input(
         user_message=request.user_message.strip(),
@@ -614,6 +616,8 @@ async def handle_desktop_chat_stream(
         metadata["model"] = request.model
     if request.attachments:
         metadata["attachments"] = request.attachments
+    if request.pasted_chars:
+        metadata["pasted_chars"] = str(request.pasted_chars)
 
     resp_iter = ai_service.process_user_input(
         user_message=request.user_message.strip(),

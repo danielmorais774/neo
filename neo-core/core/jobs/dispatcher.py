@@ -24,6 +24,23 @@ from shared import Message, MessageRole
 
 logger = logging.getLogger(__name__)
 
+#: Quanto do resumo o redator chega a LER, quando o job não declarou `entrega`.
+#:
+#: O par com o teto de saída (`max_tokens=700`, ~1.470 caracteres de prosa em
+#: pt-BR) é o defeito em si: entra mais do que sai, e a diferença é comprimida
+#: por um modelo sem deixar registro. Medido em 227 jobs de prod, este corte
+#: disparou UMA vez — o problema nunca foi o corte, era a compressão. Quem
+#: declara `entrega` não passa por aqui; para os outros, o corte agora LOGA.
+_COMPOSE_ENTRADA_MAX = 3500
+
+#: Idem no caminho sem redator. Exposição medida: 27 de 227 jobs passam disto.
+_FALLBACK_ENTRADA_MAX = 1200
+
+#: Acima disto a mensagem redigida está perto do teto de 700 tokens, o que quer
+#: dizer que o redator está TRANSPORTANDO conteúdo em vez de redigir. É a medida
+#: que diz quais `kind` ainda precisam declarar a entrega em duas metades.
+_COMPOSE_SAIDA_ALERTA = 1400
+
 
 _COMPOSE_SYSTEM = (
     "Você é o Neo avisando o usuário que uma tarefa que rodava em segundo plano "
@@ -79,7 +96,10 @@ class ProactiveDispatcher:
             await self._mark_notified(job)
             return
 
-        text = self._append_images(job, await self._compose(job))
+        # A ordem é a regra: o modelo escreve, o código entrega. Primeiro a
+        # prosa (`_compose`), depois o bloco íntegro (`_com_itens`), depois as
+        # imagens (`_append_images`) — as duas últimas por fora do modelo.
+        text = self._append_images(job, self._com_itens(await self._compose(job), job))
 
         # 1. Persiste na história da sessão de origem (se houver).
         if job.session_id is not None:
@@ -199,8 +219,69 @@ class ProactiveDispatcher:
                 saida.append(str(item))
         return saida
 
+    @staticmethod
+    def _entrega(job: AgentJob) -> tuple[str, list[str]]:
+        """A entrega em duas metades: o que se REDIGE e o que vai ÍNTEGRO.
+
+        `(fecho, itens)`, e `("", [])` para quem não declarou nada — aí vale o
+        caminho de sempre, com o resumo inteiro indo ao redator.
+
+        **Por que existe.** O `_compose` lia até 3.500 caracteres e escrevia no
+        máximo ~1.470 (700 tokens de prosa), então todo resultado entre os dois
+        números era COMPRIMIDO por um modelo — sem aviso, sem log, sem registro
+        do que caiu. Para lista de fatos (preço, número de pedido, nome de
+        arquivo, caminho, uuid de retomada) parafrasear é a operação errada: o
+        modelo derruba um item, arredonda um valor ou amacia um status, e isso
+        chega ao usuário com cara de resposta certa.
+
+        Medido em 227 jobs de prod: o corte em 3.500 disparou UMA vez, e 27 jobs
+        passaram de 1.200. O problema nunca foi o corte — era a compressão.
+
+        **O princípio já era da casa**, em dois lugares deste arquivo: o
+        `texto_literal` da agenda entrega sem passar pelo redator, e o
+        `_append_images` pendura as imagens DEPOIS dele, porque "um LLM
+        redigindo no seu tom de sempre reescreve, resume ou come um token
+        estranho no meio do texto". Isto é a mesma regra, em grão mais fino: o
+        modelo escreve, o código entrega.
+        """
+        entrega = (job.extra_metadata or {}).get("entrega")
+        if not isinstance(entrega, dict):
+            return "", []
+        fecho = str(entrega.get("fecho") or "").strip()
+        itens = [str(i).strip() for i in (entrega.get("itens") or []) if str(i).strip()]
+        return fecho, itens
+
+    def _com_itens(self, texto: str, job: AgentJob) -> str:
+        """Cola o bloco íntegro DEPOIS do redator — como o `_append_images`.
+
+        Fora do `_compose` de propósito, e é a metade que importa do conserto: o
+        bloco não entra na chamada ao modelo, então não existe caminho pelo qual
+        ele possa ser reescrito. Se entrasse com a instrução "copie exatamente",
+        estaríamos de volta ao defeito de origem — pedir a um modelo que
+        transporte fatos que já estão guardados (job 5ab98119).
+        """
+        _, itens = self._entrega(job)
+        if not itens:
+            return texto
+        # Duas famílias, e o runner já as entrega nesta ordem: o que foi
+        # COLETADO (vira lista) e os RODAPÉS que o próprio runner redigiu com
+        # glifo na frente (aba, downloads, retomada, diário). Juntar as duas num
+        # bloco só faz o rodapé parecer item da lista.
+        marcas = ("-", "•", "⏸", "⬇", "⏳", "📸", "(")
+        achados = [f"- {i}" for i in itens if not i.startswith(marcas)]
+        rodapes = [i for i in itens if i.startswith(marcas)]
+        partes = ["\n".join(achados)] if achados else []
+        if rodapes:
+            partes.append("\n".join(rodapes))
+        corpo = "\n\n".join(partes)
+        return f"{texto.rstrip()}\n\n{corpo}" if texto.strip() else corpo
+
     async def _compose(self, job: AgentJob) -> str:
-        """Redige a mensagem do usuário a partir do resultado do job."""
+        """Redige a mensagem do usuário a partir do resultado do job.
+
+        Devolve SÓ a prosa. O bloco íntegro é colado pelo `_com_itens`, no
+        `dispatch`, depois desta chamada.
+        """
         # Texto já pronto (agenda): entrega como está. Um alerta de texto fixo
         # reescrito pelo redator vira paráfrase — e a resposta de um turno
         # cognitivo agendado JÁ saiu com a persona certa; passá-la de novo por um
@@ -219,21 +300,58 @@ class ProactiveDispatcher:
             # "Estado final: failed" sozinho é fraco demais: o modelo lê o resumo,
             # acha uma frase otimista e escreve "deu tudo certo". A ordem em
             # português, no imperativo, é o que segura.
-            aviso = (
-                ""
-                if job.status == "completed"
-                else (
+            if job.status == "completed":
+                aviso = ""
+            elif job.status == "waiting":
+                # Parada de propósito, esperando o usuário (o card no aparelho ou
+                # a pergunta do clique). "Diga o que falhou" fazia o redator abrir
+                # com "A tarefa falhou" em cima de um pedido de liberação que
+                # estava funcionando (sessão 9b2e29e2).
+                aviso = (
+                    "\nATENÇÃO: a tarefa está PAUSADA esperando o usuário — não falhou "
+                    "e não terminou. É PROIBIDO dizer que falhou, que deu certo ou que "
+                    "enviou. Diga onde parou e o que ele precisa fazer para ela "
+                    "continuar.\n"
+                )
+            else:
+                aviso = (
                     f"\nATENÇÃO: a tarefa NÃO foi concluída (estado {job.status}). "
                     "É PROIBIDO dizer que deu certo, que baixou, que enviou ou que "
                     "terminou. Diga o que falhou e onde parou.\n"
                 )
-            )
+            fecho, itens = self._entrega(job)
+            if fecho or itens:
+                # O redator NÃO vê os itens. É isso que torna a paráfrase
+                # impossível em vez de proibida: ele não pode reescrever um
+                # texto que nunca recebeu.
+                plural = "linha" if len(itens) == 1 else "linhas"
+                bloco = (
+                    f"\nUm bloco de {len(itens)} {plural} com o que foi coletado vai "
+                    "ANEXADO ao final da sua mensagem, íntegro, por fora de você. "
+                    "Não o reescreva, não o resuma e não repita os itens: você não "
+                    "os recebeu. Escreva só a abertura e o fecho.\n"
+                    if itens
+                    else ""
+                )
+                corpo = fecho or "(sem resumo)"
+            else:
+                if len(summary) > _COMPOSE_ENTRADA_MAX:
+                    # Até hoje este corte era mudo. Ver `_entrega`: o kind que
+                    # aparecer aqui é candidato a declarar a entrega em duas
+                    # metades, como o `browser_local` já faz.
+                    logger.warning(
+                        "[Dispatch] resumo do job %s (kind=%s) tem %d caracteres e "
+                        "vai CORTADO em %d para o redator — fatos podem não chegar",
+                        job.id, job.kind, len(summary), _COMPOSE_ENTRADA_MAX,
+                    )
+                bloco = ""
+                corpo = summary[:_COMPOSE_ENTRADA_MAX] or "(sem saída)"
             user_ctx = (
                 f"Tarefa: {job.title}\n"
                 f"Detalhe: {detail}\n"
                 f"Estado final: {job.status}\n"
-                f"{aviso}"
-                f"Resultado/logs (pode estar truncado):\n{summary[:3500] or '(sem saída)'}"
+                f"{aviso}{bloco}"
+                f"Resultado/logs (pode estar truncado):\n{corpo}"
             )
             messages = [
                 Message(role=MessageRole.SYSTEM, content=_COMPOSE_SYSTEM),
@@ -258,6 +376,18 @@ class ProactiveDispatcher:
                 disable_thinking=True,
             )
             text = (resp.get_content() or "").strip()
+            if len(text) > _COMPOSE_SAIDA_ALERTA:
+                # O LADO DA SAÍDA, que é onde a compressão acontece de fato: a
+                # entrada podia trazer 3.500 caracteres e os 700 tokens só
+                # comportam ~1.470. Prosa longa aqui quer dizer que o redator
+                # está transportando conteúdo em vez de redigir — e é o sinal de
+                # que este `kind` precisa declarar a entrega em duas metades.
+                logger.warning(
+                    "[Dispatch] mensagem redigida do job %s (kind=%s) tem %d "
+                    "caracteres, perto do teto de 700 tokens — o redator está "
+                    "transportando conteúdo",
+                    job.id, job.kind, len(text),
+                )
             return text or fallback
         except Exception as e:  # noqa: BLE001
             logger.warning("[Dispatch] compose LLM failed for job %s: %s", job.id, e)
@@ -283,17 +413,38 @@ class ProactiveDispatcher:
             return text
         return (text.rstrip() + "\n\n" + "\n".join(novos)).strip()
 
-    @staticmethod
-    def _fallback_text(job: AgentJob, summary: str) -> str:
+    @classmethod
+    def _fallback_text(cls, job: AgentJob, summary: str) -> str:
+        """A mensagem quando não há redator — e ela nunca pode perder fato.
+
+        Este é o caminho em que a entrega em duas metades vale MAIS: o modelo
+        redator falhou, veio vazio ou nem existe, e é justamente aí que o
+        `[:1200]` cortava. Com `entrega` declarada, a cabeça vem fixa, o fecho
+        vem inteiro, e os itens são colados pelo `_com_itens` depois — então o
+        corte deixa de existir neste caminho em vez de ser afrouxado.
+        """
         if job.status == "completed":
             head = f"✅ Terminei: {job.title}."
         elif job.status == "timeout":
             head = f"⏱️ A tarefa \"{job.title}\" estourou o tempo limite e foi interrompida."
         elif job.status == "cancelled":
             head = f"🚫 Cancelei a tarefa \"{job.title}\"."
+        elif job.status == "waiting":
+            head = f"⏸ A tarefa \"{job.title}\" parou esperando você."
         else:
             head = f"❌ A tarefa \"{job.title}\" falhou."
-        tail = f"\n\n{summary[:1200]}" if summary else ""
+        fecho, itens = cls._entrega(job)
+        if fecho or itens:
+            # Os itens NÃO entram aqui: quem os cola é o `_com_itens`, uma vez
+            # só, nos dois caminhos. Juntar nos dois duplicaria a lista.
+            return f"{head}\n\n{fecho}".rstrip() if fecho else head
+        if summary and len(summary) > _FALLBACK_ENTRADA_MAX:
+            logger.warning(
+                "[Dispatch] fallback do job %s (kind=%s) corta o resumo de %d "
+                "caracteres em %d — este kind devia declarar `entrega`",
+                job.id, job.kind, len(summary), _FALLBACK_ENTRADA_MAX,
+            )
+        tail = f"\n\n{summary[:_FALLBACK_ENTRADA_MAX]}" if summary else ""
         return head + tail
 
     async def _publish_chat_message(self, job: AgentJob, text: str) -> None:

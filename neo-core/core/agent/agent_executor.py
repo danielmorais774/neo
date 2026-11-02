@@ -16,6 +16,7 @@ from core.agent.context_manager import ContextManager
 from core.agent.loop_detector import LoopDetector
 from core.agent.prompt_builder import PromptBuilder
 from core.agent.token_counter import TokenCounter
+from core.authority import com_portao
 from core.liveness import TurnLiveness, current_liveness, touch_progress
 from core.llm import LLMRouter
 from core.memory import ConversationMemory
@@ -547,8 +548,16 @@ class AgentExecutor:
         tool_calls: list[ToolCall],
         executor: Any = None,
     ) -> list[Any]:
-        """Executa tool calls em paralelo."""
-        ex = executor or self.tool_executor
+        """Executa tool calls em paralelo, cada uma pelo portão de autoridade.
+
+        O portão vive DENTRO de dois executores, e este laço recebe o executor
+        por parâmetro: o pipeline do WhatsApp e o do Home Assistant injetam o
+        deles, que não chama o portão nenhuma vez. Envolver aqui cobre qualquer
+        executor injetado, inclusive o que ainda não existe — e envolver um que
+        já gateia por dentro é inofensivo (o portão deduplica por
+        ``tool_call.id``). Ver core/authority/wrap.py.
+        """
+        ex = com_portao(executor or self.tool_executor, rotulo="agente")
         tasks = [ex.execute_tool_call(tc) for tc in tool_calls]
         return await asyncio.gather(*tasks)
 

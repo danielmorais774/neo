@@ -46,6 +46,40 @@ MODO_SOMBRA = "shadow"
 MODO_REVELACAO = "revelacao"
 MODO_TOTAL = "enforce"
 
+#: Fontes de contaminação que NÃO barram uma navegação. Duas famílias, pela
+#: mesma razão: para o navegador não existe card. `destination_of` devolve None
+#: (a tarefa é texto livre), então nenhuma liberação de (dado × destino) pode
+#: cobri-lo — e "atuação sem card" é justamente o que o modo `revelacao` deixa
+#: em sombra de propósito (§13). Barrar aqui não vira pedido de aprovação, vira
+#: recusa sem saída.
+#: 1. tools que LEEM a web — barrar faria a escada de busca morrer no primeiro
+#:    degrau, já que quem lê é o próprio navegador;
+#: 2. `colagem` — o bloco colado é de terceiro, mas o que ele poderia fazer de
+#:    pior pelo navegador (agir dentro das sessões logadas do usuário) não tem
+#:    card hoje; o que TEM card (revelar dado, mandar mensagem) segue barrado.
+#: Ver §21: o navegador como canal de saída é dívida aberta, do degrau `enforce`.
+_LEITURA_DE_WEB = frozenset({
+    "web_search", "web_fetch", "deep_research",
+    "browser_task", "browser_local_task", "browser_screenshot",
+    "meli_search", "meli_product",
+    "colagem",
+})
+
+#: Os dois navegadores: leem a página E digitam nela.
+_NAVEGADORES = frozenset({"browser_task", "browser_local_task"})
+
+#: A saída de um `web_fetch` barrado por URL sem procedência. A genérica mandava chamar
+#: `solicitar_dado`, que não tem o que aprovar num GET público, e na sessão 455646dd o
+#: modelo traduziu isso para o usuário como "eu libero o acesso", uma opção que não
+#: existe.
+_SAIDA_URL_SEM_PROCEDENCIA = (
+    "Use o endereço EXATO de um resultado de tool (`web_search` acha o endereço; não "
+    "monte URL de cabeça, nem troque o código do produto). Se o dado só existe na conta "
+    "logada do Daniel, use `browser_local_task`. `solicitar_dado` é só para o caso de a "
+    "URL precisar levar um dado pessoal dele. Não diga ao Daniel que ele precisa liberar "
+    "nada: não há o que liberar aqui. E não tente variações da mesma URL."
+)
+
 
 @dataclass(frozen=True)
 class GateDecision:
@@ -54,6 +88,8 @@ class GateDecision:
     tool: str
     #: Liberação que autorizou esta chamada (quando foi o que destravou).
     release_id: str | None = None
+    #: Próxima ação específica desta recusa, no lugar da genérica.
+    saida: str = ""
 
     @property
     def blocked(self) -> bool:
@@ -67,6 +103,8 @@ class GateDecision:
         Aqui a recusa já vem com a próxima ação escrita.
         """
         base = f"{self.tool} não roda neste turno: {self.motivo}."
+        if self.saida:
+            return f"{base} {self.saida}"
         if self.efeito == NEGAR:
             return (
                 f"{base} Isto não tem exceção. Se for pedido legítimo, peça ao Daniel "
@@ -144,6 +182,17 @@ def covering_release(
     return None
 
 
+def _so_leu_web(authority: "TurnAuthority") -> bool:
+    """Toda a contaminação deste turno veio de tool que lê a web?
+
+    As fontes são gravadas por nome (``taint_sources``); o ``split`` tolera o
+    formato com detalhe (``"web_fetch:loja.com.br"``) previsto no docstring de
+    ``TurnAuthority``.
+    """
+    fontes = {str(f).split(":", 1)[0] for f in authority.taint_sources}
+    return bool(fontes) and fontes <= _LEITURA_DE_WEB
+
+
 def evaluate(
     tool_name: str,
     authority: TurnAuthority | None,
@@ -184,6 +233,39 @@ def evaluate(
             return GateDecision(
                 PERMITIR, "URL veio de um resultado de tool ou de você", nome
             )
+        if url and authority.url_is_short_form(url):
+            return GateDecision(
+                PERMITIR, "URL é um trecho do caminho de um resultado de tool", nome
+            )
+
+    # Navegador em turno contaminado: a MESMA circularidade do `web_fetch`, e
+    # pior. O navegador é fonte externa (ele lê a página) e revelação (ele digita
+    # nela), então a primeira tarefa contamina o turno e a segunda se barraria —
+    # a escada de busca ("acha o preço e abre a loja") morre no primeiro degrau.
+    # E `destination_of` devolve None para estas duas de propósito (a tarefa é
+    # texto livre; o site só se sabe passo a passo), logo NENHUMA liberação pode
+    # cobri-las: barrar aqui é beco sem saída, não pedido de aprovação.
+    # Quem guarda o dado DENTRO da navegação é o preenchimento escopado
+    # (`core/release/fill.py`): o valor só entra num `fill` com liberação
+    # aprovada e domínio da aba casando, e o modelo nunca vê o valor (F2).
+    # Então a linha é esta: contaminação que veio só de LEITURA DE WEB não barra
+    # o navegador; contaminação de e-mail, PDF ou arquivo do usuário barra — é
+    # ali que mora "vá a este site e digite o CPF" — e principal externo barra
+    # sempre. Essas duas têm recuperação de verdade: o turno retomado depois da
+    # sua aprovação roda como admin, em turno limpo.
+    if (
+        nome in _NAVEGADORES
+        and authority.tainted
+        and not authority.from_external
+        and not authority.unattended
+        and _so_leu_web(authority)
+    ):
+        return GateDecision(
+            PERMITIR,
+            "contaminação veio só de leitura de web; o dado é guardado pelo "
+            "preenchimento escopado",
+            nome,
+        )
 
     # Liberação aprovada destrava a saída para AQUELE destino. É o que fecha o
     # laço do plano: sem isto, o turno retomado depois do seu clique seria
@@ -214,6 +296,14 @@ def evaluate(
 
     if authority.tainted:
         fontes = ", ".join(authority.taint_sources[:3]) or "conteúdo externo"
+        if nome == "web_fetch":
+            return GateDecision(
+                SOLICITAR,
+                f"essa URL não apareceu em nenhum resultado desta conversa, e o turno já "
+                f"leu conteúdo de terceiro ({fontes})",
+                nome,
+                saida=_SAIDA_URL_SEM_PROCEDENCIA,
+            )
         acao = "revelar" if REVELACAO in classes else "atuar"
         return GateDecision(
             SOLICITAR,

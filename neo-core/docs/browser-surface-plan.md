@@ -666,6 +666,37 @@ clicar em *Parear este navegador com o Neo*, autorizar no diálogo — e a super
 tem que aparecer aninhada na aba Dispositivos. Depois disso, "o que está tocando?"
 pelo painel deve enxergar as abas sem o desktop no canal.
 
+#### Primeira tentativa real (2026-09-28) — `Failed to fetch` na `neo-browser-local`
+
+O pareamento pelo popup falhou antes de a rede ser tocada. **Causa: o
+`content_security_policy.extension_pages` herdado do upstream traz
+`connect-src 'self'`.** Upstream a extensão só fala por *native messaging*, que
+não passa por CSP; o apêndice desta implementação acrescentou as duas primeiras
+saídas de rede da extensão — o `fetch` de `/devices/pair` e o `WebSocket` de
+`/ws/devices/control` — e **as duas eram recusadas pelo próprio manifest**.
+
+O que faz esse defeito valer registro: ele é **invisível do lado do core**. O
+`POST /api/v1/devices/pair` responde certo (verificado contra prod: 403 +
+`access-control-allow-origin` para `Origin: chrome-extension://…`), o túnel
+estava de pé, o código era válido — e o cliente devolve `TypeError: Failed to
+fetch`, que é **exatamente** a frase de "não há ninguém na porta". Uma hipótese
+de rede consome a investigação inteira sem chegar perto.
+
+Corrigido na `neo-browser-local` v0.2.1 (`UPSTREAM.md` tem o aviso de reaplicar
+ao atualizar o upstream):
+- `connect-src` abre `127.0.0.1`/`localhost` em qualquer porta (o túnel) e
+  `https:`/`wss:` (entrada pública no futuro), e segue recusando `http://` para
+  fora da máquina;
+- `neoSurfForaDoAlcance()` recusa endereço fora dessa lista **antes** do `fetch`,
+  com o motivo — o campo *Avançado* do popup não alcança o CSP, e sem isso
+  apontar o core para outro lugar daria o mesmo erro mudo;
+- o `catch` do `fetch` passa a nomear o endereço e a mandar olhar o console do
+  service worker; o `new WebSocket` que **levanta** (rede fora do ar não levanta,
+  vira `onclose`) grava o motivo em vez de entrar em reconexão eterna.
+
+A `neo-music-ext` não tem esse problema: ela declara CSP nenhum, e sem a chave o
+default do MV3 não restringe `connect-src`.
+
 ### Invariante que guiou a implementação
 
 Cada mudança é **aditiva**: nada que funcionava hoje passa por caminho novo. Em

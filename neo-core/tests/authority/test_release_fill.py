@@ -100,12 +100,80 @@ async def test_campo_nao_liberado_nao_sai_nem_no_dominio_certo():
 
 
 @pytest.mark.asyncio
-async def test_uso_unico_a_segunda_vez_nao_preenche():
-    f = _filler([_Row(["pks:cep"], "loja.com.br")])
+async def test_uso_unico_outro_job_nao_reusa_a_liberacao():
+    """Uso único é por TAREFA: o filler nasce por job, e o job seguinte não herda."""
+    servico = _Service([_Row(["pks:cep"], "loja.com.br")])
     user = uuid4()
-    primeira = await f.resolve(user_id=user, texto="«pks:cep»", url="https://loja.com.br/a")
-    segunda = await f.resolve(user_id=user, texto="«pks:cep»", url="https://loja.com.br/b")
+    deste_job = ReleaseFiller(servico, _PKS())
+    do_proximo = ReleaseFiller(servico, _PKS())
+    primeira = await deste_job.resolve(user_id=user, texto="«pks:cep»", url="https://loja.com.br/a")
+    segunda = await do_proximo.resolve(user_id=user, texto="«pks:cep»", url="https://loja.com.br/b")
     assert primeira.ok and not segunda.ok
+    assert segunda.sem_liberacao == ["cep"]
+
+
+@pytest.mark.asyncio
+async def test_uma_aprovacao_preenche_todos_os_campos_do_formulario():
+    """Sessão 1a605544: aprovar CEP+CPF e ver o CPF recusado porque o CEP já
+    tinha gastado a liberação seria pedir duas vezes a mesma coisa."""
+    servico = _Service([_Row(["pks:cep", "pks:cpf"], "docs.google.com")])
+    f = ReleaseFiller(servico, _PKS({"cep": "72630-123", "cpf": "52998224725"}))
+    user = uuid4()
+    url = "https://docs.google.com/forms/d/e/x/viewform"
+    cep = await f.resolve(user_id=user, texto="«pks:cep»", url=url)
+    cpf = await f.resolve(user_id=user, texto="«pks:cpf»", url=url)
+    assert cep.texto == "72630-123" and cpf.texto == "52998224725"
+    assert len(servico.consumidas) == 1  # gasta UMA vez, no primeiro campo
+
+
+@pytest.mark.asyncio
+async def test_a_aprovacao_em_uso_nao_vale_em_outro_dominio():
+    servico = _Service([_Row(["pks:cep", "pks:cpf"], "docs.google.com")])
+    f = ReleaseFiller(servico, _PKS({"cep": "72630-123", "cpf": "52998224725"}))
+    user = uuid4()
+    await f.resolve(user_id=user, texto="«pks:cep»", url="https://docs.google.com/forms/x")
+    fora = await f.resolve(user_id=user, texto="«pks:cpf»", url="https://atacante.tld/forms")
+    assert not fora.ok and "52998224725" not in fora.texto
+
+
+@pytest.mark.asyncio
+async def test_sem_liberacao_separa_o_que_o_daniel_resolve_com_um_clique():
+    """Só a falta de aprovação vira pedido; memória vazia não se resolve aprovando."""
+    sem_aprovacao = await _filler([]).resolve(
+        user_id=uuid4(), texto="«pks:cep»", url="https://loja.com.br/a"
+    )
+    assert sem_aprovacao.sem_liberacao == ["cep"]
+    sem_memoria = await _filler([_Row(["pks:cep"], "loja.com.br")], props={}).resolve(
+        user_id=uuid4(), texto="«pks:cep»", url="https://loja.com.br/a"
+    )
+    assert not sem_memoria.ok and sem_memoria.sem_liberacao == []
+
+
+@pytest.mark.asyncio
+async def test_nome_acha_full_name_na_memoria():
+    """O formulário pergunta "nome"; a memória de produção guarda `full_name`."""
+    f = _filler([_Row(["pks:nome"], "docs.google.com")], props={"full_name": "Daniel Morais"})
+    out = await f.resolve(user_id=uuid4(), texto="«pks:nome»", url="https://docs.google.com/f")
+    assert out.ok and out.texto == "Daniel Morais"
+
+
+@pytest.mark.asyncio
+async def test_tem_liberacao_e_disponivel():
+    f = _filler([_Row(["pks:cep"], "loja.com.br")], props={"cep": "01234-567"})
+    user = uuid4()
+    assert await f.tem_liberacao(user_id=user, campo="cep", url="https://www.loja.com.br/x")
+    assert not await f.tem_liberacao(user_id=user, campo="cpf", url="https://loja.com.br/x")
+    assert not await f.tem_liberacao(user_id=user, campo="cep", url="")
+    assert await f.disponivel(user_id=user, campo="cep") is None
+    assert "não está na memória" in (await f.disponivel(user_id=user, campo="cpf") or "")
+
+
+def test_campos_do_texto_em_ordem_e_sem_repetir():
+    from core.release import campos_do_texto
+
+    texto = "preencha «pks:nome», «pks:endereco», «pks:cep» e «pks:CPF» (de novo «pks:cep»)"
+    assert campos_do_texto(texto) == ["nome", "endereco", "cep", "cpf"]
+    assert campos_do_texto("nada aqui") == []
 
 
 @pytest.mark.asyncio

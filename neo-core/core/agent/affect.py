@@ -731,6 +731,24 @@ POSTURE_TEXT_ABREVIADA = (
     "resolve depois do incidente."
 )
 
+# Postura quando o que está em jogo é um PEDIDO DE AÇÃO do dono, não um argumento.
+#
+# As cinco posturas acima são de DEBATE ("mantenha o núcleo", "sem entregar o
+# ponto central"), e não sabem distinguir opinião de pedido: a insistência do
+# Daniel num pedido entrava como pressão (`obtuse`) e a resposta era segurar
+# posição — contra o próprio pedido dele. Duas sessões inteiras recusadas assim:
+# a 89b9aa31 (um `pks_remember`) e a 8f2febfa (preencher o formulário DELE com os
+# dados DELE, 5 turnos, ira 20→61). O afeto muda o tom; o desfecho de um pedido
+# do dono é dele. Ressalva cabe — uma vez — e o que pede autorização sai pelo
+# aviso do aparelho, que é onde ele decide.
+POSTURE_TEXT_PEDIDO = (
+    "o que está em jogo é um PEDIDO do Daniel para você FAZER algo, não um "
+    "argumento — e pedido repetido não é ataque à sua posição. Não defenda "
+    "posição contra o dono: se tiver uma ressalva, diga UMA vez, numa frase, e "
+    "faça na mesma resposta. O que depende de autorização dele (dado pessoal, "
+    "ação que não desfaz) sai pelo aviso do aparelho, que é onde ele decide."
+)
+
 
 # ── Directive rendering ───────────────────────────────────────────────────────
 
@@ -824,8 +842,14 @@ def render_directive(
     caps: "RegisterProfile | None" = None,
     birra_armed: bool = False,
     now: datetime | None = None,
+    pedido_de_acao: bool = False,
 ) -> str:
     """Render the injected tone directive for the current (already decayed) state.
+
+    ``pedido_de_acao`` (turno imperativo, limpo, do dono — decidido por quem
+    chama): a linha de postura vira :data:`POSTURE_TEXT_PEDIDO` e o "Motivo
+    recente" de pressão sai. O TOM continua inteiro; o que muda é que a
+    insistência dele deixa de ser tratada como argumento a vencer.
 
     When nothing is salient we still emit a short "de boa" nudge so the model
     knows it may be lighter — this is what makes Neo *funnier* when the user has
@@ -925,7 +949,9 @@ def render_directive(
     if pressure:
         posture = posture_key(stats)
         postura_mode = caps.postura if caps is not None else "plena"
-        if postura_mode == "abreviada":
+        if pedido_de_acao:
+            posture_text = POSTURE_TEXT_PEDIDO
+        elif postura_mode == "abreviada":
             posture_text = POSTURE_TEXT_ABREVIADA
         elif postura_mode == "contida":
             posture_text = POSTURE_TEXT_CONTIDA[posture]
@@ -938,6 +964,11 @@ def render_directive(
          if isinstance(e, dict) and e.get("trigger") not in (None, "neutral") and e.get("why")),
         None,
     )
+    # Num pedido do dono, o motivo de PRESSÃO ("Sexta repetição de obstinação;
+    # ignora a exigência de transparência…") é a acusação que sustentava a
+    # recusa: ele lê a insistência no pedido como o erro do usuário.
+    if latest and pedido_de_acao and latest.get("trigger") in PRESSURE_TRIGGERS:
+        latest = None
     if latest and not calm and leveza_max >= 1:
         lines.append(f"- Motivo recente: {latest['why']}.")
 

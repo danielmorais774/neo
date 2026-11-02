@@ -245,6 +245,12 @@ class RoutingDecision(BaseModel):
     # ``skill_name``, this never fires a skill directly. See neo-music-feature.
     skill_hint: str | None = None
 
+    # O classificador escolheu `browser_local_task`: o usuário pediu o navegador DELE.
+    # Essa tool é server-side, então a guarda de catálogo do CLIENT_TOOL rebaixa o
+    # turno para o cognitivo e zera o `tool_name`. Sem este campo, a informação de que
+    # ele escolheu o navegador morria ali (ver `_aviso_navegador_pedido`).
+    navegador_do_usuario: bool = False
+
     # --- speech act (Workstream B — bias to brain) ---
     # imperative | question | conditional | definition | chitchat.
     # A side-effecting skill (HA/WhatsApp) is only fired on a confident imperative;

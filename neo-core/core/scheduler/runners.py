@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable
 from uuid import UUID
 
+from core.authority import turno_de_fundo
 from core.scheduler.conditions import fingerprint
 from core.scheduler.timing import in_quiet_hours, quiet_hours_end, to_local, to_utc_naive, utcnow
 from db.models.agent_job import AgentJob
@@ -116,11 +117,18 @@ async def _run_tool(job: AgentJob, action: dict, spec: dict, ai_service: Any) ->
         user_message=job.title or "",
     )
     timeout = _timeout_of(spec)
+    # Autoridade do turno: este disparo não passa pelo `process_message`, então
+    # sem isto rodava como "fora de turno" — e o portão trata fora de turno como
+    # permitir. A regra de `unattended` (sem ninguém na frente, saída pede
+    # aprovação) não valia justamente no caminho mais desacompanhado que existe.
+    # `tool_policy` continua sendo a trava de QUAIS tools; o portão decide se
+    # ESTA chamada, neste turno, pode entregar algo a terceiro.
     try:
-        resultado = await asyncio.wait_for(
-            executor.execute_tool_call(ToolCall(name=nome, arguments=argumentos)),
-            timeout=timeout,
-        )
+        with turno_de_fundo({"source": "schedule", "unattended": True}, job.user_id):
+            resultado = await asyncio.wait_for(
+                executor.execute_tool_call(ToolCall(name=nome, arguments=argumentos)),
+                timeout=timeout,
+            )
     except asyncio.TimeoutError:
         return {"status": "timeout", "result_summary": f"A tool {nome} passou de {timeout}s."}
 

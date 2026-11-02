@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from core.pks.ontology import normalize_token
+from core.pks.ontology import INTERNAL_FIELD_KEYS, normalize_token
 from core.pks.schemas import Neighborhood, RetrievalResult
 from core.pks.sensitivity import SECRET, effective_level, redact_value, redaction_enabled
+
+#: Teto por campo. O bloco é UM candidato no seletor e é tudo-ou-nada: um único
+#: field longo passa do orçamento e leva junto todo o resto do que foi
+#: recuperado. O ranking v2 já corta em 80; aqui o corte é mais folgado porque
+#: este caminho não reempacota nada depois.
+_MAX_FIELD_CHARS = 240
 
 
 class ContextBuilder:
@@ -35,6 +41,10 @@ class ContextBuilder:
                 # banco, todas gravadas como `private`.
                 nivel = effective_level(field.key, field.sensitivity)
                 if redaction_enabled() and nivel == SECRET:
+                    continue
+                # Escrituração interna tem seção própria no prompt (o estado
+                # emocional); aqui ela só repetiria o JSON cru.
+                if field.key in INTERNAL_FIELD_KEYS:
                     continue
                 value = self._format_field_value(field.key, field.value)
                 value, redigido = redact_value(field.key, value, field.sensitivity)
@@ -77,4 +87,9 @@ class ContextBuilder:
                 return value.strftime("%d/%m")
             if isinstance(value, date):
                 return value.strftime("%d/%m")
-        return value.isoformat() if hasattr(value, "isoformat") else value
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        texto = str(value)
+        if len(texto) > _MAX_FIELD_CHARS:
+            return texto[: _MAX_FIELD_CHARS - 1] + "…"
+        return value

@@ -5,6 +5,7 @@ the sandbox is a scripted fake. Exercises status mapping, ownership scoping, the
 enqueue→poke path, and the dispatcher's persist + publish + idempotency.
 """
 
+import logging
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -279,6 +280,186 @@ def test_dispatch_fallback_text_variants():
     assert "Terminei" in done
     fail = disp._fallback_text(AgentJob(kind="sandbox_task", title="T", spec_json={}, status="failed"), "")
     assert "falhou" in fail
+
+
+# ── a entrega em duas metades: o modelo escreve, o código entrega ───────────
+#
+# O `_compose` lia até 3.500 caracteres e escrevia no máximo ~1.470 (700 tokens
+# de prosa), então todo resultado entre os dois era COMPRIMIDO por um modelo —
+# sem aviso e sem registro. Para lista de fatos (preço, nome de arquivo, uuid de
+# retomada) parafrasear é a operação errada. Medido em 227 jobs de prod: o corte
+# em 3.500 disparou uma vez; o problema nunca foi o corte, era a compressão.
+
+
+class _ComposeProvider:
+    """Guarda o prompt que recebeu — é nele que está o invariante do conserto."""
+
+    def __init__(self, resposta: str = "Terminei de olhar a Amazon pra você."):
+        self.resposta = resposta
+        self.prompts: list[str] = []
+
+    async def complete(self, *, messages, **kw):
+        self.prompts.append("\n".join(m.content for m in messages))
+        resposta = self.resposta
+
+        class _R:
+            def get_content(self):
+                return resposta
+
+        return _R()
+
+
+class _ComposeLLM:
+    def __init__(self, provider):
+        self._p = provider
+
+    def get_provider(self, _name):
+        return self._p
+
+
+_ITENS = [
+    "pen drive SanDisk Ultra 64GB — R$ 65,76, frete grátis, nota 4,7",
+    "pen drive Kingston DataTraveler 64GB — R$ 72,10, vendido por Kabum",
+    "pen drive Multilaser Twist 64GB — R$ 51,99, chega quinta",
+    "pen drive Sandisk Cruzer 64GB — R$ 58,40, nota 4,5",
+]
+
+
+def _job_com_entrega(**kw):
+    base = dict(
+        user_id=uuid4(), session_id=uuid4(), kind="browser_local",
+        title="Procurar pen drive 64GB", spec_json={"task": "pen drive"},
+        status="completed", notify_policy="chat",
+        result_summary="Terminei a tarefa.\n\nO que coletei (4) — …:\n"
+                       + "\n".join(f"- {i}" for i in _ITENS),
+        extra_metadata={"entrega": {"fecho": "Terminei a tarefa.", "itens": list(_ITENS)}},
+    )
+    base.update(kw)
+    return AgentJob(**base)
+
+
+@pytest.mark.asyncio
+async def test_o_redator_nao_ve_os_itens():
+    """O invariante de verdade: paráfrase impossível, não proibida.
+
+    Se o bloco entrasse na chamada com um "copie exatamente", estaríamos de
+    volta ao defeito de origem — pedir a um modelo que transporte fatos que já
+    estão guardados (job 5ab98119). Ele não pode reescrever o que nunca recebeu.
+    """
+    db, broker = _FakeDB(), _FakeBroker()
+    prov = _ComposeProvider()
+    disp = ProactiveDispatcher(db=db, broker=broker, llm_router=_ComposeLLM(prov))
+    job = _job_com_entrega()
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    assert prov.prompts, "o redator nem foi chamado"
+    prompt = prov.prompts[0]
+    for item in _ITENS:
+        assert item not in prompt
+    assert "65,76" not in prompt
+    # Mas ele sabe que o bloco existe, senão escreve como se nada houvesse.
+    assert "4 linhas" in prompt
+
+
+@pytest.mark.asyncio
+async def test_os_itens_chegam_caractere_por_caractere():
+    db, broker = _FakeDB(), _FakeBroker()
+    disp = ProactiveDispatcher(
+        db=db, broker=broker, llm_router=_ComposeLLM(_ComposeProvider())
+    )
+    job = _job_com_entrega()
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    entregue = db.messages[0]["content"]
+    assert "Terminei de olhar a Amazon pra você." in entregue  # a prosa
+    for item in _ITENS:
+        assert item in entregue                                # e os fatos, inteiros
+
+
+@pytest.mark.asyncio
+async def test_sem_redator_os_itens_ainda_chegam_inteiros():
+    """O caminho em que a entrega em duas metades vale MAIS.
+
+    O `[:1200]` do fallback cortava justamente quando o redator falhou — 27 de
+    227 jobs de prod passam desse tamanho.
+    """
+    db, broker = _FakeDB(), _FakeBroker()
+    disp = ProactiveDispatcher(db=db, broker=broker, llm_router=None)
+    job = _job_com_entrega()
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    entregue = db.messages[0]["content"]
+    assert "Terminei" in entregue
+    for item in _ITENS:
+        assert item in entregue
+
+
+@pytest.mark.asyncio
+async def test_caderno_grande_chega_sem_perder_item():
+    """20 itens entregam 20. É o caso que a compressão silenciosa comia."""
+    db, broker = _FakeDB(), _FakeBroker()
+    # Do tamanho real de uma nota de caderno: nome, preço, frete, vendedor,
+    # nota e URL. É esse tamanho que faz 20 itens passarem do teto de saída.
+    muitos = [
+        f"pen drive Marca{n:02d} Ultra 64GB — R$ {n}9,90, frete grátis, "
+        f"vendido por Loja {n:02d}, nota 4,{n % 10} — "
+        f"https://www.amazon.com.br/dp/B0{n:02d}ABCDEFG"
+        for n in range(1, 21)
+    ]
+    disp = ProactiveDispatcher(
+        db=db, broker=broker, llm_router=_ComposeLLM(_ComposeProvider())
+    )
+    job = _job_com_entrega(
+        extra_metadata={"entrega": {"fecho": "Achei 20.", "itens": muitos}}
+    )
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    entregue = db.messages[0]["content"]
+    for item in muitos:
+        assert item in entregue
+    assert len(entregue) > 1470  # acima do que os 700 tokens comportariam
+
+
+@pytest.mark.asyncio
+async def test_itens_nao_sao_colados_duas_vezes():
+    """`_fallback_text` não pode juntar o que o `_com_itens` já cola."""
+    db, broker = _FakeDB(), _FakeBroker()
+    disp = ProactiveDispatcher(db=db, broker=broker, llm_router=None)
+    job = _job_com_entrega()
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    assert db.messages[0]["content"].count(_ITENS[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_job_sem_entrega_se_comporta_como_antes():
+    """Guarda de regressão para os outros 8 `kind` em produção."""
+    db, broker = _FakeDB(), _FakeBroker()
+    prov = _ComposeProvider()
+    disp = ProactiveDispatcher(db=db, broker=broker, llm_router=_ComposeLLM(prov))
+    job = AgentJob(
+        user_id=uuid4(), session_id=uuid4(), kind="sandbox_task", title="Converter CSV",
+        spec_json={"command": "python conv.py"}, status="completed",
+        result_summary="[completed] exit=0\n12 linhas", notify_policy="chat",
+    )
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    # Caminho de sempre: o resumo inteiro vai ao redator, e nada é colado depois.
+    assert "12 linhas" in prov.prompts[0]
+    assert db.messages[0]["content"] == prov.resposta
+
+
+def test_o_corte_do_fallback_deixa_de_ser_mudo(caplog):
+    """Até aqui os três cortes da entrega não registravam nada.
+
+    É o que transformava o próximo incidente numa sessão de medição. O kind que
+    aparecer neste log é candidato a declarar `entrega`.
+    """
+    disp = ProactiveDispatcher(db=None, broker=None, llm_router=None)
+    job = AgentJob(kind="sandbox_task", title="T", spec_json={}, status="completed")
+    with caplog.at_level(logging.WARNING):
+        disp._fallback_text(job, "x" * 2000)
+    assert "corta o resumo" in caplog.text
 
 
 # ── Comando adotado (neo_bash que passou do orçamento) e continuação por `then` ──

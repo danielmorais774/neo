@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 
+from core.liveness import touch_progress
 from core.llm.router import LLMRouter
 from core.pks.schemas import PKSOperation
 from shared import Message, MessageRole
 
 logger = logging.getLogger(__name__)
+
+
+# Teto de parede para a chamada do planner.
+#
+# O turno do desktop só sobrevive enquanto o keepalive do gRPC atesta vida:
+# 240s de janela no core (``grpc_server._STALL_WINDOW_S``) + 90s de paciência do
+# cliente (``ai_agent.rs`` ``STREAM_IDLE_TIMEOUT``) = **330s**. O SDK da OpenAI,
+# sem ``timeout`` explícito, só desiste aos 600s — quase o DOBRO da janela. Em
+# 2026-09-28 três chamadas a ``deepseek-v4-flash@baidu`` penduraram (o POST saiu,
+# a resposta nunca voltou) e mataram turnos inteiros: 303s e 323s, com o usuário
+# vendo "Neo Core ficou 90s sem dar sinal de progresso".
+#
+# Gravar memória é ACESSÓRIO: não pode derrubar a conversa. Aqui a gente desiste
+# muito antes da janela e o turno segue vivo sem o que o planner ia gravar.
+_PLANNER_TIMEOUT_S = float(os.getenv("NEO_PKS_PLANNER_TIMEOUT_S", "45"))
 
 
 _MEMORY_PLANNER_PROMPT = """\
@@ -203,6 +221,7 @@ class PKSMemoryPlanner:
             f"Resposta atual do assistente:\n{assistant_response}\n\n"
             f"Limite de operações: {max_operations}"
         )
+        model = "(não resolvido)"
         try:
             # Modelo EXPLÍCITO: sem isso, o provider caía no DEFAULT_MODEL, que já
             # foi "deepseek-chat" (aposentado → 400 invalid_request) e fazia TODA
@@ -218,22 +237,41 @@ class PKSMemoryPlanner:
                 getattr(provider, "name", provider.__class__.__name__),
                 model,
             )
-            response = await provider.complete(
-                messages=[
-                    Message(role=MessageRole.SYSTEM, content=prompt),
-                    Message(role=MessageRole.USER, content=user_content),
-                ],
-                model=model,
-                temperature=0.0,
-                # Folga: o modelo às vezes monta um grafo maior (pessoa +
-                # coleção + entidade + relações) e, com o teto antigo (3000), o
-                # JSON truncava no meio → parse falhava → 0 operações salvas
-                # (session-77a77b00). O parser ainda salva o que completou.
-                max_tokens=8000,
+            # Esta é a ÚNICA chamada LLM do PKS e roda DENTRO do turno, sem
+            # gerar bolha nenhuma: para o keepalive do gRPC o turno parece
+            # parado. Avisar que há trabalho legítimo em curso é o que impede o
+            # desktop de matar a conversa enquanto a memória é planejada.
+            touch_progress()
+            response = await asyncio.wait_for(
+                provider.complete(
+                    messages=[
+                        Message(role=MessageRole.SYSTEM, content=prompt),
+                        Message(role=MessageRole.USER, content=user_content),
+                    ],
+                    model=model,
+                    temperature=0.0,
+                    # Folga: o modelo às vezes monta um grafo maior (pessoa +
+                    # coleção + entidade + relações) e, com o teto antigo (3000), o
+                    # JSON truncava no meio → parse falhava → 0 operações salvas
+                    # (session-77a77b00). O parser ainda salva o que completou.
+                    max_tokens=8000,
+                ),
+                timeout=_PLANNER_TIMEOUT_S,
             )
+            touch_progress()
             raw = response.get_content() or "{}"
             logger.info("[PKS][plan_memory] llm_response_received chars=%d", len(raw))
             logger.debug("[PKS][plan_memory] llm_response_preview=%s", raw[:500])
+        except asyncio.TimeoutError:
+            # Não é "falhou": é "demorou demais para algo acessório". Log próprio
+            # porque cair no genérico esconde a causa (foi o que custou o
+            # diagnóstico de 2026-09-28).
+            logger.warning(
+                "[PKS] Plan Memory desistiu após %.0fs (modelo=%s) — turno preservado, nada gravado",
+                _PLANNER_TIMEOUT_S,
+                model,
+            )
+            return []
         except Exception as exc:
             logger.warning("[PKS] Plan Memory LLM call failed: %s", exc)
             return []

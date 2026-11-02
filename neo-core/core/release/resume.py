@@ -25,7 +25,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from db.models.release_request import STATUS_APROVADA, ReleaseRequest
+from db.models.release_request import STATUS_APROVADA, STATUS_RECUSADA, ReleaseRequest
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,29 @@ def _instrucao(row: ReleaseRequest) -> str:
     )
 
 
-def build_resumer(*, get_ai_service: Any, announce: Any = None) -> Any:
-    """Devolve ``async (row) -> bool`` — ``True`` quando um turno foi disparado."""
+def build_resumer(
+    *, get_ai_service: Any, announce: Any = None, resume_job: Any = None
+) -> Any:
+    """Devolve ``async (row) -> bool`` — ``True`` quando um turno foi disparado.
+
+    ``resume_job`` (``core/jobs/release_resume.py``) vem PRIMEIRO: quando o
+    pedido nasceu de uma tarefa do navegador que parou no campo, continuar
+    aquela tarefa é exato — mesma tarefa, mesma aba — e não depende de um
+    modelo redescobrir o que estava sendo feito. O turno cognitivo fica para o
+    pedido que não tem job esperando (``solicitar_dado`` de um e-mail, etc.).
+    """
 
     async def resume(row: ReleaseRequest) -> bool:
-        if row is None or row.status != STATUS_APROVADA:
+        if row is None:
+            return False
+        if row.status != STATUS_APROVADA:
+            # Recusa não abre turno nenhum, mas a tarefa do navegador que parou
+            # esperando por ela tem de deixar de esperar.
+            if resume_job is not None and row.status == STATUS_RECUSADA:
+                try:
+                    await resume_job(row)
+                except Exception:  # noqa: BLE001
+                    logger.exception("[release][retomada] encerrar a tarefa de %s falhou", row.id)
             return False
         if row.session_id is None:
             logger.info("[release][retomada] %s não tem sessão — nada a continuar", row.id)
@@ -66,6 +84,14 @@ def build_resumer(*, get_ai_service: Any, announce: Any = None) -> Any:
         if chave in _retomadas:
             logger.info("[release][retomada] %s já foi retomada", chave)
             return False
+        if resume_job is not None:
+            try:
+                if await resume_job(row):
+                    _retomadas.add(chave)
+                    logger.warning("[release][retomada] %s continuou a tarefa do navegador", chave)
+                    return True
+            except Exception:  # noqa: BLE001 — cai no turno, que ainda pode resolver
+                logger.exception("[release][retomada] continuação do job de %s falhou", chave)
         ai_service = get_ai_service() if callable(get_ai_service) else get_ai_service
         if ai_service is None:
             logger.warning("[release][retomada] AIService indisponível")

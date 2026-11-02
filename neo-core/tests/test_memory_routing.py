@@ -38,6 +38,16 @@ _router = object.__new__(IntentRouter)
         "guarda essa receita",
         "anota essa dica pra mim",
         "salva isso pra eu lembrar depois",
+        # Âncora POSSESSIVA (session-be7659d2): "grava" era o verbo mais natural da
+        # diretiva e não casava com nada — a frase só entrava quando trazia a palavra
+        # "pks", que era também a que autocarregava a skill de SELECT e calava a
+        # escrita. Sem o acidente, 4 pedidos seguidos saíram com confirmed_save=False.
+        "grava 01310-100 como meu CEP",
+        "Grava 01310-100 Como Meu CEP",
+        "salva isso como minha senha do wifi",
+        "anota 11999998888 como meu telefone",
+        "registra são paulo como minha cidade",
+        "guarda esse email como meu email principal",
     ],
 )
 def test_memory_directives_detected(message):
@@ -54,6 +64,16 @@ def test_memory_directives_detected(message):
         # Save de ARQUIVO não pode virar diretiva de memória (Fase 2 não regride):
         "salva o arquivo no desktop",
         "salva isso em downloads",
+        # A âncora possessiva não pode engolir ENTREGA DE ARQUIVO — o nome do arquivo
+        # vem depois de "como meu/minha" exatamente na mesma forma, e aí o destino é
+        # file_save, não o PKS. É a guarda de extensão do padrão.
+        "salva o arquivo como meu relatorio.pdf",
+        "salva esse csv como meu-extrato.csv",
+        "salva o gráfico como minha-analise.png",
+        # "grav" solto é inviável: medido no corpus de prod, 7 de 9 casos são destes.
+        "grava a tela por 10 segundos",
+        "isso é mais grave do que parece",
+        "faz a transcrição do vídeo gravacao de tela 2026-09-12.mov",
     ],
 )
 def test_non_memory_messages_not_flagged(message):

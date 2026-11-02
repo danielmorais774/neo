@@ -370,9 +370,12 @@ class Settings(BaseSettings):
     )
     browser_local_max_steps: int = Field(
         default=25,
-        description="Teto de passos por tarefa no navegador local. Menor que o do "
-        "headless: cada passo é uma ida-e-volta até a máquina do usuário, e ele "
-        "está olhando.",
+        description="Orçamento BASE de passos por tarefa no navegador local. Menor "
+        "que o do headless: cada passo é uma ida-e-volta até a máquina do usuário, "
+        "e ele está olhando. Não é mais um teto fixo: cada vez que o caderno cresce "
+        "o job ganha um passo de volta (até o DOBRO deste valor, que é o limite "
+        "duro), e quem encerra antes é a falta de retorno — 12 passos sem nada novo "
+        "no caderno, ou giro na mesma tela sem nada a entregar.",
     )
     browser_local_job_timeout: int = Field(
         default=600,
@@ -973,6 +976,23 @@ class Settings(BaseSettings):
         "trocado por um endereço `«pks:<campo>»`. O valor volta sob demanda pela tool "
         "`pks_reveal` — que num turno contaminado passa pelo portão. Off → o valor "
         "viaja inteiro em todo turno que recuperar a entidade, como era antes.",
+    )
+    neo_paste_taint_enabled: bool = Field(
+        default=True,
+        description="Texto COLADO acima do limiar marca o turno como contaminado "
+        "(fonte `colagem`). É o fio que faltava: conteúdo de terceiro que chega por "
+        "tool (página, e-mail, PDF) contamina, mas colado entrava como se fosse o "
+        "próprio usuário falando — `principal=admin, contaminado=não` — e todo o "
+        "portão ficava inerte, inclusive para 'me dê o CPF e manda para x@y.com'. "
+        "Com isto, revelar passa a pedir o card (pks_reveal, email, WhatsApp, "
+        "gateway). Off → volta a confiar em tudo que foi colado.",
+    )
+    neo_paste_taint_min_chars: int = Field(
+        default=240, ge=1,
+        description="A partir de quantos caracteres colados o turno é marcado. Colar "
+        "um link, um nome ou uma linha de erro não é 'bloco de terceiro' — e marcar "
+        "isso só geraria card em cima de uso legítimo. O cliente informa quantos "
+        "caracteres vieram do clipboard (`pasted_chars` no metadata).",
     )
     neo_release_gate_mode: str = Field(
         default="shadow",

@@ -15,9 +15,9 @@ from core.pks.bootstrap import PKSBootstrap
 from core.pks.context_builder import ContextBuilder
 from core.pks.entity_resolver import EntityResolver
 from core.pks.ledger_guard import is_ledger_memory
-from core.pks.ontology import OntologyResolver, OntologyValidator
+from core.pks.ontology import INTERNAL_FIELD_KEYS, OntologyResolver, OntologyValidator
 from core.pks.ranking import GLOBAL_TYPES as GLOBAL_RANK_TYPES
-from core.pks.sensitivity import redact_properties
+from core.pks.sensitivity import SECRET, effective_level, redact_properties, redact_value
 from core.pks.repository import PKSRepository
 from core.pks.retriever import PKSRetriever
 from core.pks.schemas import UpsertEntityInput, UpsertFieldInput, UpsertRelationInput
@@ -47,6 +47,13 @@ from db.async_client import AsyncPostgresClient
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+#: Orçamento da busca de UMA pergunta de formulário. Medido com os 8 rótulos do
+#: formulário de treino: ~1000 tokens trazem os seis treinos com exercícios e
+#: séries; o do dia perguntado vem em primeiro.
+_EVIDENCIA_TOKENS = 1500
+#: Alvos por linha de relação no bloco do dono (ele tem dezenas).
+_DONO_POR_RELACAO = 12
 
 
 class PKSService:
@@ -104,6 +111,32 @@ class PKSService:
     async def ensure_system_pks(self) -> dict[str, Any]:
         return await self.system_bootstrap.ensure()
 
+    @staticmethod
+    def _turno_contaminado() -> str:
+        """Fontes de terceiro deste turno, ou "" quando o turno é limpo.
+
+        O aprendizado automático é um SINK que o portão não vê: ele não é tool
+        call, roda depois do turno, e escreve em bloco de Alta Prioridade que
+        entra em todo prompt. Medido em 2026-10-03: dois payloads de injeção que
+        o Daniel colou para testar a defesa foram aprendidos como "preferência de
+        comunicação" dele — a injeção virou moradora permanente do contexto, que
+        é exatamente o que a regra `negar` do portão existe para impedir
+        (release-request-plan §23). Aqui o critério é o mesmo do portão: num turno
+        que leu conteúdo de terceiro, o aprendizado AUTOMÁTICO não grava. O
+        explícito (`pks_remember`, `confirmed_save=True`) continua valendo — ali
+        foi ele que mandou guardar, e o pedido é dele mesmo quando o turno leu
+        uma página no caminho.
+        """
+        try:
+            from core.authority import current_authority
+
+            autoridade = current_authority()
+        except Exception:  # noqa: BLE001 — sem autoridade, nada muda
+            return ""
+        if autoridade is None or not autoridade.tainted:
+            return ""
+        return ", ".join(autoridade.taint_sources[:3]) or "conteúdo externo"
+
     async def learn_before_response(
         self,
         *,
@@ -112,6 +145,14 @@ class PKSService:
         memory_target: str = "user",
         source_message_id: str | None = None,
     ) -> dict[str, Any]:
+        fontes = self._turno_contaminado()
+        if fontes:
+            logger.warning(
+                "[pks] aprendizado automático recusado (pré-resposta): o turno leu "
+                "conteúdo de terceiro (%s) — texto colado/página não vira memória",
+                fontes,
+            )
+            return {}
         return await self.writer.learn_before_response(
             user_id=user_id,
             user_message=user_message,
@@ -134,6 +175,17 @@ class PKSService:
         confirmed_save: bool = False,
         forget: bool = False,
     ) -> list[dict[str, Any]]:
+        # `confirmed_save` = ele mandou guardar (pks_remember). Só o automático
+        # é recusado — ver `_turno_contaminado`.
+        if not confirmed_save and not forget:
+            fontes = self._turno_contaminado()
+            if fontes:
+                logger.warning(
+                    "[pks] aprendizado automático recusado: o turno leu conteúdo de "
+                    "terceiro (%s) — texto colado/página não vira memória",
+                    fontes,
+                )
+                return []
         return await self.writer.learn(
             user_id=user_id,
             user_message=user_message,
@@ -557,6 +609,107 @@ class PKSService:
                         continue
                     return self._format_place(place)
         return None
+
+    async def primary_user_field(self, *, user_id: UUID, key: str) -> Any | None:
+        """Valor do campo ``key`` na entidade do PRÓPRIO usuário, sem redação.
+
+        É o dono certo para o preenchimento escopado: «pks:cpf» é o CPF DELE, e
+        a busca por texto não serve para isso — `full_name` é chave genérica
+        demais para localizar entidade (``GENERIC_FIELD_KEYS``), então «pks:nome»
+        nunca achava o nome do Daniel (sessão 9b2e29e2, 2026-11-01). Credencial
+        (``secret``) não sai daqui: o lugar dela é o cofre.
+        """
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            primary = await self.repository.get_primary_user_entity(session, workspace_id)
+            if not primary:
+                return None
+            field = await self.repository.get_field(session, primary.id, key)
+        if field is None or field.sensitivity == "secret" or field.value in (None, ""):
+            return None
+        return field.value
+
+    async def evidencia_de_formulario(
+        self, *, user_id: UUID, perguntas: list[str]
+    ) -> dict[str, Any]:
+        """A memória que responde cada pergunta de um formulário, uma busca por pergunta.
+
+        É a matéria-prima do respondedor (``core/browser_local/respondedor.py``).
+        A busca usa o texto LITERAL de cada rótulo porque o bloco do turno é
+        ranqueado pela mensagem do Daniel: na sessão e752a399 ela era "preencha e
+        envie", o bloco trouxe só o treino de antebraço, e os outros quatro dias
+        do formulário foram inventados. Medido em 2026-11-01 com os 8 rótulos
+        reais: o treino certo de cada dia vem em primeiro nos cinco.
+
+        Devolve ``{"dono": texto, "perguntas": [[(chave, texto), ...], ...]}``.
+        O dono vai à parte porque responde o que a busca não acha — o e-mail é
+        campo dele, a academia é relação dele — e o que é de saúde (sempre no
+        bloco do turno) vai junto dele, uma vez só.
+        """
+        por_pergunta: list[list[tuple[str, str]]] = []
+        sempre: dict[str, str] = {}
+        for pergunta in perguntas:
+            try:
+                _, outcome, *_ = await self.retriever.rank(
+                    user_id=user_id,
+                    user_message=pergunta,
+                    budget_tokens=_EVIDENCIA_TOKENS,
+                    relative_cutoff=0.3,
+                    touch=False,
+                )
+            except Exception:  # noqa: BLE001 — pergunta sem evidência, não job morto
+                logger.exception("[PKS][formulário] busca falhou: %s", pergunta[:80])
+                por_pergunta.append([])
+                continue
+            achados: list[tuple[str, str]] = []
+            for g in outcome.groups:
+                if not g.text:
+                    continue
+                if g.head.entity.type in GLOBAL_RANK_TYPES:
+                    sempre.setdefault(str(g.head.entity.id), g.text)
+                    continue
+                achados.append((str(g.head.entity.id), g.text))
+            por_pergunta.append(achados)
+        dono = "\n".join(p for p in (await self._bloco_do_dono(user_id), *sempre.values()) if p)
+        return {"dono": dono, "perguntas": por_pergunta}
+
+    async def _bloco_do_dono(self, user_id: UUID) -> str:
+        """A entidade do Daniel, com os campos REDIGIDOS e as relações por tipo.
+
+        Redigidos pela mesma régua do bloco do turno: CPF, CEP e e-mail saem
+        como ``«pks:campo»``, e quem troca pelo valor é o preenchimento, só com
+        liberação para o site. O respondedor nunca vê o dado.
+        """
+        workspace_id = await self.bootstrap.ensure_workspace(user_id)
+        async with self.db.get_session() as session:
+            dono = await self.repository.get_primary_user_entity(session, workspace_id)
+            if dono is None:
+                return ""
+            campos = (
+                await self.repository.get_fields_for_entities(session, [dono.id])
+            ).get(dono.id, [])
+            relacoes = await self.repository.get_relations(session, dono.id)
+        linhas = [f"### {dono.name} [{dono.type}] — o próprio Daniel, dono dos dados"]
+        for f in campos:
+            if f.key in INTERNAL_FIELD_KEYS or f.value in (None, "", {}, []):
+                continue
+            if effective_level(f.key, f.sensitivity) == SECRET:
+                continue
+            valor, _ = redact_value(f.key, f.value, f.sensitivity)
+            linhas.append(f"- {f.key}: {' '.join(str(valor).split())[:200]}")
+        por_tipo: dict[str, list[str]] = {}
+        for r in relacoes:
+            if r.sensitivity in ("secret", "sensitive"):
+                continue
+            if r.from_entity_id == dono.id:
+                chave, alvo = f"{r.relation_type} ->", f"{r.to_name} [{r.to_type}]"
+            else:
+                chave, alvo = f"{r.relation_type} <-", f"{r.from_name} [{r.from_type}]"
+            por_tipo.setdefault(chave, []).append(alvo)
+        for chave, alvos in por_tipo.items():
+            mais = f" (+{len(alvos) - _DONO_POR_RELACAO})" if len(alvos) > _DONO_POR_RELACAO else ""
+            linhas.append(f"- {chave} " + "; ".join(alvos[:_DONO_POR_RELACAO]) + mais)
+        return "\n".join(linhas)
 
     # ── Neo affect (per-user emotional vector) ────────────────────────────
     async def get_user_affect(self, *, user_id: UUID):

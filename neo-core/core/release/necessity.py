@@ -21,6 +21,7 @@ Duas escolhas que evitam que isto vire teatro:
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 #: finalidade conhecida -> (palavras que a identificam, campos admitidos)
@@ -70,9 +71,15 @@ def _normalizar(texto: str) -> str:
     )
 
 
+#: Endereço não é finalidade: um "pix" ou "nota" no meio de um caminho de URL
+#: escolheria a linha da tabela por acaso — e o pedido do Daniel costuma trazer
+#: o link junto.
+_URL = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+
 def finalidade_conhecida(finalidade: str) -> str | None:
     """Nome interno da finalidade, ou ``None`` quando a tabela não a conhece."""
-    alvo = _normalizar(finalidade)
+    alvo = _normalizar(_URL.sub(" ", finalidade or ""))
     if not alvo:
         return None
     for nome, palavras, _ in _TABELA:

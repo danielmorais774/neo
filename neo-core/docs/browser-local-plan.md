@@ -1393,3 +1393,1059 @@ vale para o driver também, não só para o inspetor: o modelo estava lendo CSS
 como nome de elemento.
 
 Extensão em **0.1.45**.
+
+---
+
+### 2026-09-29 — O print entregue não era o da resposta (job `78d998ee`)
+
+Pedido: *"acessa o meu navegador local e vai na amazon e vê se tenho algum
+produto pra chegar"*. O agente **respondeu certo** — "Produto
+Exemplo, chega 5 de outubro, R$ 49,86" — e anexou o print da página de rastreio de
+**outro** pedido (Produto B, entregue 17/set), com o carrinho aberto por
+cima.
+
+**Nada falhou.** `self.shots` — a lista que vira anexo — era alimentada em dois
+lugares: a triagem de painel (`_triagem_visual`) e a ação `screenshot`. A tarefa
+inteira usou `look`, que fotografa, pergunta à visão e **descarta a imagem**. O
+agente nunca chamou `screenshot`. Então o único print que chegou ao usuário foi
+um acidente: um painel «Subtotal» que abriu sozinho no passo 18, na página
+errada. Confirmado por sha256 — o `stored_file` entregue é byte a byte o
+`22-tela.jpg` do diário. O print que estava perfeito (`23-tela.jpg`, a lista com
+o Produto Exemplo no topo) foi tirado no passo 19 e jogado fora.
+
+Somava um segundo erro, que sozinho já bastaria: a janela guardava os
+**primeiros** `max_screenshots`. Numa tarefa de navegador a evidência se
+acumula — a tela que responde a pergunta é a do fim, não a primeira que
+apareceu.
+
+**O conserto, em três peças:**
+
+1. **`look` alimenta a entrega.** A imagem que o modelo *escolheu* olhar é a
+   melhor candidata que existe no meio da tarefa: é uma tela sobre a qual
+   alguém teve uma pergunta.
+2. **A janela guarda os ÚLTIMOS** (`_guardar_print`). A triagem de painel
+   perdeu a prioridade e entrou na mesma fila — era ela que, sendo um dos dois
+   únicos caminhos, transformava um painel qualquer na única imagem do job.
+3. **Print no fim, na frente e sem marcações** (`_shot(para_usuario=True)` +
+   `_fechar_prints`). É a tela de onde saiu a resposta, e é a única que se sabe
+   relevante: se o teto só deixar passar uma, que seja essa. Sai limpa porque
+   os números desenhados são andaime do modelo de visão e, para quem lê o chat,
+   só sujam a foto. Vale nos **seis** finais, não só no `done` — é no fim ruim
+   (desistiu, acabaram os passos, parou para confirmar) que a foto de onde
+   parou vale mais.
+
+Duas consequências que não são óbvias:
+
+- **O print do fim não depende da visão estar ligada.** Quem lê aquele print é
+  uma pessoa, não o modelo — e job cego que entrega texto e nenhuma tela foi
+  exatamente o que `browser_local_vision_model` existe para não repetir. Para
+  distinguir "sem visão" de "o device não fotografa", entrou `_shot_broken`.
+- **`DriverResult.screenshot_captions`**: a primeira imagem é a do fim e diz
+  isso ("a tela quando terminei"); as outras são "no caminho". Sem legenda as
+  três chegavam com o mesmo rótulo e o usuário tinha que adivinhar qual era a
+  conclusão.
+
+Testes: `tests/browser_local/test_prints_da_entrega.py` (as três promessas + o
+fim ruim). `test_sem_visao_nao_tira_print_nem_manda_imagem` virou
+`test_sem_visao_o_modelo_fica_cego_mas_o_usuario_nao` — a promessa mudou de
+propósito.
+
+**O que este job mostrou e NÃO foi consertado** (fica registrado porque é o
+próximo gargalo, não um detalhe):
+
+- **162s, e a resposta estava pronta aos 50s.** O `note` com o Produto Exemplo é do
+  passo 9 (01:10:57). Os 112s seguintes foram conferir se havia outros: 8
+  rolagens a mais, um clique no "Rastrear pacote" do pedido errado e 3 olhadas.
+  Percorreu a mesma página três vezes (y: 0→2800→0→2400→1200→2000→0→1200).
+- **77% do tempo é LLM**: 25 decisões × 3,9s de média (pico 7,1s) = 98,7s, mais
+  25,7s de visão. O navegador em si custou 5,8s — as 14 rolagens somaram 2,9s.
+- **O `max_steps` do classificador é descartado.** Ele montou
+  `max_steps: 15` + `start_url`, e o modelo COGNITIVE reemitiu a tool com só
+  `task`/`title`/`visible` — o teto caiu no default 25
+  (`executor.py:813`). Com os 15 pedidos, o job teria parado em 01:11:35 (88s
+  em vez de 162s) com o Produto Exemplo já no caderno.
+
+---
+
+### 2026-09-30 — A mesma leitura cinco vezes (job `6633351e`)
+
+Mesmo pedido de sempre ("tenho algum produto pra chegar?"). A resposta certa
+entrou no caderno **no passo 2, aos 5 segundos**. O job morreu no teto de 25
+passos, **115s** depois, com estado `failed` — e o que chegou ao usuário trazia
+**cinco cópias do menu de atalhos de teclado da Amazon**.
+
+Repetições literais em 29 decisões: `scroll {"delta": 700}` ×6, `extract {}` ×5,
+`wait_for {"text":"Pedidos"}` ×2, `press Escape` ×2. Duas recusas dispararam, e
+nenhuma pegou a que custou o job.
+
+**O motor era o `extract`, e o defeito é um que este plano já corrigiu uma vez.**
+`extract` sem `ref` mirava `document.body`, que sai em ordem de DOCUMENTO — os
+1500 caracteres viravam os skip-links e o painel de atalhos, em qualquer página
+da Amazon. É literalmente o lixo que o comentário de `principal` no `js_snapshot`
+cita pelo nome desde o job 9968e68a: *"o vencedor foi um `<nav>` de skip-links
+('Ir para / Conteúdo principal / Atalhos do teclado')"*. O snapshot ganhou o
+conteúdo principal; o `extract` ficou para trás.
+
+Daí o ciclo se fechava sozinho:
+
+1. o texto tinha >200 chars → **ia sozinho para o caderno** (auto-caderno);
+2. o modelo não achava o que queria e tentava de novo;
+3. a trava de releitura (`_reads_on_screen`) é chaveada pela **TELA**, e entre um
+   `extract` e outro houve clique e rolagem → tela nova, trava limpa;
+4. cinco vezes, e o caderno (que é o que vai para o usuário) virou lixo.
+
+**Conserto em três camadas, uma por ponta:**
+
+- **O snapshot PUBLICA o que escolheu** (`NEO.principal = principal ? principal.el
+  : null`, uma linha) e o `js_extract` sem `ref` lê dali. Não é reimplementação:
+  é a MESMA escolha que acabou de ir no prompt. Reimplementar criaria uma segunda
+  verdade — o erro que a extensão já cometeu uma vez (`neo-map.generated.js`), e
+  aqui seria pior, porque o modelo leria uma região e veria outra descrita.
+  `isConnected` cobre a página ter trocado desde o snapshot; sem ela, cai no
+  corpo, que ainda é melhor que um elemento morto.
+- **`js_extract` devolve `label`** e o driver prefixa o resultado com
+  `(li de «...»)`. Sem isso, leitura certa e leitura errada chegam idênticas ao
+  modelo — era o que o deixava repetir sem ter como perceber.
+- **Trava por LEITURA, não por tela** (`_leituras` / `_leituras_repetidas`): texto
+  que já voltou é dito ("MESMO TEXTO que você já leu antes"), **não é anotado de
+  novo**, e a terceira tentativa com a mesma assinatura é recusada com a saída
+  junto. A trava velha (`_reads_on_screen`) fica: ela pega o caso barato, antes
+  de gastar a ida ao device.
+
+O auto-caderno continua valendo para leitura NOVA — ele existe porque leitura
+substancial que morre no histórico é tarefa perdida (job 6785cf70). O que mudou é
+que o critério era só o TAMANHO.
+
+**Medido no laboratório, não no job.** `scripts/snapshot-lab` extrai o JS do `.rs`
+e roda num Chromium de verdade — foi lá que o defeito e o conserto foram provados,
+em `amazon.com.br/s?k=teclado`:
+
+```
+antes:  EXTRACT sem ref → "Ir para ⏎ Conteúdo principal ⏎ Atalhos do teclado ⏎ …"
+depois: EXTRACT sem ref → label: 'Filtros'  ·  mesma região do snapshot.main: SIM
+```
+
+As duas fixtures (`questionario.html`, `questionario-com-modal.html`) seguem
+passando iguais, `cargo test` 85/85, e o `neo-map.generated.js` foi regerado.
+
+**Deploy:** a parte do Rust **só vale depois de reiniciar o `tauri dev`**; sem
+isso o `extract` continua no `document.body` (e a trava nova do core apenas o
+barra mais cedo). O `neo-map.generated.js` regerado só afeta o inspetor da
+extensão — precisa de reload em `edge://extensions` para o inspetor voltar a
+enxergar igual ao driver.
+
+**Não foi feito, de propósito:** usar VISÃO para escolher onde o `extract` mira.
+A imagem não faltava — o modelo já tem `look` para pergunta visual, e o alvo
+agora é determinístico (a região que ele acabou de ver descrita). Pagar uma
+chamada de visão em toda leitura para adivinhar o que o snapshot já sabe seria
+trocar um bug por um custo.
+
+**O que continua de pé:** 6 `scroll {"delta": 700}` idênticos. A guarda de
+repetição só recusa ação que não mudou a tela, e rolar muda — então rolar em
+círculos é "progresso" pela regra atual. E o teto de passos segue sendo o que
+termina o job em `failed` com a resposta certa já no caderno desde o passo 2:
+falta um sinal de "já tenho o que foi pedido, pare de conferir".
+
+---
+
+### 2026-09-30 — O orçamento deixou de ser um número e virou uma régua
+
+O teto fixo de 25 passos tratava igual duas coisas opostas, e errou dos dois
+lados nos dois traces que existem:
+
+* **`6633351e`** anotou a resposta na 2ª decisão e gastou **23 passos e 110s**
+  depois dela, terminando `failed` no teto — com a resposta certa no caderno;
+* **`78d998ee`** chegou ao `done` no passo 20 de 25. Terminou certo, mas quase
+  não coube: uma coleta de vinte itens (um clique e uma anotação cada) não cabe.
+
+**A régua é o CADERNO, não o movimento.** Ele é literalmente o que o job tem
+para entregar. Rolar oito vezes para percorrer uma lista longa é trabalho
+legítimo — o `78d998ee` fez exatamente isso e terminou certo. Voltar e revoltar
+sem nada entrar no caderno é giro. Um contador de "passos sem novidade na tela"
+não separa os dois: **rolar fabrica tela nova**, e foi por isso que a primeira
+versão desta régua cortava o job que tinha dado certo no passo 14.
+
+Três peças:
+
+- **`_sem_ganho`** — passos de atuação desde a última vez que o caderno cresceu.
+  Vale ZERO enquanto o caderno está vazio: antes de existir algo para entregar,
+  procurar É o trabalho, e cortar aí seria cortar a tarefa.
+- **`_teto_de_passos()`** — o orçamento é elástico **para cima e só por
+  produção**: cada crescimento do caderno devolve um passo, até o dobro do
+  orçamento base, que continua sendo o limite duro (é o navegador dele, e ele
+  está olhando).
+- **`_motivo_para_parar()`** — encerra por falta de retorno, no topo da rodada,
+  **antes de gastar a decisão**: parar cedo custa um snapshot, não mais uma
+  chamada ao modelo. Dois desfechos, dois motivos escritos para o usuário:
+  *"12 passos seguidos sem acrescentar nada ao que eu já tinha"* e *"voltei à
+  mesma tela N vezes e não consegui nada para te entregar"*. O segundo só vale
+  com o caderno VAZIO — revisitar uma tela com coisa anotada é navegação normal
+  (abrir um detalhe e voltar).
+
+**A cutucada é o mecanismo; a parada é a rede.** Quatro passos antes de o limite
+bater, o prompt ganha: *"se você JÁ TEM o que a tarefa pediu, responda `done`
+agora — conferir de novo não melhora o que você vai entregar"*, com a contagem
+regressiva. Nos dois traces reais o aviso cai com folga para o modelo fechar
+sozinho, que é sempre melhor que ser cortado.
+
+**Os limiares foram MEDIDOS, não escolhidos.** `_SEM_GANHO_MAX = 12` é o número
+que faz os dois traces acabarem certo; com 10 o job bom é amputado dois passos
+antes de fechar sozinho. Replay das duas sequências reais de decisões contra o
+driver:
+
+```
+6633351e (girou)       13 passos (real: 27)  failed  → "Parei: 12 passos seguidos sem…"
+78d998ee (deu certo)   17 passos (real: 20)  completed → "achei o que você pediu"
+```
+
+Ou seja: **metade do desperdício, zero do trabalho.** Os dois roteiros estão
+fixados em `tests/browser_local/test_orcamento_por_producao.py` — mudar o
+limiar tem que passar por eles.
+
+**A contabilidade fica num lugar só** (`_contabilizar_producao`, no topo da
+rodada, medindo o diff de `len(self.notes)`). É o que faz valer para as TRÊS
+fontes de nota — o `note` do modelo, o auto-caderno do `extract` e a transcrição
+de painel — sem espalhar contabilidade por elas.
+
+`browser_local_max_steps` passou a ser o orçamento BASE; a descrição no
+`shared/config.py` e o cabeçalho do diário dizem isso.
+
+**O que isto NÃO resolve:** as 6 rolagens idênticas seguem passando, porque
+rolar muda a tela e a guarda de repetição só recusa ação que não mudou nada. A
+diferença é que agora elas custam caro — cada uma é um passo sem ganho, e doze
+delas encerram o job.
+
+---
+
+### 2026-10-01 — Três jobs mortos em 73s, nenhum por burrice do modelo
+
+Sessão `277a4afd`: o usuário pediu a mesma coisa **quatro vezes** e recebeu
+quatro "já mandei, te aviso quando terminar". Nenhum job respondeu. Os três
+morreram em guardas NOSSAS que não deixavam saída.
+
+**`7fd73dca` (11s)** — a Amazon redirecionou `/gp/css/order-history` para o
+signin. **Não existia tratamento nenhum para "caí numa tela de login"**: o
+modelo tentou `fill «pks:email»`, falhou, e repetiu a MESMA ação três vezes até
+a regra das quatro recusas matar o job. A recusa que ele recebia ("escolha outro
+elemento, dblclick, rolar, navegar direto") não resolve nada quando o que falta
+é a credencial.
+
+**`14578a69` (54s)** — o pior, e a cadeia é toda nossa:
+
+1. o carrinho «Subtotal» abriu sozinho na página de detalhes do pedido;
+2. foi para a triagem visual e **a visão respondeu VAZIO** (7,8s, nada);
+3. a triagem caiu no default `conteudo` ("o erro que custa caro é fechar a
+   resposta");
+4. e o prompt então DECLAROU: *"O PAINEL «Subtotal» ABRIU E É CONTEÚDO… NÃO
+   feche, NÃO aperte Escape… a resposta está AQUI DENTRO"*. **O driver disse ao
+   modelo que o carrinho de compras era a resposta e proibiu fechá-lo.** O
+   `extract` passou a ler o carrinho (`(li de «Subtotal»): Subtotal R$ 75,77…`);
+5. e aí as duas recusas de leitura **apontaram uma para a outra**: a do `look`
+   mandava usar `extract`, a do `extract` mandava ler o snapshot ou "escolher
+   outro caminho". `extract → look → extract → look → extract`, quatro recusas,
+   job morto — com a página certa aberta na tela.
+
+**`23cde731` (8s)** — abriu **aba nova** apesar de a tarefa dizer "na aba que já
+está aberta"; sem a aba, o modelo chutou `amazon.com` (EUA) em vez de `.com.br`,
+caiu no signin, emitiu `done` sem `answer` e morreu num `Debugger unattached`.
+
+#### Os quatro consertos
+
+**1. O print apagava a sessão de aba (regressão).** `_gravar_sessao` grava o
+`browser_session`; o bloco dos prints montava o `extra_metadata` dele a partir
+da cópia **em memória** do job, de antes dessa gravação, e sobrescrevia. Medido
+nos 16 `browser_local` mais recentes: **todo** job com `images` tem
+`browser_session` nulo; todo job com `browser_session` não tem `images`. O bug é
+antigo — mas era intermitente, porque só jobs que por acaso tiravam print
+perdiam a continuidade. **Virou 100% quando o print do fim passou a existir
+sempre** (2026-09-30). Agora `_gravar_sessao` devolve o metadata vivo e quem
+escreve depois parte dele.
+
+**2. As recusas de leitura paravam de se apontar** (`_recusa_de_leitura`). A
+partir da SEGUNDA recusa de leitura na mesma tela, a mensagem deixa de sugerir
+outro jeito de ler e manda AGIR, nomeando alvos pelo número
+(`_saidas_da_tela`) — e oferecendo encerrar com `done` e o que já se tem. É a
+lição de 2026-08-29 em forma nova: lá as recusas não ofereciam saída; aqui cada
+uma oferecia, e a saída de uma era a outra.
+
+**3. Triagem que falhou parou de declarar o painel como resposta.** O default
+cauteloso (`conteudo`) continua certo para tudo que vem depois — fechar a
+resposta é o erro caro. O que estava errado era o TEXTO: com `fonte` em
+(`default`, `erro`) o render agora diz *"ABRIU e eu NÃO consegui classificar…
+se for estorvo, pode fechar e seguir"*. **A própria guarda de fechamento já
+discordava do texto antigo** — ela só recusa com `fonte` de evidência
+(`causa`/`visao`/`dom`), ou seja, fechar sempre foi permitido ali; só o prompt
+dizia o contrário. Resposta vazia virou um caso distinto no diário: não é "olhei
+e não entendi", é "a triagem não aconteceu" — 16 vezes nos últimos 20 MB de log.
+
+**4. Parede de login** (`_PAREDE_DE_LOGIN`): uma rodada numa tela de login é
+acidente de redirect e o modelo ainda pode sair sozinho; a segunda, com o
+caderno vazio, encerra com *"a página pediu LOGIN e eu não tenho como entrar na
+sua conta"*. Antes disso o prompt já avisa, com a saída (`done` honesto). O
+casamento é por SEGMENTO do caminho, não por pedaço de palavra: sem a borda,
+`/help/login-faq` virava parede — e falso positivo aqui encerra tarefa legítima.
+Dez URLs reais sob teste.
+
+Testes: `tests/browser_local/test_saidas_sem_saida.py` (4) e dois novos em
+`test_sessao_de_aba.py`. 3341 no total.
+
+#### Achado que NÃO foi consertado, e por quê
+
+**`self._last_seen_url` nunca é atribuído depois do `__init__`.** É a URL que
+escopa a substituição de `«pks:campo»` no `fill` (release-request §7.2) — com
+ela sempre vazia, **toda** substituição falha com *"não sei em que página estou
+— não substituo dado sem domínio"*. O preenchimento escopado está morto neste
+driver desde que existe, e foi nessa mensagem que o job `7fd73dca` bateu quatro
+vezes.
+
+Consertar é uma linha. Não fiz porque o efeito não é "voltar a funcionar": é
+**passar a injetar dado pessoal dele em formulário de site**, quando houver
+liberação aprovada para o domínio. A autorização por domínio continua valendo e
+é ela que decide — mas ligar isso é decisão dele, não minha.
+
+### 2026-10-30 — O conteúdo principal era o menu do site (job `29c739d4`)
+
+Pedido: *"usando o meu navegador local, veja se tem alguma compra para chegar na
+Amazon"*. Resposta certa: **nenhuma** — os 5 pedidos dos últimos 3 meses estavam
+todos entregues. O job gastou 20 ações em 75,6s, terminou `failed`, e a mensagem
+que chegou ao usuário trazia, como *"o que consegui coletar"*, o menu de atalhos
+de teclado da Amazon.
+
+As 20 ações: `1 navigate · 5 extract · 6 scroll · 1 press Home · 3 click · 4
+look` — **4 recusadas** pelos freios antes de tocar na página. A visão respondeu
+a tarefa duas vezes (*"todos os pedidos estão Entregue, nenhum A caminho"*) e as
+duas foram descartadas.
+
+#### A medição
+
+O texto da página tem **13.249 caracteres** e o primeiro pedido começa no
+caractere **3.263**. As duas janelas de texto do snapshot — `main[0:2200]` e
+`corpo[0:1500]` — começavam **as duas no caractere 0 da MESMA string**: 3.700
+caracteres de orçamento rendendo ~2.400 únicos, e **zero** úteis, porque o
+prefixo comum era a moldura inteira do site. O corte efetivo caiu 659 caracteres
+antes do primeiro pedido.
+
+A eleição do conteúdo principal escolheu o wrapper da página (rótulo `"Ir para"`,
+os skip-links) em **10 dos 15 snapshots**. A página de pedidos não tem `<main>`
+nem `role="main"` — zero ocorrências — então o caminho rápido não achava nada e
+o fallback decidia tudo, com o critério `t.length > principal.texto.length`:
+*o maior texto ganha*. Como `closest(CHROME)` só rejeita quem **está dentro** da
+moldura, nunca um `<div>` que a **embrulha**, esse critério converge sempre para a
+raiz. O defeito já estava escrito no comentário do próprio `js_snapshot` desde
+2026-09-05 — *"na Amazon o vencedor foi um `<nav>` de skip-links"* — anotado ao
+consertar o modal, e o picker nunca foi mexido.
+
+#### Cinco camadas, cada uma suficiente para salvar o job
+
+1. **Eleição por texto LÍQUIDO** (`js_snapshot`, Rust). A pontuação desconta o
+   texto das subárvores de moldura, e o desempate — dentro de 10%, que é o caso
+   NORMAL, porque o container da lista e o wrapper que o embrulha têm quase o
+   mesmo conteúdo — é pelo bloco **mais profundo**. `textContent` no desconto, e
+   não `innerText`: innerText força layout e esta varredura não pode virar
+   O(página); como é desconto, superestimar penaliza o wrapper, que é o lado
+   seguro do erro. Estar dentro de um `<aside>`/`[role=search]` também
+   desqualifica da ELEIÇÃO — o que não é o mesmo que carimbar `item.chrome`, que
+   esconde, e foi assim que o painel do Drive virou invisível no job `9025d9f8`.
+   Medido na captura real: a moldura soma 2.384 caracteres, e descontá-la move o
+   primeiro pedido do caractere 3.263 para o **879**.
+2. **Último recurso para página sem elemento interativo no conteúdo.** O
+   fallback subia a partir dos CANDIDATOS, que são elementos interativos — um
+   artigo puro, uma fatura, um texto legal nunca era considerado e caía no mesmo
+   desfecho. Descoberto pela fixture `com-aside.html`, não pelo job.
+3. **As duas janelas pararam de se sobrepor** (`js_snapshot` + `_render`). Os
+   literais 2200/1500 viraram derivados de `text_chars` — que o core já mandava e
+   que era **ignorado** sempre que havia principal eleito, então não existia
+   alavanca nenhuma. E o piso de 200 caracteres da deduplicação saiu: o que ele
+   fazia na prática era RESTAURAR o duplicado, porque o corpo chegava pré-cortado
+   em 1500 e o que sobrava era subconjunto do principal. Com principal eleito o
+   corpo é fallback e ganha teto curto (`_CORPO_COM_MAIN`).
+4. **As duas mensagens que mentiam** (`_render`, `_onde_esta_o_texto`). A recusa
+   de releitura afirmava, SEMPRE, que *"o conteúdo dos painéis já vem inteiro no
+   snapshot (inclusive a parte abaixo da dobra)"*. Não havia painel nenhum e o
+   texto estava cortado: cada vez que o modelo concluía, **corretamente**, que o
+   dado não estava no texto, a recusa respondia com autoridade que estava — cinco
+   vezes. E o aviso de corte mandava **rolar**, quando o texto sai em ordem de
+   documento e rolar não muda o prefixo; o modelo obedeceu sete vezes (6 `scroll`
+   e um `Home`). Conselho errado, repetido com autoridade, é o que fabrica giro.
+   Agora a recusa só afirma o que o snapshot daquele passo sustenta, e tem um
+   quarto regime: **device antigo**. O core sobe sozinho e o Rust só depois do
+   restart — sem a chave `text_cut`, "não houve corte" é *desconhecido*, não
+   *ausência de corte*.
+5. **A visão vai para o caderno** (`_anotar_visao`). O auto-caderno nasceu para o
+   `extract` (job `6785cf70`) e nunca cobriu o `look`. Piso baixo de propósito —
+   resposta de visão é resposta a uma PERGUNTA, e a deste job tinha ~150
+   caracteres, que o piso de 200 do `extract` descartaria. Duas sutilezas que a
+   suíte pegou: *"não consegui ver"* **não é observação** (os quatro caminhos de
+   falha da visão viraram a constante `_VISAO_SEM_RESPOSTA`), e nota de visão
+   **não devolve passo ao orçamento** — olhar não muda a página, e o freio de
+   giro existe para detectar exatamente "nada está mudando", então deixar `look`
+   render passo transformaria o freio em acelerador (o replay do job `6633351e`
+   virou `completed` até isso ser corrigido).
+
+Em `extract`: a leitura passa a dizer quando saiu da **moldura** — o rótulo
+sozinho não bastava, o modelo recebeu três vezes 1500 caracteres de menu
+rotulados `"Ir para"` sem como distinguir leitura certa de errada — e moldura
+**não entra no caderno nem na primeira vez**. A deduplicação já impedia as cópias
+2 a 5 (job `6633351e`), mas a primeira passava, e neste job ela era a *única*
+nota: foi exatamente ela que o usuário recebeu.
+
+#### O efeito, medido na mesma página
+
+| | antes | depois |
+|---|---|---|
+| bloco eleito | `"Ir para"` (skip-links) | `"Sua conta › Seus pedidos"` |
+| moldura no bloco eleito | 100% | **0** linhas |
+| status de entrega no prompt | 0, em 15 snapshots | **8**, no primeiro |
+| nº de pedido e data | nenhum | 4 dos 5 pedidos |
+| "Texto da página" | 2.500 chars de menu | 1.385 chars (o que sobrou) |
+
+A tarefa passou a ser respondível em **um** passo.
+
+#### Testes
+
+`tests/browser_local/test_moldura_e_visao.py` (15), uma por camada, mais o
+`--check` do `neo-map.generated.js` — que existia desde sempre e não tinha onde
+rodar, porque não há CI neste repositório; mexer na eleição sem regerar o mapa é
+o erro que passa desapercebido. 3470 no total, suíte inteira verde.
+
+A camada 1 é do device e `cargo test` não alcança string JS: ela é provada em
+`neo-desktop-tauri/scripts/snapshot-lab/conteudo-principal.py`, que roda um
+**corpus** de cinco formas de página num Chromium headless — a captura real da
+Amazon entre elas, como uma amostra. Afinar contra uma página só é como se chega
+num atalho por site disfarçado de heurística.
+
+#### Deploy
+
+As camadas 3(core), 4 e 5 são Python: Mutagen + `--reload`, já no ar. As camadas
+1, 2, 3(device) e o `moldura` do `extract` são Rust — **exigem reiniciar o
+`tauri dev`** (nunca `tauri build`) e, depois, `python3
+neo-browser-local/scripts/gerar-mapa.py` com recarga **manual** da extensão.
+
+### 2026-10-30 (2) — O passo final morreu transcrevendo o que já tinha (job `5ab98119`)
+
+Primeiro job depois do conserto da eleição, e ele **deu certo**: 4 pendrives com
+preço real, parcelamento, frete, vendedor, nota e URL, todos anotados. O caderno
+foi entregue ao usuário (`_com_caderno`) e as duas respostas de visão viraram
+nota — as camadas 5 e 6 da entrada anterior funcionando. O device novo estava no
+ar: o marcador `"este bloco CONTINUA"` aparece 3 vezes neste diário e 0 no do
+job `29c739d4`.
+
+Mas o job terminou `failed`, 20 passos, 144,1s. **O modelo decidiu `done` quatro
+vezes, com a resposta completa escrita, e o JSON foi cortado no meio da string
+nas quatro.** `max_tokens` da decisão era 700 — dimensionado para "pensamento +
+ação + argumentos curtos" — e o `done` carrega **o resultado inteiro** dentro do
+campo `answer`: ~1.650 caracteres, da ordem de 600 tokens, mais o pensamento e o
+andaime do JSON. Morreu na regra das quatro recusas com tudo já no caderno.
+
+**O sinal do defeito estava invertido: quanto MELHOR a tarefa tinha ido, mais
+certo era o passo final falhar.** Uma tarefa de 1 item nunca bate no teto; uma de
+5, sempre.
+
+E a recusa não era acionável: *"não entendi a resposta do modelo: Unterminated
+string starting at: line 1 column 245 (char 244)"* — mensagem de parser de
+Python. O modelo reemitiu a MESMA resposta longa quatro vezes. É a mesma classe
+da recusa que mentia no job `29c739d4`: freio que não nomeia a saída vira giro.
+
+- `_DECISAO_MAX_TOKENS = 2000` (teto é limite, não gasto: só custa no passo que
+  de fato escreve muito).
+- Corte passou a ser um caso PRÓPRIO: resposta completa e inválida termina em
+  `}`, resposta cortada termina no meio. A mensagem diz que reenviar vai cortar
+  igual, e aponta o caderno — que já viaja em todo passo e já é a resposta.
+- A linha do `done` no prompt passou a dizer que o `answer` é curto e que
+  recopiar os itens anotados é o que estoura o teto. A regra do caderno já
+  existia ("`done` só precisa fechar o que já está anotado") e não bastou: sem
+  consequência visível, instrução de prompt não se sustenta.
+
+#### Dois defeitos da ELEIÇÃO que este job expôs
+
+Medidos na página ao vivo pelo `snapshot-lab`, não deduzidos do diário.
+
+**1. `role="dialog"` não é promessa de sobreposição.** A barra de filtros da
+busca da Amazon é um `<div role="dialog">` de **262×7957px, em fluxo**, à
+esquerda dos resultados — passa por `visivel` e está de fato na tela. A regra
+"modal aberto É o conteúdo" a elegia por cima do `#search`, que pontuava **18.711
+caracteres líquidos contra os 1.305 dela**. Em 4 snapshots o modelo leu marcas e
+faixas de preço como se fossem a lista de resultados. Agora o modal precisa
+SOBREPOR: `aria-modal="true"`, ou `position: fixed` em até 5 ancestrais (o
+desenho comum é fundo `fixed` com a caixa `absolute` dentro). Fixture nova
+`com-modal-aria.html` protege o modal legítimo, que é por causa de quem a regra
+existe.
+
+**2. `NEO.visible` não tem teste horizontal nenhum.** O carrinho lateral
+(`#nav-flyout-ewc`, `role=dialog`) vive no DOM em **`left: 1819` numa janela de
+1600px** — fora da tela — e sequestrou o conteúdo principal em **10 dos 17
+snapshots**, inclusive nos passos em que a visão respondeu *"não há painel
+lateral aberto"*. O modelo gastou um `look` de 11s procurando o X de um painel
+que não existia, e o 4º produto teve de sair por visão porque o bloco de
+conteúdo era um resumo de carrinho. A generosidade do `visivel` (até 2000px
+abaixo da dobra, sem limite lateral) é deliberada — elemento fora da dobra ainda
+precisa virar `ref` — então o teste de interseção entrou **só no ramo do modal**,
+onde "está aberto" é a premissa.
+
+**3. O teto de 6 níveis da subida favorecia região RASA.** Numa grade de
+resultados o container fica ~10 níveis acima dos links dos produtos, fora de
+alcance; o container de uma barra de filtros, raso, entrava. O teto existia
+porque, com a pontuação por `t.length`, subir mais sempre ganhava. Com o desconto
+de moldura a raiz pontua ZERO e se autoexclui (`#a-page` na busca: 21.426
+caracteres de `innerText` contra 48.893 de moldura por `textContent`, que inclui
+menu escondido) — então o teto virou só o obstáculo. Saiu; o limite de custo
+continua sendo o `olhados`, agora checado também dentro da subida.
+
+#### O efeito
+
+Na busca ao vivo, o bloco eleito passou de «Filtros» (1.305 caracteres de marcas
+e faixas de preço) para «Exibindo resultados para pen drive 64gb», com **41
+preços dentro do orçamento padrão de 3.000** — incluindo os R$ 65,76 e R$ 72,10
+que o job levou 144s e quatro visitas a páginas de produto para colher um por um.
+
+Testes: 3 novos em `test_moldura_e_visao.py` (18 no arquivo), 3474 no total;
+corpus da eleição em 6 casos.
+
+### 2026-10-30 (3) — A resposta final tinha DOIS donos
+
+Continuação direta do item anterior. Subir `_DECISAO_MAX_TOKENS` para 2.000
+resolvia a tarefa de 4 produtos e não resolveria a de 15: teto é remendo quando
+o problema é *quem escreve a resposta*.
+
+#### O que a varredura dos outros seis laços mostrou
+
+Em `deep_read`, `deep_research`, roteador, entrega de job, PKS e planejador, **a
+última chamada ao modelo não produz o resultado**. Três mecanismos, usados
+juntos:
+
+1. **acumular fora do turno** — o `deep_read` lê parte por parte, 3.000 tokens
+   cada, e nenhuma janela nunca vê o documento inteiro;
+2. **montar por código** — o relatório da pesquisa é concatenação (uma chamada
+   por seção); o `deep_read` escreve `notas/<doc>.md` e `sintese.md` no disco;
+3. **a última chamada só fecha**, e vê o material já cortado pelo código
+   (`[:4000]` por rascunho na síntese, `[:3500]` no redator da entrega).
+
+E quando estoura mesmo assim, quatro defesas — cada uma com o incidente de prod
+anotado no comentário: **salvar o que veio inteiro** (`_salvage_object_list`,
+`salvage_findings`, `_salvage_operations`), **retentar com mais espaço** (o
+roteador, que distingue corte de prosa pelo `finish_reason`), **ter resposta que
+não depende do modelo** (`return text or fallback`) e **degradar em vez de
+morrer** (consolidação que falha 2× ainda entrega as evidências conferidas).
+
+O navegador local era o único laço sem nenhuma das quatro — e o único em que o
+modelo recopiava o resultado.
+
+#### A contradição que matava o job
+
+O prompt dizia uma coisa: *"o caderno viaja em todo passo e é ELE que vira sua
+resposta no fim"*. A recusa do `_validate` dizia o contrário: *"o `answer` É a
+resposta que o usuário vai ler"*. Essa frase foi escrita em 2026-09-02, quando o
+problema era o oposto (o modelo emitia `done` vazio e não entregava nada).
+Consertou aquele incidente e plantou este — e o modelo acredita na recusa,
+porque é o que ele lê no momento em que está errando.
+
+Pior: a prosa do `answer` **é reescrita de qualquer jeito** uma camada acima.
+`browser_local` nasce com `notify_policy="chat"`, então o `result_summary` passa
+pelo `_compose` do dispatcher, que tem orçamento de prosa, `disable_thinking`, a
+persona e `_fallback_text` sem modelo atrás. O trabalho que matou o job era
+trabalho descartável.
+
+#### O conserto, em cinco camadas
+
+1. **`answer` só é obrigatório com o caderno VAZIO** (`_validate`). Uma
+   condicional resolve as duas falhas de sinal oposto: sem caderno e sem texto
+   não há o que entregar (02/09, recusa certa); com 4 produtos anotados, a
+   recusa matava um job que tinha dado certo (30/10).
+2. **O `done` é pescado de dentro do JSON cortado** (`_parse`). O `answer` é o
+   último campo e o único que cresce com a tarefa, então o corte cai nele e a
+   intenção de terminar chega inteira. O **fragmento é descartado**: meia frase
+   ("…- R$ 5") como linha de fecho entrega um preço truncado ao usuário. É o que
+   torna esta pescaria mais segura que as outras três da casa — nada do conteúdo
+   vem do texto salvo. Só o `done` é pescado: um `click` cortado pode ter
+   perdido o `ref`.
+3. **A frase que ensinava o errado saiu.** A recusa do quadrante vazio diz o que
+   fazer (`note` primeiro, ou `extract`, ou `give_up`) sem dizer que o `answer`
+   é a resposta.
+4. **Tamanho em número, não em adjetivo**: `_ANSWER_MAX_CHARS = 300`, no prompt.
+   Mesma ideia do `_words_for` da pesquisa — o alvo tem de caber folgado no teto.
+   Estourar o dobro só deixa marca no diário (`"answer longo"`), que é a medida
+   de se o pedido está pegando.
+5. **`finish_reason == "length"`** (`_foi_cortado`) no lugar de adivinhar pela
+   cauda ("termina com `}`?"), que erra nos dois sentidos. Ausência é "não sei",
+   nunca "não foi cortado" — mesmo princípio do `text_cut` do device antigo.
+
+De lambuja: `_com_caderno` passou a receber o `status`. Com o `done` fechando em
+uma linha, colar o caderno virou o caminho **normal do sucesso**, e o rótulo
+"O que eu TINHA coletado até parar" mentiria sobre o desfecho.
+
+Testes: 10 novos em `test_moldura_e_visao.py`, 3484 no total.
+
+### 2026-10-30 (4) — A entrega em duas metades (o `[:3500]` do `_compose`)
+
+O mesmo defeito uma camada acima, e a medição mudou o diagnóstico. Em 227 jobs
+de prod, o corte em 3.500 disparou **uma vez**; 27 jobs passaram do `[:1200]` do
+fallback. **O problema nunca foi o corte — era a compressão:** o `_compose` lia
+até 3.500 caracteres e escrevia no máximo ~1.470 (700 tokens de prosa em pt-BR),
+então todo resultado entre os dois números era reescrito por um modelo sem
+registro do que caiu. Para lista de fatos — preço, nome de arquivo, caminho,
+uuid de retomada — parafrasear é a operação errada.
+
+Pior que o óbvio: o `continue_job="<uuid>"` que permite retomar uma tarefa
+pausada **só chega ao cérebro pela mensagem entregue**, e até aqui chegava lá
+depois de passar pelo redator.
+
+#### O princípio já era da casa, duas vezes no mesmo arquivo
+
+O `texto_literal` da agenda entrega sem passar pelo redator, e o
+`_append_images` pendura as imagens **depois** dele — *"um LLM redigindo no seu
+tom de sempre reescreve, resume ou come um token estranho no meio do texto"*.
+**O que tem de chegar íntegro passa por fora do redator.** As imagens já
+passavam; os fatos não. Isto é a mesma regra em grão mais fino: **o modelo
+escreve, o código entrega.**
+
+#### O desenho
+
+`extra_metadata["entrega"] = {"fecho": str, "itens": [str]}` — coluna `JSON` que
+já existe, **zero migração**. O `DriverResult` ganhou `fecho` (o `summary` antes
+de o `_com_caderno` colar), e o runner declara, pedaço por pedaço, o que é prosa
+e o que é fato:
+
+| | |
+|---|---|
+| **fecho** (redigível) | linha do `done`, aviso do `_honest`, aba onde parou, "📸 N prints em anexo", "⏸ Parei e preciso da sua autorização" |
+| **itens** (íntegro) | o caderno, a instrução de retomada com o uuid, os nomes dos arquivos baixados, o que ainda está vindo, o caminho do diário |
+
+No dispatcher: `_compose` vê **só o fecho** mais a contagem de linhas do bloco —
+não pode reescrever o que nunca recebeu. `_com_itens` cola o bloco por fora,
+agrupando achados (em lista) e rodapés (com glifo) em parágrafos separados. A
+ordem do `dispatch` é a regra em código: `_compose` → `_com_itens` →
+`_append_images`, as duas últimas por fora do modelo.
+
+O `result_summary` **não mudou** — é contrato com o cérebro e com o caderno do
+servidor. O raio de alcance é só o caminho da entrega.
+
+#### Os três cortes deixaram de ser mudos
+
+`_COMPOSE_ENTRADA_MAX` (3500), `_FALLBACK_ENTRADA_MAX` (1200) e
+`_COMPOSE_SAIDA_ALERTA` (1400) agora logam quando disparam. O terceiro é o que
+importa: prosa redigida perto do teto quer dizer que o redator está
+**transportando** conteúdo, e é a medida que diz qual `kind` ainda precisa
+declarar `entrega`. Era a medição que faltava — e nenhum dos três registrava
+nada.
+
+No caminho do fallback o corte deixou de existir em vez de ser afrouxado: com
+`entrega` declarada, cabeça fixa + fecho inteiro, e os itens colados uma vez só
+pelo `_com_itens` (nos dois caminhos, para não duplicar).
+
+Testes: 8 novos (7 em `tests/test_jobs.py`, 1 no driver), 3492 no total. Guarda
+de regressão explícita para os 8 outros `kind`, que seguem no caminho de hoje
+até declararem `entrega`.
+
+---
+
+### 2026-10-30 (5) — A faixa virou painel: a linha do tempo do que está acontecendo
+
+A faixa no topo da aba tinha **uma linha**, e cada passo apagava o anterior
+(`js_banner` → `window.postMessage({__neo_overlay:{text}})` → o content script
+trocava o `textContent`). Duas consequências:
+
+1. **o histórico não existia na tela.** Quem estava olhando a própria aba mexer
+   sozinha via o presente e nada mais. "O que ele fez até agora?" só tinha
+   resposta no diário do job, depois;
+2. **o que o agente PRODUZIU não tinha onde caber.** A leitura do `extract`, a
+   resposta da olhada com visão, o rótulo do que foi clicado de verdade, o
+   motivo da falha — tudo isso já era calculado e virava `detail` do `Step`,
+   mas a faixa só recebia `thought[:90]`. O retorno do passo nunca chegava aos
+   olhos do usuário.
+
+Agora cada evento **empilha** um item num painel na lateral direita, com tipo:
+`fase` (preparação), `passo` (o raciocínio como manchete, a ação concreta como
+legenda — `passo 3/14 · clicando em «Entrar»`), `ok` (a primeira linha do
+retorno como manchete, o resto como detalhe), `erro`, `parado`, `fim`.
+
+| camada | mudança |
+|---|---|
+| `driver.py` | `_banner(text, *, kind, detail)`; chamadas novas no retorno de cada passo (sucesso **e** falha), no `done`, no `give_up`, na recusa e na parada por improdutividade. `_acao_em_palavras()` traduz `click {'ref': 42}` para "clicando em «Entrar»" — e **nunca** o `value` do `fill`, mesma regra do `Step.render` |
+| `browser_local.rs` | `js_banner` ganhou `kind` e `detail`; `browser.banner` repassa os dois |
+| `content-overlay.js` | reescrito: painel lateral, lista rolável com teto de 60 itens, repetição vira contador, detalhe cortado em 3 linhas com clique para abrir, recolher para pastilha |
+| `background.js` | o estado por aba passou a carregar a lista inteira (com o mesmo teto, porque é o que vai para o `storage.session`) |
+
+**O que o painel não pode fazer, e como fica provado.** Ele é maior que a faixa,
+então os riscos cresceram junto:
+
+- **roubar clique / empurrar a página**: `position:fixed`, shadow fechado,
+  `pointer-events:none` fora do painel, e o host segue sendo o último filho do
+  `<html>` — a mesma lição de §"A faixa da extensão estava ocupando espaço na
+  página" (o `all:initial` continua declarado PRIMEIRO);
+- **aparecer no inventário**: o id (`neo-browser-local-overlay`) já é excluído
+  pelo snapshot e pelo `JS_RECTS`. Mudar o id faz o agente enxergar o próprio
+  painel como conteúdo;
+- **comer a foto**: uma faixa de 44px cabia no print; uma lateral de ~310px
+  come um quarto da largura útil e cobre conteúdo que o modelo de visão precisa
+  ler. `browser.screenshot` agora **esconde** o painel pelo id (`visibility`,
+  síncrono pelo mundo principal) antes do `Page.captureScreenshot` e devolve
+  depois — inclusive quando a captura falha.
+
+`scripts/testar-painel.py` (na extensão) roda os três num Chromium de verdade:
+mede a página antes e depois, compara os pixels das fotos com e sem o painel
+(a caixa de diferença tem que ficar na metade direita), e clica no PARE **por
+coordenada, achando o botão pelo vermelho** — o shadow é fechado, então o teste
+chega nele pelo mesmo caminho que o olho do usuário. Foi esse teste que pegou a
+primeira regressão: ao fazer o painel encolher para a altura do conteúdo, o
+PARE saiu do pé da janela.
+
+Do lado do core, `tests/browser_local/test_painel_linha_do_tempo.py` (4 testes):
+os quatro momentos são emitidos, a falha vai com o motivo, o detalhe respeita o
+teto de 1200 caracteres — e o que foi digitado num `fill` não aparece em evento
+nenhum. Este último não é higiene: o painel fica **na tela**, e portanto dentro
+de todo print que o agente tirar depois.
+
+---
+
+### 2026-10-30 (6) — A vistoria de tela entregue como se fosse achado (job `4a1e6748`)
+
+Busca por "monitor OLED 27 polegadas" na Amazon. Cinco olhadas: três
+perguntaram preço e acertaram; duas perguntaram se havia um painel de carrinho
+na frente. Essas duas foram as únicas notas ruins da entrega — e uma delas
+entregou isto ao usuário:
+
+> NÃO. Não há painel lateral de carrinho aberto. O botão X para fechá-lo não
+> está visível, pois o carrinho não está expandido. A página do produto (preço,
+> frete) está totalmente visível atrás — **preço R$ 43,90**, frete grátis, e
+> todos os detalhes técnicos estão legíveis. Nenhum overlay ou modal cobre o
+> conteúdo principal.
+
+**R$ 43,90 numa busca por monitores de R$ 3.199,90.** Ninguém perguntou preço
+ali: os olhos preencheram a frase. É a regra que faltava — *conteúdo que
+ninguém pediu é conteúdo que ninguém conferiu* — e o caderno é o que vai para o
+usuário (`_com_caderno` entrega mesmo quando o desfecho é `failed`).
+
+**O conserto está no CADERNO, não no `look`.** `_anotar_visao` passou a receber
+a PERGUNTA junto da resposta: se a pergunta é uma vistoria de obstrução, não
+vira nota — nem que a resposta venha cheia de números. O `look` continua indo
+para os olhos.
+
+**A primeira tentativa estava errada nas duas pontas, e o log provou.** Ela
+interceptava o `look` antes dos olhos e respondia pelo `_panels_now`:
+
+1. **não teria disparado.** `_e_vistoria_de_obstrucao` olhava a frase inteira,
+   via o "Onde está o botão X" da SEGUNDA cláusula e classificava como pergunta
+   aberta. As duas vistorias reais do job passavam direto — 0 de 5 nas
+   perguntas verdadeiras. Agora julga só a PRIMEIRA cláusula (é o que o modelo
+   quer saber; o resto é guarnição): 5 de 5;
+2. **se tivesse disparado, teria piorado.** A vistoria real vinha GRUDADA numa
+   pergunta de conteúdo ("…a página do produto (preço, frete) está visível
+   atrás?"). Responder pelo snapshot jogaria fora a metade que o modelo foi
+   buscar — e `_panels()` não é detector completo de obstrução (é por isso que
+   `_triage_panel` existe e usa visão): responder "não há painel" quando há
+   trava o job com uma mentira barata.
+
+Duas limpezas menores no mesmo caminho, pelo mesmo motivo (o caderno é texto
+para o USUÁRIO, não para o modelo):
+
+- `_sem_vistoria()` tira da resposta boa o veredito de brinde ("Nenhum overlay
+  ou modal cobre o conteúdo principal") e o "SIM."/"NÃO." solto da frente;
+- `_SEM_MARCACAO` tira `(elemento 124)` — o número da marcação do print é
+  contrato entre o driver e os olhos, e saía inteiro em três das cinco notas.
+
+E uma linha a mais na lista "NÃO use `look` para" do prompt: perguntar se tem
+painel cobrindo a página, que o snapshot já responde a cada passo.
+
+**Medido no job real** (as 5 notas, replayadas pelo caminho novo): 5 notas de
+visão → 3. Saíram `R$ 43,90`, `(elemento …)`, `overlay` e `painel lateral`;
+ficaram os três preços (R$ 3.199,90, R$ 3.899,00, R$ 4.100,00).
+
+`tests/browser_local/test_vistoria_de_obstrucao.py`: 10 testes com as perguntas
+e respostas do job palavra por palavra, incluindo a guarda da primeira
+tentativa (o "Onde" da segunda cláusula não pode salvar a vistoria) e as duas
+de regressão — "não há pedidos a caminho" (job 29c739d4, em que a visão ERA a
+resposta) e o painel que É o conteúdo pedido.
+
+---
+
+### 2026-10-31 — A guarda de painel virou a prisão (job `b22acf4b`)
+
+Tarefa: 3 a 5 anúncios de TV 55" na Amazon, com preço e frete. **Morreu no
+passo 9 de 40, em 68 segundos, com UMA nota no caderno**, dizendo "Travei:
+quatro tentativas seguidas foram recusadas antes de chegar na página".
+
+O que aconteceu, na ordem:
+
+1. o carrinho da Amazon («Subtotal») abriu — sozinho, com um protetor de surto
+   de R$ 54,90 dentro, nada a ver com TV;
+2. a triagem visual foi chamada e **voltou VAZIA**. O default conservador é
+   `tipo: conteudo` (o erro caro é fechar a resposta), com `fonte: erro` para
+   marcar que não houve evidência;
+3. o prompt, corretamente, disse ao modelo: *"Pode ser o resultado do que você
+   pediu, e pode ser estorvo (carrinho, promoção, cadastro). (…) **se for
+   estorvo, pode fechar e seguir**"*;
+4. o modelo mandou `Escape` — e a guarda de vaivém respondeu *"você já abriu e
+   fechou o painel «Subtotal» 2 vezes (…) **A informação está DENTRO dele**"*;
+5. quatro vezes. Teto de recusas seguidas. Fim da tarefa.
+
+**O prompt autorizava e a guarda proibia, sobre um painel que ninguém
+conseguiu classificar.** Guarda que contradiz o prompt não corrige o modelo —
+trava ele.
+
+Três consertos, todos no mesmo princípio que já estava escrito no arquivo e só
+valia para metade dos casos:
+
+| | antes | agora |
+|---|---|---|
+| **evidência** | a guarda de vaivém não olhava o veredito | só recusa com `fonte` em `causa`/`visao`/`dom`. Triagem que falhou (`erro`) ou nem rodou (`default`) não dá base para dizer "está DENTRO dele" |
+| **teto** | recusa ilimitada (vaivém sempre; conteúdo sempre, exceto `causa`) | **UMA recusa por painel**, contador compartilhado. Depois do aviso, a ação passa |
+| **memória** | `_panel_verdict` era limpo quando o painel sumia da tela | `_panel_dismissed` guarda o que o modelo já julgou estorvo e sobrevive ao fecha/abre |
+
+O teto é o ponto central: **depois do aviso a ação vira ação de verdade, e laço
+de ação tem detector** (`_note_change`, `_stuck`, a guarda de repetição). Laço
+de RECUSA não tem — a ação nunca roda, `_pending_signature` nunca é armado,
+nada sobe, e a única coisa que acontece é o teto de quatro que mata a tarefa
+inteira. Trocar uma prisão por um detector é estritamente melhor.
+
+A memória é a outra metade, e é o que o usuário pediu com todas as letras:
+*"apenas ignorasse nos próximos passos se já julgou irrelevante pelo passo
+anterior"*. Na Amazon o carrinho reabre a cada navegação; sem ela, cada
+reabertura recomeçava do zero — nova triagem (mais uma olhada paga), novo
+">>> pode ser o resultado do que você pediu", nova recusa. Agora o veredito
+vira `intruso` com `fonte: "modelo"` — que **não** está na lista de evidências
+que autoriza recusa, de propósito: ele só muda o que o prompt diz, nunca vira
+bloqueio.
+
+Quatro testes novos em `test_painel_triagem.py`, incluindo o job inteiro em
+miniatura (triagem que volta vazia + quatro `Escape`). Os quatro falham contra
+o código de ontem. A guarda central continua de pé: fechar o painel que É a
+resposta ainda é recusado — uma vez, com a saída junto.
+
+---
+
+### 2026-10-31 (2) — O modelo lia o DOM; o usuário lia a tela (job `45e85695`)
+
+Os dois consertos anteriores (a vistoria fora do caderno, a guarda com teto) tratavam
+sintoma. A pergunta do usuário foi a certa: *"veja se a forma como o neo lê a página
+não está cortando as partes relevantes, e por isso ele tenta fechar"*. Estava.
+
+Dois jobs na mesma tarde, no mesmo site, são o experimento natural:
+
+| | `2d416462` | `45e85695` |
+|---|---|---|
+| navegador | headless, 1280×819 | o real, ~1912px de largura |
+| carrinho | fora da tela (`left: 1819`) | visível, preso na borda |
+| painel do Neo | não existe no headless | por cima da página |
+| resultado | 12 itens em 100s | 3 itens em 196s, `failed` |
+
+**A causa, em quatro camadas que se reforçavam:**
+
+1. **O carrinho virou "conteúdo principal".** A regra era "`role=dialog` + `fixed`
+   visível na tela É o conteúdo". Nas janelas de menos de ~1830px o carrinho fica
+   fora da tela e o filtro `naTela` o barrava; numa janela larga ele entra. O print
+   é conclusivo: é uma faixa de 150px, com a página inteira visível ao lado, sem X,
+   que não fecha com nada. Nos 19 snapshots de página de produto em que ele foi
+   eleito, 15 não tinham o preço do produto e 4 só o traziam enterrado numa linha de
+   variação. Para quem recebia aquele prompt, fechar o painel era a decisão racional.
+2. **O painel que eu fiz fabricou o obstáculo.** `elementFromPoint` devolve o host do
+   overlay, um `div` fixo de shadow fechado, e todo elemento embaixo dele saía
+   `⟪COBERTO por "div"⟫`, cuja regra é "dispense o intruso primeiro". `COBERTO por
+   "div"`: 0 nos três jobs anteriores ao painel, 432 no primeiro depois, 540 neste.
+3. **A saída oferecida não existia.** O aviso de corte mandava "`extract` no `ref` do
+   bloco", mas texto puro não tem `ref`: o modelo chutou o 0 (um skip-link) e o 110
+   (uma imagem, que devolveu vazio).
+4. **A triagem nunca aconteceu.** `_look` manda `disable_thinking`, `_triage_vision`
+   não mandava: 10 de 10 triagens vazias em 10,1s, contra 0 de 15 olhadas em 4,2s. O
+   qwen raciocina por default e isso consumia a resposta. Cada vazia virava
+   ">>> ABRIU e eu NÃO consegui classificar… pode fechar e seguir".
+
+**O conserto de fundo foi mudar a pergunta.** Todos os remendos anteriores decidiam
+*qual pedaço do DOM vai na frente*, e bastava a eleição errar para o modelo ficar
+cego. `NEO.ler` pergunta **o que está na janela agora**: anda pelos nós de texto em
+ordem de documento e fica com o que está visível. Não depende de landmark, de
+framework nem de eleição, e rolar passa a trazer texto novo. Na mesma página do
+notebook: 1.385 caracteres em 11 ms, com preço, parcelas, frete, estoque, vendedor e
+nota. É a seção `>>> NA TELA AGORA`, a primeira do prompt.
+
+| camada | mudança |
+|---|---|
+| leitura | `tela` e `resto` no snapshot. `main` e o corpo passam a ser só "o que a tela ainda não mostrou", por continência, e o dump em ordem de documento some quando há `tela` |
+| painéis | `quadro()` classifica pela GEOMETRIA: `fora`, `fluxo`, `lateral`, `bloqueia`, `solto`. Só `bloqueia` toma o lugar do principal. `lateral` nem é painel: sem triagem, sem veredito, com seção própria dizendo para ignorar |
+| hit-test | `NEO.topo` pula os overlays do Neo e atravessa shadow DOM aberto. Usado nos 5 pontos que testavam a tela |
+| teto de elementos | coleta o triplo, o que está na janela primeiro, e o teto escolhe por relevância, com cota para a moldura. Antes cortava em ordem de documento: 0 de 6 botões visíveis na fixture saturada, agora 6 de 6 |
+| alcance | `extract {}` lê a página sem menus, `{"de": N}` continua, `{"busca": "termo"}` é o Ctrl+F e diz quando não tem. Nada mais fica atrás de um corte sem saída |
+| outros sites | shadow DOM aberto em elementos e texto; iframe do mesmo domínio é lido, o de outro domínio é declarado com o endereço |
+| velocidade | `anotar` na mesma resposta da ação (12 das 28 rodadas do `2d416462` eram só `note`); `assentar` espera a página no próprio device depois do clique (o snapshot saía com 59 elementos, todos de cabeçalho); a trava de olhada só solta depois de uma ação, porque página viva muda o fingerprint sozinha |
+| prompt | moldura numa linha, link repetido fora (1 em cada 4 linhas era o mesmo link), rastro de URL fora, histórico podado depois de 3 passos |
+| caderno | nota de 400 para 1000 caracteres: a URL pedida saía cortada em `…/dp/B0F` |
+
+**Medido na página real, com carrinho e painel do Neo injetados na geometria do job:**
+
+| | código de antes | agora |
+|---|---|---|
+| conteúdo principal | `Subtotal` | o bloco do produto |
+| parcelas e estoque do produto | ausentes | no topo do prompt |
+| "pode fechar e seguir" | sim | não |
+| `⟪COBERTO⟫` | 7 | 0 |
+| tamanho do prompt | 33.971 | 25.701 |
+
+**O que NÃO está provado.** A cena acima foi montada: a barra foi injetada para
+reproduzir a geometria do print, e a página é a de um visitante anônimo. Falta um job
+real na janela larga. Nele, procurar no diário por `BARRA LATERAL FIXA`: se ela não
+aparecer e voltar `>>> O PAINEL «Subtotal»`, a medida real da barra escapou dos
+limites de `quadro()`, e mesmo assim `NA TELA AGORA` continua trazendo o preço.
+
+**Cuidado que ficou para quem medir de novo:** procurar o preço por substring engana.
+Na primeira versão da tabela acima, "3.399" e "Entrega GRÁTIS" deram verdadeiro no
+código antigo: eram de outro notebook e de um mouse, nas recomendações.
+
+Provas: `snapshot-lab/leitura.py` (39 verificações em Chromium real, com o
+`content-overlay.js` de verdade), `tests/browser_local/test_leitura_da_tela.py` (24).
+
+---
+
+### 2026-10-31 (3) — 32 decisões atrás de uma foto que nenhuma ferramenta devolvia (job `aa4c89f8`)
+
+O conserto da leitura passou no teste de verdade: janela larga, carrinho na tela,
+`BARRA LATERAL FIXA` em 37 snapshots, zero `COBERTO`, nenhum Escape, nenhum `look`, e
+5 notas numa decisão só. Os 4 produtos estavam completos em 69s. Só que o job levou
+128s, e 32 das 39 decisões foram a mesma coisa: procurar a URL da foto.
+
+**Um pedido impossível.** A tarefa exigia "a URL da FOTO principal" (o cérebro precisa
+dela para mostrar a imagem no chat) e dizia para não inventar. Nenhuma ferramenta
+devolvia endereço de imagem: o snapshot não traz `src`, `extract` no `img` voltava
+vazio com `ok`, e `busca` lê texto. O modelo entendeu isso sozinho ("extract de texto
+não pega atributos") e, sem alternativa, continuou tentando.
+
+**Três coisas que eu introduzi na rodada anterior transformaram isso em giro:**
+
+1. a mensagem do `busca` terminava com "se não for assunto que aparece escrito com
+   outra palavra, não está aqui". Era um convite, e ele aceitou: 26 buscas, 15 termos;
+2. `anotar` não tinha nenhum filtro. O modelo passou a usar o caderno como rascunho
+   ("PRODUTO 4 foto: tentar extract 'AC_'") e a reescrever o mesmo produto ("completo",
+   "confirmado", "FINAL", "relido"): 35 notas para 5 produtos. Foi isso que você
+   recebeu no chat, e por isso teve de pedir "resume essa info";
+3. toda nota nova conta como produção e devolve um passo. O orçamento foi de 35 para
+   66 e o freio de improdutividade (12 rodadas sem ganho) nunca disparou: havia
+   "ganho" em quase toda rodada.
+
+**O conserto:**
+
+| | antes | agora |
+|---|---|---|
+| imagens | nenhum endereço em lugar nenhum | `>>> IMAGENS NA TELA` com as 8 maiores; `→ url` no elemento `img`; `extract` no `img` devolve o endereço |
+| `busca` | só texto | também endereço e nome de links e imagens: "não achei" passa a ser verdade |
+| busca vazia | convite a tentar outra palavra | "registre não informado e siga"; mesmo termo na mesma página é recusado, e 3 vazias seguidas encerram a procura |
+| trava de repetição | por tela (solta sozinha em página viva) | por endereço |
+| caderno | toda nota entra | rascunho é recusado; o mesmo item reescrito atualiza a nota (`_mesma_nota`) |
+| produção | caderno cresceu | continua assim, mas agora só dado novo o faz crescer |
+| `role=dialog` em fluxo | "O PAINEL «Filtros» ABRIU E É CONTEÚDO", 9.408 caracteres de 29.851 | parte da página (`quadro` = `pagina`) |
+
+As 35 notas reais, replayadas pelo caminho novo: **9** (5 produtos e 4 "foto não
+informado"), e o teto de passos pararia em 44 em vez de 66. Na página real do produto
+4, a mesma em que o job passou 21 rodadas, o endereço da foto chega no primeiro
+snapshot.
+
+Um teste pegou um erro meu antes de ir ao ar: "PRODUTO 2 foto: https://…" tinha
+código e texto suficientes em comum com a nota do produto para ser fundida nela, e a
+URL ia embora. Nota que traz um endereço que a outra não tem é dado novo, sempre.
+
+#### O que NÃO foi mexido, de propósito
+
+**O portão do `web_fetch`.** Fez o que devia: em turno com conteúdo de terceiro, só
+passa URL que veio de um resultado de tool, e das 3 barradas uma tinha um código de
+produto que nunca apareceu em resultado nenhum (`B0D2L5Q4SS`: inventado). As outras
+duas eram a forma curta (`/dp/CODIGO`) de URLs reais, então a recusa é falso positivo
+ali. A mensagem manda chamar `solicitar_dado`, que não se aplica a um GET público, e
+o modelo traduziu isso para "Eu libero o acesso", uma opção que não existia. Afrouxar
+é decisão de segurança, não ajuste de leitura.
+
+**A primeira mensagem da sessão.** O pedido era "no meu navegador local", o
+classificador acertou, e a regra 14 manda chamar `browser_local_task` no mesmo turno.
+Mas o cérebro leu o caderno da sessão anterior, viu o job que falhou e decidiu não
+usar o navegador ("não repetir a mesma tentativa"), respondendo com o resultado
+velho como se fosse novo. Pedido explícito perdeu para memória de fracasso.
+
+---
+
+### 2026-10-31 (4) — Pedido explícito perdia para a memória do fracasso
+
+Os dois itens que a seção anterior deixou de fora. O método foi reenviar ao modelo o
+request REAL da sessão `455646dd`, tirado do `RAW payload` do log, com e sem a mudança.
+O log guarda só o nome das tools, então as que importam foram remontadas do código, e
+as outras seguiram só pelo nome nos dois braços.
+
+**Abrir o navegador pedido.** O classificador tinha acertado, mas a guarda de catálogo
+do CLIENT_TOOL só conhece tool client-side, tratou `browser_local_task` como
+"desconhecida" e zerou o `tool_name`. O sinal morria antes de chegar ao cérebro.
+
+| 8 chamadas cada | abriu o navegador |
+|---|---|
+| como estava | 2 |
+| instrução escrita na regra 14 | 3 |
+| tirar `web_search`/`web_fetch` da mesa | 7 |
+| **aviso logo depois da mensagem dele** | **8** |
+
+A regra escrita não mediu efeito: está a 27 mil caracteres da decisão, e a skill
+`compras`, ativa no turno, manda buscar na web. Por isso ela foi revertida em vez de
+ficar engordando o prompt de todo turno. O que resolve é a POSIÇÃO: `navegador_do_usuario`
+preserva o sinal e `_aviso_navegador_pedido` põe o aviso logo depois da mensagem. Ele
+continua valendo com o resultado do caderno entrando depois dele (8 de 8). Só existe em
+turno limpo: texto colado, mensagem de fora e agenda não recebem o empurrão.
+
+**A forma curta no portão.** `url_is_short_form` aceita `/dp/CODIGO` quando isso é um
+trecho CONTÍGUO do caminho de UMA URL vista, mesmo esquema e host, sem query, em base de
+até 12 segmentos. A versão óbvia, subsequência, abriria um canal: um link com o
+alfabeto em segmentos escreveria qualquer texto. O teto fecha a variante De Bruijn.
+Vale só para o `web_fetch`: a procedência de imagem continua exata. Verificado por
+mutação: enfraquecer cada condição derruba um teste, e o único mutante vivo (aceitar
+query) é equivalente, porque um segmento com `?` nunca bate com um segmento visto.
+
+**A recusa do portão.** Mandava chamar `solicitar_dado`, que não tem o que aprovar num
+GET público. Reenviado o mesmo momento, com 8 chamadas: com a mensagem antiga, 6
+encerraram o turno em texto e 2 ofereceram "liberar"; com a nova, as 8 foram atrás do
+endereço certo por `web_search`, e nenhuma ofereceu nada.
+
+Testes: `tests/test_navegador_pedido_explicito.py` (10) e
+`tests/authority/test_forma_curta_de_url.py` (19, a maioria tentativas de abuso).
+
+### 2026-10-31 — O clique chega no controle (job `8bc25dd1`)
+
+"Coloque no carrinho" gastou 16 cliques com `ok:true` em "Adicionar ao carrinho" e
+terminou com o carrinho vazio. A Amazon não bloqueou nada. O botão real é um `<input
+class="a-button-input">` com `opacity:0.01`, esticado sobre um desenho e FILHO do
+`span` que o inventário ofereceu: o `visivel` corta abaixo de 0.05, o passo do
+procurador oferece o pai, e o clique no pai não desce. No mesmo job o `Excluir`, um
+input visível, funcionou. Prova em Chromium real: `.click()` no input abre a gaveta,
+no `span` não abre nada.
+
+**A correção troca a pergunta**, de "qual elemento?" para "quem recebe este pixel?".
+
+1. **Mira** (`NEO.mirar`, `NEO.preparar`). Hit test no alvo. `el` sem ser controle com
+   um controle no pixel: vai para o controle. `el` já controle com outro controle no
+   pixel (link no meio do label): procura outro ponto. Por baixo do painel do Neo,
+   aba em segundo plano e botão direito não usam mouse real. O direito abriria o menu
+   nativo do sistema por cima da página.
+2. **Mouse real com sonda** (`clicar()`). `Input.dispatchMouseEvent`, como o
+   `press_key` já fazia com tecla. A sonda escuta `pointerdown`/`mousedown`/`click`, e
+   o evento fabricado só entra se ela provar que nada chegou: sem isso seria item em
+   dobro. `window.__neo` sumido quer dizer que a página navegou, logo o clique chegou.
+   `desvio` avisa se caiu fora do alvo.
+3. **Varredura da DOM** (`NEO.candidatos`, ação `find`). Documento inteiro, shadow DOM
+   e iframe de mesma origem, por NOME ACESSÍVEL: texto, `value`, `aria-label`,
+   `aria-labelledby`, `title`, `alt`, `placeholder`. Texto sem controle em volta sobe
+   ao dono, inclusive pelo caminho de volta do `aria-labelledby` e pela geometria. O
+   `click_text` passou a usar a mesma lista, e `n` escolhe o candidato. Custo medido:
+   5–36 ms. Iframe de outra origem não se alcança: `frames_fechados` diz quantos.
+4. **Inventário honesto**. O transparente que recebe o pixel entra como ele mesmo
+   (`input(button) "Adicionar ao carrinho"`), com o nome do desenho quando não tem
+   nome próprio. `fill` e `select` seguem o rosto até o controle (`NEO.controles`): o
+   `js_select` recusava todo `[seleciona select[...]]`.
+5. **Socorro** (`_socorrer_clique_morto`). Clique que não muda a tela roda a varredura
+   sozinho, uma vez por rótulo, e o resultado entra no histórico sem custo de LLM.
+
+**Guardas que o clique vivo exigiu.** Botão morto também é botão que não compra.
+A `trava` manda `_SENSITIVE` ao device, conferida no alvo REAL na hora do clique: antes
+`click_text "agora"` chegava em "Comprar agora" sem passar por guarda nenhuma. "Fechar
+pedido" entrou na lista. O portão do PARE (`ATUA`, `parado`) barra toda ação que muda
+algo: em 8bc25dd1 ele foi apertado às 19:49:54 e um clique saiu às 19:50:11, porque o
+sinal só era lido no snapshot. `SENSIVEL:` e `PARE:` são conferidos com `startswith`,
+senão texto da página citado num erro acionaria a parada.
+
+Medido: corpus `snapshot-lab/clique.py`, 15 falhas → 0 em 36 tentativas, contando
+exatamente 1 por cena. Na Amazon real, sem login: `Quantidade: 2`, gaveta de garantia,
+`Não, obrigado`, contador em 2, por `ref` e por nome. Rust real em Chromium real em
+`o_clique_chega_no_controle_transparente_uma_vez_so`. **Não exercitado: Edge logado,
+pela extensão.** O caminho do CDP é o mesmo `executeCdp` do `press_key`, e a reserva
+cobre o mouse que não chegar.
+

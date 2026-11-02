@@ -150,3 +150,48 @@ async def test_falha_ao_gravar_nao_derruba_o_job():
 
     await _gravar_sessao(_Morto(), _job(), "device-1", SimpleNamespace(
         tab_ref=77, url="u", pending="", status="completed"))
+
+
+@pytest.mark.asyncio
+async def test_os_prints_nao_podem_apagar_a_sessao_de_aba():
+    """O registro dos prints montava o `extra_metadata` dele a partir da cópia
+    EM MEMÓRIA do job — que é de antes desta gravação. Resultado: o print
+    apagava a sessão de aba.
+
+    O efeito era invisível job a job e total no conjunto. Medido em produção em
+    2026-10-01, nos 16 `browser_local` mais recentes: **todo** job com `images`
+    tinha `browser_session` nulo, e todo job com `browser_session` não tinha
+    `images`. Virou 100% quando o print do fim passou a existir sempre — e foi
+    o que fez a tarefa seguinte abrir aba nova depois de o usuário dizer "na
+    aba que já está aberta" (job 23cde731, que então chutou o domínio errado e
+    bateu no login).
+
+    Por isso `_gravar_sessao` DEVOLVE o metadata vivo: quem escreve depois parte
+    dele.
+    """
+    db, job = _DB(), _job(extra_metadata={"origem": "chat"})
+
+    metadata = await _gravar_sessao(db, job, "device-1", SimpleNamespace(
+        tab_ref=42, url="https://amazon.com.br/pedido", status="failed", pending=""))
+
+    assert metadata["browser_session"]["tab_ref"] == 42
+    assert metadata["origem"] == "chat", "o que já existia não pode sumir"
+
+    # É ESTE dicionário que o bloco dos prints usa como base. Com a cópia velha
+    # do job, a sessão sumia aqui.
+    terminal = {**metadata, "images": [{"file_id": "x"}]}
+    assert "browser_session" in terminal, "o print apagou a sessão de aba de novo"
+    assert terminal["browser_session"]["tab_ref"] == 42
+
+
+@pytest.mark.asyncio
+async def test_sem_aba_o_metadata_volta_intacto():
+    """Sem `tab_ref` não há o que registrar — mas quem chamou ainda precisa do
+    metadata para escrever os prints em cima."""
+    db, job = _DB(), _job(extra_metadata={"origem": "chat"})
+
+    metadata = await _gravar_sessao(db, job, "device-1", SimpleNamespace(
+        tab_ref=None, url="", status="failed", pending=""))
+
+    assert metadata == {"origem": "chat"}
+    assert not db.patches, "não tinha o que gravar"

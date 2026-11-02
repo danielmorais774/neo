@@ -19,6 +19,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from core.authority import turno_de_fundo
 from core.scheduler import conditions as cond
 from core.scheduler.timing import apply_jitter, to_local, utcnow
 
@@ -239,10 +240,13 @@ class SchedulerTick:
                 metadata={"source": "schedule", "unattended": True},
                 user_message=tarefa.name,
             )
-            resultado = await asyncio.wait_for(
-                executor.execute_tool_call(ToolCall(name=nome, arguments=dict(args or {}))),
-                timeout=60,
-            )
+            # Mesmo motivo do `runners.py`: condição de tarefa roda sem turno
+            # cognitivo, e sem autoridade instalada o portão permite tudo.
+            with turno_de_fundo({"source": "schedule", "unattended": True}, tarefa.user_id):
+                resultado = await asyncio.wait_for(
+                    executor.execute_tool_call(ToolCall(name=nome, arguments=dict(args or {}))),
+                    timeout=60,
+                )
             if getattr(resultado, "error", None):
                 raise RuntimeError(resultado.error)
             return getattr(resultado, "result", resultado)

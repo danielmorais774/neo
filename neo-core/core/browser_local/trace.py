@@ -110,12 +110,23 @@ class RunTrace:
         )
 
     def shot(
-        self, number: int, data: str, marked: bool | None, recorte: bool = False
+        self,
+        number: int,
+        data: str,
+        marked: bool | None,
+        recorte: bool = False,
+        final: bool = False,
     ) -> str | None:
         """Salva o JPEG do passo e devolve o nome do arquivo."""
         if not self.ok or not data:
             return None
-        name = f"{number:02d}-painel.jpg" if recorte else f"{number:02d}-tela.jpg"
+        # O print do fim ganha nome próprio: é o que vai para o chat, e no
+        # diário ele precisa ser achável sem contar passos.
+        name = (
+            f"{number:02d}-final.jpg" if final
+            else f"{number:02d}-painel.jpg" if recorte
+            else f"{number:02d}-tela.jpg"
+        )
         try:
             import base64
 
@@ -127,7 +138,8 @@ class RunTrace:
         # `marked is None` = o device não respondeu o campo, ou seja é uma versão
         # anterior ao desenho das marcações. É o sintoma de desktop desatualizado.
         estado = (
-            "recorte do painel, sem marcações (é para LER, não para clicar)" if recorte
+            "a tela do FIM, sem marcações — é este que vai para o chat" if final
+            else "recorte do painel, sem marcações (é para LER, não para clicar)" if recorte
             else "com marcações" if marked
             else ("SEM marcações (desktop antigo? o campo `marks` nem voltou)" if marked is None
                   else "SEM marcações (o device não conseguiu desenhar)")

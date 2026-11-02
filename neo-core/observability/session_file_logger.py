@@ -230,13 +230,37 @@ class SessionFileLogger:
         model: str = "",
         provider: str = "",
         temperature: float | None = None,
+        tools: list[Any] | None = None,
+        tool_choice: Any = None,
     ) -> None:
+        """O que foi enviado ao modelo — INCLUSIVE a mesa de tools.
+
+        O payload abaixo se anuncia como "completo" e durante muito tempo não
+        era: `tools` e `tool_choice` ficavam de fora. A pergunta que o diário
+        então não respondia é a primeira de qualquer investigação de "por que
+        ele não chamou X?" — se X estava na mesa. Nas sessões 0cd866a1 e
+        e0905aae só deu para afirmar que `browser_local_task` estava disponível
+        porque um turno POSTERIOR a chamou; o log, sozinho, não dizia.
+
+        `tool_choice` entra pelo mesmo motivo, do outro lado: um round com
+        `required` explica uma chamada de tool que de outro jeito pareceria
+        iniciativa do modelo.
+        """
         self._write(f"### 6. LLM Request — {stage}\n\n")
         self._write(f"- **Provider:** {provider}\n")
         self._write(f"- **Model:** {model}\n")
         if temperature is not None:
             self._write(f"- **Temperature:** {temperature}\n")
-        self._write(f"- **Total mensagens:** {len(messages)}\n\n")
+        self._write(f"- **Total mensagens:** {len(messages)}\n")
+        nomes = [
+            str(getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else t))
+            for t in (tools or [])
+        ]
+        self._write(f"- **Tools na mesa ({len(nomes)}):** ")
+        self._write(", ".join(f"`{n}`" for n in nomes) + "\n" if nomes else "_nenhuma_\n")
+        if tool_choice:
+            self._write(f"- **tool_choice:** `{tool_choice}`\n")
+        self._write("\n")
 
         # Build the raw payload list for JSON dump
         raw_messages: list[dict] = []
@@ -257,6 +281,12 @@ class SessionFileLogger:
         if temperature is not None:
             raw_payload["temperature"] = temperature
         raw_payload["stream"] = True
+        # Só os NOMES: o schema inteiro de 40 tools infla o diário em centenas de
+        # KB por round e não responde nada que o nome não responda.
+        if nomes:
+            raw_payload["tools"] = nomes
+        if tool_choice:
+            raw_payload["tool_choice"] = tool_choice
         self._write(
             f"<details>\n<summary>⚡ RAW payload completo (JSON)</summary>\n\n"
             f"```json\n{_safe_json(raw_payload)}\n```\n\n</details>\n\n"

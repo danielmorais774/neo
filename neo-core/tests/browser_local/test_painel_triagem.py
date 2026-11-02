@@ -327,3 +327,136 @@ async def test_extract_substancial_vai_sozinho_para_o_caderno():
     result = await driver.run("veja a timeline de rastreio")
     assert any("Cabo de Santo Agostinho" in nota for nota in driver.notes)
     assert result.status == "failed"  # mesmo falhando, entrega o que leu
+
+
+# ── 6. a guarda não pode virar a prisão (job b22acf4b, 2026-10-31) ──────────
+#
+# TVs de 55" na Amazon. O carrinho («Subtotal») abriu sozinho, a triagem visual
+# voltou VAZIA, e o prompt disse ao modelo, com todas as letras: "se for
+# estorvo, pode fechar e seguir". Ele mandou `Escape` — e a guarda de vaivém
+# respondeu "a informação está DENTRO dele" quatro vezes seguidas, em cima de um
+# painel que ninguém conseguiu classificar. Quatro recusas seguidas é o teto do
+# `_validate`: o job morreu no passo 9 de 40, com UMA nota no caderno.
+#
+# Guarda que contradiz o prompt não corrige o modelo — trava ele.
+
+
+def _vaivem():
+    """Snapshots que fazem o painel ABRIR DUAS vezes — é o gatilho da guarda.
+
+    A 3ª rodada é a que tem o painel na SEGUNDA abertura: é lá que o `Escape`
+    do roteiro precisa cair. Por isso os dois `note` na frente de cada roteiro
+    daqui — eles gastam rodada sem gastar passo nem tocar na página.
+    """
+    return [_aberto(), _fechado(), _aberto(), _aberto(), _aberto(), _aberto(), _aberto()]
+
+
+@pytest.mark.asyncio
+async def test_sem_veredito_o_vaivem_nao_impede_de_fechar():
+    """Sem visão, o veredito nasce `default` — palpite não bloqueia o `Escape`."""
+    driver, acted = _driver(
+        [
+            {"action": "note", "args": {"texto": "esperando o painel reabrir"}},
+            {"action": "note", "args": {"texto": "reabriu"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "done", "args": {"answer": "fim"}},
+        ],
+        snapshots=_vaivem(),
+    )
+    result = await driver.run("abra 3 anúncios de TV 55 polegadas")
+
+    assert any(a == "browser.press" for a, _ in acted), (
+        "o Escape nunca chegou na página — o prompt autoriza fechar estorvo"
+    )
+    assert result.status == "completed"
+    assert "Travei" not in (result.summary or "")
+
+
+@pytest.mark.asyncio
+async def test_com_veredito_a_recusa_de_vaivem_acontece_uma_vez_so():
+    """Com evidência, o aviso vem — mas UMA vez. Insistir não pode matar a tarefa.
+
+    Depois do aviso a ação PASSA, e aí ela vira ação de verdade: o freio de giro
+    e o `_stuck` sabem vigiar laço de ação. Laço de RECUSA só tem o teto que mata.
+    """
+    driver, _ = _driver(
+        [
+            {"action": "click", "args": {"ref": 50}},      # abre o painel (causa)
+            {"action": "note", "args": {"texto": "o painel reabriu sozinho"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "done", "args": {"answer": "fim"}},
+        ],
+        snapshots=_vaivem(),
+    )
+    result = await driver.run("abra 3 anúncios de TV 55 polegadas")
+
+    # Conta só a guarda sob teste: outras (elemento atrás do painel, ação
+    # repetida) têm recusa própria e cada uma responde pelo seu teto.
+    vaivem = [s for s in result.steps if "vaivém" in (s.detail or "")]
+    assert len(vaivem) <= 1, f"a guarda de vaivém recusou {len(vaivem)} vezes: {vaivem}"
+    assert "Travei" not in (result.summary or "")
+
+
+@pytest.mark.asyncio
+async def test_o_painel_dispensado_continua_dispensado_quando_reabre():
+    """A outra metade do laço: o driver esquecia o julgamento do passo anterior.
+
+    `_panel_verdict` é limpo quando o painel some da tela. Sem memória do que o
+    modelo já dispensou, cada reabertura recomeçava do zero — nova triagem
+    (mais uma olhada paga), novo ">>> pode ser o resultado do que você pediu",
+    nova recusa. Na Amazon o carrinho reabre sozinho a cada navegação.
+    """
+    driver, _ = _driver(
+        [
+            {"action": "note", "args": {"texto": "painel na tela"}},
+            {"action": "note", "args": {"texto": "fechou sozinho"}},
+            {"action": "press", "args": {"key": "Escape"}},   # reabriu: dispensa aqui
+            {"action": "note", "args": {"texto": "fechou de novo"}},
+            {"action": "note", "args": {"texto": "e reabriu de novo"}},
+            {"action": "done", "args": {"answer": "fim"}},
+        ],
+        # abre · fecha · abre(2ª) · fecha · abre(3ª)
+        snapshots=[_aberto(), _fechado(), _aberto(), _fechado(), _aberto(), _aberto()],
+    )
+    await driver.run("abra 3 anúncios de TV 55 polegadas")
+
+    assert driver._panel_dismissed, "o driver não guardou o julgamento do modelo"
+    veredito = next(iter(driver._panel_verdict.values()))
+    assert veredito["tipo"] == "intruso"
+    assert veredito["fonte"] == "modelo", "a reabertura triou de novo em vez de lembrar"
+
+
+@pytest.mark.asyncio
+async def test_triagem_que_voltou_vazia_nao_pode_travar_a_tarefa():
+    """O job b22acf4b inteiro, em miniatura.
+
+    A triagem do «Subtotal» voltou VAZIA (`fonte: erro`, `tipo: conteudo` —
+    o default conservador), o prompt disse "se for estorvo, pode fechar e
+    seguir", o modelo mandou `Escape` quatro vezes e levou quatro recusas
+    dizendo o contrário. Quatro recusas seguidas é o teto do `_validate`:
+    morreu no passo 9 de 40, com uma nota no caderno.
+    """
+    driver, acted = _driver(
+        [
+            {"action": "note", "args": {"texto": "painel na tela"}},
+            {"action": "note", "args": {"texto": "sumiu"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "press", "args": {"key": "Escape"}},
+            {"action": "done", "args": {"answer": "as 3 TVs"}},
+        ],
+        snapshots=_vaivem(),
+        vision="   ",  # a visão respondeu VAZIO → veredito `fonte: erro`
+    )
+    result = await driver.run("abra 3 anúncios de TV 55 polegadas")
+
+    assert result.status == "completed", f"a tarefa morreu de novo: {result.summary}"
+    assert "Travei" not in (result.summary or "")
+    assert any(a == "browser.press" for a, _ in acted), "nenhum Escape chegou na página"
+    assert not [s for s in result.steps if "vaivém" in (s.detail or "")], (
+        "recusou em cima de uma triagem que não aconteceu"
+    )

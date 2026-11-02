@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
@@ -48,6 +50,10 @@ _MAX_URLS = 2_000
 
 #: Pontuação que gruda no fim de URL em texto corrido.
 _TRAILING = ".,;:!?'\"”’)]}"
+
+#: Até quantos segmentos uma URL vista serve de base para a forma curta. Ver
+#: `url_is_short_form`: é o teto que mantém pequeno o número de trechos possíveis.
+_MAX_SEGMENTOS_BASE = 12
 
 
 def canonical_url(url: str) -> str:
@@ -140,6 +146,48 @@ class TurnAuthority:
         canonica = canonical_url(url)
         return bool(canonica) and canonica in self.seen_urls
 
+    def url_is_short_form(self, url: str) -> bool:
+        """Esta URL é um TRECHO do caminho de uma URL vista, sem nada de novo?
+
+        Loja publica `/Nome-do-Produto/dp/B083LGFDGJ/ref=x?tag=y` e o modelo, com
+        razão, encurta para `/dp/B083LGFDGJ`: nada ali é novo, e a recusa só atrapalha.
+
+        A regra é estreita de propósito, porque esta trava existe contra dado saindo
+        DENTRO da URL (`docs/release-request-plan.md` §12.3):
+
+        * mesmo esquema e mesmo host, sem query nem fragmento;
+        * trecho CONTÍGUO de UMA URL vista. Subsequência abriria o canal que a trava
+          fecha: uma página publicaria um link com o alfabeto repetido em segmentos, e
+          qualquer texto seria subsequência dele. Misturar URLs daria o mesmo;
+        * a base tem no máximo `_MAX_SEGMENTOS_BASE` segmentos, senão um caminho enorme
+          montado para conter toda combinação curta traria o mesmo canal de volta. Com
+          o teto são menos de 80 trechos por URL, menos escolhas do que as 2.000 URLs
+          exatas que uma página já pode oferecer hoje;
+        * pelo menos 2 segmentos: um só não identifica nada.
+
+        Fica de fora de `url_has_provenance` para valer só no `web_fetch`.
+        """
+        canonica = canonical_url(url)
+        if "://" not in canonica or "?" in canonica or "#" in canonica:
+            return False
+        esquema, resto = canonica.split("://", 1)
+        host, _, cauda = resto.partition("/")
+        pedido = [p for p in cauda.split("/") if p]
+        tamanho = len(pedido)
+        if tamanho < 2:
+            return False
+        prefixo = f"{esquema}://{host}/"
+        for vista in self.seen_urls:
+            if not vista.startswith(prefixo):
+                continue
+            caminho = re.split(r"[?#]", vista[len(prefixo):], maxsplit=1)[0]
+            partes = [p for p in caminho.split("/") if p]
+            if len(partes) > _MAX_SEGMENTOS_BASE:
+                continue
+            if any(partes[i:i + tamanho] == pedido for i in range(len(partes) - tamanho + 1)):
+                return True
+        return False
+
     @property
     def from_external(self) -> bool:
         return self.principal == PRINCIPAL_EXTERNO
@@ -187,6 +235,40 @@ def bind_authority(authority: TurnAuthority) -> Token:
 
 def current_authority() -> TurnAuthority | None:
     return _current.get()
+
+
+def reset_authority(token: Token) -> None:
+    """Desinstala a autoridade (par do :func:`bind_authority`)."""
+    try:
+        _current.reset(token)
+    except ValueError:  # pragma: no cover - token de outro contexto
+        _current.set(None)
+
+
+@contextmanager
+def turno_de_fundo(
+    metadata: dict[str, Any] | None = None, user_id: Any = None
+) -> Iterator[TurnAuthority | None]:
+    """Autoridade para um disparo que NÃO passa pelo ``process_message``.
+
+    A agenda com ação ``tool`` (``core/scheduler/runners.py``) e a condição de
+    uma tarefa (``core/scheduler/tick.py``) chamam o executor direto, sem turno
+    cognitivo. Sem isto rodavam como "fora de turno", que o portão trata como
+    permitir: a regra de ``unattended`` (disparo sem ninguém na frente pede
+    aprovação) nunca valia para o caminho mais desacompanhado que existe.
+
+    Respeita autoridade já instalada — aninhar não reclassifica um turno seu.
+    """
+    if current_authority() is not None:
+        yield current_authority()
+        return
+    principal, ref = principal_from_metadata(metadata)
+    autoridade = TurnAuthority(principal=principal, principal_ref=ref, user_id=user_id)
+    token = bind_authority(autoridade)
+    try:
+        yield autoridade
+    finally:
+        reset_authority(token)
 
 
 def note_tool_result(tool_name: str, result: Any) -> None:

@@ -29,6 +29,7 @@ from core.authority.risk import (
     LEITURA_PRIVADA,
     REVELACAO,
     classes_of,
+    is_actuation,
     is_external_source,
     is_private_read,
     is_sink,
@@ -44,11 +45,19 @@ from core.authority.turn import (
     current_authority,
     note_tool_result,
     principal_from_metadata,
+    reset_authority,
+    turno_de_fundo,
 )
+# Importado DEPOIS de gate/turn de propósito: o invólucro usa os dois.
+from core.authority.wrap import ExecutorComPortao, com_portao
 
 __all__ = [
     "ATUACAO",
     "Destination",
+    "ExecutorComPortao",
+    "com_portao",
+    "reset_authority",
+    "turno_de_fundo",
     "covering_release",
     "covers",
     "destination_of",
@@ -74,6 +83,7 @@ __all__ = [
     "current_authority",
     "evaluate",
     "gate_tool_call",
+    "is_actuation",
     "is_external_source",
     "is_private_read",
     "is_sink",

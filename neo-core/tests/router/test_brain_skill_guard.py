@@ -202,6 +202,30 @@ def test_job_tools_continuam_visiveis_apesar_do_prefixo():
     assert "data_list" not in visiveis
 
 
+def _toolset_escolhendo(nomes: list[str], escolhida: str | None) -> set[str]:
+    from modules.desktop.ai_service import AIService
+
+    servico = AIService.__new__(AIService)
+    servico.agent = type("Agent", (), {"tool_registry": _RegistryFalso(nomes)})()
+    return {t.name for t in servico._server_tool_toolset(escolhida)}
+
+
+def test_solicitar_dado_esta_no_trilho_do_servidor():
+    """Sessão 1a605544: a recusa mandava "chame solicitar_dado", o agente não a
+    tinha e respondeu "ficou esperando aprovação" sem pedido nenhum criado."""
+    assert "solicitar_dado" in _toolset(["browser_local_task", "get_weather"])
+
+
+def test_pks_reveal_so_quando_o_classificador_escolheu():
+    """Mandado preencher um formulário, o agente revelou o CEP por conta própria
+    e o escreveu no chat (sessão 1a605544). "vc sabe o meu cpf?" continua
+    funcionando: ali a tool escolhida É a pks_reveal."""
+    nomes = ["browser_local_task", "pks_reveal", "search_pks"]
+    assert "pks_reveal" not in _toolset_escolhendo(nomes, "browser_local_task")
+    assert "pks_reveal" in _toolset_escolhendo(nomes, "pks_reveal")
+    assert "search_pks" in _toolset_escolhendo(nomes, "browser_local_task")
+
+
 def test_tool_de_cliente_fica_de_fora_do_agente_do_servidor():
     """session-30b1e484: o agente do SERVER_TOOL via `run_command`, chamava, e o
     turno morria em "Executor para módulo 'desktop' não registrado" com o job do

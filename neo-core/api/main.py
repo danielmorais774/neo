@@ -851,6 +851,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         build_release_notifier,
         build_text_announcer,
     )
+    from core.jobs.release_resume import build_job_resumer
     from core.release.resume import build_resumer
 
     _release_service = ReleaseService(_db, notifier=build_release_notifier(_db))
@@ -870,6 +871,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resumer=build_resumer(
             get_ai_service=lambda: getattr(app.state, "ai_service", None),
             announce=build_text_announcer(_db),
+            # Pedido que nasceu de uma tarefa do navegador parada no campo:
+            # aprovar CONTINUA aquela tarefa, na mesma aba, sem turno no meio.
+            resume_job=build_job_resumer(
+                db=_db, job_manager=_job_manager, announce=build_text_announcer(_db)
+            ),
         ),
     )
 

@@ -412,11 +412,22 @@ class PKSRetriever:
         terms = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
         if terms:
             return terms[:6]
-        words = re.findall(r"[\wÀ-ÿ]{4,}", user_message.lower())
+        # 3 letras, não 4: este caminho só roda quando o classificador não
+        # devolveu keywords (foi o caso no 403 da sessão 369d812c), e é
+        # justamente aí que "cep", "cpf" e "rg" — a palavra que carrega o
+        # pedido inteiro — eram descartadas por serem curtas demais.
+        words = re.findall(r"[\wÀ-ÿ]{3,}", user_message.lower())
         stop = {
             "para", "como", "qual", "quais", "quando", "onde", "porque", "isso",
             "essa", "esse", "minha", "meu", "meus", "minhas", "sobre", "voce",
             "você", "pode", "fazer", "quero",
+            # ruído de 3 letras que o corte anterior escondia
+            "que", "com", "por", "uma", "uns", "dos", "das", "nos", "nas",
+            "num", "sem", "sim", "nao", "não", "tem", "ter", "foi", "era",
+            "ele", "ela", "seu", "sua", "tua", "teu", "mim", "voc", "vai",
+            "vem", "faz", "fez", "diz", "ver", "vou", "sou", "tao", "tão",
+            "aos", "ate", "até", "lhe", "pra", "pro", "mas", "qua", "eai",
+            "oi", "ola", "olá",
         }
         deduped: list[str] = []
         for word in words:

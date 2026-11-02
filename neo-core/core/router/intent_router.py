@@ -96,6 +96,23 @@ _MEMORY_DIRECTIVE_PATTERNS = [
         r"\bnas?\s+(minhas?\s+|nossas?\s+|suas?\s+)?(anotac\w+|notas)\b",  # nas (nossas) anotações
         r"\b(salv|guard|anot|registr)\w*\s+(a |o |essa |esta |esse |este |uma |um )?(ideia|dica|receita|informacao|info|observacao)\b",  # salva essa ideia/dica
         r"\b(pra|para)\s+(eu\s+)?lembrar\b",            # pra lembrar / para eu lembrar
+        # "grava 01310-100 como meu CEP", "salva isso como minha senha do wifi" —
+        # verbo de gravação + âncora POSSESSIVA. Faltava: `grava` era o verbo mais
+        # natural em pt-BR para a diretiva e não casava com NADA aqui; a frase só
+        # entrava quando trazia a palavra "pks", que casava por acidente — e era a
+        # mesma palavra que autocarregava a skill `postgres-neo` (SELECT) e calava a
+        # escrita. Tirado o acidente (session-be7659d2), o buraco apareceu: 4 pedidos,
+        # `confirmed_save=False`, planner devolvendo `{"operations": []}`.
+        # Medido nas 2387 mensagens de usuário em prod: `\bgrav` solto pega 9, sendo 7
+        # falsos ("gravação de tela", "mais grave", "ele gravou"); `grava` + âncora de
+        # conteúdo (que/isso/aqui) pega ZERO, porque a frase-alvo não tem nenhuma. O
+        # que qualifica é o "como meu/minha" — a afirmação de que o dado é DELE, que é
+        # exatamente o que vira fato de PKS: 2 casos, 0 falso positivo.
+        # A guarda de extensão separa a entrega de arquivo ("salva o arquivo como meu
+        # relatorio.pdf"), que é file_save e não memória.
+        r"\b(salv|grav|anot|registr|guard)\w*\b"
+        r"(?![^.!?]*\.(pdf|docx?|xlsx?|pptx?|png|jpe?g|gif|svg|md|txt|csv|tsv|json|zip|mp[34]|mov)\b)"
+        r".{0,40}\bcomo\s+(o\s+|a\s+)?(meu|minha|meus|minhas)\b",
     )
 ]
 
@@ -370,6 +387,29 @@ def _urls_nao_fundamentadas(command: str, haystack_lower: str) -> list[str]:
             continue
         fora.append(limpa)
     return fora
+
+
+#: Marca de URL que o próprio classificador sabe ser de mentira: "XXXXXX", um
+#: `<link>` por preencher, o domínio de exemplo.
+_URL_PLACEHOLDER = re.compile(r"[Xx]{6,}|<[^>]*>|\bexample\.(?:com|org)\b|\bseu[-_]link\b", re.I)
+#: Segmento de caminho que é IDENTIFICADOR (id de formulário, documento, arquivo):
+#: longo e misturando letra com dígito. Não se adivinha — ou alguém citou, ou é
+#: inventado.
+_URL_ID_SEGMENTO = re.compile(r"/(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{16,}")
+
+
+def _url_inventada(url: str) -> bool:
+    """Esta URL (já sabida NÃO citada na conversa) só pode ter sido inventada?
+
+    Estreita de propósito. ``open 'https://www.youtube.com/results?search_query=AC/DC'``
+    também não é citação literal e é legítimo — o classificador MONTA a busca a
+    partir da fala (8 dos 9 `open` com URL nos logs de produção, 01/11). O que
+    não se monta é placeholder e id: na session-8f2febfa "faz isso" virou
+    ``open -a "Google Chrome" ".../forms/d/e/1FAIpQLSfXXXXXXXX…/viewform"``, com a
+    própria explicação dizendo "usarei um placeholder genérico".
+    """
+    caminho = url.split("?", 1)[0].split("#", 1)[0]
+    return bool(_URL_PLACEHOLDER.search(url) or _URL_ID_SEGMENTO.search(caminho.split("://", 1)[-1]))
 
 
 # Print do navegador DO SERVIDOR não responde pergunta sobre a mídia DELE.
@@ -1339,6 +1379,8 @@ class IntentRouter:
         # Workstream A: HA routing carries no execution details — the skill resolves
         # its own entity. Discard anything the model emitted to kill hallucinations.
         tool_name = data.get("tool_name")
+        # Lido aqui porque as guardas abaixo zeram `tool_name`.
+        pediu_navegador = tool_name == "browser_local_task"
         tool_arguments = data.get("tool_arguments")
         raw_command = data.get("raw_command")
         if intent == IntentType.HOME_ASSISTANT:
@@ -1500,6 +1542,27 @@ class IntentRouter:
                     tool_name = None
                     tool_arguments = None
                     raw_command = None
+            elif _cmd_net and _URL_IN_COMMAND.search(str(_cmd_net)):
+                # Fora de download (`open`, navegador): só barra a URL que não
+                # pode ter vindo da conversa — placeholder ou id inventado. A
+                # busca montada a partir da fala passa (ver `_url_inventada`).
+                _hay = (user_message + "\n" + "\n".join(
+                    str(m.get("content", "")) for m in (conversation_history or [])[-8:]
+                )).lower()
+                _inventadas = [
+                    u for u in _urls_nao_fundamentadas(str(_cmd_net), _hay) if _url_inventada(u)
+                ]
+                if _inventadas:
+                    logger.warning(
+                        "Router: CLIENT_TOOL abrindo URL inventada %r (comando: %r) — "
+                        "devolvendo ao cognitivo, que tem o endereço real no histórico "
+                        "ou pergunta",
+                        _inventadas, str(_cmd_net)[:160],
+                    )
+                    intent = IntentType.DIRECT_RESPONSE
+                    tool_name = None
+                    tool_arguments = None
+                    raw_command = None
 
         # Grounding guard: um comando de shell que cita um caminho de arquivo
         # ESPECÍFICO (com extensão) que não apareceu em lugar nenhum da conversa é
@@ -1571,6 +1634,7 @@ class IntentRouter:
             intent=intent,
             confidence=float(data.get("confidence", 0.8)),
             tool_name=tool_name,
+            navegador_do_usuario=pediu_navegador,
             tool_arguments=tool_arguments,
             explanation=data.get("explanation"),
             requires_approval=data.get("requires_approval", intent == IntentType.CLIENT_TOOL),

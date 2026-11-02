@@ -31,6 +31,12 @@ class DesktopChatMessage(BaseModel):
     user_id: UUID | None = None
     # Ids do File Store (neo-core) anexados a este turno — ver file-store-plan.md §5.
     attachments: list[str] | None = None
+    # Caracteres desta mensagem que vieram do CLIPBOARD. Acima do limiar o turno é
+    # marcado como contaminado (fonte `colagem`): texto colado é conteúdo de
+    # TERCEIRO, e sem esta marca o portão de liberação ficava inerte justamente na
+    # entrada mais fácil de injetar. Quem sabe é o cliente — o core só vê o texto
+    # final. Ver docs/release-request-plan.md §21.
+    pasted_chars: int | None = Field(default=None, ge=0)
 
 
 class ExecuteTaskRequest(BaseModel):

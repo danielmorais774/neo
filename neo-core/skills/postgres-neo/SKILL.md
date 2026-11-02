@@ -4,7 +4,12 @@ description: >
   Consulta o banco Postgres do Neo (PKS, sessões e mensagens de conversa,
   missões, preferências, jobs) com SQL somente-leitura. Use para perguntas
   sobre os dados internos do Neo.
-keywords: [banco do neo, banco de dados do neo, postgres do neo, tabela do neo, pks]
+# `pks` SOLTO não entra aqui: é também o padrão nº 1 de
+# _MEMORY_DIRECTIVE_PATTERNS (core/router/intent_router.py), ou seja a MESMA
+# palavra que marca "diretiva de memória, grava". Com ela na lista, "salva o meu
+# cep no pks" carregava esta skill — que só tem SELECT — e a gravação morria
+# (session-89b9aa31). As formas abaixo são as de QUERY, que é o que a skill faz.
+keywords: [banco do neo, banco de dados do neo, postgres do neo, tabela do neo, tabela pks, pks_entity, consulta no pks, sql no pks]
 kind: tool_backed
 register: oficina
 tools: [sql_query_ro]

@@ -26,8 +26,14 @@ from typing import Any, Callable, Iterable, Sequence
 from uuid import UUID
 
 from core.pks.ledger_guard import is_ledger_memory, looks_like_money_query
-from core.pks.ontology import OntologyResolver, normalize_token
+from core.pks.ontology import (
+    INTERNAL_FIELD_KEYS,
+    OntologyResolver,
+    field_key_terms,
+    normalize_token,
+)
 from core.pks.schemas import EntityRecord, FieldRecord, RelationRecord
+from core.pks.sensitivity import SECRET, effective_level, redact_value
 
 # ── Configuração ─────────────────────────────────────────────────────────────
 
@@ -104,6 +110,11 @@ _BM25_B = 0.75
 # pontuados à parte: casar só com o texto de um dossiê ("dois inquéritos" ×
 # "quanto é dois mais dois") não pode valer o mesmo que casar com o nome.
 _W_NAME, _W_ALIAS, _W_TYPE, _W_NEIGHBOR = 3.0, 2.0, 1.0, 0.5
+# A CHAVE do campo é identidade, não conteúdo: quem pergunta "qual meu cep"
+# está nomeando o FATO, e quem tem o fato é a entidade. Pesa como o tipo —
+# abaixo de nome e apelido, porque a chave descreve um pedaço da entidade e
+# não ela inteira.
+_W_FIELD_KEY = 1.0
 _HUB_DEGREE = 12
 _CONTENT_FACTOR = 0.6
 _FIELD_INDEX_CHARS = 2000
@@ -280,7 +291,14 @@ def _build_doc(
         for name in neighbor_names:
             add(tf, "id", name, _W_NEIGHBOR)
     for f in fields:
-        # Field sensível/secreto não ajuda a achar a entidade: pontuar por ele
+        # A chave entra mesmo quando o VALOR é redigido: no prompt a entidade
+        # já aparece com `cep: «pks:cep»`, então casar pela palavra "cep" não
+        # conta nada que a recuperação não fosse contar de qualquer jeito.
+        # Credencial fica de fora — o ContextBuilder nem renderiza o campo.
+        if effective_level(f.key, f.sensitivity) != SECRET:
+            for termo in field_key_terms(f.key):
+                add(tf, "id", termo, _W_FIELD_KEY)
+        # Já o VALOR de field sensível/secreto não pontua: casar por ele
         # revelaria que o conteúdo existe mesmo sem renderizá-lo.
         if _visible(f.sensitivity):
             add(ctf, "content", _field_text(f.value)[:_FIELD_INDEX_CHARS], 1.0)
@@ -851,9 +869,31 @@ def _fmt_value(value: Any, limit: int) -> str:
 def _visible_fields(fields: Sequence[FieldRecord], direct: bool) -> list[FieldRecord]:
     return [
         f for f in fields
-        if f.sensitivity != "secret" and (f.sensitivity != "sensitive" or direct)
+        # O nível EFETIVO, não só o gravado: `senha` gravada como "private"
+        # continua sendo segredo (é a mesma régua do índice, acima).
+        if effective_level(f.key, f.sensitivity) != SECRET
+        and (f.sensitivity != "sensitive" or direct)
+        and f.key not in INTERNAL_FIELD_KEYS  # escrituração tem seção própria
         and f.value not in (None, "", {}, [])
     ]
+
+
+def _shown(f: FieldRecord, limit: int) -> str:
+    """O valor que o bloco mostra: o real, ou o ``«pks:campo»`` no lugar dele.
+
+    É a redação do bloco antigo (``ContextBuilder``, F2 do
+    docs/release-request-plan.md §7): CPF, CEP, e-mail e endereço não vão em
+    claro para prompt nenhum. O v2 mostrava o valor cru — e o respondedor de
+    formulário (core/browser_local/respondedor.py) usa este texto como evidência.
+    """
+    valor, _ = redact_value(f.key, f.value, f.sensitivity)
+    return _fmt_value(valor, limit)
+
+
+#: Aliases por entidade. Em entidade sem campo nenhum eles SÃO o conteúdo: o
+#: "Objetivo do treino de Daniel" guarda "hipertrofia e força" só ali, e o
+#: bloco sem eles dizia que o objetivo existe sem dizer qual é.
+_ALIASES_CAP = 5
 
 
 def _render_group(
@@ -894,7 +934,7 @@ def _render_group(
         extra = _visible_fields(fields_by_entity.get(mid, []), direct=False)
         if not extra:
             return name
-        inline = ", ".join(f"{f.key}: {_fmt_value(f.value, 40)}" for f in extra[:3])
+        inline = ", ".join(f"{f.key}: {_shown(f, 40)}" for f in extra[:3])
         return f"{name} ({inline})"
 
     by_type: dict[str, list[UUID]] = {}
@@ -933,16 +973,22 @@ def _render_group(
         return out
 
     if level == "full":
+        aliases = [
+            a for a in (e.aliases or [])
+            if a and a.strip().casefold() != e.name.strip().casefold()
+        ][:_ALIASES_CAP]
+        if aliases:
+            lines.append("- também chamado: " + "; ".join(aliases))
         for f in fields:
             unit = f" {f.unit}" if f.unit else ""
-            lines.append(f"- {f.key}: {_fmt_value(f.value, 400)}{unit}")
+            lines.append(f"- {f.key}: {_shown(f, 400)}{unit}")
         lines.extend(list_lines(with_fields=True))
         lines.extend(rest_lines(cfg.other_relations_cap))
         return "\n".join(lines)
 
     # compact
     if fields:
-        lines.append("- " + "; ".join(f"{f.key}: {_fmt_value(f.value, 80)}" for f in fields))
+        lines.append("- " + "; ".join(f"{f.key}: {_shown(f, 80)}" for f in fields))
     lines.extend(list_lines(with_fields=False))
     if rest:
         lines.append(f"- +{len(rest)} outras relações")

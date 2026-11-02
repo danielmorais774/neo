@@ -969,21 +969,17 @@ class PKSWriter:
                     }
                 )
 
-        if not updates and allow_confirmation_fallback and confirmation and assistant_response:
-            artifact = " ".join((assistant_response or "").strip().split())[:320]
-            if artifact:
-                updates.append(
-                    {
-                        "name": SYSTEM_WORLD_STATE_NAME,
-                        "type": SYSTEM_WORLD_STATE_TYPE,
-                        "aliases": ["world state", "neo world state", "session state"],
-                        "metadata": {"workspace_name": SYSTEM_WORKSPACE_NAME, "is_core_world_state": True},
-                        "default_properties": DEFAULT_WORLD_STATE_PROPERTIES,
-                        "properties": {"recent_events": [artifact]},
-                        "reason": "confirmação explícita de memória sem classificação específica",
-                        "confidence": 0.88,
-                    }
-                )
+        # Aqui havia um fallback: "salva isso" sem classificação específica
+        # gravava a RESPOSTA DO NEO (320 chars) em `neo-world-state.recent_events`
+        # — um bloco de Alta Prioridade que entra em TODO prompt. Em cinco meses
+        # de produção ele guardou quatro coisas, nenhuma útil, e a última era uma
+        # RECUSA do próprio Neo ("Não. E o motivo é o mesmo que já te dei…",
+        # session-89b9aa31): o "não" de um dia virou "evento recente do mundo" em
+        # todos os turnos seguintes, e na session-8f2febfa (2026-11-01) ajudou a
+        # recusar cinco vezes o formulário do Daniel. Salvar a pedido é trabalho
+        # do `pks_remember`, que grava o FATO, não a frase de quem respondeu.
+        # `allow_confirmation_fallback`/`assistant_response` ficam na assinatura
+        # porque os dois chamadores ainda os passam.
         return updates
 
     def _build_agent_training_updates(

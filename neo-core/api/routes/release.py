@@ -123,11 +123,12 @@ async def decidir(
             await _announcer(row)
         except Exception:  # noqa: BLE001
             logger.exception("[release] falha ao anunciar %s", release_id)
-    # Retomada (F3c): só na APROVAÇÃO, e nunca segura a resposta do clique.
+    # Retomada (F3c): só a APROVAÇÃO continua alguma coisa; a recusa passa por
+    # lá para encerrar a tarefa que esperava por ela. Nunca segura a resposta.
     retomado = False
-    if aprovar and _resumer is not None and row is not None:
+    if _resumer is not None and row is not None:
         try:
-            retomado = bool(await _resumer(row))
+            retomado = bool(await _resumer(row)) and aprovar
         except Exception:  # noqa: BLE001
             logger.exception("[release] falha ao retomar %s", release_id)
     return {"ok": True, "liberacao": vista.to_dict(), "retomado": retomado}
@@ -136,18 +137,35 @@ async def decidir(
 # ── painel (administração, só leitura) ───────────────────────────────────
 
 @panel_router.get("")
-async def listar(user_id: UUID = Query(...)) -> dict:
-    """Pendentes de um usuário, para a tela de administração.
+async def listar(
+    user_id: UUID = Query(...),
+    status: str = Query("pendentes", pattern="^(pendentes|todas)$"),
+    limit: int = Query(60, ge=1, le=300),
+) -> dict:
+    """Liberações de um usuário, para a tela de administração.
 
-    Só leitura de propósito: ver não é aprovar, e o token do painel não diz
-    QUEM está olhando.
+    Só leitura de propósito: ver não é aprovar — quem aprova é o aparelho
+    pareado (ver o docstring do módulo). `status=todas` traz o histórico com as
+    decididas, usadas e expiradas; o default segue sendo só as pendentes, que é
+    o que uma tela de "o que está me esperando" precisa.
+
+    Cada item vem com o TEXTO DO CARD que chegou no aparelho (`card`), lido da
+    notificação — a tela mostra o mesmo que você aprovaria, não uma segunda
+    redação do mesmo pedido.
     """
     service = _require_service()
-    pendentes = await service.list_pending(user_id)
-    return {
-        "total": len(pendentes),
-        "liberacoes": [ReleaseView.of(r).to_dict() for r in pendentes],
-    }
+    rows = (
+        await service.list_recent(user_id, limit=limit)
+        if status == "todas"
+        else await service.list_pending(user_id)
+    )
+    cards = await service.cards_of(rows)
+    itens = []
+    for row in rows:
+        item = ReleaseView.of(row).to_dict()
+        item["card"] = cards.get(item["id"])
+        itens.append(item)
+    return {"total": len(itens), "status": status, "liberacoes": itens}
 
 
 @panel_router.get("/{release_id}")
@@ -156,4 +174,7 @@ async def detalhe(release_id: str) -> dict:
     row = await service.get(release_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Liberação não encontrada")
-    return {"liberacao": ReleaseView.of(row).to_dict()}
+    cards = await service.cards_of([row])
+    vista = ReleaseView.of(row).to_dict()
+    vista["card"] = cards.get(vista["id"])
+    return {"liberacao": vista}
