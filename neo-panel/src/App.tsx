@@ -26,6 +26,7 @@ import FilesPanel from './FilesPanel';
 import SpotifyPanel from './SpotifyPanel';
 import SirenePanel from './SirenePanel';
 import DadosPanel from './DadosPanel';
+import LiberacoesPanel from './LiberacoesPanel';
 import Sidebar from './Sidebar';
 import { ToastContainer, useToast } from './ToastNotification';
 
@@ -98,6 +99,7 @@ function App() {
             <Route path="/pesquisas" element={<ResearchPanel />} />
             <Route path="/agenda" element={<AgendaPanel />} />
             <Route path="/servicos" element={<ServicesPanel />} />
+            <Route path="/liberacoes" element={<LiberacoesPanel />} />
             <Route path="/arquivos" element={<FilesPanel />} />
             {/* Cadastros generativos: a MESMA tela serve todos os cadastros —
                 o :slug escolhe qual schema renderizar. */}

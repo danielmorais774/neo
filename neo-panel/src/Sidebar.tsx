@@ -31,6 +31,7 @@ const NAV_GROUPS: NavGroup[] = [
       { path: '/pesquisas', label: 'Pesquisas', icon: 'search' },
       { path: '/agenda', label: 'Agenda', icon: 'clock' },
       { path: '/servicos', label: 'Serviços', icon: 'gear' },
+      { path: '/liberacoes', label: 'Liberações', icon: 'key' },
       { path: '/arquivos', label: 'Arquivos', icon: 'file' },
       { path: '/dados', label: 'Dados', icon: 'table' },
       { path: '/sirene', label: 'Sirene', icon: 'siren' },
