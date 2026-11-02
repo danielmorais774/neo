@@ -1,0 +1,11 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Página que estoura o teto</title>
+<style>body{margin:0;font:14px Arial} .grade{display:grid;grid-template-columns:220px 1fr}
+.filtros{height:1000px;overflow:hidden} .itens{padding:12px}</style></head><body>
+<div class="grade"><div class="filtros" id="f"></div><div class="itens" id="i"><h1>Resultados</h1></div></div>
+<script>
+const f = document.getElementById('f');
+// 700 links de filtro ANTES do conteúdo no DOM: é o que comia os 200 lugares.
+for (let k = 0; k < 700; k++) { const a = document.createElement('a'); a.href = '/f/' + k; a.textContent = 'Filtro ' + k; a.style.cssText='display:block;height:12px;font-size:10px;overflow:hidden'; f.appendChild(a); }
+const i = document.getElementById('i');
+for (let k = 0; k < 6; k++) { const b = document.createElement('button'); b.textContent = 'Comprar item ' + k; b.style.cssText='display:block;margin:12px'; i.appendChild(b); }
+</script></body></html>

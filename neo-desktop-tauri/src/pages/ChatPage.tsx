@@ -328,7 +328,10 @@ export const ChatPage = () => {
     content: string,
     modeOverride?: string,
     attachmentIds?: string[],
-    voice?: VoiceInputMeta
+    voice?: VoiceInputMeta,
+    // Quantos caracteres desta mensagem foram COLADOS (o Chat conta; ver §21 do
+    // release-request-plan). O core usa para marcar o turno como contaminado.
+    pastedChars?: number
   ) => {
     addMessage({
       role: 'user',
@@ -347,7 +350,8 @@ export const ChatPage = () => {
         modeOverride ?? chatMode,
         selectedProvider,
         attachmentIds,
-        voice
+        voice,
+        pastedChars
       );
     } catch (error: any) {
       console.error('Erro:', error);
@@ -505,7 +509,9 @@ export const ChatPage = () => {
         maxIterations={maxIterations}
         // O Chat manda anexos no 2º arg; o Live usa esse mesmo slot para o mode
         // (useLiveMode chama handleSendMessage(texto, 'live')) — daí o wrapper.
-        onSendMessage={(msg, attachmentIds) => handleSendMessage(msg, undefined, attachmentIds)}
+        onSendMessage={(msg, attachmentIds, pastedChars) =>
+          handleSendMessage(msg, undefined, attachmentIds, undefined, pastedChars)
+        }
         onClearHistory={handleClearHistory}
         onNewChat={handleNewChat}
         onStop={handleStop}

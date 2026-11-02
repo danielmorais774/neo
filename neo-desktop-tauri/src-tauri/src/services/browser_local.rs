@@ -36,6 +36,9 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const SOCKET_RECORD: &str = "/tmp/open-browser-use/active.json";
+/// Onde o host nativo cria o socket. O `active.json` mora aqui dentro, e os
+/// `*.sock` ao lado dele são o plano B — ver `socket_path`.
+const SOCKET_DIR: &str = "/tmp/open-browser-use";
 const SESSION_ID: &str = "neo-browser-local";
 /// Teto de uma chamada ao backend. O passo inteiro tem timeout do lado do core;
 /// este aqui só impede que uma chamada pendurada segure a conexão para sempre.
@@ -59,22 +62,87 @@ struct Conn {
     turn_id: String,
 }
 
+/// Onde está o socket do host nativo — pelo registro, e, se ele sumiu, pelo
+/// próprio diretório.
+///
+/// O `active.json` era a ÚNICA fonte, e isso quebrava o navegador local sozinho
+/// a cada poucos dias. O limpador diário de `/tmp` do macOS apaga arquivo comum
+/// sem acesso há 3 dias e **não** apaga o socket: o host segue vivo, o socket
+/// segue atendendo, e some só o bilhete que diz onde ele está. Medido em
+/// 2026-10-05 nesta máquina — host de pé desde 28/09 respondendo `ping`→`pong` e
+/// `getInfo` com a extensão conectada, `active.json` inexistente, e o Neo
+/// dizendo ao usuário "a extensão do Neo não está ativa". Dois jobs morreram
+/// assim (37a29567, 45fce2e8), e a mensagem ainda mandava arrumar o que não
+/// estava quebrado.
+///
+/// O plano B não substitui o registro: ele é consultado primeiro, porque é o
+/// único que diz QUAL socket é o atual quando há mais de um. A varredura só
+/// entra quando não há registro nenhum, e aí o socket mais recente é a melhor
+/// resposta disponível — quem confirma se ele atende é o `ping` logo em seguida.
 fn socket_path() -> Result<PathBuf, String> {
-    let raw = std::fs::read_to_string(SOCKET_RECORD).map_err(|_| {
+    match std::fs::read_to_string(SOCKET_RECORD) {
+        Ok(raw) => {
+            let record: Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("registro do socket do open-browser-use ilegível: {}", e))?;
+            let path = record
+                .get("socketPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if path.is_empty() {
+                return Err("registro do socket do open-browser-use sem socketPath".to_string());
+            }
+            Ok(PathBuf::from(path))
+        }
+        Err(_) => socket_por_varredura(),
+    }
+}
+
+/// O `.sock` mais recente em `/tmp/open-browser-use`, quando o registro sumiu.
+fn socket_por_varredura() -> Result<PathBuf, String> {
+    socket_por_varredura_em(std::path::Path::new(SOCKET_DIR))
+}
+
+fn socket_por_varredura_em(dir_base: &std::path::Path) -> Result<PathBuf, String> {
+    let ausente = || {
         "o navegador local não está com a extensão do Neo ativa (host do open-browser-use \
          não está no ar)"
             .to_string()
-    })?;
-    let record: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("registro do socket do open-browser-use ilegível: {}", e))?;
-    let path = record
-        .get("socketPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if path.is_empty() {
-        return Err("registro do socket do open-browser-use sem socketPath".to_string());
+    };
+    let dir = std::fs::read_dir(dir_base).map_err(|_| ausente())?;
+    let mut melhor: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entrada in dir.flatten() {
+        let caminho = entrada.path();
+        if caminho.extension().and_then(|e| e.to_str()) != Some("sock") {
+            continue;
+        }
+        // É socket mesmo? Um arquivo comum chamado `.sock` não serve, e
+        // descobrir isso no `connect` custaria o erro errado.
+        let meta = match entrada.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if !meta.file_type().is_socket() {
+                continue;
+            }
+        }
+        let quando = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if melhor.as_ref().map_or(true, |(t, _)| quando > *t) {
+            melhor = Some((quando, caminho));
+        }
     }
-    Ok(PathBuf::from(path))
+    match melhor {
+        Some((_, caminho)) => {
+            info!(
+                "[browser_local] active.json sumiu (limpeza do /tmp); usando o socket {}",
+                caminho.display()
+            );
+            Ok(caminho)
+        }
+        None => Err(ausente()),
+    }
 }
 
 impl Conn {
@@ -357,8 +425,638 @@ const JS_HELPERS: &str = r#"
     if (!el || !el.isConnected) return null;
     return el;
   };
+  // MOLDURA do site, em UM lugar. Era uma string literal dentro do
+  // `js_snapshot` e o `js_extract` não tinha acesso a ela — então o extract
+  // devolvia 1500 caracteres de menu sem nenhum sinal de que era menu, e
+  // leitura certa chegava ao modelo idêntica a leitura errada. Repetir o
+  // seletor nos dois lugares criaria duas verdades, que é exatamente como esta
+  // base já mentiu com autoridade uma vez.
+  //
+  // Só landmark DECLARADO, de propósito (ver a seção "moldura do site" do
+  // inventário): errar para menos aqui é barato, errar para mais esconde a
+  // resposta.
+  NEO.CHROME = 'nav,[role=navigation],header,[role=banner],footer,[role=contentinfo]';
+  // Conjunto AMPLO, só para DESCONTAR texto na eleição do conteúdo principal.
+  // Não carimba elemento nenhum e não esconde texto de ninguém: muda apenas
+  // QUAL bloco é adicionado na frente. Por isso pode ser mais largo que o
+  // `NEO.CHROME`, onde errar para mais é caro.
+  NEO.CHROME_DESCONTO = NEO.CHROME + ',aside,[role=complementary],[role=search]';
+  // Profundidade no DOM — o desempate da eleição do principal.
+  NEO.fundura = (el) => {
+    let n = 0;
+    for (let p = el; p; p = p.parentElement) n++;
+    return n;
+  };
+  // ── O PAINEL DO NEO NÃO É A PÁGINA ─────────────────────────────────────
+  // `elementFromPoint` devolve o host do overlay da extensão quando o ponto cai
+  // nele, e esse host é um `div` fixo de shadow fechado, sem nome. Todo elemento
+  // embaixo do painel saía `⟪COBERTO por "div"⟫`: 0 ocorrências nos jobs de antes
+  // de a faixa virar painel lateral, 540 no job 45e85695. E a regra do prompt
+  // para COBERTO é "dispense o intruso primeiro" — o próprio Neo fabricava o
+  // obstáculo que depois gastava passos tentando tirar da frente.
+  NEO.NOSSOS = '#neo-browser-local-overlay,#neo-marks,#neo-map-overlay';
+  // `elementFromPoint` de verdade: pula o que é nosso e atravessa shadow DOM
+  // aberto, senão o ponto para no host do web component e nada lá dentro existe.
+  NEO.topo = (x, y, doc) => {
+    const d = doc || document;
+    let el = null;
+    try { el = d.elementFromPoint(x, y); } catch (_) { return null; }
+    if (el && el.matches(NEO.NOSSOS)) {
+      el = null;
+      try {
+        for (const c of d.elementsFromPoint(x, y)) {
+          if (!c.matches(NEO.NOSSOS)) { el = c; break; }
+        }
+      } catch (_) { return null; }
+    }
+    for (let n = 0; el && el.shadowRoot && n < 8; n++) {
+      let dentro = null;
+      try { dentro = el.shadowRoot.elementFromPoint(x, y); } catch (_) { break; }
+      if (!dentro || dentro === el) break;
+      el = dentro;
+    }
+    return el;
+  };
+  // `contains` e `closest` param na fronteira do shadow; estes dois atravessam.
+  NEO.contem = (a, b) => {
+    if (a.contains(b)) return true;
+    for (let n = b; n; ) {
+      if (n === a) return true;
+      const pai = n.parentNode;
+      n = pai && pai.host ? pai.host : pai;
+    }
+    return false;
+  };
+  NEO.subir = (el, sel) => {
+    for (let n = el; n; ) {
+      const achou = n.closest(sel);
+      if (achou) return achou;
+      const raiz = n.getRootNode();
+      n = raiz && raiz.host ? raiz.host : null;
+    }
+    return null;
+  };
+  // As raízes onde procurar. `querySelectorAll` não entra em shadow DOM, e web
+  // component é como Salesforce, Reddit e todo design system corporativo
+  // desenham a tela: sem isto, esses sites simplesmente não têm elementos.
+  NEO.raizes = (doc) => {
+    const out = [doc || document];
+    for (let i = 0; i < out.length && out.length < 80; i++) {
+      for (const el of out[i].querySelectorAll('*')) {
+        if (el.shadowRoot) out.push(el.shadowRoot);
+      }
+    }
+    return out;
+  };
+  NEO.todos = (sel, raizes) => {
+    const rs = raizes || NEO.raizes();
+    if (rs.length === 1) return document.querySelectorAll(sel);
+    const out = [];
+    for (const r of rs) out.push(...r.querySelectorAll(sel));
+    return out;
+  };
+  // O endereço de uma imagem. `data:` é a miniatura embutida do carregamento
+  // preguiçoso, e o endereço de verdade fica em `data-src` ou no `srcset`.
+  NEO.srcDe = (img) => {
+    const direto = String(img.currentSrc || img.src || '');
+    if (direto && !direto.startsWith('data:')) return direto;
+    const lazy = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || '';
+    if (lazy) return lazy;
+    const conjunto = img.getAttribute('data-srcset') || img.getAttribute('srcset') || '';
+    return conjunto ? conjunto.split(',')[0].trim().split(/\s+/)[0] : '';
+  };
+  NEO.normaliza = (v) => String(v || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+
+  // ── LEITURA: o texto que um humano enxerga ─────────────────────────────
+  // O snapshot lia `body.innerText`, que sai em ordem de DOCUMENTO: todo site põe
+  // a navegação primeiro, então o orçamento acabava antes do conteúdo. Os
+  // remendos (`principal`, teto do corpo) só mudavam QUAL pedaço do DOM ia na
+  // frente — e bastava a eleição errar para o modelo ficar cego. No job 45e85695
+  // ela elegeu o carrinho em 19 snapshots de página de produto: em 15 o preço do
+  // produto, que estava na tela, não chegou ao prompt, e nos outros 4 só apareceu
+  // enterrado numa linha de variação.
+  //
+  // Aqui a pergunta é outra: o que está NA JANELA agora? Independe de landmark,
+  // de framework e de eleição, e rolar passa a trazer texto novo, que é o que
+  // qualquer um espera. Medido na mesma página: 1.385 caracteres em 11 ms, com
+  // preço, parcelas, frete, estoque, vendedor e nota.
+  //
+  // Ordem de documento dentro da janela, e não ordenação por coordenada: o DOM
+  // respeita coluna, e ordenar por `top` intercalaria as colunas linha a linha.
+  NEO.SEM_TEXTO = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|OPTION|OPTGROUP|DATALIST|TEXTAREA|TITLE)$/i;
+  // Tapado = atrás de uma camada FIXA e OPACA. Errar para menos é o lado seguro:
+  // o erro oposto some com texto visível. Card com `<a>` transparente esticado
+  // por cima (o `stretched-link`, comuníssimo em lista de produto) pegaria o
+  // ponto do hit-test e levaria o texto inteiro junto se bastasse "não me acertou".
+  NEO.tapado = (el, r, gasto) => {
+    const x = (Math.max(r.left, 0) + Math.min(r.right, innerWidth)) / 2;
+    const y = (Math.max(r.top, 0) + Math.min(r.bottom, innerHeight)) / 2;
+    const topo = NEO.topo(x, y);
+    if (!topo || topo === el || NEO.contem(el, topo) || NEO.contem(topo, el)) return false;
+    let q = topo, opaco = false;
+    for (let n = 0; q && q !== document.body && q.nodeType === 1 && n < 8; n++) {
+      gasto();
+      const s = getComputedStyle(q);
+      const cor = s.backgroundColor.match(/[\d.]+/g) || [];
+      const alfa = cor.length >= 4 ? parseFloat(cor[3]) : cor.length === 3 ? 1 : 0;
+      if (alfa >= 0.9 || s.backgroundImage !== 'none') opaco = true;
+      if (s.position === 'fixed') return opaco && !NEO.contem(q, el);
+      q = q.parentElement;
+    }
+    return false;
+  };
+  // Devolve `tela` (na janela agora) e `resto` (existe, mas fora dela). À ESQUERDA
+  // da página não conta como "resto": x negativo não se alcança rolando, é onde
+  // moram os skip-links e o painel de atalhos de teclado da Amazon.
+  NEO.ler = (excluir) => {
+    const vw = innerWidth, vh = innerHeight;
+    const decisao = new Map();
+    let orcamento = 400;
+    const gasto = () => { orcamento--; };
+    const decidir = (el) => {
+      let d = decisao.get(el);
+      if (d !== undefined) return d;
+      d = 0;
+      if (!NEO.SEM_TEXTO.test(el.tagName) && !(excluir && excluir(el))) {
+        let pode = true;
+        try {
+          if (el.checkVisibility) {
+            pode = el.checkVisibility({
+              opacityProperty: true, visibilityProperty: true,
+              checkOpacity: true, checkVisibilityCSS: true,
+            });
+          }
+        } catch (_) { pode = true; }
+        if (pode) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0 && r.right > 0) {
+            const naJanela = r.bottom > 0 && r.top < vh && r.left < vw;
+            d = naJanela && !(orcamento > 0 && NEO.tapado(el, r, gasto)) ? 1 : 2;
+          }
+        }
+      }
+      decisao.set(el, d);
+      return d;
+    };
+    const linhas = { 1: [], 2: [] };
+    const anterior = { 1: null, 2: null };
+    const colher = (no) => {
+      const t = no.nodeValue.replace(/\s+/g, ' ').trim();
+      if (!t) return;
+      const el = no.parentElement || (no.parentNode && no.parentNode.host);
+      if (!el) return;
+      const d = decidir(el);
+      if (!d) return;
+      const r = el.getBoundingClientRect();
+      const ant = anterior[d];
+      const lista = linhas[d];
+      const naMesma = ant && lista.length &&
+        Math.abs(r.top - ant.top) < Math.max(r.height, ant.height) * 0.7 && r.left >= ant.left;
+      if (naMesma) lista[lista.length - 1] += ' ' + t;
+      else lista.push(t);
+      anterior[d] = r;
+    };
+    const varrer = (raiz) => {
+      const w = document.createTreeWalker(raiz, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = w.nextNode())) {
+        if (n.nodeType === 3) colher(n);
+        else if (n.shadowRoot) varrer(n.shadowRoot);
+      }
+    };
+    if (document.body) varrer(document.body);
+    const juntar = (l) => l.filter((x, i) => x !== l[i - 1]).join('\n');
+    return { tela: juntar(linhas[1]), resto: juntar(linhas[2]) };
+  };
   NEO.fire = (el, type, extra) =>
     el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true, ...(extra || {}) }));
+
+  // ── ONDE O CLIQUE CAI ──────────────────────────────────────────────────
+  // Evento SOBE na árvore, não desce. O inventário escolhe um elemento visível e
+  // o clique era despachado nele, mas o controle de verdade pode ser um FILHO: o
+  // botão da Amazon é um `<input>` com `opacity:0.01` esticado sobre um desenho, e
+  // o clique no `span` pai nunca chegava nele. Foram 16 tentativas com `ok:true` e
+  // o carrinho vazio no fim (job 8bc25dd1), enquanto o `Excluir` do mesmo job, um
+  // input visível, funcionava. Só `<label>` encaminha para o controle.
+  //
+  // A pergunta certa não é "qual elemento?", é "quem recebe este PIXEL?". É o que o
+  // navegador faz para um humano, e por isso vale em qualquer site, sem saber nada
+  // da Amazon.
+  NEO.CONTROLE = 'a[href],area[href],button,input:not([type=hidden]),select,textarea,summary,label,' +
+    '[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],[role=tab],' +
+    '[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=option],[role=combobox]';
+  NEO.dono = (el) => NEO.subir(el, NEO.CONTROLE);
+  // Controle transparente sem nome próprio: o nome dele é o que se lê no desenho
+  // embaixo. Sem isto ele entra na lista como um elemento mudo, ou com o `name`
+  // técnico do formulário, e o modelo não tem como saber que é aquele botão.
+  NEO.nomeDe = (el) => {
+    const proprio = NEO.label(el);
+    if (el.tagName !== 'INPUT' || !el.parentElement) return proprio;
+    if (proprio && proprio !== el.getAttribute('name')) return proprio;
+    if (parseFloat(getComputedStyle(el).opacity || '1') >= 0.05) return proprio;
+    return NEO.shortLabel(el.parentElement) || proprio;
+  };
+  // O controle por trás de um rosto. É o que torna verdade o `[seleciona ...]`
+  // que o inventário escreve: `fill` e `select` recebiam o rosto e desistiam.
+  NEO.controleDe = (el) => {
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return el;
+    return (NEO.controles && NEO.controles.get(el)) || (el.tagName === 'LABEL' ? el.control : null) || null;
+  };
+  // `a` tapa ao menos 80% de `b`.
+  NEO.cobre = (a, b) => {
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    const w = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
+    const h = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
+    return w > 0 && h > 0 && w * h >= rb.width * rb.height * 0.8;
+  };
+  NEO.vizinhos = (a, b) => {
+    let p = b;
+    for (let n = 0; p && n < 3; n++) {
+      p = p.parentElement;
+      if (p && p.contains(a)) return true;
+    }
+    return false;
+  };
+  // Controle transparente que está na frente: invisível para o filtro de
+  // visibilidade, mas é ele que recebe o clique de quem olha o desenho embaixo.
+  // Fora da janela não existe teste de acerto, e aí vale a geometria.
+  NEO.naFrente = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 12 || r.height < 12 || r.right <= 0 || r.bottom <= -200) return false;
+    const s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x >= 0 && y >= 0 && x < innerWidth && y < innerHeight) return NEO.topo(x, y) === el;
+    return s.position === 'absolute' && !!el.parentElement && NEO.cobre(el, el.parentElement);
+  };
+  // De onde o documento do elemento começa. Num iframe de mesma origem o elemento
+  // mede relativo ao quadro dele, e o mouse real anda na janela de cima.
+  NEO.origem = (el) => {
+    const doc = el.ownerDocument;
+    let dx = 0, dy = 0;
+    try {
+      for (let w = doc.defaultView; w && w !== w.parent; w = w.parent) {
+        const f = w.frameElement;
+        if (!f) break;
+        const b = f.getBoundingClientRect();
+        dx += b.left + f.clientLeft;
+        dy += b.top + f.clientTop;
+      }
+    } catch (_) { /* quadro de outra origem: fica o que deu para somar */ }
+    return { doc, dx, dy };
+  };
+  NEO.mirar = (el) => {
+    const { doc, dx, dy } = NEO.origem(el);
+    const vista = doc.defaultView || window;
+    const r = el.getBoundingClientRect();
+    const cy = r.top + r.height / 2;
+    const meio = [r.left + r.width / 2, cy];
+    const pontos = [
+      meio,
+      [r.left + Math.min(r.width * 0.25, 40), cy],
+      [r.right - Math.min(r.width * 0.25, 40), cy],
+    ];
+    // Link quebrado em duas linhas: o centro da caixa cai no vazio entre elas.
+    const partes = el.getClientRects();
+    if (partes.length > 1) pontos.push([partes[0].left + partes[0].width / 2, partes[0].top + partes[0].height / 2]);
+    const controle = el.matches(NEO.CONTROLE);
+    const nome = NEO.normaliza(NEO.label(el));
+    const ponto = (x, y) => ({ x, y, gx: x + dx, gy: y + dy });
+    let reserva = null, tampa = null;
+    for (const [x, y] of pontos) {
+      if (x < 0 || y < 0 || x >= vista.innerWidth || y >= vista.innerHeight) continue;
+      const t = NEO.topo(x, y, doc);
+      if (!t) continue;
+      if (t === el) return { ...ponto(x, y), alvo: el, pixel: true };
+      if (NEO.contem(el, t)) {
+        const d = NEO.dono(t);
+        const outro = d && d !== el && NEO.contem(el, d) && !(el.tagName === 'LABEL' && el.control === d);
+        // Conteúdo do próprio alvo: o evento nasce no filho e sobe até ele.
+        if (!outro) return { ...ponto(x, y), alvo: controle ? el : t, pixel: true };
+        // `el` era o rosto e o controle está dentro dele: o caso da Amazon.
+        if (!controle) return { ...ponto(x, y), alvo: d, pixel: true };
+        // Controle dentro de controle (o "termos" no meio do label do aceite):
+        // este ponto clicaria em outra coisa. Procura um ponto que seja do alvo.
+        continue;
+      }
+      // O pixel vai para um ancestral: `el` é pintura com `pointer-events:none`.
+      if (NEO.contem(t, el)) { reserva = reserva || ponto(x, y); continue; }
+      // Outro elemento na frente. Só é o alvo se for o mesmo controle sob outra
+      // tag: mesmo nome, ou esticado sobre o rosto logo ao lado dele.
+      const d = NEO.dono(t);
+      if (d && (NEO.normaliza(NEO.label(d)) === nome || (NEO.cobre(d, el) && NEO.vizinhos(d, el)))) {
+        return { ...ponto(x, y), alvo: d, pixel: true };
+      }
+      tampa = tampa || t;
+    }
+    return { ...(reserva || ponto(meio[0], meio[1])), alvo: el, pixel: false, tampa };
+  };
+  NEO.descrever = (el) => {
+    const tipo = el.getAttribute('type');
+    return el.tagName.toLowerCase() + (tipo ? '(' + tipo + ')' : '') + (el.id ? '#' + el.id : '');
+  };
+  NEO.soltar = (c) => {
+    const janela = c.alvo.ownerDocument.defaultView || window;
+    for (const t of ['pointerdown', 'mousedown', 'click']) janela.removeEventListener(t, c.ouvir, true);
+    if (NEO.clique === c) NEO.clique = null;
+  };
+  // Primeira metade do clique: rola, descobre quem recebe o pixel e arma a SONDA,
+  // que é o que distingue "mandei" de "chegou". O disparo fica para depois porque
+  // o caminho principal é o mouse de verdade, que sai pelo CDP, fora da página.
+  //   tipo     esquerdo | duplo | direito
+  //   trava    regex das ações que não desfazem, conferida no alvo REAL: o rótulo
+  //            que o core julgou é o do rosto, e o que recebe o clique pode ser
+  //            outro. E em `click_text` ele só conhecia o texto que o modelo
+  //            escreveu: "agora" passava por "Comprar agora".
+  //   liberado rótulo que o usuário já autorizou
+  //   proprio  confere também o `el` (o core nunca viu o rótulo dele)
+  NEO.preparar = (el, o) => {
+    const opcoes = o || {};
+    if (NEO.clique) NEO.soltar(NEO.clique);
+    const ctl = NEO.controleDe(el);
+    if (el.disabled || (ctl && ctl.disabled)) return { ok: false, error: 'elemento desabilitado' };
+    el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    let m = NEO.mirar(el);
+    // Barra fixa tapando a borda: `nearest` para colado nela. Centralizar é um
+    // pulo na tela, então só quando o ponto falhou.
+    if (!m.pixel) {
+      el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const denovo = NEO.mirar(el);
+      if (denovo.pixel) m = denovo;
+    }
+    const tipo = opcoes.tipo || 'esquerdo';
+    const ehControle = m.alvo !== el && m.alvo.matches(NEO.CONTROLE);
+    // O rótulo é lido ANTES de clicar: num INTERRUPTOR ele vira no próprio clique,
+    // e o histórico registrava o estado NOVO como se fosse o que foi clicado —
+    // "Reproduzir" no clique que acabara de PAUSAR (job 717a8fbb).
+    const rotulo = (ehControle && NEO.nomeDe(m.alvo)) || NEO.nomeDe(el);
+    if (opcoes.trava) {
+      const re = new RegExp(opcoes.trava, 'i');
+      const liberado = String(opcoes.liberado || '').slice(0, 120);
+      const nomes = [ehControle ? NEO.nomeDe(m.alvo) : '', opcoes.proprio ? NEO.nomeDe(el) : ''];
+      for (const nome of nomes) {
+        if (nome && re.test(nome) && nome.trim().toLowerCase().slice(0, 120) !== liberado) {
+          return { ok: false, error: 'SENSIVEL:' + nome.slice(0, 120) };
+        }
+      }
+    }
+    const c = {
+      el, alvo: m.alvo, x: m.x, y: m.y, tipo, rotulo, recebeu: null,
+      desc: NEO.descrever(m.alvo), achados: opcoes.achados,
+    };
+    c.ouvir = (e) => { if (!c.recebeu) c.recebeu = (e.composedPath && e.composedPath()[0]) || e.target; };
+    const janela = m.alvo.ownerDocument.defaultView || window;
+    for (const t of ['pointerdown', 'mousedown', 'click']) janela.addEventListener(t, c.ouvir, true);
+    NEO.clique = c;
+    // O mouse real obedece o navegador, e o navegador não sabe que o painel é
+    // nosso: por baixo dele o clique acertaria o painel.
+    let bruto = null;
+    try { bruto = document.elementFromPoint(m.gx, m.gy); } catch (_) { /* fora da janela */ }
+    // Direito não vai pelo mouse real: abriria o menu NATIVO do sistema por cima
+    // da página. O que interessa é o menu do site, e esse responde ao evento.
+    const real = m.pixel && tipo !== 'direito' && document.visibilityState === 'visible' &&
+      !(bruto && bruto.matches(NEO.NOSSOS));
+    // Pulso visual no ponto do clique: a aba mexendo sozinha sem nenhum sinal é
+    // desconcertante para quem está olhando. Quem desenha é o shadow DOM da
+    // extensão (nenhum nó novo na página) — daí ser um postMessage e não um
+    // appendChild aqui.
+    postMessage({ __neo_ping: { x: m.gx, y: m.gy, tipo: tipo === 'direito' ? 'direito' : 'esquerdo' } }, '*');
+    return { ok: true, real, x: m.gx, y: m.gy, url: location.href, label: rotulo, alvo: c.desc, achados: c.achados };
+  };
+  // A reserva: evento fabricado no alvo resolvido. Fica para o que o mouse real
+  // não alcança (aba em segundo plano, ponto debaixo do painel do Neo, botão
+  // direito). `.click()` e não só eventos: é o que aciona o `<a>`, o submit e o
+  // label. Sequência completa porque há site que só escuta pointerdown/mouseup.
+  NEO.despachar = (c) => {
+    const el = c.alvo;
+    const vista = el.ownerDocument.defaultView || window;
+    const base = { bubbles: true, cancelable: true, composed: true, view: vista, clientX: c.x, clientY: c.y };
+    const opts = c.tipo === 'direito' ? { ...base, button: 2, buttons: 2 } : { ...base, button: 0 };
+    const Ponteiro = vista.PointerEvent || PointerEvent, Mouse = vista.MouseEvent || MouseEvent;
+    const sequencia = (detail) => {
+      el.dispatchEvent(new Ponteiro('pointerdown', opts));
+      el.dispatchEvent(new Mouse('mousedown', { ...opts, detail }));
+      if (el.focus) el.focus();
+      el.dispatchEvent(new Ponteiro('pointerup', opts));
+      el.dispatchEvent(new Mouse('mouseup', { ...opts, detail }));
+    };
+    if (c.tipo === 'direito') {
+      sequencia(1);
+      el.dispatchEvent(new Mouse('contextmenu', opts));
+    } else if (c.tipo === 'duplo') {
+      for (let i = 1; i <= 2; i++) {
+        sequencia(i);
+        el.dispatchEvent(new Mouse('click', { ...opts, detail: i }));
+      }
+      el.dispatchEvent(new Mouse('dblclick', { ...opts, detail: 2 }));
+    } else {
+      sequencia(1);
+      // SVG não tem `.click()`, e o pixel pode ter caído no `path` de um ícone.
+      if (el.click) el.click(); else el.dispatchEvent(new Mouse('click', { ...opts, detail: 1 }));
+    }
+  };
+  NEO.fimDoClique = (c, via) => {
+    const recebeu = c.recebeu;
+    NEO.soltar(c);
+    const out = { ok: true, url: location.href, label: c.rotulo, via, alvo: c.desc };
+    if (c.achados !== undefined) out.achados = c.achados;
+    // O mouse real obedece o pixel, e a página pode ter mudado entre mirar e
+    // clicar. Não dá para desfazer, mas dá para não mentir sobre onde caiu.
+    if (via === 'pixel' && recebeu && !NEO.contem(c.alvo, recebeu) && !NEO.contem(recebeu, c.alvo) &&
+        !NEO.contem(c.el, recebeu)) {
+      out.desvio = NEO.descrever(recebeu);
+    }
+    // O clique virou SELEÇÃO? É a única evidência de efeito que existe para
+    // "marque a alternativa": marcar um rádio não muda URL, nem título, nem
+    // texto — o freio de tela repetida é cego para isso por construção. O estado
+    // sai do CONTROLE, inclusive do input escondido atrás do label.
+    const ctl = NEO.controleDe(c.el) || NEO.controleDe(c.alvo) ||
+      (c.el.querySelector ? c.el.querySelector('input[type=radio],input[type=checkbox]') : null);
+    const tipo = ctl && ctl.getAttribute('type');
+    if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
+    else {
+      const aria = c.el.getAttribute('aria-checked') || c.el.getAttribute('aria-selected');
+      if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
+    }
+    // O número, quando existe: o modelo volta a poder usar `click`/`extract` nele.
+    if (NEO.refs) {
+      const i = NEO.refs.indexOf(c.el);
+      if (i >= 0) out.ref = i;
+    }
+    return out;
+  };
+
+  // ── VARREDURA DA DOM INTEIRA ───────────────────────────────────────────
+  // O inventário é o que está na tela, com teto de 200. Isto é a pergunta oposta:
+  // dado um NOME, o que existe no documento inteiro que responde por ele? Entra em
+  // shadow DOM e em iframe de mesma origem, e não filtra por visibilidade: o que
+  // está escondido volta marcado, porque "existe, mas está fechado" é resposta.
+  //
+  // Procura pelo NOME ACESSÍVEL e não só pelo texto. No job 8bc25dd1 o modelo chegou
+  // a tentar `extract {"busca": "add-to-cart"}`: o controle de verdade não tem nó de
+  // texto, o nome dele está em `value`, `title` e `aria-labelledby`, e o `click_text`
+  // só andava por nós de texto. Texto casado sem controle em volta sobe até o dono,
+  // que pode ser o `<input>` que se declarou rotulado por ele, ou o que está por cima.
+  NEO.ATIVAVEL = NEO.CONTROLE + ',[onclick],[ng-click],[data-ng-click],[jsaction],[data-action],[tabindex="0"]';
+  NEO.candidatos = (texto) => {
+    const procurado = NEO.normaliza(texto);
+    const raizes = NEO.raizes();
+    let fechados = 0;
+    for (let i = 0; i < raizes.length && raizes.length < 120; i++) {
+      for (const f of raizes[i].querySelectorAll('iframe,frame')) {
+        let d = null;
+        try { d = f.contentDocument; } catch (_) { d = null; }
+        if (d && d.body) raizes.push(...NEO.raizes(d));
+        else fechados++;
+      }
+    }
+    const grauDe = (nome) => {
+      const n = NEO.normaliza(nome);
+      if (!n) return 0;
+      if (n === procurado) return 4;
+      if (n.startsWith(procurado)) return 3;
+      const i = n.indexOf(procurado);
+      if (i < 0) return 0;
+      return i === 0 || n[i - 1] === ' ' ? 2 : 1;
+    };
+    // Quem se declarou rotulado por qual id, para o caminho de volta: do texto ao
+    // controle que aponta para ele.
+    const rotuladosPor = new Map();
+    for (const r of raizes) {
+      for (const el of r.querySelectorAll('[aria-labelledby]')) {
+        for (const id of el.getAttribute('aria-labelledby').split(/\s+/)) {
+          if (id && !rotuladosPor.has(id)) rotuladosPor.set(id, el);
+        }
+      }
+    }
+    const sobreOTexto = (el) => {
+      let p = el;
+      for (let n = 0; p && n < 3; n++) {
+        p = p.parentElement;
+        if (!p) break;
+        const perto = p.querySelectorAll('input:not([type=hidden]),button,a[href]');
+        if (perto.length > 6) break;
+        for (const c of perto) {
+          if (c !== el && !c.contains(el) && NEO.cobre(c, el)) return c;
+        }
+      }
+      return null;
+    };
+    const donoDoNome = (el) => {
+      const d = NEO.dono(el);
+      if (d) return d;
+      for (let p = el, n = 0; p && n < 4; p = p.parentElement, n++) {
+        if (p.id && rotuladosPor.has(p.id)) return rotuladosPor.get(p.id);
+      }
+      const sobre = sobreOTexto(el);
+      if (sobre) return sobre;
+      const ativavel = NEO.subir(el, NEO.ATIVAVEL);
+      if (ativavel) return ativavel;
+      for (let p = el, n = 0; p && n < 6; p = p.parentElement, n++) {
+        if (getComputedStyle(p).cursor === 'pointer') return p;
+      }
+      return el;
+    };
+    const achados = new Map();
+    let parou = false;
+    const anotar = (bruto, nome, fonte) => {
+      const grau = grauDe(nome);
+      if (!grau) return;
+      const el = donoDoNome(bruto);
+      const antes = achados.get(el);
+      if (!antes && achados.size >= 150) { parou = true; return; }
+      const fraca = (f) => f === 'title' || f === 'alt';
+      if (!antes || grau > antes.grau || (grau === antes.grau && fraca(antes.fonte) && !fraca(fonte))) {
+        achados.set(el, { el, grau, fonte, nome: String(nome).replace(/\s+/g, ' ').trim() });
+      }
+    };
+    for (const r of raizes) {
+      for (const el of r.querySelectorAll('[aria-label],[aria-labelledby],[title],[alt],[placeholder],input')) {
+        if (el.closest(NEO.NOSSOS)) continue;
+        for (const a of ['aria-label', 'title', 'alt', 'placeholder']) {
+          const v = el.getAttribute(a);
+          if (v) anotar(el, v, a);
+        }
+        const ids = el.getAttribute('aria-labelledby');
+        if (ids) {
+          const raiz = el.getRootNode();
+          const nome = ids.split(/\s+/).map((id) => {
+            const n = (raiz.getElementById && raiz.getElementById(id)) || el.ownerDocument.getElementById(id);
+            return n ? n.textContent : '';
+          }).join(' ');
+          anotar(el, nome, 'aria-labelledby');
+        }
+        if (el.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(el.type)) anotar(el, el.value, 'value');
+      }
+      // Frase que atravessa nós: em `Li e aceito os <a>termos</a>` nenhum nó de
+      // texto sozinho contém "aceito os termos". O texto inteiro do controle contém.
+      for (const el of r.querySelectorAll(NEO.CONTROLE)) {
+        if (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) || el.closest(NEO.NOSSOS)) continue;
+        anotar(el, el.textContent, 'texto');
+      }
+      const base = r.body || r;
+      const walker = (r.ownerDocument || r).createTreeWalker(base, NodeFilter.SHOW_TEXT);
+      let no;
+      while ((no = walker.nextNode())) {
+        if (!no.nodeValue || no.nodeValue.length < 2) continue;
+        const pai = no.parentElement;
+        if (!pai || NEO.SEM_TEXTO.test(pai.tagName) || pai.closest(NEO.NOSSOS)) continue;
+        anotar(pai, no.nodeValue, 'texto');
+      }
+    }
+    const lista = [];
+    for (const a of achados.values()) {
+      const el = a.el;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      const doc = el.ownerDocument;
+      const vista = doc.defaultView || window;
+      const estado = {};
+      const semArea = r.width < 2 || r.height < 2;
+      if (semArea || s.display === 'none' || s.visibility === 'hidden') estado.escondido = true;
+      else if (el.checkVisibility && !el.checkVisibility({ checkVisibilityCSS: true })) estado.escondido = true;
+      // À esquerda da página não se chega rolando: é onde moram os skip-links.
+      if (!estado.escondido && r.right <= 0) estado.escondido = true;
+      const transparente = !estado.escondido && el.checkVisibility &&
+        !el.checkVisibility({ checkOpacity: true });
+      const naJanela = !estado.escondido && r.top < vista.innerHeight && r.bottom > 0 &&
+        r.left < vista.innerWidth && r.right > 0;
+      if (naJanela) {
+        const t = NEO.topo(r.left + r.width / 2, r.top + r.height / 2, doc);
+        if (t && (t === el || NEO.contem(el, t) || NEO.contem(t, el))) estado.recebe = true;
+        else if (t) {
+          const d = NEO.dono(t);
+          if (d && NEO.cobre(d, el) && NEO.vizinhos(d, el)) estado.recebe = true;
+          else estado.coberto = NEO.shortLabel(t) || t.tagName.toLowerCase();
+        }
+      } else if (!estado.escondido) estado.fora = true;
+      // Transparente que não recebe o pixel está escondido para qualquer um.
+      if (transparente && !estado.recebe && !(estado.fora && NEO.naFrente(el))) {
+        estado.escondido = true;
+        delete estado.fora;
+        delete estado.coberto;
+      }
+      if (el.disabled) estado.desabilitado = true;
+      const nativo = el.matches('a[href],area[href],button,input,select,textarea,summary,label');
+      const tipoAlvo = nativo ? 30 : el.matches(NEO.CONTROLE) ? 25 : el.matches(NEO.ATIVAVEL) ? 15 :
+        s.cursor === 'pointer' ? 10 : 0;
+      const nota = a.grau * 10 + (a.fonte === 'title' || a.fonte === 'alt' ? 0 : 5) + tipoAlvo +
+        (estado.recebe ? 20 : estado.fora ? 10 : 0) -
+        (estado.escondido ? 60 : 0) - (estado.desabilitado ? 40 : 0) - (estado.coberto ? 25 : 0) -
+        (NEO.subir(el, NEO.CHROME) ? 8 : 0);
+      lista.push({ ...a, ...estado, nota, area: r.width * r.height });
+    }
+    // Casar no meio de uma palavra ("editar" em "hereditárias") só serve quando
+    // não há nada melhor.
+    const melhor = lista.reduce((m, c) => Math.max(m, c.grau), 0);
+    const boas = melhor > 1 ? lista.filter((c) => c.grau > 1) : lista;
+    // Ordenação estável: empate fica na ordem do documento depois do menor.
+    boas.sort((a, b) => b.nota - a.nota || a.area - b.area);
+    boas.forEach((c, i) => { c.n = i + 1; });
+    return { lista: boas, fechados, parou };
+  };
   return true;
 })()
 "#;
@@ -403,7 +1101,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // varredura geométrica lá embaixo sobe pelos MESMOS ancestrais centenas de
   // vezes, então o cache é o que torna ela viável.
   const estilos = new Map();
-  let orcamento = 3000;
+  let orcamento = 6000;
   const cs = (el) => {{
     let s = estilos.get(el);
     if (s === undefined) {{
@@ -427,6 +1125,86 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     if (s.visibility === 'hidden' || s.display === 'none') return false;
     if (parseFloat(s.opacity || '1') < 0.05) return false;
     return r.bottom > -200 && r.top < innerHeight + 2000;
+  }};
+
+  // ── O QUE UM PAINEL ABERTO É, DE VERDADE ───────────────────────────────
+  // `role=dialog` diz o que o site DECLAROU, não o que está acontecendo na tela.
+  // A geometria decide, e por isso vale em qualquer site:
+  //   fora     nem está na janela (o carrinho da Amazon em `left: 1819` numa
+  //            janela de 1600px): não existe para esta tarefa;
+  //   pagina   `role=dialog` em fluxo: é parte da página, não abriu nada (a coluna
+  //            de filtros da busca da Amazon, 262×7957px: no job aa4c89f8 ela
+  //            saiu como ">>> O PAINEL «Filtros» ABRIU E É CONTEÚDO", com 138
+  //            itens repetidos no topo, 9.408 caracteres de um prompt de 29.851);
+  //   fluxo    não é fixo, mas flutua: menu suspenso, popover;
+  //   lateral  faixa presa na borda, sem fundo escurecendo a página;
+  //   bloqueia sobrepõe e tem fundo cobrindo a página, ou `aria-modal`, ou cobre
+  //            o centro da janela: é modal, e enquanto está aberto é o conteúdo;
+  //   solto    sobrepõe sem bloquear nada: popover, banner de rodapé.
+  //
+  // `lateral` é o carrinho da Amazon numa janela larga: 150px de 1900, sem X, que
+  // não fecha com nada. O modal era "o conteúdo" por ser `role=dialog` fixo, e a
+  // partir de ~1830px de janela ele tomava o lugar do conteúdo principal em TODA
+  // página de produto. Sobrou para o modelo o carrinho, sem os dados do produto, e
+  // fechar o painel passou a ser a decisão racional: 196s, 5 Escapes, 3 notas (job
+  // 45e85695). O job headless do mesmo dia, em 1280px, nunca viu o carrinho e
+  // coletou 12 itens em 100s.
+  // O que torna um modal "o conteúdo" é ele SOBREPOR o resto, não o papel ARIA.
+  // Dois sinais, nesta ordem: `aria-modal="true"`, que é a marcação que a spec
+  // reserva para isso; ou posicionamento `fixed` — inclusive num ancestral
+  // próximo, que é o desenho comum (fundo `fixed` com a caixa `absolute`
+  // dentro). Um elemento oito vezes mais alto que a janela é conteúdo de
+  // página, não sobreposição.
+  const ehSobreposicao = (el) => {{
+    if (el.getAttribute('aria-modal') === 'true') return true;
+    let p = el, n = 0;
+    while (p && n++ < 5) {{
+      if (getComputedStyle(p).position === 'fixed') return true;
+      p = p.parentElement;
+    }}
+    return false;
+  }};
+  // Fundo cobrindo a página: é o que separa a gaveta MODAL da faixa presa na borda,
+  // e o modal alinhado ao topo (o desenho mais comum) de um popover. O que está
+  // atrás de um fundo não responde a clique.
+  //
+  // A comparação de texto é o que distingue o fundo da CASCA do app: um `fixed`
+  // de tela inteira que contém a página toda (SPA com layout fixo) tem muito mais
+  // texto que o painel. Sem isso, toda barra lateral desses sites virava modal.
+  const fundoCobre = (p) => {{
+    let q = NEO.topo(innerWidth / 2, innerHeight / 2);
+    for (let n = 0; q && q !== document.body && n < 6; n++) {{
+      const r = box(q);
+      if (r.width * r.height >= innerWidth * innerHeight * 0.8 &&
+          getComputedStyle(q).position === 'fixed') {{
+        return String(q.innerText || '').length <= String(p.innerText || '').length + 200;
+      }}
+      q = q.parentElement;
+    }}
+    return false;
+  }};
+  const NAO_E_PAINEL = ['fora', 'lateral', 'pagina'];
+  const quadros = new Map();
+  const quadro = (p) => {{
+    let q = quadros.get(p);
+    if (q) return q;
+    const r = box(p);
+    const w = innerWidth, h = innerHeight;
+    if (!(r.top < h && r.bottom > 0 && r.left < w && r.right > 0)) q = 'fora';
+    else if (!ehSobreposicao(p)) {{
+      const pos = getComputedStyle(p).position;
+      const emFluxo = pos === 'static' || pos === 'relative' || pos === 'sticky';
+      q = emFluxo && !p.matches('[role=menu]') ? 'pagina' : 'fluxo';
+    }} else {{
+      const fundo = fundoCobre(p);
+      const borda = r.height >= h * 0.4 && r.width <= w * 0.4 && (r.right >= w - 24 || r.left <= 24);
+      const centro = r.left <= w / 2 && r.right >= w / 2 && r.top <= h / 2 && r.bottom >= h / 2;
+      if (borda && !fundo) q = 'lateral';
+      else if (fundo || centro || p.getAttribute('aria-modal') === 'true') q = 'bloqueia';
+      else q = 'solto';
+    }}
+    quadros.set(p, q);
+    return q;
   }};
 
   // ── EVIDÊNCIA DE INTERATIVIDADE ────────────────────────────────────────
@@ -462,24 +1240,43 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // Três passadas. A primeira pega o que o site DECLARA como interativo; a
   // segunda resgata o controle de formulário escondido por CSS; a terceira
   // varre a tela por PIXEL. Depois delas, a promoção do contêiner do item.
+  //
+  // `coleta` é maior que o teto de propósito. O limite cortava em ordem de
+  // DOCUMENTO: a Amazon gasta os 200 lugares com cabeçalho, filtros e carrosséis,
+  // e o que estava na tela ficava de fora. Agora junta-se o triplo e o teto
+  // escolhe por RELEVÂNCIA (ver "o teto", mais abaixo).
+  const coleta = {max} * 3;
+  const raizes = NEO.raizes();
   const cands = [];
   const vistos = new Set();
   const origens = new Map(); // el -> como ele foi achado (entra no diário)
-  const olhar = (el, origem) => {{
+  const olhar = (el, origem, forcar) => {{
     if (!el || vistos.has(el)) return;
     if (el.closest('#neo-browser-local-overlay') || el.closest('#neo-marks')) return;
     // O inspetor visual da extensão desenha num overlay próprio. Ele já é
     // invisível ao mapeamento por não ter evidência e por ser pointer-events:none,
     // mas depender disso seria depender de um acidente.
     if (el.closest('#neo-map-overlay')) return;
-    if (!visivel(el)) return;
+    if (!forcar && !visivel(el)) return;
     vistos.add(el);
     origens.set(el, origem || 'declarado');
     cands.push(el);
   }};
-  for (const el of document.querySelectorAll(SEL)) {{
-    if (cands.length >= {max}) break;
+  // O que está NA JANELA primeiro, depois o resto: uma coluna de 700 filtros antes
+  // do conteúdo no DOM esgotaria até a coleta. A numeração continua a do documento.
+  const declarados = [...NEO.todos(SEL, raizes)];
+  for (const el of declarados) {{
+    if (cands.length >= coleta) break;
+    const r = box(el);
+    if (r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) olhar(el, 'declarado');
+  }}
+  for (const el of declarados) {{
+    if (cands.length >= coleta) break;
     olhar(el, 'declarado');
+  }}
+  {{
+    const posicao = new Map(declarados.map((el, i) => [el, i]));
+    cands.sort((a, b) => posicao.get(a) - posicao.get(b));
   }}
 
   // ── 2. controle ESCONDIDO → procurador visível ─────────────────────────
@@ -492,13 +1289,21 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // sumiu. O alvo clicável passa a ser o procurador (o label, que o navegador
   // encaminha para o controle) e o ESTADO continua saindo do input real.
   const procuradores = new Map(); // procurador -> input de verdade
+  NEO.controles = new WeakMap();
   let examinados = 0;
-  for (const inp of document.querySelectorAll('input:not([type=hidden]),select,textarea')) {{
-    if (examinados++ > 200 || cands.length >= {max}) break;
+  for (const inp of NEO.todos('input:not([type=hidden]),select,textarea', raizes)) {{
+    if (examinados++ > 200 || cands.length >= coleta) break;
     if (vistos.has(inp)) continue;
     if (visivel(inp)) continue;
     // O `<label>` é o rosto de UM controle por definição — não precisa de limite.
     let alvo = (inp.labels && inp.labels[0]) || inp.closest('label') || null;
+    // Transparente e na frente: ele É o botão, e o que se vê é o desenho embaixo.
+    // Oferecer o pai aqui é o que fez o job 8bc25dd1 clicar 16 vezes no vazio.
+    if (!alvo && NEO.naFrente(inp)) {{
+      box(inp);
+      olhar(inp, 'transparente', true);
+      continue;
+    }}
     if (!alvo || !visivel(alvo)) {{
       // Sem label, sobe procurando a caixa que ENVOLVE só este controle (o
       // `<div class="opcao">` que embrulha o input invisível e o texto). As
@@ -526,7 +1331,10 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
       }}
     }}
     if (!alvo || !visivel(alvo)) continue;
-    if (!procuradores.has(alvo)) procuradores.set(alvo, inp);
+    if (!procuradores.has(alvo)) {{
+      procuradores.set(alvo, inp);
+      NEO.controles.set(alvo, inp);
+    }}
     olhar(alvo, 'procurador');
   }}
 
@@ -543,15 +1351,14 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   const PASSO = 40;
   for (let y = 20; y < innerHeight; y += PASSO) {{
     for (let x = 20; x < innerWidth; x += PASSO) {{
-      let no = null;
-      try {{ no = document.elementFromPoint(x, y); }} catch (_) {{ continue; }}
+      const no = NEO.topo(x, y);
       if (no) alvos.add(no);
     }}
   }}
   const negativos = new Set();
   const provas = new Map(); // el -> por que ele entrou (a poda abaixo usa isto)
   for (const no of alvos) {{
-    if (cands.length >= {max} || orcamento <= 0) break;
+    if (cands.length >= coleta || orcamento <= 0) break;
     let p = no, n = 0;
     while (p && p !== document.body && p !== document.documentElement && n++ < 10) {{
       if (vistos.has(p)) break;           // já inventariado por outra passada
@@ -635,12 +1442,12 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     subirAte(el.parentElement);
   }}
   for (const el of rolaveis) {{
-    if (cands.length >= {max}) break;
+    if (cands.length >= coleta) break;
     olhar(el, 'painel');
   }}
 
   for (const el of cands.slice()) {{
-    if (cands.length >= {max}) break;
+    if (cands.length >= coleta) break;
     const dono = el.closest(CONTAINER);
     // Wrapper puro (o `li` que embrulha um único link e repete o nome dele) não
     // entra: dobraria a lista sem acrescentar alvo. O contêiner só vale quando
@@ -684,7 +1491,58 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // detalhes ABERTO — que continha a resposta — foi carimbado como moldura e o
   // modelo aprendeu a ignorá-lo. Errar para menos aqui é barato (nada marcado);
   // errar para mais esconde a resposta.
-  const CHROME = 'nav,[role=navigation],header,[role=banner],footer,[role=contentinfo]';
+  //
+  // Mora no `JS_HELPERS` porque o `js_extract` também precisa dele para dizer
+  // ao modelo quando a leitura saiu da moldura. Aqui é só o apelido local.
+  const CHROME = NEO.CHROME;
+
+  // ── o teto: o que fica quando não cabe tudo ────────────────────────────
+  // Por RELEVÂNCIA, não por ordem de documento, e a ordem de `cands` (que é a
+  // numeração dos refs) continua a do documento. Moldura na tela tem cota: o
+  // cabeçalho precisa continuar alcançável ("Meus pedidos", a busca), mas não
+  // pode tirar o lugar do que está na tela. Página que não bate no teto não
+  // passa por nada disto.
+  let omitidos = 0;
+  if (cands.length > {max}) {{
+    const COTA_MOLDURA = 40;
+    const altura = innerHeight, largura = innerWidth;
+    const notas = new Map();
+    for (const el of cands) {{
+      const r = box(el);
+      const naJanela = r.bottom > 0 && r.top < altura && r.right > 0 && r.left < largura;
+      const moldura = !!NEO.subir(el, CHROME);
+      const painel = el.closest(OPEN);
+      const destaque = painel && naJanela && !NAO_E_PAINEL.includes(quadro(painel));
+      let nota;
+      if (rolaveis.has(el) || destaque) nota = 0;
+      else if (moldura && el.matches('input,textarea,select,[role=searchbox],[role=combobox]')) nota = 1;
+      else if (naJanela && !moldura) nota = 1;
+      else if (naJanela) nota = 2;
+      else if (!moldura && r.right > 0 && r.left < largura) nota = 3;
+      else nota = 4;
+      const longe = r.top > altura ? r.top - altura : r.bottom < 0 ? -r.bottom : 0;
+      notas.set(el, nota + Math.min(longe / 1000000, 0.9));
+    }}
+    const ranking = cands.slice().sort((a, b) => notas.get(a) - notas.get(b));
+    const ficam = new Set();
+    let molduras = 0;
+    for (const el of ranking) {{
+      if (ficam.size >= {max}) break;
+      if (Math.floor(notas.get(el)) === 2 && molduras++ >= COTA_MOLDURA) continue;
+      ficam.add(el);
+    }}
+    for (const el of ranking) {{
+      if (ficam.size >= {max}) break;
+      ficam.add(el);
+    }}
+    omitidos = cands.length - ficam.size;
+    const dentro = cands.filter((el) => ficam.has(el));
+    for (const el of cands) {{
+      if (!ficam.has(el)) {{ vistos.delete(el); origens.delete(el); }}
+    }}
+    cands.length = 0;
+    cands.push(...dentro);
+  }}
 
   // ── 3. quem embrulha quem ──────────────────────────────────────────────
   // Para cada candidato, o candidato-ancestral mais próximo. Sobe pelo DOM
@@ -715,7 +1573,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     // `label` de um painel é o innerText inteiro dele, e a linha do elemento
     // viraria um parágrafo. O conteúdo tem lugar próprio (`item.texto`).
     const row = el.matches(CONTAINER) || rolaveis.has(el);
-    const item = {{ ref, tag: el.tagName.toLowerCase(), text: row ? NEO.shortLabel(el) : NEO.label(el) }};
+    const item = {{ ref, tag: el.tagName.toLowerCase(), text: row ? NEO.shortLabel(el) : NEO.nomeDe(el) }};
     const type = el.getAttribute('type') || el.getAttribute('role');
     if (type) item.type = type;
 
@@ -753,10 +1611,9 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
         let acertou = false, tampa = null;
         for (const [x, y] of pontos) {{
           if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
-          let topo = null;
-          try {{ topo = document.elementFromPoint(x, y); }} catch (_) {{ continue; }}
+          const topo = NEO.topo(x, y);
           if (!topo) continue;
-          if (topo === el || el.contains(topo) || topo.contains(el)) {{ acertou = true; break; }}
+          if (topo === el || NEO.contem(el, topo) || NEO.contem(topo, el)) {{ acertou = true; break; }}
           if (!tampa) tampa = topo;
         }}
         if (!acertou && tampa) {{
@@ -769,7 +1626,10 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
             if (flutua || q.matches(OPEN)) {{ camada = q; break; }}
             q = q.parentElement;
           }}
-          if (camada) {{
+          // Barra lateral não conta. O clique é despachado direto no nó, então ele
+          // chega, e dizer "coberto" reabriria a caça ao X de um painel que não fecha.
+          const barra = camada && camada.closest(OPEN);
+          if (camada && !(barra && quadro(barra) === 'lateral')) {{
             item.coberto = NEO.shortLabel(camada) || camada.tagName.toLowerCase();
             // QUEM cobre muda o conselho. Um banner de cookie na frente = feche
             // e siga; um PAINEL ABERTO na frente = o que interessa provavelmente
@@ -801,7 +1661,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     if (acima !== undefined && ordem.has(acima)) item.dentro = ordem.get(acima);
 
     // Fora da área da tarefa: menu lateral, cabeçalho, rodapé.
-    if (el.closest(CHROME)) item.chrome = true;
+    if (NEO.subir(el, CHROME)) item.chrome = true;
 
     // Região que ROLA. Duas coisas de uma vez: o modelo descobre que existe um
     // painel (e qual ref rolar), e ganha o TEXTO dele — que inclui o que está
@@ -820,7 +1680,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     // que ERA a resposta da tarefa — não apareceu em nenhum dos 25 prompts do
     // job 6785cf70: o modelo abriu e fechou o mesmo modal 7 vezes procurando
     // uma informação que estava dentro dele e que ele nunca teve como ler.
-    if (el.matches(OPEN)) {{
+    if (el.matches(OPEN) && !NAO_E_PAINEL.includes(quadro(el))) {{
       item.raiz = true;
       if (!item.texto) {{
         const dentro = String(el.innerText || el.textContent || '').replace(/\n{{3,}}/g, '\n\n').trim();
@@ -833,9 +1693,14 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     // do download é cancelar o trabalho (job 0611add0, 10 passos perdidos).
     const painel = el.closest(OPEN);
     if (painel) {{
-      item.menu = true;
-      const nome = NEO.shortLabel(painel);
-      if (nome) item.panel = nome;
+      const q = quadro(painel);
+      if (q === 'lateral') {{
+        item.lateral = NEO.shortLabel(painel) || 'barra lateral';
+      }} else if (!NAO_E_PAINEL.includes(q)) {{
+        item.menu = true;
+        const nome = NEO.shortLabel(painel);
+        if (nome) item.panel = nome;
+      }}
     }}
     if (!row) {{
       // Botão sem nome próprio herda o nome da linha: "Mais ações" em "Print".
@@ -881,6 +1746,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     const origem = origens.get(el);
     if (origem && origem !== 'declarado') item.via = origem;
     if (el.tagName === 'A') item.href = String(el.href || '').slice(0, 300);
+    if (el.tagName === 'IMG') item.src = NEO.srcDe(el).slice(0, 300);
     elements.push(item);
   }}
   // Texto da PÁGINA INTEIRA, sempre. Tentei recortar isto para "a área da
@@ -892,6 +1758,9 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // nó fora do fluxo somem do innerText. Em Chrome o innerText sempre existe, então
   // isto é só a rede de segurança (e o que torna o coletor exercitável fora dele).
   const corpo = (document.body ? document.body.innerText || document.body.textContent : '') || '';
+  // Normalizado UMA vez: o corte e o flag de "foi cortado" têm de medir a
+  // MESMA string, senão o flag mente na fronteira.
+  const corpoLimpo = corpo.replace(/\n{{3,}}/g, '\n\n').trim();
 
   // ── conteúdo PRINCIPAL, à frente da moldura ────────────────────────────
   // `body.innerText` sai em ordem de DOCUMENTO, e todo site põe a navegação
@@ -907,11 +1776,59 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   let principal = null;
   const considerar = (el) => {{
     if (!el || !visivel(el) || el.closest(CHROME)) return;
+    // Estar DENTRO de uma barra lateral / caixa de busca também desqualifica —
+    // não basta recusar o `<aside>`, porque a `<ul>` lá dentro não é um aside e
+    // passava, ganhando a eleição por volume de texto contra o artigo ao lado.
+    //
+    // Isto usa o conjunto AMPLO, e não contradiz a regra de que o amplo só
+    // serve para descontar: recusar a ELEIÇÃO não esconde texto nenhum — o
+    // corpo e a seção de painéis continuam carregando o que estiver aí, e sem
+    // nenhum eleito o corpo volta a receber o orçamento inteiro. Carimbar
+    // `item.chrome`, não: aquilo muda como o modelo TRATA o elemento, e foi
+    // assim que o painel de detalhes do Drive virou invisível no job 9025d9f8.
+    // Mecanismos diferentes, custos de erro diferentes.
+    if (el.closest(NEO.CHROME_DESCONTO)) return;
     const r = box(el);
     if (r.width * r.height < innerWidth * innerHeight * 0.08) return;
     const t = String(el.innerText || '').replace(/\n{{3,}}/g, '\n\n').trim();
     if (t.length < 150) return;
-    if (!principal || t.length > principal.texto.length) principal = {{ el, texto: t }};
+    // "O MAIOR TEXTO GANHA" elegia sempre o wrapper mais EXTERNO que não É
+    // moldura — e um `<div>` que EMBRULHA o cabeçalho não está dentro dele,
+    // então `closest(CHROME)` o aprova. O critério `t.length` então converge
+    // para a página inteira, sempre.
+    //
+    // Na página de pedidos da Amazon (job 29c739d4) o vencedor foi o wrapper
+    // da página: os 2200 caracteres de orçamento viraram os skip-links e a
+    // lista de departamentos, e os 5 pedidos — que começavam 659 caracteres
+    // depois do corte — não apareceram em NENHUM dos 15 prompts. O modelo
+    // rolou 6 vezes atrás de um texto que não muda com rolagem (o dump sai em
+    // ordem de documento) e morreu no freio de giro com a resposta na tela.
+    //
+    // A pontuação passa a ser o texto LÍQUIDO, fora moldura. `textContent` e
+    // não `innerText` de propósito: innerText força layout e esta varredura
+    // não pode virar O(página inteira). Como é DESCONTO, superestimar penaliza
+    // o wrapper — que é o lado seguro do erro.
+    let moldura = 0;
+    for (const c of el.querySelectorAll(NEO.CHROME_DESCONTO)) moldura += (c.textContent || '').length;
+    const liquido = Math.max(0, t.length - moldura);
+    if (liquido < 150) return;
+    // Quase só moldura não é conteúdo, é wrapper. Teto folgado (60%) porque
+    // rejeitar demais devolve `principal = null`, e aí o corpo volta a ser
+    // despejado em ordem de documento — o defeito que esta seção existe para
+    // evitar.
+    if (moldura > t.length * 0.6) return;
+    const fundo = NEO.fundura(el);
+    if (!principal) {{ principal = {{ el, texto: t, liquido, fundo }}; return; }}
+    // EMPATE É O NORMAL, não a exceção: o container da lista e o wrapper que o
+    // embrulha contêm quase o mesmo texto líquido (na Amazon, 10.800 contra
+    // 10.865). Dentro de 10% ganha o MAIS PROFUNDO — o bloco específico, não
+    // quem o embrulha. É este desempate que faz o trabalho; o desconto só
+    // torna as duas pontuações comparáveis.
+    const folga = Math.max(principal.liquido, liquido) * 0.1;
+    if (liquido > principal.liquido + folga) {{ principal = {{ el, texto: t, liquido, fundo }}; return; }}
+    if (Math.abs(liquido - principal.liquido) <= folga && fundo > principal.fundo) {{
+      principal = {{ el, texto: t, liquido, fundo }};
+    }}
   }};
   for (const el of document.querySelectorAll('main,[role=main],[role=tabpanel],article')) {{
     considerar(el);
@@ -924,11 +1841,49 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     for (const el of cands) {{
       if (olhados.size > 120) break;
       if (el.closest(CHROME)) continue;
-      let pp = el.parentElement, n = 0;
-      while (pp && pp !== document.body && n++ < 6) {{
+      let pp = el.parentElement;
+      // SEM TETO DE PROFUNDIDADE. O teto era 6 níveis, e ele existia porque,
+      // quando a pontuação era `t.length`, subir mais SEMPRE ganhava: a raiz
+      // tem todo o texto. Com o desconto de moldura isso virou ao contrário —
+      // a raiz pontua ZERO e se autoexclui (medido na busca da Amazon:
+      // `#a-page` tem 21.426 caracteres de `innerText` e 48.893 de moldura por
+      // `textContent`, porque o textContent inclui os menus escondidos; o
+      // líquido dá 0).
+      //
+      // E o teto não era neutro: ele favorecia sistematicamente região RASA.
+      // Numa grade de resultados o container fica ~10 níveis acima dos links
+      // dos produtos, fora do alcance — enquanto o container de uma barra de
+      // filtros, que é rasa, entrava. Foi assim que a BARRA DE FILTROS ganhou
+      // a eleição na busca de pendrive (job 5ab98119): 1.305 caracteres de
+      // marcas e faixas de preço eleitos como conteúdo, com os 18.711 do
+      // `#search` nunca considerados.
+      //
+      // O custo continua limitado pelo `olhados`, que é o limite de verdade:
+      // ancestral compartilhado entra uma vez só, e o teto de 120 agora é
+      // checado também aqui dentro — senão um candidato fundo sozinho poderia
+      // estourar o orçamento de `innerText`, que força layout.
+      while (pp && pp !== document.body) {{
+        if (olhados.size > 120) break;
         if (!olhados.has(pp)) {{ olhados.add(pp); considerar(pp); }}
         pp = pp.parentElement;
       }}
+    }}
+  }}
+  if (!principal) {{
+    // ÚLTIMO RECURSO: o laço de cima sobe a partir dos CANDIDATOS, que são
+    // elementos interativos. Uma página cujo conteúdo não tem link nem botão
+    // dentro — um artigo puro, uma fatura, um texto legal — nunca era
+    // considerada, e caía no mesmo desfecho do wrapper de moldura: nenhum
+    // `principal`, corpo despejado em ordem de documento, cabeçalho primeiro.
+    //
+    // Só roda quando nada foi eleito, e com o MESMO teto de 120: chegar aqui já
+    // significa que a página é simples (nenhuma região interativa de conteúdo),
+    // e o teto é o que impede o `innerText` de virar varredura de página
+    // inteira — o custo que esta seção não pode ter.
+    let vistos = 0;
+    for (const el of document.querySelectorAll('main,article,section,div,ul,ol,table,dl')) {{
+      if (vistos++ > 120) break;
+      considerar(el);
     }}
   }}
   // MODAL ABERTO GANHA o lugar de conteúdo principal — enquanto está aberto, ele
@@ -937,12 +1892,86 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
   // modal legítimo perde para o `<main>` atrás dele. Na Amazon o vencedor foi um
   // `<nav>` de skip-links ("Ir para / Conteúdo principal / Atalhos do teclado"),
   // enquanto o modal com a resposta não entrou em lugar nenhum.
-  const modal = [...document.querySelectorAll('[role=dialog],[role=alertdialog],[aria-modal="true"]')]
-    .filter((el) => visivel(el))
+  //
+  // Só `bloqueia` (ver `quadro`). Foram três reprises do mesmo erro com o mesmo
+  // painel, cada uma remendada com mais um filtro: fora da tela (`left: 1819`),
+  // em fluxo (a barra de filtros), e agora na borda de uma janela larga. O que
+  // faltava era a pergunta certa: ele cobre o que o usuário está olhando?
+  const modal = [...NEO.todos('[role=dialog],[role=alertdialog],[aria-modal="true"]', raizes)]
+    .filter((el) => visivel(el) && quadro(el) === 'bloqueia')
     .sort((a, b) => {{ const ra = box(a), rb = box(b); return rb.width * rb.height - ra.width * ra.height; }})[0];
   if (modal) {{
     const t = String(modal.innerText || modal.textContent || '').replace(/\n{{3,}}/g, '\n\n').trim();
-    if (t.length >= 40) principal = {{ el: modal, texto: t }};
+    // `liquido`/`fundo` vão aqui só para o formato não divergir do que
+    // `considerar` produz — esta atribuição é a última e ninguém pontua depois
+    // dela, mas um registro com forma diferente é como um campo vira
+    // `undefined` seis meses depois.
+    if (t.length >= 40) principal = {{ el: modal, texto: t, liquido: t.length, fundo: NEO.fundura(modal) }};
+  }}
+  // PUBLICADO para o `extract` sem `ref` (ver `js_extract`). Não é cache: é a
+  // MESMA escolha que acabou de ir no prompt, guardada em vez de reimplementada.
+  // Reimplementar criaria uma segunda verdade, e é assim que a extensão passou a
+  // mentir com autoridade uma vez (`neo-map.generated.js`) — aqui seria pior,
+  // porque o modelo leria uma região e veria outra descrita.
+  NEO.principal = principal ? principal.el : null;
+  // Publicado pelo mesmo motivo: `extract` lê com o mesmo critério do snapshot.
+  NEO.modal = modal && principal && principal.el === modal ? modal : null;
+  // ── a LEITURA da página (ver `NEO.ler`) ────────────────────────────────
+  // Barra lateral tem seção própria e moldura é moldura. O resto do que está na
+  // janela entra, inclusive modal e popover: o driver deduplica por linha.
+  NEO.foraDaLeitura = (el) => {{
+    const p = el.closest(OPEN);
+    if (p && quadro(p) === 'lateral') return true;
+    return !!NEO.subir(el, CHROME);
+  }};
+  const leitura = NEO.ler(NEO.foraDaLeitura);
+  const TETO_TELA = {chars} + 2000;
+  const barras = [];
+  for (const [p, q] of quadros) {{
+    if (q !== 'lateral') continue;
+    barras.push({{
+      rotulo: NEO.shortLabel(p),
+      texto: String(p.innerText || '').replace(/\s*\n\s*/g, ' · ').trim().slice(0, 300),
+    }});
+  }}
+  // IMAGENS. O texto da página não traz endereço de imagem, e nenhuma ferramenta
+  // devolvia: "a URL da foto principal" era impossível por construção. O cérebro
+  // pede isso em toda coleta de produto, porque só mostra no chat a imagem que
+  // algum resultado de tool trouxe. No job aa4c89f8 o modelo gastou 32 de 39
+  // decisões procurando um dado que nenhuma leitura podia devolver.
+  const imagens = [];
+  for (const img of NEO.todos('img', raizes)) {{
+    const r = box(img);
+    if (r.width < 100 || r.height < 100) continue;
+    if (!(r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth)) continue;
+    if (!visivel(img)) continue;
+    const url = NEO.srcDe(img);
+    if (!url || url.startsWith('data:')) continue;
+    imagens.push({{
+      url: url.slice(0, 300),
+      alt: String(img.alt || '').trim().slice(0, 70),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+    }});
+  }}
+  imagens.sort((a, b) => b.w * b.h - a.w * a.h);
+  // IFRAME. Nem `innerText` nem `querySelectorAll` entram nele, então checkout,
+  // formulário embutido e player de outro domínio eram tela branca sem aviso:
+  // o modelo só podia concluir que a informação não existia. O mesmo domínio dá
+  // para ler daqui; o de outro domínio, não, mas o endereço dele dá para abrir.
+  const iframes = [];
+  for (const f of NEO.todos('iframe', raizes)) {{
+    if (iframes.length >= 4) break;
+    const r = f.getBoundingClientRect();
+    if (r.width * r.height < innerWidth * innerHeight * 0.1) continue;
+    if (!(r.top < innerHeight && r.bottom > 0 && r.left < innerWidth && r.right > 0)) continue;
+    let texto = '';
+    let legivel = false;
+    try {{
+      const b = f.contentDocument && f.contentDocument.body;
+      if (b) {{ texto = String(b.innerText || '').trim().slice(0, 2000); legivel = true; }}
+    }} catch (_) {{ legivel = false; }}
+    iframes.push({{ url: String(f.src || '').slice(0, 300), titulo: f.title || '', legivel, texto }});
   }}
   // ── estado REAL da mídia ───────────────────────────────────────────────
   // O rótulo do botão de play/pause nomeia a AÇÃO, não o estado: o YouTube
@@ -981,13 +2010,47 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     ready: document.readyState,
     stop: document.documentElement.getAttribute('data-neo-stop') === '1',
     scroll: {{ y: Math.round(scrollY), height: Math.round(document.body ? document.body.scrollHeight : 0) }},
-    // Com conteúdo principal identificado, o corpo (que é quase todo moldura)
-    // fica com orçamento menor: o total no prompt não cresce, só muda de mãos.
-    text: corpo.replace(/\n{{3,}}/g, '\n\n').trim().slice(0, principal ? 1500 : {chars}),
+    // ORÇAMENTO. Eram dois literais (2200 para o principal, 1500 para o corpo)
+    // e as DUAS janelas começavam no caractere 0 da MESMA string: 3700
+    // caracteres de prompt entregando ~2400 únicos — e no job 29c739d4, ZERO
+    // úteis, porque o prefixo comum era a moldura inteira da Amazon. Pior: o
+    // `text_chars` que o core manda era ignorado sempre que havia principal,
+    // então não existia alavanca nenhuma.
+    //
+    // Agora os dois saem de `text_chars` e o corpo vai INTEIRO até o
+    // orçamento. Pré-cortá-lo em 1500 era justamente o que impedia a subtração
+    // no driver de funcionar: o que sobrava era subconjunto do `main`, o
+    // resultado vinha vazio, caía abaixo do piso de segurança e a moldura
+    // voltava DUPLICADA. A subtração continua morando num lugar só — o driver,
+    // que já a fazia e já tem o histórico dela.
+    text: corpoLimpo.slice(0, {chars}),
+    // Houve corte? O driver precisa saber para não afirmar ao modelo que o
+    // snapshot traz a página inteira — foi essa afirmação falsa que realimentou
+    // o giro do job 29c739d4, cinco vezes.
+    text_cut: corpoLimpo.length > {chars},
     main: principal
-      ? {{ label: NEO.shortLabel(principal.el), text: principal.texto.slice(0, 2200) }}
+      ? {{
+          label: NEO.shortLabel(principal.el),
+          text: principal.texto.slice(0, {chars}),
+          cut: principal.texto.length > {chars},
+        }}
       : null,
-    truncated: elements.length >= {max},
+    // O que está NA JANELA agora e o que existe fora dela. `tela_total` é o que
+    // permite ao driver dizer de onde o `extract` com `de` continua a leitura.
+    tela: leitura.tela.slice(0, TETO_TELA),
+    tela_cut: leitura.tela.length > TETO_TELA,
+    tela_total: leitura.tela.length,
+    resto: leitura.resto.slice(0, {chars}),
+    resto_total: leitura.resto.length,
+    barras,
+    iframes,
+    // Carimbo do que este device sabe fazer. O core sobe sozinho e o device só
+    // depois de reiniciar o `tauri dev`: sem isto o core oferece ação que aqui
+    // ainda não existe.
+    capacidades: ['find', 'clique_real'],
+    imagens: imagens.slice(0, 8),
+    truncated: omitidos > 0 || elements.length >= {max},
+    omitidos,
     midia,
     elements,
   }};
@@ -998,58 +2061,49 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     )
 }
 
-fn js_click(reference: i64) -> String {
+/// Ações que mudam alguma coisa. Passam pelo portão do PARE.
+const ATUA: [&str; 8] = [
+    "browser.navigate", "browser.click", "browser.click_text", "browser.dblclick",
+    "browser.right_click", "browser.fill", "browser.select", "browser.press",
+];
+
+/// O PARE chegou enquanto o modelo decidia? O snapshot só lê no começo da rodada,
+/// e uma decisão leva segundos: no job 8bc25dd1 ele foi apertado às 19:49:54 e um
+/// clique ainda saiu às 19:50:11. Lê o atributo porque é a via confiável, e porque
+/// o `eval` é também o que consome a notificação `neo.stop`.
+async fn parado(id: i64) -> bool {
+    let atributo = eval(id, "document.documentElement.getAttribute('data-neo-stop') === '1'").await;
+    matches!(atributo, Ok(Value::Bool(true))) || stop_requested()
+}
+
+/// O que o core manda conferir no alvo REAL do clique — ver `NEO.preparar`.
+fn trava_de(args: &Value) -> String {
+    json!({
+        "trava": args.get("trava").and_then(|v| v.as_str()).unwrap_or(""),
+        "liberado": args.get("liberado").and_then(|v| v.as_str()).unwrap_or(""),
+    })
+    .to_string()
+}
+
+/// Primeira metade de um clique por `ref`: mira, arma a sonda e devolve o pixel.
+/// `tipo` é esquerdo, duplo ou direito.
+fn js_mirar(reference: i64, tipo: &str, trava: &str) -> String {
     format!(
         r#"{helpers};
 (() => {{
   const NEO = window.__neo;
   const el = NEO.el({reference});
   if (!el) return {{ ok: false, error: 'stale' }};
-  if (el.disabled) return {{ ok: false, error: 'elemento desabilitado' }};
-  el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
-  const r = el.getBoundingClientRect();
-  const x = r.left + r.width / 2, y = r.top + r.height / 2;
-  // O rótulo é lido ANTES de clicar: num INTERRUPTOR ele vira no próprio clique,
-  // e o histórico registrava o estado NOVO como se fosse o que foi clicado —
-  // "Reproduzir" no clique que acabara de PAUSAR (job 717a8fbb).
-  const rotulo = NEO.label(el);
-  const opts = {{ bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }};
-  // Sequência completa: sites que só escutam pointerdown/mouseup não reagem a
-  // um .click() seco.
-  // Pulso visual no ponto do clique: a aba mexendo sozinha sem nenhum sinal é
-  // desconcertante para quem está olhando. Quem desenha é o shadow DOM da
-  // extensão (nenhum nó novo na página) — daí ser um postMessage e não um
-  // appendChild aqui.
-  postMessage({{ __neo_ping: {{ x, y, tipo: 'esquerdo' }} }}, '*');
-  el.dispatchEvent(new PointerEvent('pointerdown', opts));
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  el.focus && el.focus();
-  el.dispatchEvent(new PointerEvent('pointerup', opts));
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  el.click();
-  // O clique virou SELEÇÃO? É a única evidência de efeito que existe para
-  // "marque a alternativa": marcar um rádio não muda URL, nem título, nem
-  // texto — o freio de tela repetida é cego para isso por construção. O estado
-  // sai do CONTROLE, inclusive do input escondido atrás do label.
-  const out = {{ ok: true, url: location.href, label: rotulo }};
-  const ctl = (el.tagName === 'LABEL' ? el.control : null) ||
-    (el.tagName === 'INPUT' ? el : null) ||
-    el.querySelector('input[type=radio],input[type=checkbox]');
-  const tipo = ctl && ctl.getAttribute('type');
-  if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
-  else {{
-    const aria = el.getAttribute('aria-checked') || el.getAttribute('aria-selected');
-    if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
-  }}
-  return out;
+  return NEO.preparar(el, {{ ...{trava}, tipo: '{tipo}' }});
 }})()"#,
         helpers = JS_HELPERS,
-        reference = reference
+        reference = reference,
+        tipo = tipo,
+        trava = trava
     )
 }
 
-/// Clique por TEXTO VISÍVEL — a saída para o que se LÊ e não se consegue
-/// endereçar.
+/// Clique por NOME — a saída para o que se lê e não se consegue endereçar.
 ///
 /// Existe porque todo inventário de elementos é uma aposta, e aposta erra: no
 /// job 9968e68a as 5 alternativas do questionário não tinham `ref` nenhum, o
@@ -1058,194 +2112,167 @@ fn js_click(reference: i64) -> String {
 /// pergunta deixa de ser "qual o número?" e passa a ser "qual o texto?", que é
 /// verificável e que o modelo sempre tem.
 ///
-/// É o `getByText` do Playwright: acha o MENOR elemento visível cujo texto
-/// contém a frase e clica no ancestral acionável mais próximo dele.
-fn js_click_text(needle: &str) -> String {
+/// Quem acha é a varredura da DOM (`NEO.candidatos`): nome acessível, não só nó
+/// de texto. `n` escolhe outro candidato da lista que o `find` mostrou.
+fn js_click_text(needle: &str, n: i64, trava: &str) -> String {
     let encoded = serde_json::to_string(needle).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"{helpers};
 (() => {{
   const NEO = window.__neo;
-  // Acento e caixa não podem decidir se o clique acontece: o modelo escreve a
-  // frase de memória, a partir do que leu no print ou no texto da página.
-  const norm = (v) => String(v || '')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ').trim().toLowerCase();
-  const alvo = norm({needle});
-  if (alvo.length < 3) return {{ ok: false, error: 'texto curto demais para achar com segurança (mínimo 3 letras)' }};
-
-  const visivel = (el) => {{
-    if (!el || el.nodeType !== 1) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return false;
-    const s = getComputedStyle(el);
-    return s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') >= 0.05;
-  }};
-  const ACIONAVEL = 'a[href],button,input,select,textarea,label,summary,[role=button],[role=link],' +
-    '[role=checkbox],[role=radio],[role=option],[role=menuitem],[role=tab],[role=row],' +
-    '[onclick],[ng-click],[data-ng-click],[jsaction],[data-action],[tabindex="0"]';
-
-  // Nós de TEXTO, não elementos: é o que garante que a frase casada é a que o
-  // usuário lê, e não a concatenação do innerText de meia página.
-  const achados = [];
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let no;
-  while ((no = walker.nextNode())) {{
-    if (achados.length >= 40) break;
-    if (!no.nodeValue || no.nodeValue.length < 3) continue;
-    if (!norm(no.nodeValue).includes(alvo)) continue;
-    const el = no.parentElement;
-    if (!el || el.closest('#neo-browser-local-overlay,#neo-marks')) continue;
-    if (!visivel(el)) continue;
-    achados.push(el);
-  }}
-  if (!achados.length) {{
+  const procurado = {needle};
+  if (NEO.normaliza(procurado).length < 3) return {{ ok: false, error: 'texto curto demais para achar com segurança (mínimo 3 letras)' }};
+  const {{ lista }} = NEO.candidatos(procurado);
+  if (!lista.length) {{
     return {{ ok: false, error: 'não achei esse texto na página. Confira a grafia, ou role até a parte onde ele está' }};
   }}
-
-  // De cada casamento, sobe até o ancestral que de fato recebe clique. Sem
-  // isso o clique cai no <span> do rótulo, que em site com handler no
-  // contêiner não faz nada.
-  const clicaveis = [];
-  for (const el of achados) {{
-    let escolhido = el.closest(ACIONAVEL);
-    if (!escolhido || !visivel(escolhido)) {{
-      let p = el, n = 0;
-      escolhido = el;
-      while (p && n++ < 6) {{
-        if (visivel(p) && getComputedStyle(p).cursor === 'pointer') {{ escolhido = p; break; }}
-        p = p.parentElement;
-      }}
-    }}
-    if (escolhido && visivel(escolhido) && !clicaveis.includes(escolhido)) clicaveis.push(escolhido);
-  }}
-  if (!clicaveis.length) return {{ ok: false, error: 'achei o texto mas nada clicável em volta dele' }};
-
-  // O MENOR: o mais específico. Um texto casa com a página inteira, com a
-  // seção e com a opção — a opção é a que tem a menor área.
-  clicaveis.sort((a, b) => {{
-    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-    return ra.width * ra.height - rb.width * rb.height;
-  }});
-  const el = clicaveis[0];
-  el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
-  const r = el.getBoundingClientRect();
-  const x = Math.min(Math.max(r.left + r.width / 2, 1), innerWidth - 1);
-  const y = Math.min(Math.max(r.top + r.height / 2, 1), innerHeight - 1);
-  // Coberto = o usuário não conseguiria clicar aqui. Despachar o evento assim
-  // mesmo devolveria "ok" com a página inerte, que é a mentira que este
-  // desenho inteiro combate.
-  let topo = null;
-  try {{ topo = document.elementFromPoint(x, y); }} catch (_) {{ topo = null; }}
-  if (topo && topo !== el && !el.contains(topo) && !topo.contains(el)) {{
+  const clicaveis = lista.filter((c) => !c.escondido && !c.desabilitado);
+  const escolhido = {n} > 0 ? lista[{n} - 1] : clicaveis[0];
+  if (!escolhido) {{
     return {{
       ok: false,
-      error: 'esse texto está COBERTO por "' + (NEO.shortLabel(topo) || topo.tagName.toLowerCase()) +
+      error: {n} > 0
+        ? 'não existe o candidato ' + {n} + ': a lista tem ' + lista.length
+        : 'isso existe na página mas está ESCONDIDO ou desabilitado agora — abra o menu, aba ou seção que contém, ou faça o que libera o controle',
+    }};
+  }}
+  if (escolhido.escondido) return {{ ok: false, error: 'esse candidato está ESCONDIDO agora — abra o que o contém primeiro' }};
+  if (escolhido.coberto) {{
+    // Coberto = o usuário não conseguiria clicar aqui. Despachar o evento assim
+    // mesmo devolveria "ok" com a página inerte, que é a mentira que este
+    // desenho inteiro combate.
+    return {{
+      ok: false,
+      error: 'esse texto está COBERTO por "' + escolhido.coberto +
         '" — feche ou dispense o que está na frente antes de clicar',
     }};
   }}
-  const rotulo = NEO.label(el);
-  const opts = {{ bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }};
-  postMessage({{ __neo_ping: {{ x, y, tipo: 'esquerdo' }} }}, '*');
-  el.dispatchEvent(new PointerEvent('pointerdown', opts));
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  el.focus && el.focus();
-  el.dispatchEvent(new PointerEvent('pointerup', opts));
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  el.click();
-  const out = {{ ok: true, url: location.href, label: rotulo, achados: clicaveis.length }};
-  const ctl = (el.tagName === 'LABEL' ? el.control : null) ||
-    (el.tagName === 'INPUT' ? el : null) ||
-    el.querySelector('input[type=radio],input[type=checkbox]');
-  const tipo = ctl && ctl.getAttribute('type');
-  if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
-  else {{
-    const aria = el.getAttribute('aria-checked') || el.getAttribute('aria-selected');
-    if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
-  }}
-  // O número, quando existe: o modelo volta a poder usar `click`/`extract` nele.
-  if (NEO && NEO.refs) {{
-    const i = NEO.refs.indexOf(el);
-    if (i >= 0) out.ref = i;
-  }}
-  return out;
+  return NEO.preparar(escolhido.el, {{ ...{trava}, tipo: 'esquerdo', proprio: true, achados: clicaveis.length }});
 }})()"#,
         helpers = JS_HELPERS,
-        needle = encoded
+        needle = encoded,
+        n = n,
+        trava = trava
     )
 }
 
-/// Duplo clique. Em lista de arquivos (Drive, Finder web, webmail) o clique
-/// simples só SELECIONA — abrir é sempre `dblclick`.
-fn js_dblclick(reference: i64) -> String {
+/// A varredura da DOM inteira, para o modelo ler. `NEO.candidatos` é a mesma que
+/// o `click_text` usa: o número que sai daqui é o `n` que ele aceita.
+fn js_find(texto: &str, limite: usize) -> String {
+    let encoded = serde_json::to_string(texto).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"{helpers};
 (() => {{
   const NEO = window.__neo;
-  const el = NEO.el({reference});
-  if (!el) return {{ ok: false, error: 'stale' }};
-  if (el.disabled) return {{ ok: false, error: 'elemento desabilitado' }};
-  el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
-  const r = el.getBoundingClientRect();
-  const x = r.left + r.width / 2, y = r.top + r.height / 2;
-  // O rótulo é lido ANTES de clicar: num INTERRUPTOR ele vira no próprio clique,
-  // e o histórico registrava o estado NOVO como se fosse o que foi clicado —
-  // "Reproduzir" no clique que acabara de PAUSAR (job 717a8fbb).
-  const rotulo = NEO.label(el);
-  const opts = {{ bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }};
-  // Pulso visual no ponto do clique: a aba mexendo sozinha sem nenhum sinal é
-  // desconcertante para quem está olhando. Quem desenha é o shadow DOM da
-  // extensão (nenhum nó novo na página) — daí ser um postMessage e não um
-  // appendChild aqui.
-  postMessage({{ __neo_ping: {{ x, y, tipo: 'esquerdo' }} }}, '*');
-  for (let i = 1; i <= 2; i++) {{
-    el.dispatchEvent(new PointerEvent('pointerdown', opts));
-    el.dispatchEvent(new MouseEvent('mousedown', opts));
-    el.dispatchEvent(new PointerEvent('pointerup', opts));
-    el.dispatchEvent(new MouseEvent('mouseup', opts));
-    el.dispatchEvent(new MouseEvent('click', {{ ...opts, detail: i }}));
-  }}
-  el.dispatchEvent(new MouseEvent('dblclick', {{ ...opts, detail: 2 }}));
-  return {{ ok: true, url: location.href, label: rotulo }};
+  const procurado = {texto};
+  if (NEO.normaliza(procurado).length < 3) return {{ ok: false, error: 'termo curto demais (mínimo 3 letras)' }};
+  const {{ lista, fechados, parou }} = NEO.candidatos(procurado);
+  return {{
+    ok: true,
+    total: lista.length,
+    frames_fechados: fechados,
+    cortado: parou,
+    lista: lista.slice(0, {limite}).map((c) => {{
+      const ref = NEO.refs ? NEO.refs.indexOf(c.el) : -1;
+      const tipo = c.el.getAttribute('type') || c.el.getAttribute('role');
+      // O que distingue este de um homônimo: o primeiro contêiner com outro nome.
+      let em;
+      for (let p = c.el.parentElement, i = 0; p && p !== document.body && i < 10; p = p.parentElement, i++) {{
+        const nome = NEO.shortLabel(p);
+        if (nome && NEO.normaliza(nome) !== NEO.normaliza(c.nome)) {{ em = nome.slice(0, 50); break; }}
+      }}
+      return {{
+        n: c.n, tag: c.el.tagName.toLowerCase(), tipo: tipo || undefined, ref: ref >= 0 ? ref : undefined,
+        nome: c.nome.slice(0, 90), fonte: c.fonte,
+        recebe: c.recebe, fora: c.fora, escondido: c.escondido, coberto: c.coberto,
+        desabilitado: c.desabilitado, em,
+      }};
+    }}),
+  }};
 }})()"#,
         helpers = JS_HELPERS,
-        reference = reference
+        texto = encoded,
+        limite = limite
     )
 }
 
-/// Botão direito. É o único caminho para o menu de item ("Baixar", "Renomear")
-/// na maioria dos gerenciadores de arquivo na web.
-fn js_right_click(reference: i64) -> String {
-    format!(
-        r#"{helpers};
-(() => {{
+/// O evento chegou na página? Não recebe os helpers de propósito: depois de uma
+/// navegação `window.__neo` não existe mais, e é assim que se sabe que o clique
+/// foi tão bem-sucedido que levou a página embora.
+const JS_CLIQUE_CONFIRMA: &str = r#"(() => {
   const NEO = window.__neo;
-  const el = NEO.el({reference});
-  if (!el) return {{ ok: false, error: 'stale' }};
-  el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
-  const r = el.getBoundingClientRect();
-  const x = r.left + r.width / 2, y = r.top + r.height / 2;
-  // O rótulo é lido ANTES de clicar: num INTERRUPTOR ele vira no próprio clique,
-  // e o histórico registrava o estado NOVO como se fosse o que foi clicado —
-  // "Reproduzir" no clique que acabara de PAUSAR (job 717a8fbb).
-  const rotulo = NEO.label(el);
-  const opts = {{ bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 2, buttons: 2 }};
-  // Pulso visual no ponto do clique: a aba mexendo sozinha sem nenhum sinal é
-  // desconcertante para quem está olhando. Quem desenha é o shadow DOM da
-  // extensão (nenhum nó novo na página) — daí ser um postMessage e não um
-  // appendChild aqui.
-  postMessage({{ __neo_ping: {{ x, y, tipo: 'direito' }} }}, '*');
-  el.dispatchEvent(new PointerEvent('pointerdown', opts));
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  el.focus && el.focus();
-  el.dispatchEvent(new PointerEvent('pointerup', opts));
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  el.dispatchEvent(new MouseEvent('contextmenu', opts));
-  return {{ ok: true, url: location.href, label: rotulo }};
-}})()"#,
-        helpers = JS_HELPERS,
-        reference = reference
-    )
+  const c = NEO && NEO.clique;
+  if (!c) return { ok: true, entregue: null };
+  if (!c.recebeu) return { ok: true, entregue: false };
+  return { ...NEO.fimDoClique(c, 'pixel'), entregue: true };
+})()"#;
+
+const JS_CLIQUE_DESPACHA: &str = r#"(() => {
+  const NEO = window.__neo;
+  const c = NEO && NEO.clique;
+  if (!c) return { ok: false, error: 'stale' };
+  NEO.despachar(c);
+  return NEO.fimDoClique(c, 'js');
+})()"#;
+
+/// O mouse de verdade, pelo CDP. O navegador faz o teste de acerto, o site recebe
+/// `isTrusted` e os eventos de hover vêm junto. É o mesmo motivo do `press_key`:
+/// há formulário que só reage ao que é nativo.
+async fn mouse_real(id: i64, x: f64, y: f64, vezes: u32) -> Result<(), String> {
+    let evento = |tipo: &str, botao: &str, botoes: u32, contagem: u32| {
+        json!({
+            "type": tipo, "x": x, "y": y, "button": botao,
+            "buttons": botoes, "clickCount": contagem,
+        })
+    };
+    cdp(id, "Input.dispatchMouseEvent", evento("mouseMoved", "none", 0, 0)).await?;
+    for n in 1..=vezes {
+        cdp(id, "Input.dispatchMouseEvent", evento("mousePressed", "left", 1, n)).await?;
+        cdp(id, "Input.dispatchMouseEvent", evento("mouseReleased", "left", 0, n)).await?;
+    }
+    Ok(())
+}
+
+/// Os dois tempos de um clique: mira na página, dispara por fora dela e confere
+/// com a sonda. Evento fabricado só entra quando a sonda prova que nada chegou:
+/// sem essa prova, a reserva viraria clique dobrado, e clique dobrado num
+/// "Adicionar ao carrinho" é item em dobro.
+async fn clicar(id: i64, mira: String, vezes: u32) -> Result<Value, String> {
+    let alvo = unwrap_ok(eval(id, &mira).await?)?;
+    if alvo.get("real").and_then(|v| v.as_bool()) == Some(true) {
+        let x = alvo.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = alvo.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let enviado = mouse_real(id, x, y, vezes).await;
+        if let Err(e) = &enviado {
+            warn!("[BrowserLocal] mouse real falhou, vou conferir a sonda: {}", e);
+        }
+        match eval(id, JS_CLIQUE_CONFIRMA).await {
+            Ok(r) => match r.get("entregue").and_then(|v| v.as_bool()) {
+                Some(true) => return Ok(r),
+                Some(false) => {}
+                // Sem `window.__neo`: a página trocou, logo o clique chegou.
+                None => return Ok(json!({
+                    "ok": true,
+                    "url": alvo.get("url").cloned().unwrap_or(Value::Null),
+                    "label": alvo.get("label").cloned().unwrap_or(Value::Null),
+                    "alvo": alvo.get("alvo").cloned().unwrap_or(Value::Null),
+                    "achados": alvo.get("achados").cloned().unwrap_or(Value::Null),
+                    "via": "pixel",
+                })),
+            },
+            // Contexto destruído no meio da navegação: mesma leitura de cima.
+            Err(_) if enviado.is_ok() => return Ok(json!({
+                "ok": true,
+                "url": alvo.get("url").cloned().unwrap_or(Value::Null),
+                "label": alvo.get("label").cloned().unwrap_or(Value::Null),
+                "alvo": alvo.get("alvo").cloned().unwrap_or(Value::Null),
+                "achados": alvo.get("achados").cloned().unwrap_or(Value::Null),
+                "via": "pixel",
+            })),
+            Err(e) => return Err(e),
+        }
+    }
+    unwrap_ok(eval(id, JS_CLIQUE_DESPACHA).await?)
 }
 
 // ─── downloads ──────────────────────────────────────────────────────────────
@@ -1693,10 +2720,11 @@ fn js_fill(reference: i64, value: &str) -> String {
         r#"{helpers};
 (() => {{
   const NEO = window.__neo;
-  const el = NEO.el({reference});
-  if (!el) return {{ ok: false, error: 'stale' }};
+  const rosto = NEO.el({reference});
+  if (!rosto) return {{ ok: false, error: 'stale' }};
+  const el = NEO.controleDe(rosto) || rosto;
   const value = {value};
-  el.scrollIntoView({{ block: 'nearest' }});
+  rosto.scrollIntoView({{ block: 'nearest' }});
   el.focus();
   if (el.isContentEditable) {{
     el.textContent = value;
@@ -1723,8 +2751,9 @@ fn js_select(reference: i64, option: &str) -> String {
         r#"{helpers};
 (() => {{
   const NEO = window.__neo;
-  const el = NEO.el({reference});
-  if (!el) return {{ ok: false, error: 'stale' }};
+  const rosto = NEO.el({reference});
+  if (!rosto) return {{ ok: false, error: 'stale' }};
+  const el = NEO.controleDe(rosto) || rosto;
   if (el.tagName !== 'SELECT') return {{ ok: false, error: 'não é um <select>' }};
   const wanted = String({option}).trim().toLowerCase();
   const hit = Array.from(el.options).find(
@@ -1798,13 +2827,7 @@ fn js_scroll(delta: i64, reference: i64) -> String {
   const perto = (alvoRect) => {{
     const achados = [];
     const visto = new Set();
-    const noPonto = (x, y) => {{
-      try {{
-        return document.elementFromPoint ? document.elementFromPoint(x, y) : null;
-      }} catch (_) {{
-        return null;
-      }}
-    }};
+    const noPonto = (x, y) => NEO.topo(x, y);
     for (let i = 1; i <= 5; i++) {{
       for (let j = 1; j <= 5; j++) {{
         let p = noPonto((innerWidth * i) / 6, (innerHeight * j) / 6);
@@ -1837,7 +2860,7 @@ fn js_scroll(delta: i64, reference: i64) -> String {
   if (pedido) alvo = subindo(pedido) || descendo(pedido);
   // Ainda nada: o painel costuma ser VIZINHO do que ele apontou, não parente.
   if (!alvo && pedido) alvo = descendo(pedido.parentElement) || perto(pedido.getBoundingClientRect());
-  if (!alvo) alvo = subindo(document.elementFromPoint(innerWidth / 2, innerHeight / 2));
+  if (!alvo) alvo = subindo(NEO.topo(innerWidth / 2, innerHeight / 2));
   if (!alvo) alvo = perto(null);
   // Painel de conteúdo fora do centro (lista estreita, coluna lateral).
   if (!alvo) {{
@@ -1896,36 +2919,179 @@ fn js_scroll(delta: i64, reference: i64) -> String {
     )
 }
 
-fn js_extract(reference: Option<i64>, chars: usize) -> String {
-    let target = match reference {
-        Some(r) => format!("window.__neo.el({})", r),
-        None => "document.body".to_string(),
-    };
+fn js_extract(reference: i64, chars: usize) -> String {
     format!(
         r#"{helpers};
 (() => {{
-  const el = {target};
+  const el = window.__neo.el({reference});
   if (!el) return {{ ok: false, error: 'stale' }};
-  return {{ ok: true, text: String(el.innerText || el.textContent || '').replace(/\n{{3,}}/g, '\n\n').trim().slice(0, {chars}) }};
+  // De ONDE veio o texto. Sem isto, leitura errada e leitura certa chegam
+  // idênticas ao modelo — foi o que deixou ele repetir a mesma leitura inútil
+  // sem ter como perceber.
+  const bruto = String(el.innerText || el.textContent || '').replace(/\n{{3,}}/g, '\n\n').trim();
+  // Imagem não tem texto: ler uma devolvia vazio, com ok, sem explicar nada.
+  const foto = el.tagName === 'IMG' ? el : (bruto ? null : el.querySelector('img'));
+  return {{
+    ok: true,
+    imagem: foto ? window.__neo.srcDe(foto) : '',
+    alt: foto ? String(foto.alt || '') : '',
+    label: window.__neo.shortLabel ? window.__neo.shortLabel(el) : '',
+    // O rótulo sozinho NÃO bastou: no job 29c739d4 o modelo recebeu três vezes
+    // 1500 caracteres de menu rotulados "Ir para" e não tinha como distinguir
+    // leitura certa de leitura errada — chutou um `ref` do overlay de atalhos
+    // de teclado e recebeu 18 caracteres sem nenhum sinal de erro. O flag já
+    // era calculado por elemento no inventário; faltava chegar aqui.
+    moldura: !!(el.closest && window.__neo.CHROME && el.closest(window.__neo.CHROME)),
+    cortado: bruto.length > {chars},
+    text: bruto.slice(0, {chars})
+  }};
 }})()"#,
         helpers = JS_HELPERS,
-        target = target,
+        reference = reference,
         chars = chars
     )
 }
 
-fn js_banner(text: &str, active: bool, stopped: bool) -> String {
+/// Lê a PÁGINA, sem menu, em janelas de `chars` a partir do caractere `de`.
+///
+/// É o que tira o teto do snapshot de cima do modelo. O aviso de corte mandava
+/// "dar `extract` no `ref` do bloco", mas texto puro não tem `ref`: a saída que
+/// o prompt oferecia não existia, e no job 45e85695 o modelo chutou `ref` 0 (um
+/// skip-link) e 110 (uma imagem, que devolveu vazio). `body.innerText` também
+/// não servia: sai em ordem de documento, com a moldura na frente, e no job
+/// 6633351e isso foi lido cinco vezes. Agora tudo o que está escrito na página
+/// é alcançável, sem rolar, e o texto continua de onde o snapshot parou.
+///
+/// Com modal aberto ele vem primeiro: é o que está na frente do usuário.
+fn js_ler_pagina(de: usize, chars: usize) -> String {
+    format!(
+        r#"{helpers};
+(() => {{
+  const NEO = window.__neo;
+  const fora = NEO.foraDaLeitura || ((el) => !!NEO.subir(el, NEO.CHROME));
+  const l = NEO.ler(fora);
+  const modal = NEO.modal && NEO.modal.isConnected
+    ? String(NEO.modal.innerText || '').replace(/\n{{3,}}/g, '\n\n').trim()
+    : '';
+  const tudo = [modal, l.tela, l.resto].filter(Boolean).join('\n');
+  const fim = {de} + {chars};
+  return {{
+    ok: true,
+    label: 'a página, sem os menus',
+    moldura: false,
+    de: {de},
+    total: tudo.length,
+    proximo: fim < tudo.length ? fim : null,
+    cortado: fim < tudo.length,
+    text: tudo.slice({de}, fim)
+  }};
+}})()"#,
+        helpers = JS_HELPERS,
+        de = de,
+        chars = chars
+    )
+}
+
+/// Ctrl+F do agente: acha um termo no texto da página INTEIRA, moldura incluída,
+/// e devolve cada trecho com a linha de antes e a de depois. Olha também o endereço
+/// e o nome de links e imagens: "não achei" só pode ser dito se for verdade.
+///
+/// É a primitiva que mais economiza passo em site desconhecido. "Tem garantia?"
+/// e "qual o CEP de entrega?" deixam de ser rolar e olhar até achar, e "não tem"
+/// passa a ser uma resposta em vez de um passo a mais: o modelo morria no freio
+/// de giro procurando o que não estava lá.
+fn js_buscar(termo: &str, chars: usize) -> String {
+    let encoded = serde_json::to_string(termo).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"{helpers};
+(() => {{
+  const NEO = window.__neo;
+  const alvo = NEO.normaliza({termo});
+  if (alvo.length < 2) return {{ ok: false, error: 'termo curto demais para buscar' }};
+  const l = NEO.ler(null);
+  const linhas = [l.tela, l.resto].filter(Boolean).join('\n').split('\n');
+  const usadas = new Set();
+  const trechos = [];
+  let achados = 0;
+  linhas.forEach((linha, i) => {{
+    if (!NEO.normaliza(linha).includes(alvo)) return;
+    achados++;
+    if (trechos.length >= 12 || usadas.has(i)) return;
+    const pedaco = [];
+    for (let k = Math.max(0, i - 1); k <= Math.min(linhas.length - 1, i + 1); k++) {{
+      if (usadas.has(k)) continue;
+      usadas.add(k);
+      pedaco.push(linhas[k].slice(0, 240));
+    }}
+    trechos.push(pedaco.join('\n'));
+  }});
+  let enderecos = 0;
+  for (const el of NEO.todos('img,a[href]')) {{
+    if (enderecos >= 6) break;
+    const ehImagem = el.tagName === 'IMG';
+    const url = ehImagem ? NEO.srcDe(el) : String(el.href || '');
+    const nome = String((ehImagem ? el.alt : el.title) || '');
+    if (url.startsWith('data:') || !NEO.normaliza(url + ' ' + nome).includes(alvo)) continue;
+    enderecos++;
+    achados++;
+    trechos.push((ehImagem ? 'imagem: ' : 'link: ') + (nome ? nome.slice(0, 80) + ' → ' : '') + url.slice(0, 240));
+  }}
+  return {{
+    ok: true,
+    busca: true,
+    label: 'busca na página',
+    moldura: false,
+    achados,
+    total: linhas.reduce((n, t) => n + t.length, 0),
+    text: trechos.join('\n---\n').slice(0, {chars})
+  }};
+}})()"#,
+        helpers = JS_HELPERS,
+        termo = encoded,
+        chars = chars
+    )
+}
+
+/// Um evento para a linha do tempo do painel da extensão.
+///
+/// `kind` é o que dá cor e forma ao item: `fase` (preparação), `passo` (o que
+/// está sendo feito agora), `ok` (o retorno), `erro`, `fim`. `detail` é o
+/// retorno em si — a resposta da olhada com visão, o motivo da falha — e nasce
+/// cortado em 3 linhas no painel, com clique para abrir.
+fn js_banner(text: &str, active: bool, stopped: bool, kind: &str, detail: &str) -> String {
     let encoded = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    let kind_enc = serde_json::to_string(kind).unwrap_or_else(|_| "\"passo\"".to_string());
+    let detail_enc = serde_json::to_string(detail).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"(() => {{
-  window.postMessage({{ __neo_overlay: {{ active: {active}, text: {text}, stopped: {stopped} }} }}, '*');
+  window.postMessage({{ __neo_overlay: {{ active: {active}, text: {text}, stopped: {stopped}, kind: {kind}, detail: {detail} }} }}, '*');
   return {{ ok: true }};
 }})()"#,
         active = active,
         stopped = stopped,
-        text = encoded
+        text = encoded,
+        kind = kind_enc,
+        detail = detail_enc
     )
 }
+
+/// O painel da extensão fica na LATERAL, não mais numa faixa de 44px: deixá-lo
+/// na foto come um quarto da largura útil e cobre conteúdo que o modelo de
+/// visão precisa ler. Como o host do shadow é um nó comum da página (só o
+/// conteúdo é que é `closed`), o mundo principal consegue apagá-lo pelo id —
+/// síncrono, sem round-trip de mensagem e sem reflow (`visibility`, não
+/// `display`).
+const JS_PAINEL_OCULTAR: &str = r#"(() => {
+  const h = document.getElementById('neo-browser-local-overlay');
+  if (h) h.style.visibility = 'hidden';
+  return { ok: true };
+})()"#;
+
+const JS_PAINEL_MOSTRAR: &str = r#"(() => {
+  const h = document.getElementById('neo-browser-local-overlay');
+  if (h) h.style.visibility = '';
+  return { ok: true };
+})()"#;
 
 // ─── vocabulário ────────────────────────────────────────────────────────────
 
@@ -1962,6 +3128,9 @@ pub fn available() -> bool {
 
 /// Executa uma ação `browser.*` do canal de controle.
 pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
+    if ATUA.contains(&action) && parado(tab_id(args)?).await {
+        return Err("PARE: o usuário mandou parar".to_string());
+    }
     match action {
         // ── saúde / abas ──
         "browser.health" => {
@@ -2072,6 +3241,11 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                 .get("text_chars")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(3000) as usize;
+            // Só depois de uma ação que pode trocar a tela (quem pede é o core).
+            if let Some(teto) = args.get("assentar_ms").and_then(|v| v.as_u64()) {
+                let antes = args.get("url_antes").and_then(|v| v.as_str());
+                assentar(id, teto, antes).await;
+            }
             let mut snapshot = eval(id, &js_snapshot(max, chars)).await?;
             // O flag do PARE tem duas fontes: o atributo no HTML (confiável,
             // sobrevive à notificação perdida) e a notificação (rápida).
@@ -2085,35 +3259,55 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
 
         "browser.extract" => {
             let id = tab_id(args)?;
-            let reference = args.get("ref").and_then(|v| v.as_i64());
             let chars = args
                 .get("chars")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4000) as usize;
-            unwrap_ok(eval(id, &js_extract(reference, chars)).await?)
+            let termo = args
+                .get("busca")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.trim().is_empty());
+            if let Some(termo) = termo {
+                return unwrap_ok(eval(id, &js_buscar(termo, chars)).await?);
+            }
+            match args.get("ref").and_then(|v| v.as_i64()) {
+                Some(reference) => unwrap_ok(eval(id, &js_extract(reference, chars)).await?),
+                None => {
+                    let de = args.get("de").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    unwrap_ok(eval(id, &js_ler_pagina(de, chars)).await?)
+                }
+            }
         }
 
         // ── atuação ──
         "browser.click" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
-            unwrap_ok(eval(id, &js_click(reference)).await?)
+            clicar(id, js_mirar(reference, "esquerdo", &trava_de(args)), 1).await
         }
         // Saída para o que se lê e não se endereça — ver `js_click_text`.
         "browser.click_text" => {
             let id = tab_id(args)?;
             let texto = arg_str(args, "texto")?;
-            unwrap_ok(eval(id, &js_click_text(&texto)).await?)
+            let n = args.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+            clicar(id, js_click_text(&texto, n, &trava_de(args)), 1).await
+        }
+        // A varredura da DOM inteira. Só lê: não toca na página.
+        "browser.find" => {
+            let id = tab_id(args)?;
+            let texto = arg_str(args, "texto")?;
+            let limite = args.get("limite").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            unwrap_ok(eval(id, &js_find(&texto, limite.min(20))).await?)
         }
         "browser.dblclick" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
-            unwrap_ok(eval(id, &js_dblclick(reference)).await?)
+            clicar(id, js_mirar(reference, "duplo", &trava_de(args)), 2).await
         }
         "browser.right_click" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
-            unwrap_ok(eval(id, &js_right_click(reference)).await?)
+            clicar(id, js_mirar(reference, "direito", &trava_de(args)), 1).await
         }
         "browser.fill" => {
             let id = tab_id(args)?;
@@ -2159,7 +3353,9 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             }
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-            let _ = eval(id, &js_banner(text, active, false)).await?;
+            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("passo");
+            let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            let _ = eval(id, &js_banner(text, active, false, kind, detail)).await?;
             Ok(json!({ "ok": true }))
         }
         "browser.screenshot" => {
@@ -2206,7 +3402,18 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                 None
             };
 
-            let shot = cdp(id, "Page.captureScreenshot", params).await?;
+            // Esconde o painel do Neo só durante o clique do obturador. O
+            // `let shot` separado do `?` é de propósito: captura que falha
+            // ainda precisa devolver o painel para a tela.
+            let esconder = !is_headless(id);
+            if esconder {
+                let _ = eval(id, JS_PAINEL_OCULTAR).await;
+            }
+            let shot = cdp(id, "Page.captureScreenshot", params).await;
+            if esconder {
+                let _ = eval(id, JS_PAINEL_MOSTRAR).await;
+            }
+            let shot = shot?;
             let mut data = shot
                 .get("data")
                 .and_then(|v| v.as_str())
@@ -2312,7 +3519,7 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             }
             // Melhor esforço: a aba pode já ter sido fechada pelo usuário, e
             // nesse caso "soltar" já está feito.
-            let _ = eval(id, &js_banner("", false, false)).await;
+            let _ = eval(id, &js_banner("", false, false, "fim", "")).await;
             let _ = call("detach", json!({ "tabId": id })).await;
             let _ = call("turnEnded", json!({})).await;
             STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -2397,6 +3604,55 @@ async fn press_key(id: i64, key: &str) -> Result<Value, String> {
     Ok(json!({ "ok": true, "key": key }))
 }
 
+const JS_ASSENTOU: &str = r#"({
+  ready: document.readyState,
+  url: location.href,
+  nos: document.getElementsByTagName('*').length
+})"#;
+
+/// Espera a página parar de mudar antes do snapshot. Melhor esforço: estourar o
+/// teto só quer dizer que o snapshot sai como sairia sem esta espera.
+///
+/// Sem isto, o snapshot saía na mesma hora do clique, com a página pela metade:
+/// 59 elementos, todos de cabeçalho (jobs 2d416462 e 45e85695, uma vez por
+/// produto). Cada um custava uma rodada inteira de LLM para o modelo perceber e
+/// mais uma de `wait_for`, e ainda rendia decisões erradas, como "a página não
+/// tem dados do produto". O laço roda aqui e não no core de propósito: cada
+/// consulta é local ao Mac, em vez de uma ida e volta até a VPS.
+///
+/// `url_antes` vale para o clique que deve NAVEGAR. Antes de a navegação
+/// entregar, o documento velho está `complete` e parado, e pareceria assentado.
+async fn assentar(id: i64, teto_ms: u64, url_antes: Option<&str>) {
+    const PASSO: Duration = Duration::from_millis(150);
+    const ESPERA_NAVEGAR: Duration = Duration::from_millis(1200);
+    let inicio = Instant::now();
+    let fim = inicio + Duration::from_millis(teto_ms.min(5000));
+    let mut anterior: Option<(String, u64)> = None;
+    loop {
+        tokio::time::sleep(PASSO).await;
+        // Erro aqui é o contexto sendo destruído pela navegação: é só esperar.
+        if let Ok(v) = eval(id, JS_ASSENTOU).await {
+            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let nos = v.get("nos").and_then(|x| x.as_u64()).unwrap_or(0);
+            let pronta = v.get("ready").and_then(|x| x.as_str()) == Some("complete");
+            let esperando_navegar = url_antes == Some(url.as_str())
+                && inicio.elapsed() < ESPERA_NAVEGAR;
+            // Até 1% de diferença: carrossel e contador nunca param de mexer, e
+            // exigir silêncio absoluto gastaria o teto inteiro nesses sites.
+            let parada = anterior
+                .as_ref()
+                .is_some_and(|(u, n)| *u == url && nos.abs_diff(*n) * 100 <= (*n).max(1));
+            if pronta && parada && !esperando_navegar {
+                return;
+            }
+            anterior = Some((url, nos));
+        }
+        if Instant::now() >= fim {
+            return;
+        }
+    }
+}
+
 async fn wait_for(id: i64, text: &str, timeout_ms: u64) -> Result<Value, String> {
     let needle = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     let expression = format!(
@@ -2433,6 +3689,31 @@ mod tests {
             )
             .unwrap();
         out
+    }
+
+    /// O caso que derrubou dois jobs: host vivo, socket atendendo, e o
+    /// `active.json` apagado pela limpeza diária do /tmp (que não apaga socket).
+    /// Antes isso virava "a extensão do Neo não está ativa" — mentira que ainda
+    /// mandava o usuário mexer no que estava funcionando.
+    #[test]
+    fn varredura_acha_o_socket_quando_o_registro_sumiu() {
+        let base = std::env::temp_dir().join(format!("obu-teste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Diretório existe mas está vazio: continua sendo "não está no ar".
+        assert!(socket_por_varredura_em(&base).is_err());
+
+        // Arquivo comum com nome de socket NÃO serve — descobrir isso só no
+        // connect daria o erro errado.
+        std::fs::write(base.join("impostor.sock"), b"nao sou um socket").unwrap();
+        assert!(socket_por_varredura_em(&base).is_err());
+
+        let alvo = base.join("a399412b.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&alvo).unwrap();
+        assert_eq!(socket_por_varredura_em(&base).unwrap(), alvo);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -2590,6 +3871,100 @@ mod tests_headless {
         assert_eq!(super::super::headless::stats().await["tabs"], 0);
 
         super::super::headless::shutdown().await;
+    }
+
+    /// O botão da Amazon em miniatura: input transparente sobre um desenho, com o
+    /// nome em `aria-labelledby`, sem nó de texto próprio. Só o input escuta.
+    const BOTAO_DISFARCADO: &str = "data:text/html;charset=utf-8,\
+        <html><body style='margin:40px'>\
+        <span style='position:relative;display:inline-block;width:200px;height:32px'>\
+        <span id='nome' aria-hidden='true'>Adicionar ao carrinho</span>\
+        <input type='button' aria-labelledby='nome' onclick='window.n=(window.n||0)+1' \
+        style='position:absolute;left:0;top:0;width:200px;height:32px;margin:0;opacity:.01'>\
+        </span></body></html>";
+
+    async fn contagem(tab: i64) -> i64 {
+        eval(tab, "window.n || 0").await.expect("contagem").as_i64().unwrap_or(-1)
+    }
+
+    /// O caminho inteiro em Rust: mira, mouse real pelo CDP, sonda. A conta tem de
+    /// subir de 1 em 1: 0 é o clique morto do job 8bc25dd1, 2 é a reserva
+    /// disparando em cima do mouse real (item em dobro no carrinho).
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn o_clique_chega_no_controle_transparente_uma_vez_so() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": BOTAO_DISFARCADO }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+
+        let snap = execute("browser.snapshot", &json!({ "tab_ref": tab }))
+            .await
+            .expect("snapshot");
+        assert_eq!(snap["capacidades"][0], "find");
+        let botao = snap["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .find(|e| e["tag"] == "input" && e["text"] == "Adicionar ao carrinho")
+            .unwrap_or_else(|| panic!("o input transparente não entrou no inventário: {snap}"))
+            .clone();
+
+        let r = execute("browser.click", &json!({ "tab_ref": tab, "ref": botao["ref"] }))
+            .await
+            .expect("click");
+        assert_eq!(r["via"], "pixel", "{r}");
+        assert_eq!(contagem(tab).await, 1, "clique por ref");
+
+        let r = execute("browser.click_text", &json!({ "tab_ref": tab, "texto": "Adicionar ao carrinho" }))
+            .await
+            .expect("click_text");
+        assert_eq!(r["via"], "pixel", "{r}");
+        assert_eq!(contagem(tab).await, 2, "clique por nome");
+
+        let achados = execute("browser.find", &json!({ "tab_ref": tab, "texto": "adicionar ao carrinho" }))
+            .await
+            .expect("find");
+        assert_eq!(achados["lista"][0]["tag"], "input", "{achados}");
+        assert_eq!(achados["lista"][0]["recebe"], true, "{achados}");
+
+        // A trava confere o alvo real, e clique barrado não encosta na página.
+        let barrado = execute(
+            "browser.click_text",
+            &json!({ "tab_ref": tab, "texto": "carrinho", "trava": "\\badicionar\\b", "liberado": "" }),
+        )
+        .await
+        .expect_err("a trava tinha de barrar");
+        assert!(barrado.starts_with("SENSIVEL:Adicionar"), "{barrado}");
+        assert_eq!(contagem(tab).await, 2, "clique barrado não pode chegar");
+
+        // PARE apertado enquanto o modelo decidia: nada mais sai.
+        eval(tab, "document.documentElement.setAttribute('data-neo-stop', '1')")
+            .await
+            .expect("marca o PARE");
+        let parado = execute("browser.click", &json!({ "tab_ref": tab, "ref": botao["ref"] }))
+            .await
+            .expect_err("o PARE tinha de barrar");
+        assert!(parado.starts_with("PARE:"), "{parado}");
+        assert_eq!(contagem(tab).await, 2, "nada sai depois do PARE");
+
+        execute("browser.release", &json!({ "tab_ref": tab })).await.expect("release");
+        super::super::headless::shutdown().await;
+    }
+
+    #[test]
+    fn a_trava_chega_na_pagina_como_js_valido() {
+        let trava = trava_de(&json!({ "trava": "\\b(comprar|pagar)\\b", "liberado": "\"x\"" }));
+        let valor: Value = serde_json::from_str(&trava).expect("a trava tem de ser JSON");
+        assert_eq!(valor["trava"], "\\b(comprar|pagar)\\b");
+        assert!(js_mirar(3, "duplo", &trava).contains("tipo: 'duplo'"));
+        // Sem nada do core, nada é travado: é o device novo com o core antigo.
+        assert_eq!(trava_de(&json!({})), r#"{"liberado":"","trava":""}"#);
     }
 
     #[tokio::test]

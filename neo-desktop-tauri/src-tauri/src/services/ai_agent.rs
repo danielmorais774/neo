@@ -190,6 +190,7 @@ impl GrpcClient {
         mode: Option<&str>,
         attachments: Option<Vec<String>>,
         voice: Option<VoiceInput>,
+        pasted_chars: Option<u32>,
         cancel: std::sync::Arc<tokio::sync::Notify>,
         stream_tx_slot: StreamTxSlot,
         ext_bridge: ExtBridge,
@@ -239,6 +240,14 @@ impl GrpcClient {
             if let Some(engine) = &v.engine {
                 metadata.insert("asr_engine".to_string(), engine.clone());
             }
+        }
+        // Caracteres colados do clipboard. É o sinal que falta ao core para
+        // saber que parte da mensagem é de TERCEIRO: conteúdo que chega por tool
+        // (página, e-mail, PDF) contamina o turno, mas colado entrava como se
+        // fosse o usuário falando e o portão de liberação ficava inerte. Ver
+        // neo-core/docs/release-request-plan.md §21.
+        if let Some(colados) = pasted_chars.filter(|n| *n > 0) {
+            metadata.insert("pasted_chars".to_string(), colados.to_string());
         }
         // Ids do File Store anexados a ESTA mensagem. O metadata do gRPC é
         // map<string,string>, então a lista vai serializada (mesmo padrão do

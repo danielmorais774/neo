@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Modal de verdade por cima do conteúdo</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  .conteudo { padding: 24px; }
+  .fundo { position: fixed; inset: 0; background: rgba(0,0,0,.45); }
+  .caixa { position: absolute; top: 12%; left: 50%; transform: translateX(-50%);
+           width: 520px; background: #fff; padding: 20px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: o modal LEGÍTIMO — aquele por causa de quem a regra "modal aberto ganha
+  o lugar de conteúdo principal" existe. Ele perde nos três critérios do
+  `considerar` (8% do viewport, 150 caracteres, maior texto líquido) para a
+  página atrás dele, então sem a regra ele não entraria em lugar nenhum.
+
+  O que esta fixture protege: ao exigir SOBREPOSIÇÃO — `aria-modal="true"` ou
+  `position:fixed` em até 5 ancestrais — para desqualificar a barra de filtros
+  da Amazon (um `role="dialog"` de 262×7957px EM FLUXO, job 5ab98119), o modal
+  de verdade tem de continuar ganhando. Aqui ele tem as duas marcas: o
+  `aria-modal` e o fundo `fixed` com a caixa `absolute` dentro, que é o desenho
+  mais comum na web.
+-->
+<div class="conteudo">
+  <h1>A página atrás do modal</h1>
+  <p>Este é o conteúdo normal da página, com texto suficiente para passar o piso
+  de 150 caracteres e ocupar bem mais de 8% da janela — é ele que ganharia a
+  eleição se o modal não tivesse prioridade.</p>
+  <p>Segundo parágrafo, para o bloco de trás ter volume de texto bem maior que o
+  do modal. É exatamente essa diferença que faz o modal perder no critério de
+  texto e precisar da regra própria.</p>
+  <p>Terceiro parágrafo, mesma função: dar massa de texto ao fundo.</p>
+  <p>Quarto parágrafo, para não haver dúvida de qual bloco tem mais texto.</p>
+</div>
+
+<div class="fundo">
+  <div role="dialog" aria-modal="true" aria-label="Confirmar pedido" class="caixa">
+    <h2>Confirme o código</h2>
+    <p>O código de confirmação do pedido é 4821-ZX. Use este código para concluir.</p>
+    <button type="button">Entendi</button>
+  </div>
+</div>
+</body>
+</html>

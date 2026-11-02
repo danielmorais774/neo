@@ -15,7 +15,13 @@ interface ChatProps {
   maxIterations?: number;
   // `attachmentIds` são ids do File Store (neo-core) já enviados; o conteúdo do
   // arquivo não passa por aqui.
-  onSendMessage: (message: string, attachmentIds?: string[]) => void;
+  onSendMessage: (
+    message: string,
+    attachmentIds?: string[],
+    /** caracteres desta mensagem que vieram do clipboard (ver §21 do
+     *  release-request-plan: colagem = conteúdo de terceiro) */
+    pastedChars?: number
+  ) => void;
   onClearHistory: () => void;
   onNewChat: () => void;
   onStop: () => void;
@@ -208,11 +214,33 @@ function Chat({
     setAttachments((prev) => prev.filter((a) => a.key !== key));
   }, []);
 
+  // Trechos COLADOS no rascunho atual. Quem sabe que um texto é de terceiro é o
+  // cliente: o core só vê a mensagem final, e adivinhar por formato erraria nos
+  // dois sentidos. Guardamos os pedaços (não só o total) para não contar o que
+  // ele colou e depois apagou — no envio só vale o que ainda está no texto.
+  // Ver neo-core/docs/release-request-plan.md §21.
+  const pastedChunksRef = useRef<string[]>([]);
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const texto = e.clipboardData?.getData('text') ?? '';
+    // Abaixo de 24 caracteres é link curto/palavra/comando — ruído para esta conta.
+    if (texto.trim().length >= 24) {
+      pastedChunksRef.current = [...pastedChunksRef.current.slice(-19), texto];
+    }
+  }, []);
+
+  const pastedCharsNoTexto = (texto: string): number =>
+    pastedChunksRef.current
+      .filter((pedaco) => texto.includes(pedaco))
+      .reduce((total, pedaco) => total + pedaco.length, 0);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (input.trim() && !isLoading && !isExecuting && !isUploading) {
       const ids = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id!);
-      onSendMessage(input.trim(), ids.length ? ids : undefined);
+      const colados = pastedCharsNoTexto(input);
+      onSendMessage(input.trim(), ids.length ? ids : undefined, colados || undefined);
+      pastedChunksRef.current = [];
       setInput('');
       setAttachments([]);
       // Textarea shrink is handled by the useLayoutEffect on [input] below,
@@ -323,6 +351,7 @@ function Chat({
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown}
             placeholder={isExecuting ? "Agente em execução..." : "Digite sua mensagem..."}
             rows={1}

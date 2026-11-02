@@ -37,6 +37,8 @@ const STATUS_LABEL: Record<string, string> = {
   failed: 'falhou',
   timeout: 'estourou',
   cancelled: 'cancelada',
+  waiting: 'esperando você',
+  continued: 'continuada',
 };
 
 const KIND_LABEL: Record<string, string> = {

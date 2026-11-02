@@ -48,6 +48,12 @@ pub async fn execute_with_loop(
     input_source: Option<String>,
     asr_raw: Option<String>,
     asr_engine: Option<String>,
+    // Quantos caracteres desta mensagem vieram do CLIPBOARD. Acima do limiar o
+    // neo-core marca o turno como contaminado (fonte `colagem`) e revelar passa a
+    // pedir o card de liberação — colado era a única entrada de conteúdo de
+    // terceiro que o portão não enxergava. Ver
+    // neo-core/docs/release-request-plan.md §21.
+    pasted_chars: Option<u32>,
 ) -> Result<(), String> {
     info!(
         "[Neo] execute_with_loop: {} (model={:?}, mode={:?}, anexos={}, origem={:?})",
@@ -58,7 +64,7 @@ pub async fn execute_with_loop(
         input_source
     );
     let voice = VoiceInput::from_parts(input_source, asr_raw, asr_engine);
-    run_agent_message(app, message, model, mode, provider, attachments, voice);
+    run_agent_message(app, message, model, mode, provider, attachments, voice, pasted_chars);
     Ok(())
 }
 
@@ -76,6 +82,7 @@ pub fn run_agent_message(
     provider: Option<String>,
     attachments: Option<Vec<String>>,
     voice: Option<VoiceInput>,
+    pasted_chars: Option<u32>,
 ) {
     let state = app.state::<AppState>();
     let device_id = state.device_id.clone();
@@ -104,6 +111,7 @@ pub fn run_agent_message(
                 mode.as_deref(),
                 attachments,
                 voice,
+                pasted_chars,
                 cancel_notify,
                 stream_tx_slot,
                 ext_bridge,

@@ -226,7 +226,13 @@ export interface ElectronAPI {
     mode?: string,
     provider?: string,
     attachments?: string[],
-    voice?: VoiceInputSource
+    voice?: VoiceInputSource,
+    /** Quantos caracteres desta mensagem vieram do CLIPBOARD. Vira
+     *  `pasted_chars` no metadata do gRPC: acima do limiar o neo-core marca o
+     *  turno como contaminado (fonte `colagem`) e revelar passa a pedir o card
+     *  de liberação. Só o cliente sabe disso — o core só vê o texto final.
+     *  Ver neo-core/docs/release-request-plan.md §21. */
+    pastedChars?: number
   ) => Promise<void>;
   // Anexos: picker nativo → upload pro File Store do neo-core. O `id` que volta
   // é o que se manda em `attachments` no envio da mensagem.
@@ -413,7 +419,7 @@ export interface JobSummary {
   id: string;
   kind: string;
   title: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled' | string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled' | 'waiting' | 'continued' | string;
   notify_policy: string;
   session_id: string | null;
   /** ISO-8601 SEM timezone, gravado pelo core como UTC (igual ao SessionInfo). */
@@ -525,7 +531,8 @@ export const electronAPI: ElectronAPI = {
     mode?: string,
     provider?: string,
     attachments?: string[],
-    voice?: VoiceInputSource
+    voice?: VoiceInputSource,
+    pastedChars?: number
   ) =>
     invoke('execute_with_loop', {
       message,
@@ -536,6 +543,7 @@ export const electronAPI: ElectronAPI = {
       inputSource: voice?.source,
       asrRaw: voice?.raw,
       asrEngine: voice?.engine,
+      pastedChars: pastedChars && pastedChars > 0 ? pastedChars : undefined,
     }),
 
   pickAttachmentFiles: () => invoke<string[]>('pick_attachment_files'),

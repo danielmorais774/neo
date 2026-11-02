@@ -1,0 +1,13 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Web components e cartão esticado</title>
+<style>.cartao{position:relative;width:320px;padding:12px;border:1px solid #ccc;margin:10px}
+.cartao a.esticado{position:absolute;inset:0;z-index:2;background:transparent}</style></head><body>
+<h1>Loja com web components</h1>
+<produto-sombra></produto-sombra>
+<div class="cartao"><a class="esticado" href="/produto/9" aria-label="Ver produto"></a><div>Fone Bluetooth X200</div><div>R$ 249,90 à vista</div></div>
+<iframe src="data:text/html,<p>outro site</p>" title="Pagamento" style="width:900px;height:420px;border:1px solid #999"></iframe>
+<iframe srcdoc="<p>Cupom do mesmo site: VOLTA10 dá 10% de desconto.</p>" title="Cupons" style="width:900px;height:420px"></iframe>
+<script>
+class P extends HTMLElement { connectedCallback() { const r = this.attachShadow({mode:'open'});
+  r.innerHTML = '<style>div{padding:12px}</style><div><h2>Cadeira Ergonômica Pro</h2><p>Preço dentro do shadow: R$ 1.899,00</p><button>Comprar cadeira</button></div>'; } }
+customElements.define('produto-sombra', P);
+</script></body></html>

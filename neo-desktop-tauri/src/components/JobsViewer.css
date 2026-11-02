@@ -84,7 +84,15 @@
   border-color: rgba(229, 104, 107, 0.35);
 }
 
-.jobs-status-cancelled {
+/* Parada de propósito: o card de liberação ou a pergunta do clique. Não é erro. */
+.jobs-status-waiting {
+  color: var(--warning, #f59e0b);
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.jobs-status-cancelled,
+.jobs-status-continued {
   color: var(--text-secondary);
   background: var(--surface-2);
   border-color: var(--surface-border);

@@ -247,6 +247,9 @@ mod imp {
                             None,
                             None,
                             voice,
+                            // O campo do notch é nativo: não há evento de paste
+                            // para contar. Ausência nunca inventa proteção.
+                            None,
                         );
                     }
                     "notification_action" => {

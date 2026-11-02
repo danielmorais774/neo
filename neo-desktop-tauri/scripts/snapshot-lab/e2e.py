@@ -12,6 +12,9 @@ def js(nome, **kw):
     for a, b in kw.items(): t = t.replace("{"+a+"}", str(b))
     return t.replace("\x00","{").replace("\x01","}")
 
+def const(nome):
+    return re.search(rf'const {nome}: &str = r#"(.*?)"#;', s, re.S).group(1)
+
 CHROME = os.path.expanduser("~/Library/Caches/ms-playwright/chromium_headless_shell-1234/"
                             "chrome-headless-shell-mac-arm64/chrome-headless-shell")
 
@@ -47,6 +50,16 @@ async def main(url):
                     m=json.loads(await asyncio.wait_for(ws.recv(),timeout=60))
                     if m.get("id")==n[0]: return m
             await cmd("Page.enable",{}); await cmd("Page.navigate",{"url":url}); await asyncio.sleep(2.5)
+            # O mesmo `clicar()` do Rust: mira, mouse real, sonda, reserva.
+            async def clicar(mira):
+                alvo=await ev(mira)
+                if not alvo or not alvo.get("ok"): return alvo
+                if alvo.get("real"):
+                    for tipo,botao,botoes,n in (("mouseMoved","none",0,0),("mousePressed","left",1,1),("mouseReleased","left",0,1)):
+                        await cmd("Input.dispatchMouseEvent",{"type":tipo,"x":alvo["x"],"y":alvo["y"],"button":botao,"buttons":botoes,"clickCount":n})
+                    r=await ev(const("JS_CLIQUE_CONFIRMA"))
+                    if r.get("entregue") is not False: return r
+                return await ev(const("JS_CLIQUE_DESPACHA"))
 
             snap = await ev(js("js_snapshot", max=200, chars=3000))
             els = snap["elements"]
@@ -58,7 +71,7 @@ async def main(url):
             if not alt3: print("!! não achei a alternativa 3"); return
             print(f'alternativa 3 = ref {alt3["ref"]} · checked={alt3.get("checked")} · controla={alt3.get("controla")}')
 
-            r = await ev(js("js_click", reference=alt3["ref"]))
+            r = await clicar(js("js_mirar", reference=alt3["ref"], tipo="esquerdo", trava="{}"))
             print("click →", json.dumps(r, ensure_ascii=False)[:180])
 
             snap2 = await ev(js("js_snapshot", max=200, chars=3000))
@@ -66,9 +79,9 @@ async def main(url):
             resp = next((e for e in snap2["elements"] if (e.get("text") or "")=="Responder"), None)
             print(f'depois do clique: alternativa checked={e2 and e2.get("checked")} · Responder desabilitado={resp and resp.get("disabled")}')
 
-            r = await ev(js("js_click_text", needle=json.dumps("Durante a transição para o trabalho livre")))
+            r = await clicar(js("js_click_text", needle=json.dumps("Durante a transição para o trabalho livre"), n=0, trava="{}"))
             print("click_text →", json.dumps(r, ensure_ascii=False)[:220])
-            r = await ev(js("js_click_text", needle=json.dumps("texto que não existe nesta página")))
+            r = await clicar(js("js_click_text", needle=json.dumps("texto que não existe nesta página"), n=0, trava="{}"))
             print("click_text (inexistente) →", json.dumps(r, ensure_ascii=False)[:160])
     finally:
         proc.terminate(); proc.wait(timeout=10); shutil.rmtree(perfil, ignore_errors=True)
