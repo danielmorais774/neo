@@ -43,6 +43,7 @@ export const ChatPage = () => {
     setSelectedModel,
     selectedProvider,
     setSelectedProvider,
+    modelCatalog,
     chatMode,
     setChatMode,
     startupNotification,
@@ -523,6 +524,7 @@ export const ChatPage = () => {
         selectedModel={selectedModel}
         selectedMode={chatMode}
         selectedProvider={selectedProvider}
+        modelCatalog={modelCatalog}
         windowMode={windowMode}
         // initialInput={`manda uma mensagem para minha irmã avisando que vou chegar mais tarde`}
         initialInput={``}

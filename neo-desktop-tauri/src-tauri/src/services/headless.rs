@@ -348,6 +348,10 @@ struct Tab {
     session_id: String,
     last_used: Instant,
     url: String,
+    /// A aba do gerente que a abriu (link `_blank`, `window.open`). `None` = o
+    /// gerente abriu. Antes estas abas nem entravam aqui: ficavam fora do teto
+    /// de abas e da ociosidade, e só morriam no reinício pelo teto de RAM.
+    opener: Option<i64>,
 }
 
 struct Headless {
@@ -521,6 +525,19 @@ impl Headless {
                 Err(_) => continue,
             };
             if valor.get("id").and_then(|v| v.as_u64()) != Some(id) {
+                // O único evento que interessa: a aba pediu outra janela. É o
+                // gatilho de "este clique abriu uma aba" (ver browser_local.rs).
+                if valor.get("method").and_then(|v| v.as_str()) == Some("Page.windowOpen") {
+                    let sessao = valor.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(tab) = self.tabs.iter().find(|t| t.session_id == sessao) {
+                        let ev = valor.get("params").cloned().unwrap_or(Value::Null);
+                        super::browser_local::anotar_janela(
+                            -tab.id,
+                            ev.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                            ev.get("userGesture").and_then(|v| v.as_bool()).unwrap_or(false),
+                        );
+                    }
+                }
                 continue; // evento ou resposta de outra chamada
             }
             if let Some(erro) = valor.get("error") {
@@ -564,8 +581,104 @@ impl Headless {
             session_id,
             last_used: Instant::now(),
             url: url.to_string(),
+            opener: None,
         });
         Ok(id)
+    }
+
+    /// As abas que a página da aba `opener` abriu e o gerente ainda não conhece.
+    ///
+    /// Pelo `Target.getTargets`, que traz o `openerId` de cada alvo: não depende
+    /// de ter lido o evento `targetCreated` (o `request` descarta eventos) e já
+    /// é a chamada que bombeia o `Page.windowOpen` (ver `request`).
+    async fn take_new_tabs(&mut self, opener: i64) -> Result<Vec<(i64, String, String)>, String> {
+        let Some(alvo_origem) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == opener)
+            .map(|t| t.target_id.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        let lista = self.request("Target.getTargets", json!({}), None).await?;
+        let conhecidos: Vec<String> = self.tabs.iter().map(|t| t.target_id.clone()).collect();
+        let mut novas = Vec::new();
+        for info in lista
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            if info.get("type").and_then(|v| v.as_str()) != Some("page") {
+                continue;
+            }
+            if info.get("openerId").and_then(|v| v.as_str()) != Some(alvo_origem.as_str()) {
+                continue;
+            }
+            let Some(target_id) = info.get("targetId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if conhecidos.iter().any(|c| c == target_id) {
+                continue;
+            }
+            let anexo = self
+                .request(
+                    "Target.attachToTarget",
+                    json!({ "targetId": target_id, "flatten": true }),
+                    None,
+                )
+                .await?;
+            let Some(session_id) = anexo.get("sessionId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = info.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            self.tabs.push(Tab {
+                id,
+                target_id: target_id.to_string(),
+                session_id: session_id.to_string(),
+                last_used: Instant::now(),
+                url: url.clone(),
+                opener: Some(opener),
+            });
+            novas.push((id, url, title));
+        }
+        Ok(novas)
+    }
+
+    /// As abas do gerente que ainda existem — e esquece as que sumiram (o popup
+    /// que se fechou sozinho, a aba que a página fechou).
+    async fn live_tabs(&mut self) -> Result<Vec<(i64, String, String, Option<i64>)>, String> {
+        let lista = self.request("Target.getTargets", json!({}), None).await?;
+        let vivos: Vec<(String, String, String)> = lista
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|i| {
+                Some((
+                    i.get("targetId")?.as_str()?.to_string(),
+                    i.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    i.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                ))
+            })
+            .collect();
+        self.tabs.retain(|t| vivos.iter().any(|(id, _, _)| id == &t.target_id));
+        Ok(self
+            .tabs
+            .iter()
+            .map(|t| {
+                let (_, url, title) = vivos
+                    .iter()
+                    .find(|(id, _, _)| id == &t.target_id)
+                    .cloned()
+                    .unwrap_or_default();
+                (t.id, url, title, t.opener)
+            })
+            .collect())
     }
 
     async fn close_tab(&mut self, tab_id: i64) -> Result<(), String> {
@@ -649,20 +762,45 @@ impl Headless {
     }
 
     async fn shutdown(mut self) {
-        let _ = self.request("Browser.close", json!({}), None).await;
+        // Processo que já saiu não responde ao `Browser.close`, e esperar por ele
+        // custaria o prazo inteiro da chamada.
+        if self.vivo() {
+            let _ = self.request("Browser.close", json!({}), None).await;
+        }
         let _ = self.ws.close(None).await;
         let _ = self.child.kill().await;
     }
+
+    /// O processo ainda está de pé? `try_wait` devolve o status de quem já saiu.
+    fn vivo(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+/// Erro de TRANSPORTE com o navegador (a conexão caiu), e não da página.
+fn conexao_caiu(erro: &str) -> bool {
+    erro.contains("socket do navegador")
 }
 
 // ─── API pública ────────────────────────────────────────────────────────────
 
 /// Sobe o navegador se ainda não estiver de pé. Idempotente.
+///
+/// "De pé" é o PROCESSO vivo, não haver um registro guardado. O registro
+/// sobrevive ao navegador: na sessão cb41834a o Chrome sem janela morreu nas
+/// três horas paradas, e as duas tarefas seguintes escreveram no socket dele e
+/// morreram com "Broken pipe" na largada. Nada subia outro.
 pub async fn ensure_running() -> Result<(), String> {
     let slot = session_slot();
     let mut guard = slot.lock().await;
-    if guard.is_some() {
-        return Ok(());
+    if let Some(h) = guard.as_mut() {
+        if h.vivo() {
+            return Ok(());
+        }
+        warn!("[headless] o navegador (pid {}) não está mais de pé — subindo outro", h.pid);
+        if let Some(morto) = guard.take() {
+            morto.shutdown().await;
+        }
     }
     *guard = Some(Headless::launch().await?);
     Ok(())
@@ -700,7 +838,22 @@ pub async fn open_tab(url: &str) -> Result<i64, String> {
     }
 
     let h = guard.as_mut().ok_or("navegador headless não está de pé")?;
-    h.open_tab(url).await
+    match h.open_tab(url).await {
+        // O processo pode estar vivo com a conexão morta (o WebSocket caiu e o
+        // Chrome ficou). Aba é coisa nova: subir outro navegador e tentar UMA
+        // vez não perde nada, e é a diferença entre a tarefa rodar ou morrer
+        // na largada.
+        Err(e) if conexao_caiu(&e) => {
+            warn!("[headless] conexão caiu ao abrir aba ({}) — reiniciando o navegador", e);
+            if let Some(morto) = guard.take() {
+                morto.shutdown().await;
+            }
+            *guard = Some(Headless::launch().await?);
+            let h = guard.as_mut().ok_or("navegador headless não está de pé")?;
+            h.open_tab(url).await
+        }
+        outro => outro,
+    }
 }
 
 pub async fn close_tab(tab_id: i64) -> Result<(), String> {
@@ -709,6 +862,26 @@ pub async fn close_tab(tab_id: i64) -> Result<(), String> {
     match guard.as_mut() {
         Some(h) => h.close_tab(tab_id).await,
         None => Ok(()),
+    }
+}
+
+/// As filhas de `opener` que o gerente ainda não conhecia, já conectadas.
+pub async fn take_new_tabs(opener: i64) -> Result<Vec<(i64, String, String)>, String> {
+    let slot = session_slot();
+    let mut guard = slot.lock().await;
+    match guard.as_mut() {
+        Some(h) => h.take_new_tabs(opener).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `(id, url, título, quem abriu)` de cada aba viva do gerente.
+pub async fn live_tabs() -> Result<Vec<(i64, String, String, Option<i64>)>, String> {
+    let slot = session_slot();
+    let mut guard = slot.lock().await;
+    match guard.as_mut() {
+        Some(h) => h.live_tabs().await,
+        None => Ok(Vec::new()),
     }
 }
 
@@ -866,6 +1039,56 @@ mod tests {
 
         shutdown().await;
         assert_eq!(stats().await["running"], false);
+    }
+
+    /// Sessão cb41834a: o Chrome sem janela morreu nas horas paradas e as
+    /// tarefas seguintes morriam com "Broken pipe" na largada.
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn navegador_que_morreu_sobe_outro_na_proxima_aba() {
+        if find_browser(None).is_err() {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        shutdown().await;
+        set_limits(Limits { max_tabs: 3, max_ram_mb: 0, idle_ttl_s: 0, ..Limits::default() });
+        open_tab("about:blank").await.expect("aba 1");
+        let pid = stats().await["pid"].as_i64().expect("pid do navegador");
+        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let tab = open_tab("about:blank").await.expect("abrir aba depois de o navegador morrer");
+        let r = cdp(tab, "Runtime.evaluate", json!({ "expression": "1 + 1", "returnByValue": true }))
+            .await
+            .expect("evaluate no navegador novo");
+        assert_eq!(r["result"]["value"], 2);
+        assert_ne!(stats().await["pid"].as_i64(), Some(pid), "tinha de ser outro processo");
+        shutdown().await;
+    }
+
+    /// O outro jeito de morrer: o processo vivo e a conexão caída.
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn conexao_que_caiu_com_o_navegador_vivo_tambem_se_refaz() {
+        if find_browser(None).is_err() {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        shutdown().await;
+        set_limits(Limits { max_tabs: 3, max_ram_mb: 0, idle_ttl_s: 0, ..Limits::default() });
+        open_tab("about:blank").await.expect("aba 1");
+        {
+            let slot = session_slot();
+            let mut guard = slot.lock().await;
+            let h = guard.as_mut().expect("navegador de pé");
+            let _ = h.ws.close(None).await;
+        }
+        let tab = open_tab("about:blank").await.expect("abrir aba depois de a conexão cair");
+        let r = cdp(tab, "Runtime.evaluate", json!({ "expression": "2 + 2", "returnByValue": true }))
+            .await
+            .expect("evaluate depois de refazer");
+        assert_eq!(r["result"]["value"], 4);
+        shutdown().await;
     }
 
     #[tokio::test]

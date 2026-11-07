@@ -20,6 +20,7 @@ python3 cdp.py https://www.amazon.com.br/s?k=teclado ../../../snapshot.js
 
 python3 conteudo-principal.py            # o corpus da ELEIÇÃO do conteúdo principal
 python3 conteudo-principal.py <url|arq>  # inspeciona a eleição numa página só
+NEO_LAB_RS=outro.rs python3 leitura.py   # o mesmo corpus sobre outra versão do .rs
 python3 leitura.py                       # a LEITURA da tela e as formas de painel
 
 python3 clique.py                        # o corpus do CLIQUE: cada cena tem de contar 1
@@ -78,6 +79,7 @@ num atalho por site disfarçado de heurística. Cada fixture é uma FORMA de pá
 | `questionario-com-modal.html` | overlay por `position:fixed`, sem papel ARIA |
 | `com-main.html` | `<main>` declarado — o caminho rápido tem de resolver |
 | `com-aside.html` | `<aside>` com mais texto que o artigo ao lado |
+| `cartao-com-header.html` | enunciado no `<header>` de um `<article>`, que não é o banner do site (12axes, job `7b73f755`) |
 
 Para ampliar o corpus, salve a página inteira pelo navegador (Cmd+S, "página
 completa") em `sample-log/` e acrescente uma linha ao `CORPUS` no topo do script,
@@ -100,6 +102,9 @@ que é o que trava a regressão do `⟪COBERTO por "div"⟫`.
 | `paineis.html?caso=tapume` | modal opaco de tela cheia: o que está atrás sai da tela e vai para `resto` |
 | `sombra.html` | web component, cartão com `<a>` transparente esticado, iframe dos dois tipos |
 | `saturada.html` | coluna com centenas de links ANTES do conteúdo: é o que comia o teto de 200 |
+| `cartao-com-header.html` | `<header>` dentro de article/section é conteúdo; o do topo da página e o `<nav>` continuam moldura |
+| `artigo-com-header.html` | título, autor e etiquetas no `<header>`/`<footer>` do artigo; banner e rodapé do site fora da leitura |
+| `lista-recortada-e-aviso.html` | lista que esconde o enunciado com `overflow`, reticências, caixa com rolagem, e o aviso por cima (`?aviso=1` com aria-live, `?aviso=2` só `fixed`) — sessão `cb41834a` |
 
 ## O clique (`clique.py` + `botoes-disfarcados.html`)
 
@@ -134,6 +139,9 @@ Os casos que mais ensinam:
   só casa com o texto inteiro do controle;
 - **`sob-painel`**: debaixo do painel do Neo, o mouse real acertaria o painel, e a
   cena tem de sair `via=js`.
+- **`some`**: a opção desmonta o próprio cartão ao ser escolhida (a última pergunta
+  do 12axes). O resultado tem de dizer `saiu`, e não `checked:false`: nó fora da página
+  não tem estado para ler (job `f9370b43`).
 
 ## Medido em sites reais (2026-10-31, viewport 1912×1000, depois da leitura)
 

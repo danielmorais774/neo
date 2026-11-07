@@ -27,6 +27,7 @@
 
 use log::{info, warn};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -49,6 +50,47 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// (O caminho CONFIÁVEL continua sendo o atributo `data-neo-stop` no HTML — se
 /// a notificação se perder, o snapshot vê o atributo mesmo assim.)
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// `Page.windowOpen` que uma aba emitiu e que ainda ninguém consumiu, por aba.
+///
+/// É o gatilho barato de "este clique abriu outra aba" (medido no F0 de
+/// `neo-core/docs/browser-multi-aba-plan.md` §12: chega 9–31 ms depois do
+/// clique, com a URL). Sem ele, nenhum clique paga espera; com ele, vale
+/// esperar a aba nascer. Antes o `Conn::request` jogava o evento fora junto
+/// com todas as outras notificações que não eram o PARE.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JanelaPedida {
+    pub url: String,
+    pub gesto: bool,
+}
+
+static JANELAS: OnceLock<std::sync::Mutex<HashMap<i64, Vec<JanelaPedida>>>> = OnceLock::new();
+
+fn janelas() -> &'static std::sync::Mutex<HashMap<i64, Vec<JanelaPedida>>> {
+    JANELAS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Guarda um `Page.windowOpen` da aba `tab` (id do backend: negativo = headless).
+pub(crate) fn anotar_janela(tab: i64, url: &str, gesto: bool) {
+    if let Ok(mut mapa) = janelas().lock() {
+        let fila = mapa.entry(tab).or_default();
+        fila.push(JanelaPedida { url: url.to_string(), gesto });
+        // Uma página que abre janela em laço não pode crescer isto sem fim.
+        if fila.len() > 8 {
+            fila.remove(0);
+        }
+    }
+}
+
+fn janelas_de(tab: i64) -> Vec<JanelaPedida> {
+    janelas().lock().map(|m| m.get(&tab).cloned().unwrap_or_default()).unwrap_or_default()
+}
+
+fn esquecer_janelas(tab: i64) {
+    if let Ok(mut mapa) = janelas().lock() {
+        mapa.remove(&tab);
+    }
+}
 
 static CONN: OnceLock<Mutex<Option<Conn>>> = OnceLock::new();
 
@@ -222,11 +264,28 @@ impl Conn {
                 Err(_) => return Err(format!("o navegador não respondeu a '{}' a tempo", method)),
             };
 
-            // Notificação (sem id): PARE é a única que nos interessa.
+            // Notificação (sem id): o PARE, e o `Page.windowOpen` de uma aba
+            // (é o que diz que um clique abriu outra aba).
             if frame.get("id").is_none() {
-                if frame.get("method").and_then(|v| v.as_str()) == Some("neo.stop") {
-                    info!("[BrowserLocal] PARE recebido da faixa da página");
-                    STOP_REQUESTED.store(true, Ordering::SeqCst);
+                match frame.get("method").and_then(|v| v.as_str()) {
+                    Some("neo.stop") => {
+                        info!("[BrowserLocal] PARE recebido da faixa da página");
+                        STOP_REQUESTED.store(true, Ordering::SeqCst);
+                    }
+                    Some("onCDPEvent") => {
+                        let p = frame.get("params").cloned().unwrap_or(Value::Null);
+                        if p.get("method").and_then(|v| v.as_str()) == Some("Page.windowOpen") {
+                            if let Some(tab) = p.pointer("/source/tabId").and_then(|v| v.as_i64()) {
+                                let ev = p.get("params").cloned().unwrap_or(Value::Null);
+                                anotar_janela(
+                                    tab,
+                                    ev.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                                    ev.get("userGesture").and_then(|v| v.as_bool()).unwrap_or(false),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -435,7 +494,20 @@ const JS_HELPERS: &str = r#"
   // Só landmark DECLARADO, de propósito (ver a seção "moldura do site" do
   // inventário): errar para menos aqui é barato, errar para mais esconde a
   // resposta.
-  NEO.CHROME = 'nav,[role=navigation],header,[role=banner],footer,[role=contentinfo]';
+  //
+  // `header` e `footer` só são banner e rodapé DO SITE fora de um bloco de
+  // conteúdo: dentro de article, aside, main, nav ou section, o HTML os define
+  // como cabeçalho e rodapé daquele bloco (é a regra que o leitor de tela usa).
+  // O seletor pegava qualquer um, e o enunciado de um questionário, que mora no
+  // `<header>` do cartão, sumia da leitura: nos jobs 2611e76d e 7b73f755
+  // (12axes) o modelo leu "01" e cinco opções, sem a pergunta e sem o
+  // "Question 1 of 36", e reiniciou o quiz em loop. O título e o autor de toda
+  // notícia em `<article><header>` iam junto.
+  NEO.BLOCO = 'article,aside,main,nav,section,' +
+    '[role=article],[role=complementary],[role=main],[role=navigation],[role=region]';
+  NEO.CHROME = 'nav,[role=navigation],[role=banner],[role=contentinfo],' +
+    'header:not(:is(' + NEO.BLOCO + ') header),' +
+    'footer:not(:is(' + NEO.BLOCO + ') footer)';
   // Conjunto AMPLO, só para DESCONTAR texto na eleição do conteúdo principal.
   // Não carimba elemento nenhum e não esconde texto de ninguém: muda apenas
   // QUAL bloco é adicionado na frente. Por isso pode ser mais largo que o
@@ -570,8 +642,19 @@ const JS_HELPERS: &str = r#"
   // Devolve `tela` (na janela agora) e `resto` (existe, mas fora dela). À ESQUERDA
   // da página não conta como "resto": x negativo não se alcança rolando, é onde
   // moram os skip-links e o painel de atalhos de teclado da Amazon.
-  NEO.ler = (excluir) => {
+  //
+  // `{ recorte: true }` respeita o texto que o CSS esconde sem tirar do DOM:
+  // caixa de altura fixa com `overflow: hidden`, `line-clamp`, reticências,
+  // caixa com rolagem. Sem isto a caixa estar na janela bastava para TODO o
+  // texto dela contar como tela. No job 21c563c1 (Portal) a lista lateral
+  // mostrava duas linhas de cada uma das 10 questões e despejava os 10
+  // enunciados inteiros: 11 mil caracteres, o teto estourava em todo passo, e
+  // o que vinha depois no DOM (a questão atual, o aviso de finalizar) caía
+  // fora. O escondido vai para `resto`, não some. Só o snapshot pede isto: o
+  // `extract` e a busca leem o texto inteiro, como sempre leram.
+  NEO.ler = (excluir, opcoes) => {
     const vw = innerWidth, vh = innerHeight;
+    const recortar = !!(opcoes && opcoes.recorte);
     const decisao = new Map();
     let orcamento = 400;
     const gasto = () => { orcamento--; };
@@ -602,6 +685,83 @@ const JS_HELPERS: &str = r#"
     };
     const linhas = { 1: [], 2: [] };
     const anterior = { 1: null, 2: null };
+    const juntar1 = (d, r, t) => {
+      const ant = anterior[d];
+      const lista = linhas[d];
+      const naMesma = ant && lista.length &&
+        Math.abs(r.top - ant.top) < Math.max(r.height, ant.height) * 0.7 && r.left >= ant.left;
+      if (naMesma) lista[lista.length - 1] += ' ' + t;
+      else lista.push(t);
+      anterior[d] = r;
+    };
+    // A caixa que RECORTA este elemento, até 4 níveis acima: `overflow` que não
+    // é `visible` e conteúdo maior que ela. O corpo da página não conta: a
+    // rolagem dele é a janela, e a janela já é a pergunta de `decidir`.
+    // Cada eixo por si: a caixa que só corta na horizontal (a tabela larga, a
+    // linha com reticências) não diz nada sobre o que fica abaixo dela. `rola`
+    // separa o escondido que se alcança rolando a caixa (vai para o resto) do
+    // que nunca aparece (`hidden`, `clip`, line-clamp: sai do snapshot, e o
+    // `extract` e a busca continuam lendo). Mandar o segundo para o resto
+    // empurrava para fora do teto dele o que está abaixo da dobra de verdade.
+    const corta = new Map();
+    const rolavel = (v) => v === 'auto' || v === 'scroll';
+    const cortaAqui = (p) => {
+      let c = corta.get(p);
+      if (c !== undefined) return c;
+      const s = getComputedStyle(p);
+      const y = s.overflowY !== 'visible' && p.scrollHeight > p.clientHeight + 2;
+      const x = s.overflowX !== 'visible' && p.scrollWidth > p.clientWidth + 2;
+      c = y || x ? { y, x, rola: (y && rolavel(s.overflowY)) || (x && rolavel(s.overflowX)) } : null;
+      corta.set(p, c);
+      return c;
+    };
+    const recorteDe = (el) => {
+      for (let p = el, n = 0; p && p.nodeType === 1 && p !== document.body &&
+           p !== document.documentElement && n < 4; p = p.parentElement, n++) {
+        const c = cortaAqui(p);
+        if (c) return { caixa: p, ...c };
+      }
+      return null;
+    };
+    // Quanto do nó cabe na parte visível da caixa: as linhas dele (os retângulos
+    // do Range) contra a caixa, só no eixo em que ela corta, pela LARGURA
+    // visível de cada linha. A janela não entra: "está na janela" é a pergunta de
+    // `decidir`, e misturar as duas faria o mesmo parágrafo valer diferente
+    // dentro e fora de uma caixa. `[fração, lado]`: lado 1 = o visível é o
+    // começo do texto (altura fixa, line-clamp, reticências), -1 = é o fim
+    // (caixa rolada para baixo). `null` = não deu para medir.
+    const parteVisivel = (no, rec) => {
+      const caixa = rec.caixa;
+      const cr = caixa.getBoundingClientRect();
+      const topo = rec.y ? cr.top + caixa.clientTop : -Infinity;
+      const fundo = rec.y ? cr.top + caixa.clientTop + caixa.clientHeight : Infinity;
+      const esq = rec.x ? cr.left + caixa.clientLeft : -Infinity;
+      const dir = rec.x ? cr.left + caixa.clientLeft + caixa.clientWidth : Infinity;
+      let rects;
+      try {
+        const rg = document.createRange();
+        rg.selectNodeContents(no);
+        rects = [...rg.getClientRects()].filter((q) => q.width >= 1 && q.height >= 1);
+      } catch (_) { return null; }
+      // Uma linha pode vir em mais de um retângulo: com reticências o Range dá a
+      // linha inteira E o pedaço que aparece. Fica o mais largo de cada linha.
+      const porLinha = new Map();
+      for (const q of rects) {
+        const chave = Math.round(q.top);
+        const atual = porLinha.get(chave);
+        if (!atual || q.width > atual.width) porLinha.set(chave, q);
+      }
+      let total = 0, visto = 0, primeira = -1;
+      [...porLinha.values()].sort((a, b) => a.top - b.top).forEach((q, i) => {
+        total += q.width;
+        const naFaixa = q.top < fundo - 1 && q.bottom > topo + 1;
+        const w = naFaixa ? Math.max(0, Math.min(q.right, dir) - Math.max(q.left, esq)) : 0;
+        visto += w;
+        if (w > 0 && primeira < 0) primeira = i;
+      });
+      if (!total) return null;
+      return [visto / total, primeira <= 0 ? 1 : -1];
+    };
     const colher = (no) => {
       const t = no.nodeValue.replace(/\s+/g, ' ').trim();
       if (!t) return;
@@ -610,13 +770,31 @@ const JS_HELPERS: &str = r#"
       const d = decidir(el);
       if (!d) return;
       const r = el.getBoundingClientRect();
-      const ant = anterior[d];
-      const lista = linhas[d];
-      const naMesma = ant && lista.length &&
-        Math.abs(r.top - ant.top) < Math.max(r.height, ant.height) * 0.7 && r.left >= ant.left;
-      if (naMesma) lista[lista.length - 1] += ' ' + t;
-      else lista.push(t);
-      anterior[d] = r;
+      if (d === 1 && recortar) {
+        const rec = recorteDe(el);
+        const medida = rec && parteVisivel(no, rec);
+        if (medida && medida[0] < 0.98) {
+          const [fracao, lado] = medida;
+          const alvo = Math.max(1, Math.round(t.length * fracao));
+          const guardar = (x) => { if (rec.rola && x) juntar1(2, r, x); };
+          if (fracao <= 0) { guardar(t); return; }
+          // Texto curto parcialmente à vista é lido inteiro: o recorte serve para
+          // o enunciado de mil caracteres, não para "Entrega GRÁTIS". E uma lasca
+          // de texto longo ("D …" de "Duração: 3 minutos", o texto de leitor de
+          // tela numa caixa de 1px) não é leitura: sai inteira da tela.
+          if (t.length < 40) { juntar1(1, r, t); return; }
+          if (alvo < 8) { guardar(t); return; }
+          // Corta na palavra, para o modelo não ler meia palavra como dado.
+          let k = lado > 0 ? t.lastIndexOf(' ', alvo) : t.indexOf(' ', t.length - alvo);
+          if (k < 0 || (lado > 0 && k < alvo * 0.6)) k = lado > 0 ? alvo : t.length - alvo;
+          const visto = lado > 0 ? t.slice(0, k) : t.slice(k);
+          const escondido = lado > 0 ? t.slice(k) : t.slice(0, k);
+          juntar1(1, r, lado > 0 ? visto.trim() + ' …' : '… ' + visto.trim());
+          guardar(escondido.trim());
+          return;
+        }
+      }
+      juntar1(d, r, t);
     };
     const varrer = (raiz) => {
       const w = document.createTreeWalker(raiz, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
@@ -872,13 +1050,23 @@ const JS_HELPERS: &str = r#"
     // "marque a alternativa": marcar um rádio não muda URL, nem título, nem
     // texto — o freio de tela repetida é cego para isso por construção. O estado
     // sai do CONTROLE, inclusive do input escondido atrás do label.
-    const ctl = NEO.controleDe(c.el) || NEO.controleDe(c.alvo) ||
-      (c.el.querySelector ? c.el.querySelector('input[type=radio],input[type=checkbox]') : null);
-    const tipo = ctl && ctl.getAttribute('type');
-    if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
-    else {
-      const aria = c.el.getAttribute('aria-checked') || c.el.getAttribute('aria-selected');
-      if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
+    //
+    // Controle que SAIU da página não tem estado para ler. O clique pode
+    // desmontá-lo: no job f9370b43 (12axes) a 36ª resposta trocou o cartão pela
+    // etapa seguinte antes de o `aria-checked` virar `true`, o nó morto dizia
+    // `false`, e "não ficou selecionado" fez o agente ler a etapa nova como o
+    // quiz reiniciando. Sumir no clique é prova de que a página reagiu.
+    if (!c.el.isConnected) {
+      out.saiu = true;
+    } else {
+      const ctl = NEO.controleDe(c.el) || NEO.controleDe(c.alvo) ||
+        (c.el.querySelector ? c.el.querySelector('input[type=radio],input[type=checkbox]') : null);
+      const tipo = ctl && ctl.getAttribute('type');
+      if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
+      else {
+        const aria = c.el.getAttribute('aria-checked') || c.el.getAttribute('aria-selected');
+        if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
+      }
     }
     // O número, quando existe: o modelo volta a poder usar `click`/`extract` nele.
     if (NEO.refs) {
@@ -1745,7 +1933,15 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     // acrescentando em cada site.
     const origem = origens.get(el);
     if (origem && origem !== 'declarado') item.via = origem;
-    if (el.tagName === 'A') item.href = String(el.href || '').slice(0, 300);
+    // O endereço INTEIRO: o `abrir_aba` por número abre exatamente isto. Cortado em
+    // 300, o link do AliExpress (~600 chars de rastreio) chegava pela metade, e
+    // na aba D do job 9a3223a4 o corte caiu num `%xx`: a página veio vazia. O
+    // prompt já mostra o link encurtado no core, então isto não o engorda.
+    if (el.tagName === 'A') {{
+      const href = String(el.href || '');
+      item.href = href.slice(0, 2000);
+      if (href.length > 2000) item.href_cortado = true;
+    }}
     if (el.tagName === 'IMG') item.src = NEO.srcDe(el).slice(0, 300);
     elements.push(item);
   }}
@@ -1924,7 +2120,55 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     if (p && quadro(p) === 'lateral') return true;
     return !!NEO.subir(el, CHROME);
   }};
-  const leitura = NEO.ler(NEO.foraDaLeitura);
+
+  // ── AVISOS POR CIMA DA PÁGINA ──────────────────────────────────────────
+  // Toast, snackbar, a faixa "lembre-se de finalizar": a página fala com quem
+  // está usando por uma camada por cima, e essa camada costuma ser o ÚLTIMO
+  // filho do <body>, ou seja, o último texto da leitura e o primeiro a cair no
+  // teto. No job 21c563c1 (Portal) "Você respondeu todas as questões, lembre-se
+  // de Finalizar o questionário" ficou na tela por oito passos sem chegar ao
+  // modelo, que repetiu a questão 10 até o PARE. Por isso o aviso sai do texto
+  // corrido e ganha seção própria.
+  //
+  // Dois sinais, sem biblioteca: região viva declarada (`role=alert|status`,
+  // `aria-live`) e camada `fixed` presa ao <body> que FALA em vez de navegar
+  // (pouco texto, no máximo três controles). A barra do topo do site também é
+  // `fixed`, mas é feita de links e fica de fora; menu e diálogo já têm a seção
+  // de painel.
+  const AVISO_VIVO = '[role=alert],[role=status],[aria-live=polite],[aria-live=assertive]';
+  const CONTROLES = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=menuitem]';
+  const candAviso = new Set(NEO.todos(AVISO_VIVO, raizes));
+  const fila = document.body ? [...document.body.children].map((e) => [e, 0]) : [];
+  for (let i = 0; i < fila.length && i < 400; i++) {{
+    const [e, n] = fila[i];
+    if (e.matches(NEO.NOSSOS)) continue;
+    const s = cs(e);
+    if (s && s.position === 'fixed') {{ candAviso.add(e); continue; }}
+    if (n < 2) for (const c of e.children) fila.push([c, n + 1]);
+  }}
+  // Novo = texto que este elemento não mostrava no snapshot anterior. A chave é
+  // o par elemento+texto porque a biblioteca reaproveita o recipiente para o
+  // aviso seguinte. Na primeira leitura de uma página nada é "novo".
+  const avisosAntes = NEO.avisosVistos;
+  NEO.avisosVistos = new WeakMap();
+  const avisos = [];
+  for (const el of candAviso) {{
+    if (el.matches(NEO.NOSSOS) || el.closest(OPEN)) continue;
+    if (!visivel(el)) continue;
+    const r = box(el);
+    if (!(r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth)) continue;
+    if (r.width * r.height > innerWidth * innerHeight * 0.5) continue;
+    if (r.height >= innerHeight * 0.4 && r.width <= innerWidth * 0.4) continue;
+    const texto = String(el.innerText || '').replace(/\s*\n\s*/g, ' · ').replace(/\s+/g, ' ').trim();
+    if (texto.length < 3 || texto.length > 500) continue;
+    if (el.querySelectorAll(CONTROLES).length > 3) continue;
+    if (avisos.some((a) => NEO.contem(a.el, el))) continue;
+    for (let i = avisos.length - 1; i >= 0; i--) if (NEO.contem(el, avisos[i].el)) avisos.splice(i, 1);
+    avisos.push({{ el, texto, nova: !!avisosAntes && avisosAntes.get(el) !== texto }});
+  }}
+  for (const a of avisos) NEO.avisosVistos.set(a.el, a.texto);
+  const foraDaTela = (el) => avisos.some((a) => NEO.contem(a.el, el)) || NEO.foraDaLeitura(el);
+  const leitura = NEO.ler(foraDaTela, {{ recorte: true }});
   const TETO_TELA = {chars} + 2000;
   const barras = [];
   for (const [p, q] of quadros) {{
@@ -2042,6 +2286,7 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
     tela_total: leitura.tela.length,
     resto: leitura.resto.slice(0, {chars}),
     resto_total: leitura.resto.length,
+    avisos: avisos.slice(0, 4).map((a) => ({{ texto: a.texto, nova: a.nova }})),
     barras,
     iframes,
     // Carimbo do que este device sabe fazer. O core sobe sozinho e o device só
@@ -2273,6 +2518,135 @@ async fn clicar(id: i64, mira: String, vezes: u32) -> Result<Value, String> {
         }
     }
     unwrap_ok(eval(id, JS_CLIQUE_DESPACHA).await?)
+}
+
+// ─── abas que a página abre ─────────────────────────────────────────────────
+//
+// Job 3512cdd2 (2026-11-02): o anúncio do AliExpress abriu numa aba nova, o
+// navegador foi para ela, e o resultado do clique dizia só "ok" — o agente
+// seguiu na busca achando que o clique não pegou. Ver
+// `neo-core/docs/browser-multi-aba-plan.md` §4.
+
+/// Espera curta depois da ação: o `Page.windowOpen` chega em 9–31 ms (F0).
+const ESPERA_JANELA: Duration = Duration::from_millis(80);
+/// Teto para a aba nascer depois de um `windowOpen` (medido: 40–90 ms).
+const TETO_ABA_NOVA: Duration = Duration::from_millis(1000);
+
+/// As filhas de `id` que nasceram desde a última pergunta, já conectadas.
+///
+/// `None` = o backend não sabe dizer (extensão anterior à 0.2.2, sem o método).
+/// É diferente de "nenhuma": com `None` não se espera nem se afirma nada — dizer
+/// "a janela não abriu" quando ela abriu e só não foi relatada seria mentir.
+async fn tomar_abas_novas(id: i64) -> Option<Vec<Value>> {
+    let cruas: Vec<(i64, String, String)> = if is_headless(id) {
+        super::headless::take_new_tabs(-id)
+            .await
+            .ok()?
+            .into_iter()
+            .map(|(n, url, title)| (-n, url, title))
+            .collect()
+    } else {
+        match call("neoTakeNewTabs", json!({ "openerTabId": id })).await {
+            Ok(Value::Array(lista)) => lista
+                .iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("id")?.as_i64()?,
+                        t.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        t.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    ))
+                })
+                .collect(),
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                log::debug!("[BrowserLocal] extensão sem neoTakeNewTabs: {}", e);
+                return None;
+            }
+        }
+    };
+    let mut novas = Vec::new();
+    for (tab, url, title) in cruas {
+        if !is_headless(tab) {
+            if let Err(e) = call("attach", json!({ "tabId": tab })).await {
+                warn!("[BrowserLocal] aba nova {} não aceitou o debugger: {}", tab, e);
+                continue;
+            }
+        }
+        let _ = cdp(tab, "Page.enable", json!({})).await;
+        info!("[BrowserLocal] a aba {} abriu a aba {} ({})", id, tab, url);
+        novas.push(json!({ "tab_ref": tab, "url": url, "title": title, "aberta_por": id }));
+    }
+    Some(novas)
+}
+
+/// Anexa ao resultado de uma ação as abas que ela abriu.
+///
+/// `abas_novas`: as filhas, já prontas para receber comando. `janela_sem_aba`:
+/// a página pediu janela e nenhuma nasceu — com `gesto: false` é o bloqueador de
+/// popup do navegador. Sem `windowOpen`, volta na hora: nenhum clique espera.
+async fn com_abas_novas(id: i64, mut resultado: Value) -> Value {
+    tokio::time::sleep(ESPERA_JANELA).await;
+    let prazo = Instant::now() + TETO_ABA_NOVA;
+    let extra = loop {
+        // Também é a chamada que bombeia as notificações do socket.
+        let Some(novas) = tomar_abas_novas(id).await else {
+            break Value::Null;
+        };
+        if !novas.is_empty() {
+            break json!({ "abas_novas": novas });
+        }
+        let pedidas = janelas_de(id);
+        let Some(primeira) = pedidas.first().cloned() else {
+            break Value::Null;
+        };
+        if Instant::now() >= prazo {
+            break json!({ "janela_sem_aba": { "url": primeira.url, "gesto": primeira.gesto } });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    esquecer_janelas(id);
+    if let (Some(obj), Some(mais)) = (resultado.as_object_mut(), extra.as_object()) {
+        for (k, v) in mais {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    resultado
+}
+
+/// Todas as abas da sessão do agente, com origem e quem abriu.
+async fn abas_da_sessao(id: i64) -> Result<Value, String> {
+    if is_headless(id) {
+        let abas: Vec<Value> = super::headless::live_tabs()
+            .await?
+            .into_iter()
+            .map(|(n, url, title, opener)| {
+                json!({
+                    "tab_ref": -n,
+                    "url": url,
+                    "title": title,
+                    "aberta_por": opener.map(|o| -o),
+                })
+            })
+            .collect();
+        return Ok(json!({ "tabs": abas }));
+    }
+    let lista = call("neoSessionTabs", json!({})).await?;
+    let abas: Vec<Value> = lista
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| {
+            json!({
+                "tab_ref": t.get("id").cloned().unwrap_or(Value::Null),
+                "url": t.get("url").cloned().unwrap_or(Value::Null),
+                "title": t.get("title").cloned().unwrap_or(Value::Null),
+                "origem": t.get("origin").cloned().unwrap_or(Value::Null),
+                "aberta_por": t.get("openerTabId").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    Ok(json!({ "tabs": abas }))
 }
 
 // ─── downloads ──────────────────────────────────────────────────────────────
@@ -3283,14 +3657,16 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         "browser.click" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
-            clicar(id, js_mirar(reference, "esquerdo", &trava_de(args)), 1).await
+            let r = clicar(id, js_mirar(reference, "esquerdo", &trava_de(args)), 1).await?;
+            Ok(com_abas_novas(id, r).await)
         }
         // Saída para o que se lê e não se endereça — ver `js_click_text`.
         "browser.click_text" => {
             let id = tab_id(args)?;
             let texto = arg_str(args, "texto")?;
             let n = args.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
-            clicar(id, js_click_text(&texto, n, &trava_de(args)), 1).await
+            let r = clicar(id, js_click_text(&texto, n, &trava_de(args)), 1).await?;
+            Ok(com_abas_novas(id, r).await)
         }
         // A varredura da DOM inteira. Só lê: não toca na página.
         "browser.find" => {
@@ -3302,7 +3678,8 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         "browser.dblclick" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
-            clicar(id, js_mirar(reference, "duplo", &trava_de(args)), 2).await
+            let r = clicar(id, js_mirar(reference, "duplo", &trava_de(args)), 2).await?;
+            Ok(com_abas_novas(id, r).await)
         }
         "browser.right_click" => {
             let id = tab_id(args)?;
@@ -3324,7 +3701,8 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         "browser.press" => {
             let id = tab_id(args)?;
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("Enter");
-            press_key(id, key).await
+            let r = press_key(id, key).await?;
+            Ok(com_abas_novas(id, r).await)
         }
         "browser.scroll" => {
             let id = tab_id(args)?;
@@ -3525,6 +3903,79 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             STOP_REQUESTED.store(false, Ordering::SeqCst);
             info!("[BrowserLocal] aba {} liberada", id);
             Ok(json!({ "ok": true }))
+        }
+
+        // ── várias abas (neo-core/docs/browser-multi-aba-plan.md) ──
+        "browser.session_tabs" => {
+            let id = tab_id(args)?;
+            abas_da_sessao(id).await
+        }
+        // Fecha uma aba que o Neo ou a página abriu. A do usuário, a extensão recusa.
+        "browser.close_tab" => {
+            let id = tab_id(args)?;
+            if is_headless(id) {
+                super::headless::close_tab(-id).await?;
+            } else {
+                call("neoCloseTab", json!({ "tabId": id })).await?;
+            }
+            esquecer_janelas(id);
+            info!("[BrowserLocal] aba {} fechada a pedido", id);
+            Ok(json!({ "ok": true }))
+        }
+        // Traz a aba para a frente: é a que o usuário passa a ver. Reconecta antes:
+        // a aba de uma tarefa retomada foi solta (`turnEnded`) quando ela parou.
+        "browser.focus_tab" => {
+            let id = tab_id(args)?;
+            if !is_headless(id) {
+                call("attach", json!({ "tabId": id })).await?;
+                let _ = cdp(id, "Page.enable", json!({})).await;
+            }
+            cdp(id, "Page.bringToFront", json!({})).await?;
+            Ok(json!({ "ok": true }))
+        }
+        // Aba que trabalha ESCONDIDA (subagente do `paralelo`). Sem isto o Chromium
+        // para o `requestAnimationFrame`, roda timer a 1/s e não dispara o
+        // `IntersectionObserver`: o preço que carrega ao rolar nunca aparece
+        // (medido no F0, neo-core/docs/browser-multi-aba-plan.md §12).
+        "browser.keep_alive" => {
+            let id = tab_id(args)?;
+            let ligado = args.get("ligado").and_then(|v| v.as_bool()).unwrap_or(true);
+            if ligado {
+                let _ = cdp(id, "Page.setWebLifecycleState", json!({ "state": "active" })).await;
+            }
+            cdp(id, "Emulation.setFocusEmulationEnabled", json!({ "enabled": ligado })).await?;
+            Ok(json!({ "ok": true, "ligado": ligado }))
+        }
+        // Abre uma aba NOVA da sessão, em segundo plano: o agente continua onde
+        // está (o clique do meio). `tab_ref` só diz o backend — a nova é irmã.
+        "browser.open_tab" => {
+            let origem = tab_id(args)?;
+            let url = arg_str(args, "url")?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("só abro aba em endereço http(s)".to_string());
+            }
+            let tab = if is_headless(origem) {
+                // Em branco e depois o `navigate`: o `createTarget` volta antes de a
+                // página existir, e a irmã chegava sem título (pego pelo teste).
+                -super::headless::open_tab("about:blank").await?
+            } else {
+                let criada = call("createTab", json!({})).await?;
+                let id = criada
+                    .get("tabId")
+                    .or_else(|| criada.get("id"))
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| "o navegador não devolveu o id da aba nova".to_string())?;
+                call("attach", json!({ "tabId": id })).await?;
+                id
+            };
+            let _ = cdp(tab, "Page.enable", json!({})).await;
+            let carregada = navigate(tab, &url).await?;
+            info!("[BrowserLocal] aba {} aberta a pedido a partir da {} ({})", tab, origem, url);
+            Ok(json!({
+                "tab_ref": tab,
+                "url": carregada.get("url").cloned().unwrap_or(json!(url)),
+                "title": carregada.get("title").cloned().unwrap_or(Value::Null),
+            }))
         }
 
         other => Err(format!("ação de navegador desconhecida: {}", other)),
@@ -3806,6 +4257,187 @@ mod tests_headless {
         assert!(!is_headless(0));
     }
 
+    #[test]
+    fn janela_pedida_fica_ate_ser_consumida_e_nao_cresce_sem_fim() {
+        esquecer_janelas(-9001);
+        anotar_janela(-9001, "https://x/a", true);
+        anotar_janela(-9001, "https://x/b", false);
+        assert_eq!(janelas_de(-9001).len(), 2);
+        assert_eq!(
+            janelas_de(-9001)[1],
+            JanelaPedida { url: "https://x/b".into(), gesto: false }
+        );
+        esquecer_janelas(-9001);
+        assert!(janelas_de(-9001).is_empty());
+        // Página que abre janela em laço: fica só o fim da fila.
+        for i in 0..20 {
+            anotar_janela(-9002, &format!("u{i}"), true);
+        }
+        assert_eq!(janelas_de(-9002).len(), 8);
+        assert_eq!(janelas_de(-9002)[0].url, "u12");
+        esquecer_janelas(-9002);
+    }
+
+    /// Servidor HTTP de uma página só, local: `open_tab` só aceita http(s), e o
+    /// teste não pode depender da internet.
+    fn servidor_local(html: &'static str) -> String {
+        use std::io::{Read, Write};
+        let ouvinte = std::net::TcpListener::bind("127.0.0.1:0").expect("porta local");
+        let porta = ouvinte.local_addr().expect("endereço").port();
+        std::thread::spawn(move || {
+            for conexao in ouvinte.incoming().flatten() {
+                let mut conexao = conexao;
+                let mut lixo = [0u8; 2048];
+                let _ = conexao.read(&mut lixo);
+                let resposta = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = conexao.write_all(resposta.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{porta}/")
+    }
+
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn open_tab_abre_irma_em_segundo_plano_e_a_origem_continua_valendo() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+        let url = servidor_local("<html><head><title>irma</title></head><body>anuncio</body></html>");
+
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": PAGINA_QUE_ABRE }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+
+        let aberta = execute("browser.open_tab", &json!({ "tab_ref": tab, "url": url }))
+            .await
+            .expect("open_tab");
+        let irma = aberta["tab_ref"].as_i64().expect("tab_ref da irmã");
+        assert!(irma < 0 && irma != tab, "{aberta}");
+
+        // A irmã carregou a página pedida, e a origem segue aceitando comando.
+        let titulo = eval(irma, "document.title").await.expect("eval na irmã");
+        assert_eq!(titulo, json!("irma"));
+        assert!(eval(tab, "document.body.innerText").await.expect("eval na origem").is_string());
+
+        let sessao = execute("browser.session_tabs", &json!({ "tab_ref": tab })).await.expect("session_tabs");
+        assert_eq!(sessao["tabs"].as_array().map(|a| a.len()), Some(2), "{sessao}");
+
+        // Endereço que não é http(s) não abre.
+        let erro = execute("browser.open_tab", &json!({ "tab_ref": tab, "url": "file:///etc/passwd" }))
+            .await
+            .unwrap_err();
+        assert!(erro.contains("http"), "{erro}");
+
+        execute("browser.close_tab", &json!({ "tab_ref": irma })).await.expect("fecha a irmã");
+        execute("browser.release", &json!({ "tab_ref": tab })).await.expect("release");
+        assert_eq!(super::super::headless::stats().await["tabs"], 0);
+        super::super::headless::shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn keep_alive_faz_a_aba_escondida_trabalhar_como_se_estivesse_na_frente() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+        let url = servidor_local(
+            "<html><body><script>window.raf=0;(function l(){window.raf++;requestAnimationFrame(l)})();</script></body></html>",
+        );
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": url }))
+            .await
+            .expect("claim headless");
+        let escondida = claim["tab_ref"].as_i64().expect("tab_ref");
+        let outra = execute("browser.open_tab", &json!({ "tab_ref": escondida, "url": url }))
+            .await
+            .expect("open_tab")["tab_ref"]
+            .as_i64()
+            .expect("tab_ref");
+        execute("browser.focus_tab", &json!({ "tab_ref": outra })).await.expect("focus");
+
+        let raf = |tab: i64| async move { eval(tab, "window.raf").await.expect("raf").as_i64().unwrap_or(-1) };
+        let ritmo = |tab: i64| async move {
+            let a = raf(tab).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            raf(tab).await - a
+        };
+        let vis = eval(escondida, "document.visibilityState").await.expect("vis");
+        assert_eq!(vis, json!("hidden"), "a de trás tinha de estar escondida");
+        assert!(ritmo(escondida).await <= 2, "escondida, o rAF para");
+
+        execute("browser.keep_alive", &json!({ "tab_ref": escondida })).await.expect("keep_alive");
+        assert!(ritmo(escondida).await > 10, "com o ciclo de vida forçado, o rAF volta");
+
+        execute("browser.close_tab", &json!({ "tab_ref": outra })).await.expect("fecha");
+        execute("browser.release", &json!({ "tab_ref": escondida })).await.expect("release");
+        super::super::headless::shutdown().await;
+    }
+
+    /// Um botão que abre aba e um que não abre — o job 3512cdd2 em miniatura.
+    const PAGINA_QUE_ABRE: &str = "data:text/html,<html><body>\
+        <button style='width:300px;height:80px' onclick=\"window.open('about:blank','filha')\">abre</button>\
+        <button style='width:300px;height:80px'>nada</button>\
+        </body></html>";
+
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn clique_que_abre_aba_devolve_a_filha_e_o_que_nao_abre_volta_na_hora() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": PAGINA_QUE_ABRE }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+
+        let r = execute("browser.click_text", &json!({ "tab_ref": tab, "texto": "abre" }))
+            .await
+            .expect("clique que abre");
+        let novas = r["abas_novas"].as_array().cloned().unwrap_or_default();
+        assert_eq!(novas.len(), 1, "o clique abriu uma aba e o resultado não disse: {r}");
+        let filha = novas[0]["tab_ref"].as_i64().expect("tab_ref da filha");
+        assert!(filha < 0 && filha != tab, "filha tem que ser outra aba headless: {filha}");
+        assert_eq!(novas[0]["aberta_por"], json!(tab));
+
+        // A filha já aceita comando — é o que deixa o agente SEGUIR para ela.
+        let nome = eval(filha, "window.name").await.expect("eval na filha");
+        assert_eq!(nome, json!("filha"));
+
+        let sessao = execute("browser.session_tabs", &json!({ "tab_ref": tab }))
+            .await
+            .expect("session_tabs");
+        let abas = sessao["tabs"].as_array().cloned().unwrap_or_default();
+        assert_eq!(abas.len(), 2, "{sessao}");
+        assert!(abas.iter().any(|a| a["tab_ref"] == json!(filha) && a["aberta_por"] == json!(tab)));
+
+        // Clique que não abre nada não paga a espera da aba nova.
+        let t0 = Instant::now();
+        let r2 = execute("browser.click_text", &json!({ "tab_ref": tab, "texto": "nada" }))
+            .await
+            .expect("clique que não abre");
+        assert!(r2.get("abas_novas").is_none(), "{r2}");
+        assert!(t0.elapsed() < Duration::from_millis(900), "esperou {:?}", t0.elapsed());
+
+        execute("browser.close_tab", &json!({ "tab_ref": filha })).await.expect("fecha a filha");
+        let sessao = execute("browser.session_tabs", &json!({ "tab_ref": tab })).await.expect("session_tabs");
+        assert_eq!(sessao["tabs"].as_array().map(|a| a.len()), Some(1), "{sessao}");
+
+        execute("browser.release", &json!({ "tab_ref": tab })).await.expect("release");
+        assert_eq!(super::super::headless::stats().await["tabs"], 0);
+        super::super::headless::shutdown().await;
+    }
+
     /// Página autossuficiente: sem rede, o teste mede o NOSSO código e não a
     /// internet (nem o humor de um site de terceiro num dia qualquer).
     const PAGINA: &str = "data:text/html,\
@@ -3870,6 +4502,46 @@ mod tests_headless {
             .expect("release");
         assert_eq!(super::super::headless::stats().await["tabs"], 0);
 
+        super::super::headless::shutdown().await;
+    }
+
+    /// Job 9a3223a4: o link do AliExpress (~600 chars) chegava cortado em 300, e o
+    /// `abrir_aba` abria a metade. Agora vem inteiro; só o enorme é cortado, e marcado.
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn link_comprido_chega_inteiro_e_o_enorme_vem_marcado_como_cortado() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+
+        let medio = format!("https://exemplo.com/item/1.html?r={}", "a".repeat(600));
+        let enorme = format!("https://exemplo.com/item/2.html?r={}", "b".repeat(2500));
+        let pagina = format!(
+            "data:text/html,<html><body><a href='{medio}'>medio</a><a href='{enorme}'>enorme</a></body></html>"
+        );
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": pagina }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+        let snap = execute("browser.snapshot", &json!({ "tab_ref": tab }))
+            .await
+            .expect("snapshot");
+        let link = |texto: &str| -> Value {
+            snap["elements"]
+                .as_array()
+                .and_then(|els| els.iter().find(|e| e["text"] == texto).cloned())
+                .unwrap_or_else(|| panic!("o snapshot perdeu o link «{texto}»: {snap:.400}"))
+        };
+        assert_eq!(link("medio")["href"], medio);
+        assert!(link("medio").get("href_cortado").is_none());
+        assert_eq!(link("enorme")["href"].as_str().unwrap_or("").len(), 2000);
+        assert_eq!(link("enorme")["href_cortado"], true);
+
+        execute("browser.release", &json!({ "tab_ref": tab }))
+            .await
+            .expect("release");
         super::super::headless::shutdown().await;
     }
 

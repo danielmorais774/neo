@@ -41,7 +41,9 @@ import websockets
 
 AQUI = Path(__file__).resolve().parent
 RAIZ = AQUI.parents[2]
-RS = RAIZ / "neo-desktop-tauri/src-tauri/src/services/browser_local.rs"
+# `NEO_LAB_RS` mede outra versão do arquivo (a de antes de um conserto, ou uma
+# cópia em teste) sem tocar no `.rs` que o `tauri dev` está vigiando.
+RS = Path(os.environ.get("NEO_LAB_RS") or RAIZ / "neo-desktop-tauri/src-tauri/src/services/browser_local.rs")
 CHROME = os.path.expanduser(
     "~/Library/Caches/ms-playwright/chromium_headless_shell-1234/"
     "chrome-headless-shell-mac-arm64/chrome-headless-shell"
@@ -98,6 +100,14 @@ CORPUS = [
         "pagina": AQUI / "com-main.html",
         "espera": "O corpo da matéria começa aqui",
         "proibido_no_inicio": "Pular para",
+    },
+    {
+        # O enunciado mora no `<header>` do `<article>`. Com o seletor antigo da
+        # moldura ele era descontado como cabeçalho do site.
+        "nome": "<header> dentro do cartão é conteúdo (12axes, job 7b73f755)",
+        "pagina": AQUI / "cartao-com-header.html",
+        "espera": "declared by each person must be respected",
+        "proibido_no_inicio": "Restart quiz",
     },
     {
         "nome": "<aside> grande não rouba o artigo",

@@ -344,6 +344,9 @@ export interface ElectronAPI {
   // Sessões anteriores — a fonte é o neo-core (tabela conversation_session);
   // o desktop não mantém índice local. Rejeita se o core estiver inacessível.
   listSessions: (limit?: number) => Promise<SessionInfo[]>;
+  // Catálogo do seletor de provider/modelo (proxy pro neo-core). O formato é
+  // validado em lib/models.isModelCatalog; rejeita se o core estiver fora.
+  getModelCatalog: () => Promise<unknown>;
   /**
    * Decide um card de missão (aprovar / editar / cancelar).
    *
@@ -940,6 +943,7 @@ export const electronAPI: ElectronAPI = {
 
   // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
   listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),
+  getModelCatalog: () => invoke<unknown>('get_model_catalog'),
   missionCommand: (missionId, command, editedText) =>
     invoke('mission_command', { missionId, command, editedText }),
   extBridgeToken: () => invoke<string>('ext_bridge_token'),

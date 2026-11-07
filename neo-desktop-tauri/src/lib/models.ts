@@ -1,21 +1,15 @@
-// Catálogo de providers/modelos oferecidos no seletor do chat.
+// Catálogo de providers/modelos do seletor do chat — vem do neo-core.
 //
-// Vive fora do Chat.tsx porque a preferência do usuário é PERSISTIDA
-// (lib/chatPrefs): ao subir o app precisamos validar o que veio do
-// localStorage contra este mesmo catálogo — um modelo que saiu da lista não
-// pode voltar como valor selecionado (o GlassSelect exibiria o primeiro item
-// e o estado ficaria apontando pra outro).
+// Antes isto era um enum copiado à mão aqui e no chat do painel, e os dois já
+// tinham divergido do core (ofereciam um Claude que o core não conhecia). Agora
+// a fonte é `GET /api/v1/desktop/model-catalog` (editado no painel em
+// Configurações → Providers), via o comando Rust `get_model_catalog`.
+//
+// A última lista recebida fica no localStorage: o seletor abre na hora com ela
+// e a busca no core só atualiza por baixo (hooks/useModelCatalog). Sem cache e
+// sem core não há lista — e também não há chat, então não existe lista reserva.
 
-export type ProviderType =
-  | 'openai'
-  | 'groq'
-  | 'grok'
-  | 'deepseek'
-  | 'anthropic'
-  | 'gemini'
-  | 'ollama'
-  | 'openrouter';
-
+export type ProviderType = string;
 export type ModelType = string;
 
 export interface CatalogOption<T extends string> {
@@ -24,97 +18,108 @@ export interface CatalogOption<T extends string> {
   description: string;
 }
 
-export const PROVIDER_OPTIONS: CatalogOption<ProviderType>[] = [
-  { value: 'openai',    label: 'OpenAI',       description: 'GPT-4o, GPT-4.1...' },
-  { value: 'groq',      label: 'Groq',         description: 'Llama-3.3, ultra-rápido' },
-  { value: 'grok',      label: 'Grok (xAI)',   description: 'Grok-3-mini, Grok-2...' },
-  { value: 'deepseek',  label: 'DeepSeek',     description: 'Flash, V4 Pro...' },
-  { value: 'anthropic', label: 'Anthropic',    description: 'Claude 3...' },
-  { value: 'gemini',    label: 'Gemini',       description: 'Gemini 2.5 Pro...' },
-  { value: 'ollama',    label: 'Ollama',       description: 'Local (Gemma4...)' },
-  { value: 'openrouter', label: 'OpenRouter',  description: 'Grok 4.5, DeepSeek V4 Flash...' },
-];
-
-export const MODELS_BY_PROVIDER: Record<ProviderType, CatalogOption<ModelType>[]> = {
-  openai: [
-    { value: 'gpt-4.1',       label: 'GPT-4.1',        description: 'Mais capaz' },
-    { value: 'gpt-4.1-mini',  label: 'GPT-4.1 Mini',   description: 'Rápido' },
-    { value: 'gpt-4.1-nano',  label: 'GPT-4.1 Nano',   description: 'Mais rápido' },
-    { value: 'gpt-4o',        label: 'GPT-4o',          description: 'Equilíbrio' },
-    { value: 'gpt-4o-mini',   label: 'GPT-4o-mini',     description: 'Econômico' },
-  ],
-  groq: [
-    { value: 'llama-3.3-70b-versatile', label: 'Llama-3.3 70B',     description: 'Padrão (free)' },
-    { value: 'llama-3.1-8b-instant',    label: 'Llama-3.1 8B Fast', description: 'Ultra-rápido (free)' },
-    { value: 'llama3-70b-8192',         label: 'Llama3 70B 8k',     description: 'Contexto longo (free)' },
-    { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B',      description: '32k tokens (free)' },
-    { value: 'gemma2-9b-it',            label: 'Gemma2 9B',         description: 'Google (free)' },
-  ],
-  grok: [
-    { value: 'grok-3-mini-fast', label: 'Grok-3 Mini Fast', description: 'Mais rápido (free)' },
-    { value: 'grok-3-mini',      label: 'Grok-3 Mini',      description: 'Rápido (free)' },
-    { value: 'grok-2-1212',      label: 'Grok-2',           description: 'Completo (free)' },
-    { value: 'grok-3',           label: 'Grok-3',           description: 'Mais capaz (pago)' },
-  ],
-  deepseek: [
-    { value: 'deepseek-flash',    label: 'DeepSeek Flash',    description: 'Mais rápido (V4.1)' },
-    { value: 'deepseek-v4-pro',   label: 'DeepSeek V4 Pro',   description: 'Mais capaz' },
-    { value: 'deepseek-chat',     label: 'DeepSeek Chat',     description: 'Uso geral' },
-    { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner', description: 'Raciocínio lento' },
-  ],
-  anthropic: [
-    { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', description: 'Mais capaz' },
-    { value: 'claude-3-haiku-20240307',    label: 'Claude 3 Haiku',   description: 'Rápido' },
-  ],
-  gemini: [
-    { value: 'gemini-2.5-pro-preview-03-25', label: 'Gemini 2.5 Pro',     description: 'Avançado' },
-    { value: 'gemini-2.0-flash',             label: 'Gemini 2.0 Flash',   description: 'Rápido' },
-    { value: 'gemini-2.0-flash-lite',        label: 'Gemini Flash Lite',  description: 'Leve' },
-  ],
-  ollama: [
-    { value: 'gemma4:e2b', label: 'Gemma4 2B (Local)', description: 'Ultra-leve' },
-    { value: 'gemma4:12b', label: 'Gemma4 12B (Local)', description: 'Local' },
-    { value: 'phi4',       label: 'Phi-4 (Local)',      description: 'Local' },
-  ],
-  openrouter: [
-    { value: 'x-ai/grok-4.5',                label: 'Grok 4.5',      description: 'Mais capaz (raciocínio)' },
-    { value: 'x-ai/grok-4.20',               label: 'Grok 4.20',     description: 'Equilíbrio, 2M contexto' },
-    { value: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite', description: 'Econômico' },
-    // O sufixo `@fireworks` fixa o provedor de infra do gateway (o neo-core o
-    // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
-    // provedor, com outro preço e outro teto de saída.
-    //
-    // As DUAS entradas existem de propósito, e a escolha é preço x latência.
-    // O V4.1 Flash NÃO tem endpoint do Baidu (o pin da geração anterior); dos 22
-    // endpoints sondados em 2026-09-20, o Fireworks foi o único que empatou com
-    // os 74-80 tok/s do Baidu (85/69) aceitando `tool_choice=required` — o
-    // @relace e o @morph devolvem 404 na tool forçada, e o @deepinfra oscilou
-    // entre 49 e 24 tok/s. Sem o pin o gateway roteia para qualquer endpoint
-    // livre: responde na hora, mas sorteia velocidade (50 e 105 tok/s nas duas
-    // medições) e joga fora o cache de prefixo a cada troca de provedor.
-    { value: 'deepseek/deepseek-v4.1-flash@fireworks', label: 'DeepSeek V4.1 Flash (Fireworks)', description: '1M contexto, 69-85 tok/s — endpoint estável' },
-    { value: 'deepseek/deepseek-v4.1-flash',           label: 'DeepSeek V4.1 Flash (auto)',      description: 'Sem pin: qualquer endpoint livre, preço varia' },
-    { value: 'deepseek/deepseek-v4-flash@baidu',       label: 'DeepSeek V4 Flash (Baidu)',       description: 'Geração anterior — ~6x mais barato na entrada' },
-  ],
-};
-
-export const DEFAULT_PROVIDER: ProviderType = 'openai';
-
-export function isProvider(value: unknown): value is ProviderType {
-  return typeof value === 'string' && value in MODELS_BY_PROVIDER;
+export interface CatalogModel {
+  id: string;
+  label: string;
+  description: string;
+  vision: boolean;
 }
 
-export function modelsFor(provider: string): CatalogOption<ModelType>[] {
-  return isProvider(provider)
-    ? MODELS_BY_PROVIDER[provider]
-    : MODELS_BY_PROVIDER[DEFAULT_PROVIDER];
+export interface CatalogProvider {
+  name: string;
+  label: string;
+  description: string;
+  models: CatalogModel[];
 }
 
-/** Primeiro modelo do provider — o default quando não há preferência válida. */
-export function defaultModelFor(provider: string): ModelType {
-  return modelsFor(provider)[0].value;
+export interface ModelCatalog {
+  providers: CatalogProvider[];
+  /** O par que vale quando não há escolha salva (o DEFAULT_PROVIDER do core). */
+  default: { provider: string; model: string } | null;
 }
 
-export function isModelOfProvider(provider: string, model: unknown): boolean {
-  return typeof model === 'string' && modelsFor(provider).some((m) => m.value === model);
+export interface Selection {
+  provider: string;
+  model: string;
+}
+
+const CACHE_KEY = 'neo.chat.catalog';
+
+/** O JSON tem a forma que o seletor precisa? (cache velho ou resposta estranha) */
+export function isModelCatalog(value: unknown): value is ModelCatalog {
+  if (!value || typeof value !== 'object') return false;
+  const providers = (value as ModelCatalog).providers;
+  return (
+    Array.isArray(providers) &&
+    providers.every(
+      (p) =>
+        p &&
+        typeof p.name === 'string' &&
+        Array.isArray(p.models) &&
+        p.models.every((m) => m && typeof m.id === 'string')
+    )
+  );
+}
+
+export function readCachedCatalog(): ModelCatalog | null {
+  try {
+    const raw = window.localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isModelCatalog(parsed) ? parsed : null;
+  } catch {
+    // localStorage pode lançar (storage bloqueado) e o JSON pode estar corrompido.
+    return null;
+  }
+}
+
+export function storeCatalog(catalog: ModelCatalog): void {
+  try {
+    window.localStorage.setItem(CACHE_KEY, JSON.stringify(catalog));
+  } catch {
+    /* cache é conveniência: falhar em salvar não pode derrubar o app */
+  }
+}
+
+export function providerOptions(catalog: ModelCatalog): CatalogOption<ProviderType>[] {
+  return catalog.providers.map((p) => ({
+    value: p.name,
+    label: p.label || p.name,
+    description: p.description,
+  }));
+}
+
+export function modelOptions(catalog: ModelCatalog, provider: string): CatalogOption<ModelType>[] {
+  const found = catalog.providers.find((p) => p.name === provider);
+  return (found?.models ?? []).map((m) => ({
+    value: m.id,
+    label: m.label || m.id,
+    description: m.description,
+  }));
+}
+
+/** Primeiro modelo do provider — o que o seletor escolhe ao trocar de provider. */
+export function defaultModelFor(catalog: ModelCatalog, provider: string): ModelType {
+  return catalog.providers.find((p) => p.name === provider)?.models[0]?.id ?? '';
+}
+
+/**
+ * O par salvo, corrigido contra o catálogo.
+ *
+ * Provider que sumiu da lista (desligado, sem chave) cai no default do core; um
+ * modelo que não pertence mais ao provider cai no primeiro dele. Sem isso o
+ * GlassSelect mostraria o primeiro item enquanto o estado (e o que vai para o
+ * neo-core) apontava para outro.
+ */
+export function resolveSelection(catalog: ModelCatalog, wanted: Selection): Selection {
+  const provider = catalog.providers.find((p) => p.name === wanted.provider);
+  if (provider) {
+    const model = provider.models.some((m) => m.id === wanted.model)
+      ? wanted.model
+      : provider.models[0]?.id ?? '';
+    return { provider: provider.name, model };
+  }
+  if (catalog.default) return catalog.default;
+  const first = catalog.providers[0];
+  return { provider: first?.name ?? '', model: first?.models[0]?.id ?? '' };
 }

@@ -147,6 +147,83 @@ async def corpo(ev, cmd):
     confere("a lista respeita o teto", len(textos) <= 200, str(len(textos)))
     confere("o snapshot diz quanto ficou de fora", (s.get("omitidos") or 0) > 20, str(s.get("omitidos")))
 
+    print("\n■ header e footer DENTRO do conteúdo não são moldura (12axes, job 7b73f755)")
+
+    def achar(els: list, nome: str) -> dict:
+        return next((e for e in els if e.get("text") == nome), {})
+
+    await abrir(url("cartao-com-header.html"), 1600, 1000)
+    s = await snap()
+    tela, els = s.get("tela") or "", s.get("elements") or []
+    for dado in ("gender identity", "declared by each person must be respected",
+                 "Question 1 of 36", "0% complete", "PROGRESSIVE"):
+        confere(f"a tela traz «{dado}»", dado in tela, tela[:200])
+    confere("o banner do site continua fora da leitura", "Restart quiz" not in tela, tela[:200])
+    for nome in ("gender identity", "Understand this question", "Strongly agree"):
+        alvo = achar(els, nome)
+        confere(f"«{nome}» é conteúdo, não moldura", bool(alvo) and not alvo.get("chrome"), str(alvo)[:160])
+    for nome in ("Restart quiz", "Next"):
+        alvo = achar(els, nome)
+        confere(f"«{nome}» continua moldura", alvo.get("chrome") is True, str(alvo)[:160])
+
+    await abrir(url("artigo-com-header.html"), 1600, 1000)
+    s = await snap()
+    tela, els = s.get("tela") or "", s.get("elements") or []
+    for dado in ("Prefeitura anuncia nova linha de ônibus noturna", "Por Ana Ribeiro",
+                 "Etiquetas: transporte", "Leia também"):
+        confere(f"a tela traz «{dado}»", dado in tela, tela[:200])
+    for dado in ("Assine já", "© 2026"):
+        confere(f"«{dado}» (banner/rodapé do site) fica fora da leitura", dado not in tela, tela[:200])
+    alvo = achar(els, "Assine já")
+    confere("link do banner continua moldura", alvo.get("chrome") is True, str(alvo)[:160])
+
+    print("\n■ texto escondido por CSS não é 'na tela', e o aviso tem lugar próprio (job 21c563c1)")
+    await abrir(url("lista-recortada-e-aviso.html"), 1600, 1000)
+    s = await snap()
+    tela, resto = s.get("tela") or "", s.get("resto") or ""
+    confere("a questão atual entra na tela", "QUESTÃO 10" in tela and "Alternativa 3" in tela,
+            f"{len(tela)} chars, começa em {tela[:120]!r}")
+    confere("a parte visível da lista entra", "Q1 Texto de apoio 1.0" in tela, tela[:160])
+    confere("o que a lista esconde não conta como tela", tela.count("pela metade") <= 40,
+            f"{tela.count('pela metade')} repetições na tela")
+    # O que nunca aparece (`overflow: hidden`) sai do snapshot sem ocupar o resto,
+    # que é de quem está abaixo da dobra; a busca continua achando (logo abaixo).
+    confere("...e não ocupa o resto", resto.count("pela metade") <= 2, f"{resto.count('pela metade')} no resto")
+    confere("a leitura não estoura o teto", not s.get("tela_cut"), f"tela_total={s.get('tela_total')}")
+    confere("linha com reticências: só o começo é tela", "Linha única cortada" in tela
+            and tela.count("escondido à direita") < 6)
+    confere("caixa com rolagem: o fim dela não é tela, é resto (rolar a caixa revela)",
+            "Mensagem 1 da conversa" in tela and "Mensagem 12 da conversa" not in tela
+            and "Mensagem 12 da conversa" in resto, resto[:160])
+    b = await ev(js("js_buscar", termo=json.dumps("Mensagem 12 da conversa"), chars=4000))
+    confere("...e a busca continua achando o que a caixa esconde", b.get("achados", 0) >= 1, str(b)[:160])
+    b = await ev(js("js_buscar", termo=json.dumps("Texto de apoio 7.13"), chars=4000))
+    confere("...e o fim de um enunciado recortado também", b.get("achados", 0) >= 1, str(b)[:160])
+    avisos = s.get("avisos") or []
+    confere("sem aviso na página, a barra do topo não vira aviso",
+            not any("Fale com mediador" in (a.get("texto") or "") for a in avisos), str(avisos)[:200])
+    for caso, rotulo in (("1", "com aria-live"), ("2", "só a camada fixed")):
+        await abrir(url("lista-recortada-e-aviso.html") + f"?aviso={caso}", 1600, 1000)
+        s = await snap()
+        avisos = s.get("avisos") or []
+        confere(f"o aviso {rotulo} vem em `avisos`",
+                any("Você respondeu todas as questões" in (a.get("texto") or "") for a in avisos),
+                str(avisos)[:200])
+        confere(f"...e não se repete na tela ({rotulo})",
+                "Você respondeu todas as questões" not in (s.get("tela") or ""))
+    # Novidade: o aviso que aparece DEPOIS de um snapshot sai marcado como novo.
+    await abrir(url("lista-recortada-e-aviso.html"), 1600, 1000)
+    await snap()
+    await ev("""document.body.insertAdjacentHTML('beforeend', '<div id="toast-container">'
+      + '<div class="toast"><b>Bom trabalho!</b> Questão 10 respondida. <button>×</button></div></div>')""")
+    s = await snap()
+    novo = next((a for a in s.get("avisos") or [] if "Bom trabalho" in (a.get("texto") or "")), {})
+    confere("o aviso que acabou de aparecer sai como novo", novo.get("nova") is True, str(novo))
+    s = await snap()
+    velho = next((a for a in s.get("avisos") or [] if "Bom trabalho" in (a.get("texto") or "")), {})
+    confere("...e no snapshot seguinte continua lá, já não novo", velho and velho.get("nova") is False,
+            str(velho))
+
     print("\n■ extract alcança o que não coube")
     await abrir(url("produto-com-barra.html"), 1912, 1000)
     await snap()

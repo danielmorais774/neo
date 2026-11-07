@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cartão de pergunta com header</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: #f5f1ec; }
+  .site { display: flex; justify-content: space-between; align-items: center; padding: 16px 200px; border-bottom: 1px solid #ddd; }
+  .site a { font-size: 28px; color: #111; text-decoration: none; }
+  .site button { background: #1d2a26; color: #fff; border: 0; border-radius: 30px; padding: 12px 24px; }
+  .quiz-layout { max-width: 900px; margin: 24px auto; }
+  .quiz-progress-meta { display: flex; justify-content: space-between; color: #555; }
+  .question-card { position: relative; background: #faf7f3; border-radius: 16px; padding: 24px; margin-top: 16px; }
+  .question-number { position: absolute; right: 24px; top: 12px; font-size: 96px; color: #eee5dc; }
+  .question-axis-help { display: flex; gap: 12px; }
+  .question-axis-tag { margin: 0; padding: 8px 16px; background: #f3dde4; border-radius: 30px; letter-spacing: 2px; }
+  .question-help-btn { background: none; border: 1px solid #ccc; border-radius: 30px; padding: 8px 16px; }
+  h2 { font-size: 30px; margin: 16px 0; }
+  .term { font: inherit; background: none; border: 0; border-bottom: 2px dotted #333; padding: 0; }
+  .answer-grid button { display: block; width: 100%; text-align: left; margin: 8px 0; padding: 12px; background: #fff; border: 1px solid #ddd; }
+  .quiz-actions { display: flex; justify-content: space-between; margin-top: 16px; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: o cartão de questionário montado com HTML semântico. O `<header>` do
+  cartão (categoria, botão de ajuda e o ENUNCIADO num h2) e o `<header>` do
+  progresso ("Question 1 of 36") estão dentro de `<article>`/`<section>`, que é
+  onde o HTML diz que `header` é só o cabeçalho daquele bloco, e não o banner do
+  site. O seletor antigo da moldura pegava qualquer `header`, e a leitura trazia
+  só o "01" decorativo e as cinco opções (jobs 2611e76d e 7b73f755, 12axes).
+
+  Controle negativo: o `<header>` do topo, filho do `div#root`, é o banner de
+  verdade e continua sendo moldura. O `<nav>` das ações também, porque `nav` é
+  navegação em qualquer lugar.
+-->
+<div id="root">
+  <header class="site">
+    <a href="/en">12 axes</a>
+    <button type="button">Restart quiz</button>
+  </header>
+  <section class="quiz-layout">
+    <header class="quiz-progress">
+      <div class="quiz-progress-meta">
+        <span>Question <b>1 of 36</b></span>
+        <span>0% complete</span>
+      </div>
+      <div role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    </header>
+    <div class="question-stage">
+      <article class="question-card" aria-labelledby="q1">
+        <span class="question-number" aria-hidden="true">01</span>
+        <header class="question-card-header">
+          <div class="question-axis-help">
+            <p class="question-axis-tag"><span>PROGRESSIVE</span></p>
+            <button class="question-help-btn" type="button" aria-label="Understand this question"><span>Understand</span></button>
+          </div>
+          <h2 id="q1">The <button class="term" type="button">gender identity</button> declared by each person must be respected.</h2>
+        </header>
+        <div class="answer-grid" role="radiogroup" aria-label="Answers">
+          <button type="button" role="radio" aria-checked="false"><span>Strongly agree</span></button>
+          <button type="button" role="radio" aria-checked="false"><span>Agree</span></button>
+          <button type="button" role="radio" aria-checked="false"><span>Neutral or It depends</span></button>
+          <button type="button" role="radio" aria-checked="false"><span>Disagree</span></button>
+          <button type="button" role="radio" aria-checked="false"><span>Strongly disagree</span></button>
+        </div>
+      </article>
+    </div>
+    <nav class="quiz-actions" aria-label="Quiz navigation">
+      <button type="button" disabled>Back</button>
+      <button type="button" role="switch" aria-checked="true">Advance on answer</button>
+      <button type="button" disabled>Next</button>
+    </nav>
+  </section>
+</div>
+</body>
+</html>

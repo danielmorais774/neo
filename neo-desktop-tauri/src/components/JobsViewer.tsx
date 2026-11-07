@@ -26,6 +26,9 @@ type LoadState = 'loading' | 'ready' | 'error';
 type Filter = 'all' | 'active';
 
 const ACTIVE_STATUSES = new Set(['queued', 'running']);
+// Cancelar vale também para a tarefa que PAROU esperando você (um card de
+// liberação, um "pode enviar"): sem isto ela ficava na lista sem saída.
+const CANCELABLE_STATUSES = new Set(['queued', 'running', 'waiting']);
 const FAST_POLL_MS = 4_000;
 const SLOW_POLL_MS = 20_000;
 const LOG_TAIL_BYTES = 16_000;
@@ -219,6 +222,7 @@ export default function JobsViewer({ onClose }: JobsViewerProps) {
   const completed = counts.completed ?? 0;
   const failed = (counts.failed ?? 0) + (counts.timeout ?? 0);
   const isActive = detail ? ACTIVE_STATUSES.has(detail.status) : false;
+  const isCancelable = detail ? CANCELABLE_STATUSES.has(detail.status) : false;
 
   return (
     <section className="wm-screen wm-standalone jobs-screen" role="region" aria-labelledby="jobs-title">
@@ -355,7 +359,7 @@ export default function JobsViewer({ onClose }: JobsViewerProps) {
                   <span>duração {formatDuration(detail.duration_s)}</span>
                   {detail.exit_code !== null && <span>exit {detail.exit_code}</span>}
                 </div>
-                {isActive && (
+                {isCancelable && (
                   <button type="button" className="jobs-cancel" onClick={cancel} disabled={cancelling}>
                     {cancelling ? 'Cancelando…' : 'Cancelar'}
                   </button>

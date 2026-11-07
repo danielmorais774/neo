@@ -86,6 +86,11 @@
   <label class="opcao"><input type="radio" name="q" value="a" onchange="contar('radio')"><span>Alternativa correta</span></label>
 </section>
 
+<section data-cena="some"><h2>opção que desmonta o próprio cartão ao ser escolhida (a última pergunta do 12axes)</h2>
+  <div class="cartao-pergunta"><button type="button" role="radio" aria-checked="false"
+    onclick="contar('some'); this.closest('.cartao-pergunta').replaceWith(Object.assign(document.createElement('p'), {textContent: 'Etapa 2 de 6'}))">Discordo totalmente</button></div>
+</section>
+
 <section data-cena="caixa-sem-label"><h2>rádio escondido em caixa sem label, a caixa é que escuta</h2>
   <div class="opcao" onclick="const r=this.querySelector('input'); r.checked=true; contar('caixa-sem-label')"><input type="radio" name="p"><span>Plano mensal</span></div>
 </section>

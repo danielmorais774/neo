@@ -246,16 +246,32 @@ impl DeviceWsManager {
                     info!("[DeviceWS] Control connection established");
                     let (mut write, mut read) = ws_stream.split();
 
+                    // Cada comando roda na SUA tarefa, e as respostas saem por uma
+                    // escritora só. Em fila, um `navigate` (até 20 s esperando a
+                    // página) numa aba segurava o snapshot de qualquer outra — e o
+                    // `paralelo` do neo-core (docs/browser-multi-aba-plan.md §5.3)
+                    // virava fila. O core casa a resposta pelo `id`, não pela ordem.
+                    let (saida, mut fila) = mpsc::unbounded_channel::<String>();
+                    let escritora = tokio::spawn(async move {
+                        while let Some(reply) = fila.recv().await {
+                            if let Err(e) = write.send(Message::Text(reply.into())).await {
+                                warn!("[DeviceWS] Control send failed: {}", e);
+                                break;
+                            }
+                        }
+                    });
+
                     while let Some(msg) = read.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                let reply = Self::handle_control_command(&app_handle, &text).await;
-                                if let Some(reply) = reply {
-                                    if let Err(e) = write.send(Message::Text(reply.into())).await {
-                                        warn!("[DeviceWS] Control send failed: {}", e);
-                                        break;
+                                let app = app_handle.clone();
+                                let saida = saida.clone();
+                                let texto = text.to_string();
+                                tokio::spawn(async move {
+                                    if let Some(reply) = Self::handle_control_command(&app, &texto).await {
+                                        let _ = saida.send(reply);
                                     }
-                                }
+                                });
                             }
                             Ok(Message::Close(frame)) => {
                                 // 4401 = "não pareado". Reconectar em loop só
@@ -278,6 +294,8 @@ impl DeviceWsManager {
                             _ => {}
                         }
                     }
+                    drop(saida);
+                    escritora.abort();
                 }
                 Err(e) => {
                     error!("[DeviceWS] Failed to connect control WS: {}", e);

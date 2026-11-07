@@ -1302,6 +1302,33 @@ pub async fn list_sessions(limit: Option<u32>) -> Result<Vec<SessionInfo>, Strin
     Ok(parsed.sessions)
 }
 
+/// Catálogo do seletor de provider/modelo do chat (`GET /desktop/model-catalog`).
+///
+/// O JSON passa direto: quem conhece o formato é o front (lib/models.ts), que
+/// também guarda a última lista em cache para o seletor abrir sem esperar a
+/// rede. Erro vira Err — o front segue com o cache.
+#[tauri::command]
+pub async fn get_model_catalog() -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let url = format!("{}/api/v1/desktop/model-catalog", neo_core_http_url());
+    let resp = crate::with_device_token(client.get(url))
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("neo-core respondeu {}", resp.status()));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Resposta inválida do neo-core: {}", e))
+}
+
 /// Sessão ativa agora — a UI usa para destacar a linha correspondente na lista.
 #[tauri::command]
 pub fn get_session_id(state: State<'_, AppState>) -> Result<String, String> {

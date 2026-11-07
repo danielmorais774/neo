@@ -1,8 +1,8 @@
 import { useCallback, useState, useRef, useEffect, useLayoutEffect } from 'react';
 import type { Message } from '../types';
 import type { LiveState } from '../hooks/useLiveMode';
-import type { ModelType, ProviderType } from '../lib/models';
-import { MODELS_BY_PROVIDER, PROVIDER_OPTIONS, modelsFor } from '../lib/models';
+import type { ModelCatalog, ModelType, ProviderType } from '../lib/models';
+import { modelOptions, providerOptions } from '../lib/models';
 import MessageList from './MessageList';
 import GlassSelect from './GlassSelect';
 import './Chat.css';
@@ -33,6 +33,8 @@ interface ChatProps {
   selectedModel: string;
   selectedMode: 'agent' | 'plan' | 'ask';
   selectedProvider: string;
+  /** Lista do seletor, do neo-core (null = nunca carregou e não há cache). */
+  modelCatalog: ModelCatalog | null;
   windowMode: 'tooltip' | 'agent';
   initialInput?: string;
   // Modo Live (voz)
@@ -86,6 +88,7 @@ function Chat({
   selectedModel,
   selectedMode,
   selectedProvider,
+  modelCatalog,
   windowMode,
   initialInput,
   isLive = false,
@@ -404,26 +407,32 @@ function Chat({
             ]}
           />
 
+          {/* Sem catálogo (primeira abertura sem o core) mostra só o par salvo,
+              travado: não há lista para escolher, e sem core não há chat. */}
           <GlassSelect<ProviderType>
             ariaLabel="Provider"
             value={selectedProvider as ProviderType}
-            disabled={isExecuting}
+            disabled={isExecuting || !modelCatalog}
             width={130}
-            onChange={(provider) => {
-              onProviderChange(provider);
-              const models = MODELS_BY_PROVIDER[provider];
-              if (models?.length > 0) onModelChange(models[0].value);
-            }}
-            options={PROVIDER_OPTIONS}
+            onChange={(provider) => onProviderChange(provider)}
+            options={
+              modelCatalog
+                ? providerOptions(modelCatalog)
+                : [{ value: selectedProvider, label: selectedProvider || '—', description: '' }]
+            }
           />
 
           <GlassSelect<ModelType>
             ariaLabel="Modelo"
             value={selectedModel as ModelType}
-            disabled={isExecuting}
+            disabled={isExecuting || !modelCatalog}
             width={160}
             onChange={(model) => onModelChange(model)}
-            options={modelsFor(selectedProvider)}
+            options={
+              modelCatalog
+                ? modelOptions(modelCatalog, selectedProvider)
+                : [{ value: selectedModel, label: selectedModel || '—', description: '' }]
+            }
           />
         </div>
       </form>

@@ -136,6 +136,7 @@ CENAS = [
     ("handler", "Escolher entrega expressa", "handler"),
     ("confiavel", "Validar assinatura", "confiavel"),
     ("radio", "Alternativa correta", "radio"),
+    ("some", "Discordo totalmente", "some"),
     ("caixa-sem-label", "Plano mensal", "caixa-sem-label"),
     ("aceite", "Li e aceito os termos", "aceite"),
     ("cartao", "Assinar plano", "cartao"),
@@ -175,6 +176,23 @@ async def corpus(aba: Aba, rs: Rs) -> int:
                            (ret.get("alvo") or ret.get("error") or "")[:46]))
     for modo, cena, res, via, alvo in linhas:
         print(f"  {modo:<5} {cena:<16} {res:<26} {via:<6} {alvo}")
+
+    # O controle que SAI da página no clique (job f9370b43): o resultado tem de
+    # dizer que a página reagiu, e não "não ficou selecionado".
+    for modo in ("nome", "ref"):
+        await aba.cmd("Page.navigate", {"url": url})
+        await asyncio.sleep(0.25)
+        snap = await aba.ev(rs.js("js_snapshot", max=200, chars=3000))
+        if modo == "nome":
+            ret = await por_nome(aba, rs, "Discordo totalmente")
+        else:
+            alvo = next((e for e in snap["elements"]
+                         if "Discordo totalmente" in (e.get("text") or "")), None)
+            ret = await por_ref(aba, rs, alvo["ref"]) if alvo else {"error": "sem ref"}
+        ok = (ret or {}).get("saiu") is True and (ret or {}).get("checked") is not False
+        falhas += 0 if ok else 1
+        print(f"  saiu no clique ({modo:<4})            {'ok' if ok else 'FALHOU'}  "
+              f"saiu={(ret or {}).get('saiu')} checked={(ret or {}).get('checked')}")
 
     # O que NÃO pode acontecer.
     await aba.cmd("Page.navigate", {"url": url})

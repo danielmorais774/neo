@@ -5,14 +5,12 @@
 // Antes disto o estado nascia hardcoded em useAgentState ('openai'/'gpt-4.1'/
 // 'agent') a cada boot: escolher um modelo valia só até fechar o app.
 //
-// Toda leitura é VALIDADA contra o catálogo (lib/models). Um provider que sumiu
-// da lista, ou um modelo que não pertence mais ao provider salvo, cai no
-// default — senão o GlassSelect mostraria o primeiro item da lista enquanto o
-// estado (e o que vai pro neo-core) apontava pra outro.
+// Provider e modelo são lidos CRUS: o catálogo vem do neo-core e pode ainda não
+// ter chegado no boot. Quem valida é o useAgentState, quando há catálogo
+// (lib/models.resolveSelection) — validar contra lista nenhuma jogaria fora a
+// escolha do usuário a cada abertura sem rede.
 
 import type { ChatMode } from '../types';
-import type { ModelType, ProviderType } from './models';
-import { DEFAULT_PROVIDER, defaultModelFor, isModelOfProvider, isProvider } from './models';
 
 const PROVIDER_KEY = 'neo.chat.provider';
 const MODEL_KEY = 'neo.chat.model';
@@ -37,19 +35,16 @@ function write(key: string, value: string): void {
   }
 }
 
-export function readStoredProvider(): ProviderType {
-  const stored = read(PROVIDER_KEY);
-  return isProvider(stored) ? stored : DEFAULT_PROVIDER;
+export function readStoredProvider(): string {
+  return read(PROVIDER_KEY) ?? '';
 }
 
 export function storeProvider(provider: string): void {
   write(PROVIDER_KEY, provider);
 }
 
-/** O modelo só é aceito se ainda pertencer ao provider passado. */
-export function readStoredModel(provider: string): ModelType {
-  const stored = read(MODEL_KEY);
-  return isModelOfProvider(provider, stored) ? stored! : defaultModelFor(provider);
+export function readStoredModel(): string {
+  return read(MODEL_KEY) ?? '';
 }
 
 export function storeModel(model: string): void {
