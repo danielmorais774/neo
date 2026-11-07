@@ -28,16 +28,17 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from core.llm.router import (
-    DEFAULT_MODEL_BY_PROVIDER,
+from core.llm.catalog import (
+    default_model_for,
+    known_providers,
     models_by_provider,
+    provider_label,
     supports_vision,
     vision_models_by_provider,
 )
 from modules.intent_config.store import (
-    KNOWN_PROVIDERS,
-    SUGGESTED_MODEL,
     is_provider_available,
+    suggested_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ def _brain_env_default() -> tuple[str, str]:
         provider = get_settings().default_provider
     except Exception:  # pragma: no cover - defensive; import-time só depende do env
         provider = "deepseek"
-    return provider, DEFAULT_MODEL_BY_PROVIDER.get(provider, "deepseek-flash")
+    return provider, default_model_for(provider) or "deepseek-flash"
 
 
 _BRAIN_PROVIDER, _BRAIN_MODEL = _brain_env_default()
@@ -236,7 +237,7 @@ def normalize(role: str, provider: str | None, model: str | None) -> dict[str, s
     spec = ROLES[role]
     prov = (provider or "").strip().lower()
     mdl = (model or "").strip()
-    if prov not in KNOWN_PROVIDERS or not spec.accepts(prov):
+    if prov not in known_providers() or not spec.accepts(prov):
         prov = spec.default_provider
     if not mdl:
         # O `SUGGESTED_MODEL` conserta "trocou de provider e não disse o modelo":
@@ -249,7 +250,7 @@ def normalize(role: str, provider: str | None, model: str | None) -> dict[str, s
         mdl = (
             spec.default_model
             if prov == spec.default_provider
-            else SUGGESTED_MODEL.get(prov) or spec.default_model
+            else suggested_model(prov) or spec.default_model
         )
     # Slot de visão nunca pode acabar com um modelo cego. O `SUGGESTED_MODEL` do
     # provider é o barato dele, não o que enxerga: para o `deepseek` sugere
@@ -350,11 +351,12 @@ def build_catalog(
     providers = [
         {
             "name": name,
+            "label": provider_label(name),
             "available": name in available,
             "models": models.get(name, []),
-            "suggested": SUGGESTED_MODEL.get(name),
+            "suggested": suggested_model(name),
         }
-        for name in KNOWN_PROVIDERS
+        for name in known_providers()
     ]
     roles = [
         {
@@ -379,7 +381,7 @@ def build_catalog(
 
 
 __all__ = [
-    "KNOWN_PROVIDERS",
+    "known_providers",
     "PREF_CATEGORY",
     "PREF_SERVICE",
     "ROLES",

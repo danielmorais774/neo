@@ -14,6 +14,7 @@ código-fonte e por isso aprovava justamente o bug):
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -229,3 +230,68 @@ async def test_avanco_do_agente_mantem_o_turno_vivo():
     await _run(_agent(prov, _Tools()))
 
     assert liveness.idle_seconds() < 0.15
+
+
+# ── JSON quebrado na chamada de tool não vira a resposta (sessão b230a40d) ──
+
+
+class _Quebrada(_Resp):
+    """O que o `OpenAICompletionResponse` faz com argumentos cortados."""
+
+    def get_tool_calls(self) -> list[ToolCall]:
+        json.loads('{"task": "Continuar respondendo o quiz')
+        return []
+
+
+class _ContaTools(_Tools):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rodou: list[str] = []
+
+    async def execute_tool_call(self, tc: ToolCall) -> ToolResult:
+        self.rodou.append(tc.arguments["q"])
+        return await super().execute_tool_call(tc)
+
+
+@pytest.mark.asyncio
+async def test_json_quebrado_pede_de_novo_e_segue_forcando():
+    prov = _Provider([_Quebrada(), _call("tabelas"), _Resp(content="pronto")])
+    tools = _ContaTools()
+    result = await _run(_agent(prov, tools), force_tool_first=True)
+
+    assert result["status"] == "completed"
+    assert result["final_response"] == "pronto"
+    assert tools.rodou == ["tabelas"]
+    quebrada, refeita, final = prov.calls
+    # A nova tentativa ainda é o primeiro round a AGIR: soltar o forçamento
+    # aqui deixaria o modelo encerrar em prosa.
+    assert quebrada.get("tool_choice") == "required"
+    assert refeita.get("tool_choice") == "required"
+    assert "tool_choice" not in final
+    aviso = refeita["messages"][-1].content
+    assert "NÃO" in aviso and "rodou" in aviso
+
+
+@pytest.mark.asyncio
+async def test_json_sempre_quebrado_desiste_com_frase_e_sem_executar():
+    prov = _Provider([_Quebrada(), _Quebrada(), _Quebrada(), _call("nunca")])
+    tools = _ContaTools()
+    result = await _run(_agent(prov, tools), force_tool_first=True)
+
+    assert result["status"] == "failed"
+    assert tools.rodou == []
+    assert len(prov.calls) == 3
+    assert "nada foi executado" in result["final_response"]
+    # A exceção crua era o que chegava ao chat.
+    assert "Unterminated" not in result["final_response"]
+
+
+@pytest.mark.asyncio
+async def test_json_quebrado_depois_de_agir_nao_volta_a_forcar():
+    prov = _Provider([_call("a"), _Quebrada(), _Resp(content="pronto")])
+    tools = _ContaTools()
+    result = await _run(_agent(prov, tools), force_tool_first=True)
+
+    assert result["status"] == "completed"
+    assert tools.rodou == ["a"]
+    assert [c.get("tool_choice") for c in prov.calls] == ["required", None, None]

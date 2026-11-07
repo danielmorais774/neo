@@ -61,6 +61,11 @@ class ContextManager:
         if content:
             self._messages.append(Message(role=MessageRole.ASSISTANT, content=content))
 
+    def add_user_message(self, content: str) -> None:
+        """Adiciona um aviso do próprio loop ao modelo (não é fala do usuário)."""
+        if content:
+            self._messages.append(Message(role=MessageRole.USER, content=content))
+
     def add_tool_results(self, step: AgentStep) -> None:
         """Adiciona resultados de tools ao contexto."""
         results_text = self._format_tool_results(step.tool_results)

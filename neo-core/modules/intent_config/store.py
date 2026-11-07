@@ -12,7 +12,13 @@ import logging
 import time
 from typing import Any
 
-from core.llm.router import models_by_provider, provider_for_model
+from core.llm.catalog import (
+    default_model_for,
+    known_providers,
+    models_by_provider,
+    provider_for_model,
+    provider_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +33,9 @@ DEFAULT_CLASSIFIER: dict[str, str] = {
     "model": "deepseek-flash",
 }
 
-# Every provider the LLMRouter knows how to build (see ProviderType in router.py).
-KNOWN_PROVIDERS: tuple[str, ...] = (
-    "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter",
-)
+# Os providers conhecidos vêm do catálogo (`known_providers()`, editado no painel
+# em Configurações → Providers) — não de uma tupla fixa: um provider cadastrado lá
+# seria recusado aqui como "desconhecido".
 
 # A sensible fast/cheap model per provider for classification, used to prefill the
 # UI and to repair a provider switch that didn't specify a model.
@@ -43,6 +48,19 @@ SUGGESTED_MODEL: dict[str, str] = {
     "anthropic": "claude-3-haiku-20240307",
     "openrouter": "google/gemini-3.1-flash-lite",
 }
+
+
+def suggested_model(provider: str) -> str | None:
+    """O barato do provider para classificar — se ainda estiver no catálogo.
+
+    Provider cadastrado no painel não tem entrada em ``SUGGESTED_MODEL``, e um
+    sugerido que o operador apagou do catálogo não pode voltar como escolha: nos
+    dois casos vale o modelo padrão do provider.
+    """
+    picked = SUGGESTED_MODEL.get(provider)
+    if picked and provider_for_model(picked) == provider:
+        return picked
+    return default_model_for(provider)
 
 # In-process memoization so we don't hit the DB on every classify(). Invalidated
 # on set; the TTL bounds staleness when multiple workers each hold their own cache.
@@ -66,10 +84,10 @@ def normalize(provider: str | None, model: str | None) -> dict[str, str]:
     """
     prov = (provider or "").strip().lower()
     mdl = (model or "").strip()
-    if prov not in KNOWN_PROVIDERS:
+    if prov not in known_providers():
         prov = DEFAULT_CLASSIFIER["provider"]
     if not mdl:
-        mdl = SUGGESTED_MODEL.get(prov) or DEFAULT_CLASSIFIER["model"]
+        mdl = suggested_model(prov) or DEFAULT_CLASSIFIER["model"]
     return {"provider": prov, "model": mdl}
 
 
@@ -135,13 +153,14 @@ def build_catalog(available_providers: list[str], current: dict[str, str]) -> di
     models = models_by_provider()
     available = set(available_providers)
     providers = []
-    for name in KNOWN_PROVIDERS:
+    for name in known_providers():
         providers.append(
             {
                 "name": name,
+                "label": provider_label(name),
                 "available": name in available,
                 "models": models.get(name, []),
-                "suggested": SUGGESTED_MODEL.get(name),
+                "suggested": suggested_model(name),
             }
         )
     return {
@@ -159,7 +178,6 @@ def is_provider_available(name: str, available_providers: list[str]) -> bool:
 # Re-exported so callers don't import from two modules for related concerns.
 __all__ = [
     "DEFAULT_CLASSIFIER",
-    "KNOWN_PROVIDERS",
     "PREF_CATEGORY",
     "PREF_KEY",
     "PREF_SERVICE",
@@ -167,7 +185,9 @@ __all__ = [
     "get_classifier_config",
     "invalidate_cache",
     "is_provider_available",
+    "known_providers",
     "normalize",
     "provider_for_model",
     "set_classifier_config",
+    "suggested_model",
 ]

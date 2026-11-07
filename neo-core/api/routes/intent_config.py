@@ -21,7 +21,7 @@ from modules.intent_config import (
     get_classifier_config,
     set_classifier_config,
 )
-from modules.intent_config.store import KNOWN_PROVIDERS, is_provider_available
+from modules.intent_config.store import is_provider_available, known_providers
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,10 @@ async def update_intent_config(payload: IntentConfigUpdate) -> dict:
         raise HTTPException(status_code=503, detail="Service not ready")
 
     provider = payload.provider.strip().lower()
-    if provider not in KNOWN_PROVIDERS:
+    if provider not in known_providers():
         raise HTTPException(
             status_code=400,
-            detail=f"Provider desconhecido '{provider}'. Conhecidos: {', '.join(KNOWN_PROVIDERS)}",
+            detail=f"Provider desconhecido '{provider}'. Conhecidos: {', '.join(known_providers())}",
         )
 
     available = _available_providers()

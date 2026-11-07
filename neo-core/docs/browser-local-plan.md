@@ -2449,3 +2449,227 @@ exatamente 1 por cena. Na Amazon real, sem login: `Quantidade: 2`, gaveta de gar
 pela extensão.** O caminho do CDP é o mesmo `executeCdp` do `press_key`, e a reserva
 cobre o mouse que não chegar.
 
+
+### 2026-11-05 — O enunciado morava num `<header>` (jobs `2611e76d` e `7b73f755`)
+
+Quiz 12axes no modo curto. Os dois jobs leram "01" e as cinco opções, sem a pergunta e sem
+o "Question 1 of 36". O print mostrava as duas coisas. O `2611e76d` morreu em 11 s pelo
+freio de giro. O `7b73f755` começou na aba que o anterior deixou, já na pergunta 1 de 36,
+e reiniciou o quiz três vezes até o PARE.
+
+**Causa.** `NEO.CHROME` pegava qualquer `header` e `footer`, e o `NEO.foraDaLeitura` tira da
+leitura o que está dentro da moldura. O site monta `article.question-card > header > h2`
+(o enunciado) e o progresso é outro `<header>`, dentro de `section.quiz-layout`. O sinal
+estava no snapshot: "gender identity", um termo de DENTRO do enunciado, saía com
+`[moldura do site]`. Pela regra do HTML, que é a do leitor de tela, `header`/`footer` só são
+banner e rodapé do site fora de article, aside, main, nav e section (ou dos papéis
+equivalentes). O mesmo defeito apagava título e autor de toda notícia em
+`<article><header>`.
+
+**Efeito somado.** Sem o contador do site, o modelo usou o único que tinha, o
+`Passo N de no máximo M` do fim do prompt. Como o teto cresce a cada nota (50 → 57), nunca
+deu 36: "Passo 8 de no máximo 53 — ainda estou no modo longo".
+
+**Consertos.**
+1. `NEO.CHROME` segue a regra ARIA: `header:not(:is(<bloco>) header)`, idem `footer`, com
+   `NEO.BLOCO` = article, aside, main, nav, section e os papéis. `nav`, `banner` e
+   `contentinfo` explícitos continuam moldura em qualquer lugar.
+2. A linha do contador diz de quem ele é: "Seu orçamento nesta tarefa (contador SEU, não
+   da página): ação N de no máximo M. O progresso do site (pergunta, etapa, X de Y) é o
+   que a PÁGINA mostra."
+3. `_pede_acompanhar_download`: as frases de espera ("até o fim", "aguarde", "garanta
+   que") só ligam o acompanhamento quando o pedido fala de baixar alguma coisa. O
+   `2611e76d` tinha ligado por "avance até o fim".
+
+**Medido.** Fixtures `cartao-com-header.html` e `artigo-com-header.html` no
+`snapshot-lab` (o código velho reproduz o job letra por letra; o novo passa, com o banner e
+o rodapé do site ainda fora da leitura). Corpus inteiro do laboratório sem regressão
+(leitura, eleição do principal, clique, inspetor) e `cargo test browser_local
+--include-ignored`: 17/17. Em 12 sites reais, mesmo snapshot com o JS velho e o novo: o
+12axes passou a ler a pergunta e o progresso, a Wikipédia e o GitHub ganharam o título
+(`<header>` dentro de `<main>`), e nenhum menu vazou para a leitura. O portão do download
+sobre os 164 pedidos `browser_local` do banco: o velho ligava em 32, e 16 deles não tinham
+download nenhum (questionário, rastreio no AliExpress, Forms, rede social); os 16 que
+continuam ligando são todos downloads do Drive. **Não exercitado: um job real no Edge.**
+
+### 2026-11-05 (2) — A etapa nova lida como o quiz reiniciando (job `f9370b43`)
+
+Com a leitura consertada, o agente respondeu as 36 perguntas do 12axes, uma por passo. A
+36ª abriu uma etapa extra, "Identifying your archetype 1 of 6", com seis perguntas de A a F.
+Três defeitos se somaram ali, e o agente clicou em "Back to start" com as 36 respostas
+anotadas.
+
+1. **O clique mentiu.** O site desmonta o cartão da última pergunta na hora, antes de o
+   `aria-checked` virar `true`. O `fimDoClique` lia o nó que já tinha saído da página e
+   o driver disse "NÃO ficou selecionado (o clique não pegou)". Agora, controle fora da
+   página devolve `saiu: true` e o driver diz que a página reagiu.
+2. **A decisão certa foi recusada.** O passo seguinte ia responder a etapa nova ("C Live
+   and let live"). O `thought` citava `click({"ref": 5})` com aspas sem escape, e o
+   parser parou no caractere 346. Na nova rodada o modelo leu "1 of 6" como reinício.
+   `_consertar_aspas_do_thought` escapa as aspas SÓ do `thought` (que nunca vira ação);
+   `action` e `args` saem do parser como vieram, e a resposta cortada continua sendo corte.
+3. **Nada parou o recomeço.** `_check_desfaz_progresso`: com 5 anotações ou mais, clique
+   em rótulo de recomeço (restart, back to start, recomeçar, reiniciar, limpar formulário…)
+   é recusado UMA vez, com a primeira linha da tela e a explicação de que numeração que
+   volta a 1 com outro título é etapa nova. Insistir passa, e o aviso rearma quando o
+   caderno cresce mais 5.
+
+A tarefa que o cérebro escreveu já trazia a receita: "se o contador não bater, clique em
+Restart quiz ou Back to start". Ele a montou com as notas do `7b73f755`, que registravam o
+contador do PRÓPRIO agente como se fosse o do site. O contador já foi renomeado; a guarda
+cobre a receita que sobrar.
+
+**Medido.** Cena `some` no `snapshot-lab/clique.py` (opção que desmonta o próprio cartão):
+o `.rs` velho conta 1 clique e devolve `checked=False`; o novo devolve `saiu=True`, sem
+falha no resto do corpus. Guarda reencenada nos 86 cliques dos 20 diários da VPS: 7
+disparos, todos recomeços errados (6 no `7b73f755`, que reiniciava o quiz já no modo curto,
+e o do `f9370b43`), nenhum alarme falso. `cargo test browser_local --include-ignored` 17/17,
+neo-core 3799 testes. **Não exercitado: a etapa extra num job real.**
+
+### 2026-11-05 (3) — O aviso de finalizar que nunca chegou (sessão `cb41834a`, Portal)
+
+Questionário de 10 questões, site lento. O job `21c563c1` respondeu as dez. Depois do
+Responder da 10ª o site voltou para a questão 1, habilitou o Finalizar e mostrou por cima da
+página "Finalizar questionário · Você respondeu todas as questões, lembre-se de Finalizar o
+questionário". O modelo não leu o aviso, concluiu que a 10 não tinha pegado e clicou nela por
+oito passos, chegando a marcar a alternativa 1 (sem Responder, a salva continuou a 3), até o
+PARE. O pedido seguinte ("monta um arquivo com as questões") morreu em 0,5 s com Broken pipe.
+
+1. **A leitura estourava em todo passo.** Do passo 8 ao fim, `tela` = 5000 (o teto) em todos.
+   A lista lateral mostra duas linhas de cada enunciado e esconde o resto com `overflow`,
+   mas a caixa estar na janela bastava para o enunciado INTEIRO contar como tela: 11 mil
+   caracteres. O que vinha depois no DOM caía fora: o enunciado da questão atual, as
+   alternativas e os avisos, que só apareciam dentro das marcas `⟪COBERTO por "Bom
+   trabalho! Questão 8 respondida."⟫`. Conserto: `NEO.ler(…, {recorte: true})`, só no
+   snapshot, mede as linhas de cada nó (`Range.getClientRects`) contra a caixa que recorta, eixo
+   por eixo. O escondido de caixa com rolagem vai para `resto`; o de `hidden`/line-clamp sai do
+   snapshot. `extract` e busca leem tudo, como antes. Texto curto (< 40) parcialmente à vista é
+   lido inteiro.
+2. **Aviso sem lugar.** `avisos` no snapshot: região viva (`role=alert|status`, `aria-live`) ou
+   camada `fixed` presa ao `<body>` com pouco texto e no máximo 3 controles (a barra do topo é
+   feita de links e fica fora). Sai do texto corrido e entra como `>>> AVISO NA TELA`, antes da
+   tela, marcado "APARECEU AGORA" quando o par elemento+texto não estava no snapshot anterior.
+3. **A visão errou o estado e venceu o DOM.** O `look` disse "nenhuma alternativa marcada" e
+   "Responder habilitado (azul clara)"; o DOM dizia marcada e `[desabilitado]`.
+   `_com_estado_do_dom` acrescenta à resposta da visão o estado (marcado, desabilitado) dos
+   números que ela cita, quando ela fala de estado.
+4. **O navegador errado.** `headless = not local_browser_requested(mensagem atual)` mandou 3
+   de 5 tarefas para o navegador sem janela, que não tem o login dele: "continuar sem
+   recarregar" caiu no login, "monta um arquivo" tentou reaproveitar a aba do Edge. Agora
+   também valem `_asked_local_recently` (que já existia e só servia ao portão do servidor) e
+   `_trabalho_no_navegador_dele`: no mesmo site e na mesma conversa, a última tarefa foi no
+   navegador dele há até 15 min, ou a do headless parou no login há até 12 h. `_resolver_aba`
+   não reaproveita aba de um navegador num job do outro.
+5. **O headless morto não subia de novo.** `ensure_running` olhava se havia um registro, não se
+   o processo vivia. O Chrome sem janela morreu nas 3 h paradas e duas tarefas escreveram no
+   socket morto. `vivo()` (`try_wait`) e, se a conexão cair ao abrir aba, reinicia e tenta uma vez.
+
+**Medido.** Fixture `snapshot-lab/lista-recortada-e-aviso.html` (lista recortada, linha com
+reticências, caixa com rolagem, aviso com e sem ARIA, aviso novo e velho): o `.rs` velho falha
+em 10 dos 16 casos, o novo passa todos, e o corpus inteiro do laboratório segue verde. Em 12
+sites reais, palavras da tela antiga que sumiram da nova: 0 na Wikipédia, MDN, HN, gov.br e The
+Verge, nenhum preço em lugar nenhum; Amazon e KaBuM perderam o fim dos títulos que o site
+esconde com line-clamp; o aviso de cookies da The Verge virou AVISO. Mediana do snapshot igual
+(g1 +38 ms). Regra do navegador reencenada nos 5 jobs reais da sessão: os 3 que foram para o
+headless teriam ido para o navegador dele. `cargo test` 17/17 nos dois módulos, com dois testes
+novos de Chromium real (processo morto com `kill -9`, conexão caída com o processo vivo);
+neo-core 3813. **Não exercitado: o questionário num job real; o código velho do headless não
+rodou contra os testes novos.**
+
+### 2026-11-05 (4) — A nota menor que o item (job `d73fa72a`, Portal)
+
+"Extrair as questões e alternativas para o .txt". Com a leitura e o navegador já consertados
+(o aviso apareceu como `>>> AVISO NA TELA`, o job foi para o navegador dele), o agente
+percorreu as 10 questões, anotando cada uma no mesmo passo em que clicava na próxima, e depois
+recomeçou a volta, e a terceira já começava quando veio o PARE.
+
+**Causa.** `_NOTA_MAX = 1000`, cortado em silêncio. As dez notas de questão têm EXATAMENTE
+1000 caracteres no diário: o enunciado tem ~1000 e as cinco alternativas ficavam de fora ("…
+ALTERNATIVA 1: O consumo de m"). O modelo via o caderno truncado ("as notas atuais estão
+truncadas"), voltava à questão para completar, a nota nova também batia no teto com o mesmo
+começo, `_mesma_nota` a tomava por repetição, e nada crescia. A volta inteira se repetia.
+
+**Conserto.** Teto de 4000, corte DITO na própria nota (`_NOTA_CORTADA`, "anote o resto numa
+nota separada") e, no prompt, nota acima de 600 caracteres aparece compacta (`_nota_no_prompt`):
+começo, fim (a última alternativa, que prova que o item terminou) e "guardada INTEIRA no
+caderno: N caracteres — não precisa anotar de novo". O caderno do prompt de 10 questões fica
+em ~6 mil caracteres, menos que os 10 mil truncados de antes.
+
+**E o arquivo.** O agente do navegador não grava arquivo; quem grava é a continuação, que lia o
+resultado em `[:6000]` e teria de REDIGITAR 15–20 mil caracteres no `neo_write_file`, mais do
+que cabe numa resposta. `JobManager._itens_em_arquivo`: quando o pedido (`pedido`/`then`/`task`)
+fala em arquivo, os itens íntegros da entrega (sem os rodapés) vão para
+`/workspace/files/<titulo>-<job8>.txt`, e a continuação manda entregar ESTE com `file_save`.
+Sem pedido de arquivo nada é gravado, para não deixar no sandbox cópia do que ele navega.
+
+**Medido.** Notas do diário: 10 de 10 com 1000 caracteres. Testes com dez questões de ~1.400
+caracteres: cabem inteiras, a segunda volta não cria nem encurta nota, o arquivo sai idêntico à
+junção dos itens. neo-core 3820. **Não exercitado: o pedido num job real.**
+
+### 2026-11-05 (5) — O quiz parado na 15ª por "não produzir" (sessão `b230a40d`)
+
+"Usando meu navegador responda esse quiz de 36 perguntas" (12axes, versão curta). O job
+`379df104` respondeu uma pergunta por passo e parou na 15ª com "Parei: 12 passos seguidos sem
+acrescentar nada". O "ainda tá lá, dá pra continuar" do turno seguinte nem chegou a rodar.
+Não foi contexto: a chamada que quebrou tinha 18 mil tokens de prompt.
+
+1. **A régua só via nota NOVA.** O modelo guardava as respostas numa nota só ("Q1: Discordo.
+   Q2: …") e a reescrevia maior a cada clique; `_mesma_nota` a tomava pela mesma nota
+   (`atualizei a nota 2`) e `_contabilizar_producao` não contava. Progresso real virou giro. E
+   o orçamento (25, que só cresce com produção) não cabia 36 perguntas de qualquer jeito.
+   Conserto: nota atualizada também é produção, mas só com três provas juntas — ganhou
+   `_NOTA_CRESCEU_MIN` (3) palavras, o passo foi uma interação que deu certo (`_INTERAGE`:
+   clique, seleção, digitação, tecla; não `scroll`, `wait_for` nem `navigate`) e a tela
+   (`snapshot["tela"]`) trouxe `_TELA_INEDITA_MIN` (4) palavras nunca vistas no job, sem contar
+   número.
+2. **O "continuar" foi para o servidor.** O classificador escolheu `browser_task`. O portão só
+   promovia para o local quando a FRASE pedia o navegador dele; o job local de dois minutos
+   antes, na mesma conversa, não contava. Agora `_inherits_local()` também promove (com
+   device no canal); dali o `_browser_local_task` decide a janela e a aba como sempre. A
+   promoção por MENSAGEM continua proibida (`test_historico_so_mantem_nunca_promove`).
+3. **JSON quebrado virou a resposta.** O agente do SERVER_TOOL rodava no modelo do desktop
+   (nemotron-3.5-lightning, servido pela Io Net): 5.319 tokens, `finish_reason` nulo e os
+   argumentos do `browser_task` com uma string aberta. O `json.loads` do `get_tool_calls`
+   levantou e o `except` genérico do `_inner_loop` entregou "Erro na execução: Unterminated
+   string…". Agora a chamada quebrada não roda: o modelo é avisado e tenta de novo até
+   `_MAX_TOOL_CALL_QUEBRADA` (2) vezes, com a tool ainda forçada até a primeira rodar; depois
+   disso sai uma frase, não a exceção. O loop cognitivo já tratava isso
+   (`_MAX_TRUNCATED_TOOL_ROUNDS`). O JSON não é consertado: argumento cortado executado seria
+   tarefa pela metade.
+
+**Medido.** `scripts/replay_sem_ganho.py` reencena a régua sobre os diários e acerta a parada
+real do `379df104` (passo 18). Nos 20 diários da VPS, a régua nova só muda o desfecho dele.
+Duas réguas mais simples foram rejeitadas porque soltavam o `b8dbde34`, um giro real de 12
+`wait_for` em "Carregando Questionário…": "nota atualizada que cresceu" (o modelo
+narrava "ainda carregando" na nota, +6 palavras) e essa mesma régua com "tela de hash inédito"
+(a página mudava o hash a cada passo). Com as três provas, o `b8dbde34` para no mesmo passo e o
+loop da questão 10 do `21c563c1` não ganha orçamento. Portão: em 60 dias, 0 dos 21 jobs de
+servidor nasceram até 10 min depois de um job local da mesma conversa. Testes: quiz de 20
+perguntas numa nota só vai ao `done` com orçamento de 12; "carregando" com relógio, a mesma
+pergunta de novo e rolagem atualizando a nota param como antes; desligar cada prova derruba o
+teste dela. neo-core 3831. **Não exercitado: o quiz e o "continuar" num job real; a
+recuperação do JSON quebrado contra o modelo real.**
+
+### 2026-11-05 (6) — O mesmo quiz, respondido sem anotar (sessão `f6f96081`)
+
+Uma hora depois do conserto acima, o job `90b58ca3` retomou o quiz na pergunta 16 e parou de
+novo no passo 18 com "12 passos sem acrescentar nada", na 31ª pergunta. Desta vez o modelo
+(o mesmo deepseek-v4.1-flash; o cérebro era o nemotron-3.5-lightning, que só escreveu a tarefa)
+fez duas notas no começo e depois respondeu as perguntas 20 a 31 sem anotar nada. A régua da
+entrada anterior exige que uma nota cresça, então não viu avanço.
+
+**O que separa os quizzes que terminaram.** Os dois jobs do 12axes que chegaram ao resultado
+(`5bd1a1cc` e `d3aba1ca`, cérebro deepseek) anotaram cada resposta como nota NOVA: 46 e 49
+notas. Os dois que pararam fizeram 2 notas novas cada um. Anotar ou não é hábito do modelo, e a
+régua dependia dele.
+
+**Conserto.** Sem nota, também conta como produção o clique que o device confirmou MARCADO
+(`checked`, o "→ SELECIONADO") seguido de tela com `_TELA_INEDITA_MIN` palavras inéditas.
+Clique que só leva a outra página ("SAIU da tela") e `select` (que o device não confere) não
+entram.
+
+**Medido.** No replay dos 20 diários da VPS (`scripts/replay_sem_ganho.py`, régua D), só os dois
+quizzes mudam de desfecho; nos outros 18 a parada e o orçamento são os mesmos da régua velha.
+Testes: o quiz de 20 perguntas sem anotar vai ao `done`; marcar de novo a mesma pergunta e
+clicar em links com telas novas param como antes; desligar a regra derruba só o teste dela.
+neo-core 3834. **Não exercitado: o quiz num job real.**

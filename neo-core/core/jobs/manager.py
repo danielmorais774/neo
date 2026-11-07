@@ -13,11 +13,12 @@ em memória é fonte da verdade — o DB é. Ver ``docs/workbench-background-job
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 import re
 import shlex
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from db.models.agent_job import AgentJob
 from core.workbench.sandbox import WorkbenchSandbox, WorkbenchUnavailableError
@@ -35,6 +36,23 @@ _ADOPTED_HEARTBEAT_S = 30
 #: O log de um comando adotado é escrito de uma vez, em base64 num argumento de
 #: shell; acima disto o `write_file` bateria no limite de tamanho de argumento.
 _ADOPTED_LOG_MAX_CHARS = 90_000
+
+#: O pedido é um ARQUIVO? (ver `_itens_em_arquivo`)
+_PEDE_ARQUIVO = re.compile(
+    r"\barquivo\b|\.txt\b|\btxt\b|\bcsv\b|\bplanilha\b|\bmarkdown\b|\.md\b", re.IGNORECASE
+)
+#: Rodapé que o runner do navegador redige na entrega; o resto é coleta. Mesma
+#: lista do `_com_itens` do dispatcher.
+_RODAPE_DA_ENTREGA = ("-", "•", "⏸", "⬇", "⏳", "📸", "(")
+
+
+def _nome_de_arquivo(titulo: str) -> str:
+    """O título do job como nome de arquivo: sem acento, minúsculo, com hífen."""
+    import unicodedata
+
+    base = unicodedata.normalize("NFKD", titulo or "").encode("ascii", "ignore").decode()
+    base = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return base[:40].strip("-") or "coleta"
 
 
 class JobManager:
@@ -86,9 +104,27 @@ class JobManager:
         self._tick_task: asyncio.Task | None = None
         self._poke = asyncio.Event()
         self._stopped = False
+        #: Tarefas leves que o tick roda de tempos em tempos: `[intervalo, fn, última]`.
+        self._periodicas: list[list] = []
 
     def set_dispatcher(self, dispatcher: "ProactiveDispatcher") -> None:
         self._dispatcher = dispatcher
+
+    def add_periodic(self, fn: "Callable[[], Awaitable[Any]]", every_s: float) -> None:
+        """Roda `fn` no tick a cada `every_s` segundos (a varredura das esperas vencidas)."""
+        self._periodicas.append([max(1.0, float(every_s)), fn, 0.0])
+
+    async def _rodar_periodicas(self) -> None:
+        agora = time.monotonic()
+        for item in self._periodicas:
+            intervalo, fn, ultima = item
+            if agora - ultima < intervalo:
+                continue
+            item[2] = agora
+            try:
+                await fn()
+            except Exception as e:  # noqa: BLE001 — uma varredura nunca derruba o tick
+                logger.warning("[Jobs] tarefa periódica falhou: %s", e)
 
     def set_scheduled_runner(self, runner: "Callable[[AgentJob], Awaitable[dict]]") -> None:
         """Injeta o runner da agenda depois do boot (ele depende do AIService)."""
@@ -152,6 +188,7 @@ class JobManager:
                 await self._claim_and_spawn()
             except Exception as e:  # noqa: BLE001
                 logger.warning("[Jobs] tick error: %s", e)
+            await self._rodar_periodicas()
             try:
                 await asyncio.wait_for(self._poke.wait(), timeout=self.tick_interval)
             except asyncio.TimeoutError:
@@ -220,7 +257,7 @@ class JobManager:
 
     async def _settle(self, job: AgentJob, terminal: dict) -> None:
         """Persiste o estado terminal, enfileira a continuação (se houver) e entrega."""
-        then = str((job.spec_json or {}).get("then") or "").strip()
+        then = str((job.spec_json or {}).get("then") or "").strip() or await self._then_pendurado(job)
         if (
             then
             and terminal.get("status") == "completed"
@@ -230,7 +267,12 @@ class JobManager:
             # Quem fala com o usuário é a continuação, com o trabalho TERMINADO.
             # Avisar "terminei o OCR" agora e de novo com o arquivo pronto é ruído.
             # O caderno anota do mesmo jeito: `_note_result` fica acima do silent.
-            terminal = {**terminal, "notify_policy": "silent"}
+            #
+            # O navegador é a exceção: o que ele entrega SÃO os itens (preço, link,
+            # vendedor), colados íntegros pelo dispatcher. Silenciar trocaria a lista
+            # pela paráfrase da continuação — ela vem logo depois, só com a conclusão.
+            if job.kind != "browser_local":
+                terminal = {**terminal, "notify_policy": "silent"}
         updated = None
         try:
             updated = await self.db.update_agent_job(
@@ -242,6 +284,60 @@ class JobManager:
             logger.error("[Jobs] failed to persist terminal state for %s: %s", job.id, e)
         if updated is not None:
             await self._dispatch(updated)
+
+    async def _then_pendurado(self, job: AgentJob) -> str:
+        """O `then` que chegou DEPOIS de o job começar (o verificador de promessa
+        pendura a continuação no job que o turno abriu). O objeto em memória é de
+        quando o job foi reivindicado; o banco tem o atual."""
+        try:
+            fresco = await self.db.get_agent_job(job.id)
+        except Exception as e:  # noqa: BLE001 — sem banco, fica o que já se sabia
+            logger.debug("[Jobs] não reli o spec do job %s: %s", job.id, e)
+            return ""
+        return str(((getattr(fresco, "spec_json", None) or {}) if fresco else {}).get("then") or "").strip()
+
+    async def _itens_em_arquivo(self, job: AgentJob, terminal: dict) -> str:
+        """Grava os itens íntegros quando o pedido é um ARQUIVO. Devolve o caminho, ou ``""``.
+
+        A continuação recebe o resultado em até 6000 caracteres, e gravar o arquivo
+        com ``neo_write_file`` obrigava o modelo a REDIGITAR o conteúdo: as dez
+        questões do Portal (job d73fa72a) passam de 20 mil caracteres, mais do que
+        cabe numa resposta. Os itens já estão guardados íntegros na entrega (o
+        dispatcher os cola no chat sem redator), e o arquivo sai deles, sem passar
+        por modelo nenhum.
+
+        Só quando o pedido fala em arquivo: gravar toda coleta deixaria no
+        sandbox uma cópia do que ele navega sem ninguém ter pedido. Nunca levanta:
+        sem arquivo, a continuação é a de sempre.
+        """
+        spec = job.spec_json or {}
+        pedido = " ".join(str(spec.get(k) or "") for k in ("pedido", "then", "task"))
+        if not _PEDE_ARQUIVO.search(pedido):
+            return ""
+        entrega = (
+            (terminal.get("extra_metadata") or {}).get("entrega")
+            or (job.extra_metadata or {}).get("entrega")
+            or {}
+        )
+        itens = [str(i).strip() for i in (entrega.get("itens") or []) if str(i).strip()]
+        # Os rodapés que o runner redige (aba, downloads, diário) não são coleta.
+        # Mesma regra do `_com_itens` do dispatcher.
+        achados = [i for i in itens if not i.startswith(_RODAPE_DA_ENTREGA)]
+        conteudo = "\n\n".join(achados) + "\n"
+        # O `write_file` passa o conteúdo num argumento de shell (ver o teto acima).
+        if not achados or len(conteudo) > _ADOPTED_LOG_MAX_CHARS:
+            return ""
+        nome = f"files/{_nome_de_arquivo(job.title)}-{str(job.id)[:8]}.txt"
+        try:
+            gravado = await self.sandbox.write_file(nome, conteudo)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Jobs] itens do job %s não viraram arquivo: %s", job.id, e)
+            return ""
+        if not getattr(gravado, "ok", False):
+            logger.warning("[Jobs] itens do job %s não viraram arquivo: %s", job.id,
+                           getattr(gravado, "stderr", ""))
+            return ""
+        return self.sandbox.resolve_path(nome)
 
     async def _enqueue_continuation(self, job: AgentJob, then: str, terminal: dict) -> bool:
         """Enfileira o turno em que o Neo termina o que o job começou.
@@ -256,6 +352,9 @@ class JobManager:
         não existe.
         """
         resumo = str(terminal.get("result_summary") or "").strip()
+        arquivo_dos_itens = (
+            await self._itens_em_arquivo(job, terminal) if job.kind == "browser_local" else ""
+        )
         # O turno de continuação nasce SEM a skill que o job usou (session-1fcaa440:
         # ignorou o aviso do script e resumiu em vez de montar o arquivo). Quem sabe
         # qual skill é o próprio comando.
@@ -271,6 +370,19 @@ class JobManager:
             f"Job: '{job.title}' (job_id={job.id}), estado {terminal.get('status')}.\n"
             f"Resultado (pode estar truncado):\n{resumo[:6000] or '(sem saída)'}\n\n"
             + leitura_skill
+            + (
+                "Os itens que o navegador coletou JÁ foram entregues ao usuário, íntegros, "
+                "numa mensagem logo antes desta. Responda SÓ o combinado (o veredito, a "
+                "conclusão), citando os itens pelo nome e pelo preço — sem repetir a lista.\n"
+                if job.kind == "browser_local" else ""
+            )
+            + (
+                f"Os itens coletados JÁ estão gravados, íntegros, em `{arquivo_dos_itens}`. "
+                "Se o combinado é um arquivo, entregue ESTE com file_save (ajuste o formato com "
+                "neo_bash, se precisar). Não reescreva o conteúdo à mão: ele não cabe numa "
+                "resposta e sairia cortado.\n"
+                if arquivo_dos_itens else ""
+            )
             + "O que você deixou combinado para este momento — faça AGORA, até o fim:\n"
             f"{then}\n"
             + (_deep_read_contract(job) if job.kind == "deep_read" else "")

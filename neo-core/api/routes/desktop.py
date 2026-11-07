@@ -706,6 +706,31 @@ async def list_tools(
     return ListToolsResponse(tools=tool_schemas, count=len(tool_schemas))
 
 
+@router.get("/model-catalog", response_model=dict)
+async def get_model_catalog() -> dict:
+    """Vitrine do seletor de provider/modelo do chat (desktop e painel).
+
+    Antes cada cliente tinha o seu enum copiado à mão e eles já divergiam do core.
+    Agora a lista vem do catálogo (core/llm/catalog.py, editado no painel em
+    Configurações → Providers): só provider ativo, COM chave e com modelo marcado
+    para o seletor. ``default`` é o par que o cliente usa quando não tem escolha
+    salva — o cérebro da aba Modelos (slot ``cognitive``), que é o que o core
+    usaria se o cliente não mandasse nada.
+    """
+    from core.llm.catalog import selector_payload
+    from modules.model_config.store import get_model_config
+
+    if _ai_service is None:
+        raise HTTPException(status_code=503, detail="AI service not initialized")
+    llm = _ai_service.llm
+    brain = {"provider": llm.settings.default_provider, "model": None}
+    try:
+        brain = await get_model_config(_db, "cognitive")
+    except Exception as e:  # pragma: no cover - defensivo: a vitrine não depende disso
+        logger.warning("[model-catalog] slot cognitive ilegível: %s", e)
+    return selector_payload(llm.list_available_providers(), brain["provider"], brain["model"])
+
+
 @router.get("/sessions", response_model=dict)
 async def list_sessions(
     service_name: str = Query(default="neo-desktop-tauri", alias="service"),
@@ -819,6 +844,13 @@ async def get_persistent_session_history(
     serialized: list[dict[str, Any]] = []
     mission_cache: dict[UUID, Mission | None] = {}
     for message in messages:
+        # O texto que a agenda ou a continuação de um job manda ao turno é do
+        # sistema, não do Daniel: ao vivo o desktop nunca o mostrou, e reabrir a
+        # conversa o desenhava como bolha dele — 6.000 caracteres de
+        # "[Continuação automática…]" (session-bd44cc03). O cérebro continua
+        # vendo-o: o histórico do turno não passa por aqui.
+        if message.role == "user" and (message.extra_metadata or {}).get("source") == "schedule":
+            continue
         mission = None
         if message.mission_id:
             if message.mission_id not in mission_cache:

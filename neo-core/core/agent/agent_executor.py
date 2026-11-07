@@ -7,6 +7,7 @@ Inner loop: LLM → Tools → LLM (execução normal)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -36,6 +37,14 @@ from shared import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Chamadas de tool com JSON quebrado que o loop ainda pede de novo antes de
+#: desistir. Sessão b230a40d (2026-11-05): o nemotron-3.5-lightning devolveu os
+#: argumentos do `browser_task` com uma string aberta, o `json.loads` levantou e
+#: o `except` genérico entregou "Erro na execução: Unterminated string…" como a
+#: resposta do Neo. Mesmo teto do loop cognitivo (`_MAX_TRUNCATED_TOOL_ROUNDS`
+#: em modules/desktop/ai_service.py), que já tratava isso.
+_MAX_TOOL_CALL_QUEBRADA = 2
 
 
 class _AgentStalled(Exception):
@@ -374,6 +383,7 @@ class AgentExecutor:
         watch = watch or _StallWatch()
         status = ExecutionStatus.RUNNING
         iteration = 0
+        quebradas = 0
         final_response: str | None = None
 
         # Componentes por execução (estado isolado)
@@ -445,7 +455,13 @@ class AgentExecutor:
                 # round é o 1. Com `== 0` (como estava) o forçamento nunca
                 # disparava — toda chamada da session-d35696d4 saiu com
                 # tool_choice "auto".
-                forcando = bool(force_tool_first and iteration == 1 and available_tools)
+                #
+                # "Até a primeira tool rodar", e não "só no round 1": quando a
+                # chamada forçada volta com JSON quebrado, o round seguinte ainda
+                # é o primeiro a agir, e soltá-lo daria ao modelo a saída de
+                # responder em prosa. Sem chamada quebrada, os dois são o mesmo
+                # round (`passos` nasce vazio a cada tentativa do outer loop).
+                forcando = bool(force_tool_first and not steps and available_tools)
                 # O raciocínio do OpenRouter vem ligado sozinho, é gerado antes do
                 # primeiro token e ignora o max_tokens: na session-d35696d4 cada ida
                 # ao modelo levou 31-61s. Mesma flag do loop cognitivo — é o mesmo
@@ -469,7 +485,33 @@ class AgentExecutor:
                 )
 
                 content = response.get_content()
-                tool_calls = response.get_tool_calls()
+                try:
+                    tool_calls = response.get_tool_calls()
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    # Argumentos que não são JSON (cortados, ou com aspas
+                    # soltas). NADA roda: consertar o JSON executaria uma tarefa
+                    # pela metade, ou um e-mail com o corpo cortado.
+                    quebradas += 1
+                    logger.warning(
+                        "[agent] tool call com JSON quebrado (%d/%d): %s",
+                        quebradas, _MAX_TOOL_CALL_QUEBRADA, e,
+                    )
+                    if quebradas > _MAX_TOOL_CALL_QUEBRADA:
+                        final_response = (
+                            f"O modelo devolveu a chamada da ferramenta quebrada "
+                            f"{quebradas} vezes seguidas (JSON inválido), então nada "
+                            "foi executado. Me peça de novo; se repetir, troque o "
+                            "modelo no seletor."
+                        )
+                        status = ExecutionStatus.FAILED
+                        break
+                    context_mgr.add_user_message(
+                        "Sua última chamada de ferramenta chegou com os argumentos "
+                        f"QUEBRADOS (JSON inválido ou cortado: {e}), então ela NÃO "
+                        "rodou. Refaça a chamada com JSON válido e argumentos curtos, "
+                        "sem repetir texto longo."
+                    )
+                    continue
 
                 # 4. Sem tool calls → resposta final
                 if not tool_calls:

@@ -101,8 +101,9 @@ class ProactiveDispatcher:
         # imagens (`_append_images`) — as duas últimas por fora do modelo.
         text = self._append_images(job, self._com_itens(await self._compose(job), job))
 
-        # 1. Persiste na história da sessão de origem (se houver).
-        if job.session_id is not None:
+        # 1. Persiste na história da sessão de origem (se houver) — salvo quando o
+        #    turno agendado que produziu o texto já o gravou ali.
+        if job.session_id is not None and not await self._turno_ja_gravou(job):
             try:
                 metadados = {"source": "agent_job", "job_id": str(job.id), "kind": job.kind}
                 if (job.extra_metadata or {}).get("files"):
@@ -125,6 +126,32 @@ class ProactiveDispatcher:
             await self._publish_notch(job, text)
 
         await self._mark_notified(job)
+
+    async def _turno_ja_gravou(self, job: AgentJob) -> bool:
+        """O `texto_literal` já está na sessão, gravado pelo turno que o escreveu?
+
+        O `_run_prompt` (agenda, continuação de job) roda um turno cognitivo
+        inteiro, e o turno salva a própria resposta — com o `tool_trace` e os
+        arquivos que o turno seguinte lê. Gravar o texto de novo aqui duplicava a
+        mensagem: 4 de 4 entregas de `scheduled_prompt` desde 14/09
+        (session-bd44cc03). Olha o banco em vez de confiar num caminho, porque o
+        turno tem uma dezena de lugares que salvam a resposta. Na dúvida, grava.
+        """
+        literal = str((job.extra_metadata or {}).get("texto_literal") or "").strip()
+        if not literal:
+            return False
+        try:
+            recentes = await self.db.fetch_session_messages(
+                session_id=job.session_id, limit=5, roles=["assistant"]
+            )
+            return any(
+                str(m.content or "").strip() == literal
+                and (job.started_at is None or m.created_at >= job.started_at)
+                for m in recentes
+            )
+        except Exception as e:  # noqa: BLE001 — sem a conferência, grava como antes
+            logger.debug("[Dispatch] não conferi a sessão do job %s: %s", job.id, e)
+            return False
 
     # ------------------------------------------------------------------
 

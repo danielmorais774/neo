@@ -15,7 +15,7 @@ from sqlalchemy import Column, Integer, String, Text, Uuid as SAUuid, JSON
 from sqlmodel import Field, SQLModel
 
 # Estados terminais — o dispatcher só entrega uma vez, ao alcançar um destes.
-TERMINAL_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled", "continued"})
 
 
 class AgentJob(SQLModel, table=True):

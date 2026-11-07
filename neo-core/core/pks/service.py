@@ -473,6 +473,37 @@ class PKSService:
         """
         if get_settings().pks_ranker_v2_enabled:
             return await self._search_ranked(user_id=user_id, query=query, redact=redact)
+        antigos = await self._search_legacy(user_id=user_id, query=query, redact=redact)
+        # Pergunta com vários termos vai pela nota de prioridade (v2). Medido em
+        # prod (2026-11-02): "treino segunda terça … exercícios repetições" pela
+        # busca antiga trouxe 5 exercícios do antebraço — "repetições" casa com o
+        # campo `reps` e a nota fixa 0,75 tirava a vaga dos treinos de cada dia —
+        # e o Neo concluiu que segunda, quarta e sexta não tinham exercícios. O v2
+        # traz os cinco treinos. Pergunta curta sobre um campo ("meu cep") fica na
+        # antiga, que acha a entidade do dono pela chave (o v2 não acha); o v2 é a
+        # reserva quando ela não acha nada ("minha academia").
+        if len(self._distinctive_terms(query)) < 3 and antigos:
+            return antigos
+        try:
+            ranqueados = await self._search_ranked(user_id=user_id, query=query, redact=redact)
+        except Exception:  # noqa: BLE001 — sem o v2, a busca antiga como sempre foi
+            logger.exception("[PKS][search] ranking v2 falhou; ficando com a busca antiga")
+            return antigos
+        if not ranqueados:
+            return antigos
+        # Acerto exato de nome da busca antiga entra junto, na frente.
+        nomes = {str(r.get("name") or "").casefold() for r in ranqueados}
+        exatos = [
+            r for r in antigos
+            if r.get("matched_by") in ("name", "alias")
+            and str(r.get("name") or "").casefold() not in nomes
+        ]
+        return [*exatos, *ranqueados]
+
+    async def _search_legacy(
+        self, *, user_id: UUID, query: str, redact: bool = True
+    ) -> list[dict[str, Any]]:
+        """A busca de sempre: nome, alias, chave de campo e trigram."""
         workspace_id = await self.bootstrap.ensure_workspace(user_id)
         async with self.db.get_session() as session:
             rows = await self.repository.search_entities(session, workspace_id, query)

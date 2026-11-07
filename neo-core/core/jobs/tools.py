@@ -351,6 +351,16 @@ JOB_TOOLS: list[ToolSchema] = [
                 ),
                 required=False,
             ),
+            "then": ToolParameter(
+                type="string",
+                description=(
+                    "Opcional: o que VOCÊ faz quando o navegador terminar, como ordem "
+                    "completa (ex.: 'compare os 3 anúncios e diga qual compensa mais'). "
+                    "O resultado vem junto; o usuário recebe os itens e, logo depois, a "
+                    "sua conclusão — sem precisar pedir de novo."
+                ),
+                required=False,
+            ),
             "context": ToolParameter(
                 type="string",
                 description=(

@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules, release
+from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, llm_catalog, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules, release
 from api.auth import assert_secret_configured, auth_mode, require_owner, require_principal
 from api.security import require_panel_jwt
 from core import (
@@ -109,6 +109,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _tool_registry = ToolRegistry()
     _tool_executor = ToolExecutor(_tool_registry)
     _llm_router = LLMRouter()
+    # Catálogo de providers/modelos (painel → Providers): troca a semente pelo
+    # banco e remonta os providers com as chaves gravadas lá. Nunca levanta —
+    # sem as tabelas, segue com a semente (o mesmo catálogo de antes do CRUD).
+    from modules.llm_catalog.store import refresh as refresh_llm_catalog
+
+    _catalog = await refresh_llm_catalog(_db, _llm_router)
+    print(f"✅ LLM catalog: {_catalog.source} ({len(_catalog.providers)} providers, {len(_catalog.models)} models)")
     _session_manager = SessionManager()  # legacy in-memory (used by DesktopService)
 
     # Wire LLM into compactor after LLMRouter is ready
@@ -878,6 +885,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
         ),
     )
+    # Card de liberação que VENCE sem resposta: a tarefa que esperava por ele é
+    # encerrada com aviso, em vez de ficar "esperando você" para sempre.
+    if _job_manager is not None:
+        from core.jobs.release_resume import build_varredura_de_vencidas
+
+        _job_manager.add_periodic(
+            build_varredura_de_vencidas(db=_db, announce=build_text_announcer(_db)),
+            every_s=60,
+        )
 
     # Wire research route (neo-panel → aba Pesquisas)
     research.set_db(_db)
@@ -889,6 +905,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wire subsystem model config route (neo-panel → Modelos: memory planner +
     # Deep Research volume/writer)
     model_config.set_dependencies(_db, _llm_router)
+
+    # Wire LLM catalog CRUD (neo-panel → Providers: providers, chaves, modelos)
+    llm_catalog.set_dependencies(_db, _llm_router)
 
     # Wire voice (TTS) config route (neo-panel → Settings page)
     voice_config.set_dependencies(_db)
@@ -1060,6 +1079,7 @@ app.include_router(devices_ws_router, prefix="/api/v1")  # WebSocket — desktop
 app.include_router(app_logs.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(intent_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(llm_catalog.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(file_edit_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(datasets.install_router)

@@ -15,6 +15,7 @@ estado terminal do job — com os prints indo para o File Store pelo mesmo
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -177,6 +178,11 @@ async def _resolver_aba(
             tab_ref = int(sessao["tab_ref"])
         except (TypeError, ValueError):
             return None
+        # Aba do navegador DELE não existe no headless, e a do headless não existe
+        # no dele. Na sessão cb41834a a tarefa headless foi "reaproveitar" a aba
+        # do Edge, não achou, e só então abriu uma nova.
+        if (tab_ref < 0) != bool(spec.get("headless")):
+            continue
         # Aba do HEADLESS (ref negativa) é de um navegador que o desktop iniciou:
         # ela não existe para a extensão, e reivindicá-la de outra via daria
         # "Debugger unattached" no meio do primeiro passo.
@@ -319,6 +325,83 @@ def _respostas_para_sessao(outcome: Any) -> dict:
     respostas = list(getattr(outcome, "respostas", None) or [])
     if respostas and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release"):
         return {"respostas_memoria": respostas}
+    return {}
+
+
+def _rodape_das_abas(outcome: Any) -> str:
+    """"(abas desta tarefa: A …; B … — fechada)" — só quando houve mais de uma.
+
+    As notas lidas noutra aba levam "[aba B]"; sem este rodapé, o cérebro não
+    tinha como saber que o dado veio da página do produto e não da busca (job
+    3512cdd2: "isso é o que a página de BUSCA mostrou").
+    """
+    from core.browser_local.driver import _url_curta
+
+    abas = [a for a in (getattr(outcome, "abas", None) or []) if isinstance(a, dict)]
+    if len(abas) < 2:
+        return ""
+    partes = []
+    for a in abas:
+        estado = " — a que ficou aberta" if a.get("entregue") else ("" if a.get("viva") else " — fechada")
+        partes.append(f"{a.get('rotulo')} {_url_curta(str(a.get('url') or '')) or '(sem endereço)'}{estado}")
+    return "(abas desta tarefa: " + "; ".join(partes) + ")"
+
+
+# "Resultado final" fica de fora: é título ("RESULTADO FINAL — 3 anúncios"), não
+# veredito. "Melhor preço por GB" ficava de fora e não devia (job 9a3223a4).
+_LINHA_DE_CONCLUSAO = re.compile(
+    r"(mais barat|mais em conta|compensa|melhor (?:op|pre|custo)|menor pre|conclus|veredito"
+    r"|vencedor|recomendo|recomendação)",
+    re.IGNORECASE,
+)
+_TETO_DA_CONCLUSAO = 220
+
+
+def _frase_da_conclusao(outcome: Any) -> str:
+    """A linha de conclusão da ÚLTIMA nota, se houver — não descrição de produto."""
+    notas = list(getattr(outcome, "notes", None) or [])
+    if not notas:
+        return ""
+    for linha in reversed(str(notas[-1]).split("\n")):
+        limpa = re.sub(r"\s*\[aba [A-Z][0-9]*\]\s*$", "", linha.strip())
+        if len(limpa) > _TETO_DA_CONCLUSAO:
+            # Linha comprida: a FRASE do veredito, não a linha descartada inteira.
+            # "RESULTADO FINAL — melhor preço por GB: Anúncio 2 … = R$0,79/GB.
+            # Comparativo: …" (271 chars) saía vazia, e a mensagem perguntou "quer
+            # que eu detalhe qual passo falhou?" em vez de dar o veredito.
+            frases = re.split(r"(?<=[.!?])\s+", limpa)
+            limpa = next((f for f in frases if _LINHA_DE_CONCLUSAO.search(f)), "")
+            if len(limpa) > _TETO_DA_CONCLUSAO:
+                limpa = limpa[:_TETO_DA_CONCLUSAO].rsplit(" ", 1)[0] + "…"
+        if limpa and _LINHA_DE_CONCLUSAO.search(limpa):
+            return (
+                f"A conclusão do agente está no último item da lista abaixo: «{limpa}». "
+                "Diga-a numa frase — sem oferecer comparar de novo."
+            )
+    return ""
+
+
+def _frase_das_abas(outcome: Any) -> str:
+    """Para o redator: quantas páginas a tarefa abriu e leu em abas próprias."""
+    abas = [a for a in (getattr(outcome, "abas", None) or []) if isinstance(a, dict)]
+    notas = list(getattr(outcome, "notes", None) or [])
+    abertas = [a for a in abas if a.get("origem") != "inicial"]
+    if not abertas:
+        return ""
+    lidas = [a["rotulo"] for a in abertas if any(f"[aba {a['rotulo']}]" in n for n in notas)]
+    if not lidas:
+        return f"Abri {len(abertas)} página(s) em abas separadas; nenhuma rendeu item."
+    return (
+        f"Abri e li {len(lidas)} página(s) em abas separadas ({', '.join(lidas)}): os itens "
+        "foram lidos nessas páginas, não só na lista de onde saíram — cada um diz de qual aba veio."
+    )
+
+
+def _abas_para_sessao(outcome: Any) -> dict:
+    """As abas de uma tarefa PARADA, para a retomada continuar com elas."""
+    abas = [a for a in (getattr(outcome, "abas", None) or []) if isinstance(a, dict)]
+    if len(abas) >= 2 and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release"):
+        return {"abas": abas}
     return {}
 
 
@@ -795,6 +878,8 @@ def build_browser_local_runner(
             respondedor=_build_respondedor(pks_service, llm_router, step_model, job),
             # Retomada: o que a parada anterior respondeu e o Daniel conferiu.
             respostas_previas=list(spec.get("respostas_memoria") or []),
+            # Retomada: as abas que a tarefa tinha quando parou.
+            abas_previas=list(spec.get("abas") or []),
             pedido=str(spec.get("pedido") or ""),
         )
 
@@ -844,6 +929,7 @@ def build_browser_local_runner(
                     "release_host": pedido_liberacao.get("host") or "",
                 }
         extra_sessao.update(_respostas_para_sessao(outcome))
+        extra_sessao.update(_abas_para_sessao(outcome))
         metadata = await _gravar_sessao(
             db, job, device_id, outcome, chave_navegador, extra=extra_sessao
         )
@@ -863,6 +949,23 @@ def build_browser_local_runner(
         if outcome.url:
             summary += f"\n\n(a aba ficou em {outcome.url})"
             fecho.append(f"(a aba ficou em {outcome.url})")
+        rodape_abas = _rodape_das_abas(outcome)
+        if rodape_abas:
+            summary += f"\n\n{rodape_abas}"
+            itens.append(rodape_abas)  # liga o "[aba B]" das notas ao endereço
+            # E uma linha de PROSA para o redator, que não vê os itens: sem ela,
+            # "(a aba ficou na busca)" + "4 itens" virou "os preços são da lista
+            # de resultados — quer que eu abra os anúncios?" (job e8092a4b).
+            frase = _frase_das_abas(outcome)
+            if frase:
+                fecho.append(frase)
+        # A conclusão que o próprio agente escreveu ("MAIS BARATA: anúncio 3…"),
+        # para o redator, que não vê os itens: sem ela ele perguntava "quer que eu
+        # compare?" com o veredito no fim da lista (job a0c7951a). Com ela, 6/6
+        # mensagens disseram o veredito; antes, 0/6.
+        conclusao = _frase_da_conclusao(outcome)
+        if conclusao:
+            fecho.append(conclusao)
 
         # Instrução acionável para o cérebro. Sem ela ele reimprovisa a tarefa
         # do zero quando o usuário autoriza — foi o que produziu três jobs

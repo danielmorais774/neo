@@ -143,6 +143,56 @@ async def test_job_de_outra_sessao_nao_herda():
     assert await ex._gate_browser("browser_local_task") == "browser_local_task"
 
 
+def _job_local(session_id, *, minutos: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        kind="browser_local",
+        session_id=session_id,
+        created_at=datetime.utcnow() - timedelta(minutes=minutos),
+    )
+
+
+@pytest.mark.asyncio
+async def test_continuacao_de_tarefa_local_promove_o_servidor():
+    """Sessão b230a40d: o quiz rodava na aba dele e "ainda tá lá dar pra continuar"
+    saiu como `browser_task` — o servidor não tem a aba nem as 15 respostas."""
+    session_id = uuid4()
+    ex = _executor(
+        "ainda ta lá dar pra continuar", jobs=[_job_local(session_id, minutos=2)],
+        session_id=session_id,
+    )
+    assert await ex._gate_browser("browser_task") == "browser_local_task"
+
+
+@pytest.mark.asyncio
+async def test_tarefa_local_velha_nao_promove():
+    session_id = uuid4()
+    ex = _executor(
+        "continua", jobs=[_job_local(session_id, minutos=45)], session_id=session_id
+    )
+    assert await ex._gate_browser("browser_task") == "browser_task"
+
+
+@pytest.mark.asyncio
+async def test_tarefa_local_de_outra_conversa_nao_promove():
+    ex = _executor("continua", jobs=[_job_local(uuid4(), minutos=1)])
+    assert await ex._gate_browser("browser_task") == "browser_task"
+
+
+@pytest.mark.asyncio
+async def test_continuacao_sem_device_nao_promove():
+    session_id = uuid4()
+    ex = JobToolExecutor(
+        db=_FakeDB([_job_local(session_id, minutos=1)]),
+        job_manager=SimpleNamespace(poke=lambda: None),
+        user_id=uuid4(),
+        session_id=session_id,
+        user_message="continua",
+        device_id=None,
+    )
+    ex._enabled = True
+    assert await ex._gate_browser("browser_task") == "browser_task"
+
+
 @pytest.mark.asyncio
 async def test_tools_que_nao_sao_de_browser_passam_intactas():
     ex = _executor("no meu navegador, faz tudo")

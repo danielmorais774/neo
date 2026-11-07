@@ -1144,6 +1144,23 @@ def _open_jobs(tool_trace: list[dict[str, Any]] | None) -> tuple[list[str], bool
 _NOTE_ONLY_KEYS = ("note_detail", "noted", "primeira_linha")
 
 
+def _ultimo_job_sem_continuacao(tool_trace: list[dict[str, Any]] | None) -> str | None:
+    """O job mais recente que o turno abriu e que ainda não tem `then`."""
+    for e in reversed(tool_trace or []):
+        e = e or {}
+        if e.get("async_job") and e.get("job_id") and not e.get("then"):
+            return str(e["job_id"])
+    return None
+
+
+def _ultimo_job_aberto(tool_trace: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """A entrada do trace do job mais recente que o turno abriu, com ou sem `then`."""
+    for e in reversed(tool_trace or []):
+        if (e or {}).get("async_job") and e.get("job_id"):
+            return e
+    return None
+
+
 def _strip_note_detail(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Cópia do trace sem os campos do caderno, para tudo que paga contexto."""
     return [{k: v for k, v in (e or {}).items() if k not in _NOTE_ONLY_KEYS} for e in trace]
@@ -5918,6 +5935,14 @@ class AIService:
             if not full_response.strip():
                 full_response = "Ok 🎵"
 
+        # Autocontinuação ESCRITA pelo cérebro com job aberto neste turno: ela
+        # depende do job ("quando o job terminar, compare…") e, rodando agora, só
+        # consulta o status e manda "Ainda rodando" (session-bd44cc03: o turno
+        # passou `then` ao job E emitiu o bloco). A proteção do verificador logo
+        # abaixo nunca via este caso — ela só roda quando NÃO há bloco.
+        if enable_handoff and any(h.is_self for h in pipeline_handoffs):
+            pipeline_handoffs = await self._continuar_depois_do_job(pipeline_handoffs, tool_trace, slog)
+
         # Self-continuation backstop. The prompt contract is not enough on its own:
         # on the first E2E run the instruction was in the payload verbatim and the
         # model still closed on "vou baixar…" with no block. Same shape as the music
@@ -5959,6 +5984,23 @@ class AIService:
                 (metadata or {}).get("pipeline_work_note"),
                 dispatched,
             )
+            # Promessa que DEPENDE do job ("te aviso com o veredito de qual compensa"):
+            # rodar agora só consulta o status e responde "ainda rodando" — e o
+            # veredito se perde quando o job acaba (job b8648f0e). Pendurada no job,
+            # ela roda quando ele terminar, com o resultado na mão.
+            if synth is not None and jobs_linhas:
+                job_aberto = _ultimo_job_sem_continuacao(tool_trace)
+                if job_aberto and await self._pendurar_no_job(job_aberto, synth.input_text):
+                    logger.info(
+                        "[SELF-HANDOFF] continuação pendurada no job %s: %s",
+                        job_aberto, synth.input_text[:120],
+                    )
+                    if slog:
+                        slog.log_event(
+                            "Continuação pendurada no job",
+                            f"job {job_aberto}: {synth.input_text} — roda quando ele terminar",
+                        )
+                    synth = None
             if synth is not None:
                 pipeline_handoffs.append(synth)
                 if slog:
@@ -8924,6 +8966,69 @@ class AIService:
         same_session = [f for f in exact if session_id and f.session_id == session_id]
         pool = same_session or exact
         return max(pool, key=lambda f: f.created_at)
+
+    async def _continuar_depois_do_job(
+        self, handoffs: list["Handoff"], tool_trace: list[dict[str, Any]] | None, slog: Any = None
+    ) -> list["Handoff"]:
+        """Tira do turno a autocontinuação que tem de esperar o job que ele abriu.
+
+        Ela vira o `then` do job (ou entra junto do que já estava combinado) e roda
+        quando ele terminar, com o resultado na mão. Job que já acabou não segura
+        nada: a continuação roda agora, como antes. A entrada do trace passa a
+        dizer `then` — é por ela que o verificador logo depois sabe que a
+        continuação está combinada e não sintetiza outra para rodar já.
+        """
+        entrada = _ultimo_job_aberto(tool_trace)
+        if entrada is None:
+            return handoffs
+        mantidos: list[Handoff] = []
+        for h in handoffs:
+            if h.is_self and await self._pendurar_no_job(entrada["job_id"], h.input_text, juntar=True):
+                entrada["then"] = True
+                logger.info(
+                    "[SELF-HANDOFF] continuação escrita pendurada no job %s: %s",
+                    entrada["job_id"], h.input_text[:120],
+                )
+                if slog:
+                    slog.log_event(
+                        "Continuação pendurada no job",
+                        f"job {entrada['job_id']}: {h.input_text} — o bloco [[HANDOFF:continuar]] "
+                        "espera o job terminar, em vez de rodar agora",
+                    )
+                continue
+            mantidos.append(h)
+        return mantidos
+
+    async def _pendurar_no_job(self, job_id: str, ordem: str, *, juntar: bool = False) -> bool:
+        """A continuação vira o `then` do job aberto — se ele ainda não acabou.
+
+        ``juntar``: com `then` já combinado, a ordem entra junto dele em vez de ser
+        recusada (é a autocontinuação que o próprio cérebro escreveu — perdê-la
+        seria pior que repeti-la).
+        """
+        from uuid import UUID as _UUID
+
+        try:
+            job = await self.db.get_agent_job(_UUID(str(job_id)))
+        except Exception as exc:  # noqa: BLE001 — sem o job, a continuação roda agora
+            logger.debug("[SELF-HANDOFF] job %s ilegível: %s", job_id, exc)
+            return False
+        if job is None or job.status not in ("queued", "running"):
+            return False
+        spec = dict(job.spec_json or {})
+        ordem = str(ordem or "").strip()
+        combinado = str(spec.get("then") or "").strip()
+        if combinado and not juntar:
+            return False
+        if combinado and ordem.casefold() in combinado.casefold():
+            return True
+        spec["then"] = (f"{combinado}\n{ordem}" if combinado else ordem)[:4000]
+        try:
+            await self.db.update_agent_job(job.id, spec_json=spec)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SELF-HANDOFF] não pendurei a continuação no job %s: %s", job_id, exc)
+            return False
+        return True
 
     async def _verify_promise_continuation(
         self,

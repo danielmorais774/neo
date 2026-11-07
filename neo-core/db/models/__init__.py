@@ -43,6 +43,7 @@ from .event import EventDelivery, EventSubscription
 from .scheduled_task import ScheduledTask
 from .file_link import FileLink
 from .release_request import ReleaseRequest
+from .llm_catalog import LLMModel, LLMProvider
 
 __all__ = [
     "User",
@@ -74,6 +75,8 @@ __all__ = [
     "FinRecurring",
     "FinTransaction",
     "Credential",
+    "LLMModel",
+    "LLMProvider",
     "ServiceConnection",
     "ServiceRequestLog",
     "StoredFile",

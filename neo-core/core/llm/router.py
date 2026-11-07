@@ -1,9 +1,22 @@
 """Router para seleção e gestão de LLM providers."""
 
+import hashlib
 import logging
 from typing import Literal
 
+from core.llm import catalog
+from core.llm.catalog import (  # noqa: F401 — reexportados: o resto do core importa daqui
+    ADAPTERS,
+    ENV_KEY_FIELD,
+    ProviderSpec,
+    default_model_for,
+    models_by_provider,
+    provider_for_model,
+    supports_vision,
+    vision_models_by_provider,
+)
 from core.llm.claude_provider import ClaudeProvider
+from core.llm.compatible_provider import OpenAICompatibleProvider
 from core.llm.deepseek_provider import DeepSeekProvider
 from core.llm.gemini_provider import GeminiProvider
 from core.llm.grok_provider import GrokProvider
@@ -16,221 +29,27 @@ from shared import LLMProviderError, get_settings
 
 logger = logging.getLogger(__name__)
 
+# Os providers DE FÁBRICA. O catálogo (core/llm/catalog.py, editado no painel)
+# aceita outros nomes; isto é só tipagem dos chamadores que pedem um destes.
 ProviderType = Literal[
     "openai", "anthropic", "ollama", "deepseek", "gemini", "grok", "groq", "openrouter"
 ]
 
-# Mapeamento de nome de modelo → provider
-_MODEL_TO_PROVIDER: dict[str, str] = {
-    # OpenAI
-    "gpt-4o": "openai",
-    "gpt-4o-mini": "openai",
-    # Família 4.1: visão + parâmetros clássicos do Chat Completions
-    # (`max_tokens`/`temperature`, que é o que esta camada manda). É daqui que
-    # sai o olho do navegador local — ver browser_local_vision_model.
-    "gpt-4.1": "openai",
-    "gpt-4.1-mini": "openai",
-    "gpt-4.1-nano": "openai",
-    "gpt-4-turbo": "openai",
-    "gpt-4-turbo-preview": "openai",
-    "gpt-3.5-turbo": "openai",
-    "meta-llama/llama-4-scout-17b-16e-instruct": "openai",
-    # Anthropic
-    "claude-3-opus-20240229": "anthropic",
-    "claude-3-sonnet-20240229": "anthropic",
-    "claude-3-haiku-20240307": "anthropic",
-    # DeepSeek
-    # ``deepseek-flash`` é o id da flash atual (V4.1) na API direta; o
-    # ``deepseek-v4-flash`` saiu da listagem em 2026-09-20 mas fica aqui para
-    # que uma config antiga continue resolvendo para o provider certo.
-    "deepseek-flash": "deepseek",
-    "deepseek-v4-flash": "deepseek",
-    "deepseek-v4-pro": "deepseek",
-    "deepseek-chat": "deepseek",
-    "deepseek-reasoner": "deepseek",
-    # Gemini
-    "gemini-2.5-pro-preview-03-25": "gemini",
-    "gemini-2.0-flash": "gemini",
-    "gemini-2.0-flash-lite": "gemini",
-    "gemini-1.5-pro": "gemini",
-    "gemini-1.5-flash": "gemini",
-    # Ollama (modelos locais)
-    "gemma4:e2b": "ollama",
-    "gemma4:12b": "ollama",
-    "llama3": "ollama",
-    "llama3:8b": "ollama",
-    "llama3:70b": "ollama",
-    "mistral": "ollama",
-    "phi4": "ollama",
-    # Grok (xAI) — free plan
-    "grok-3-mini": "grok",
-    "grok-3-mini-fast": "grok",
-    "grok-2-1212": "grok",
-    # Grok (xAI) — paid
-    "grok-3": "grok",
-    "grok-3-fast": "grok",
-    # Groq (groq.com) — ultra-fast LPU inference
-    "llama-3.3-70b-versatile": "groq",
-    "llama-3.1-8b-instant": "groq",
-    "llama3-70b-8192": "groq",
-    "mixtral-8x7b-32768": "groq",
-    "gemma2-9b-it": "groq",
-    # OpenRouter (openrouter.ai) — gateway unificado (IDs no formato vendor/modelo)
-    "x-ai/grok-4.5": "openrouter",
-    "x-ai/grok-4.20": "openrouter",
-    "google/gemini-3.1-flash-lite": "openrouter",
-    "google/gemini-2.0-flash-001": "openrouter",
-    "anthropic/claude-3.5-sonnet": "openrouter",
-    "meta-llama/llama-3.3-70b-instruct": "openrouter",
-    "qwen/qwen3.5-flash-02-23": "openrouter",
-    # É o que o subagente browser-use do servidor (container neo-browser-agent)
-    # já usava, cravado no compose. Entrou no catálogo quando virou o role
-    # `browser_agent` do painel — sem estar aqui, o valor em uso aparecia como
-    # "custom" no dropdown, como se ninguém o tivesse escolhido.
-    "google/gemini-2.5-flash": "openrouter",
-    # Sufixo "@slug" = pin de provedor de infra, consumido pelo OpenRouterProvider
-    # (ver _PROVIDER_PIN_SEP lá) e nunca enviado à API. O mesmo modelo tem dezenas
-    # de endpoints no gateway e eles NÃO são equivalentes; sem o pin o gateway
-    # escolheria outro a cada chamada, com outro preço, outro teto e outra
-    # velocidade. É texto puro (não lê imagem), então fica fora de _VISION_MODELS
-    # de propósito.
-    #
-    # O V4.1 Flash **não tem endpoint do Baidu** — o pin que o V4 Flash usava não
-    # existe nesta geração. Sondados os 22 endpoints em 2026-09-20 (2 chamadas de
-    # ~200 tokens cada, mais uma com `tool_choice` forçado):
-    #   @fireworks  85/69 tok/s   tool forçada OK   $0,22/$0,66 por M
-    #   @streamlake 46/59 tok/s   tool forçada OK   $0,22/$0,88
-    #   @deepinfra  49/24 tok/s   tool forçada OK   $0,14/$0,42
-    #   @relace / @morph          404 na tool forçada (não servem o caminho quente)
-    #   @deepseek                 404 "No endpoints found" (não roteia por aqui)
-    #   sem pin     50/105 tok/s, sorteando provedor a cada chamada
-    # O @fireworks é o único que empata com os 74-80 tok/s que o @baidu entregava
-    # no V4 Flash E aceita tool forçada — por isso é ele o pin do catálogo.
-    "deepseek/deepseek-v4.1-flash@fireworks": "openrouter",
-    # O MESMO modelo sem pin. Precisa estar aqui explicitamente, e não só como
-    # opção do seletor: sem esta linha `get_provider_for_model` não acha o ID,
-    # cai no provider default e o turno vai parar em `api.deepseek.com` — que é
-    # outra carteira, hoje com saldo zero (402 "Insufficient Balance"). O ID com
-    # barra é do GATEWAY; o sem barra (`deepseek-flash`, acima) é que é a API
-    # direta da DeepSeek. Eles não são intercambiáveis.
-    "deepseek/deepseek-v4.1-flash": "openrouter",
-    # Geração anterior. Continua no mapa (e não no seletor) porque é ~6x mais
-    # barata na entrada e é para onde se volta se a V4.1 decepcionar.
-    "deepseek/deepseek-v4-flash@baidu": "openrouter",
-    "deepseek/deepseek-v4-flash": "openrouter",
+# O catálogo e as consultas sobre ele (`provider_for_model`, `supports_vision`…)
+# moravam aqui como dicts fixos. Hoje vêm de core/llm/catalog.py — banco, ou a
+# semente de core/llm/catalog_seed.py enquanto as tabelas não existem.
+
+_ADAPTER_CLASSES: dict[str, type[LLMProvider]] = {
+    "openai": OpenAIProvider,
+    "anthropic": ClaudeProvider,
+    "deepseek": DeepSeekProvider,
+    "gemini": GeminiProvider,
+    "grok": GrokProvider,
+    "groq": GroqProvider,
+    "openrouter": OpenRouterProvider,
+    "ollama": OllamaProvider,
+    "openai_compatible": OpenAICompatibleProvider,
 }
-
-
-# Modelos que aceitam imagem (content block `image_url`) — a capacidade que o
-# olho do navegador local exige.
-#
-# Isto é DADO, não confiança em quem escolhe, porque escolher errado falha de um
-# jeito silencioso e caro: a família DeepSeek responde
-#     400 "This model does not support image"
-# (sondado contra a API real em 2026-08-31, os dois modelos v4), e essa frase
-# casa com `_VISION_FAILURE_IS_PERMANENT` no driver — ou seja, apontar a visão
-# para o DeepSeek desliga a visão no PASSO 1 de todo job, sem erro visível, e a
-# tarefa inteira sai às cegas. Foi assim que o job a0eab88c queimou 25 passos
-# clicando no mesmo contêiner (ali por falta de crédito na OpenAI, mesmo efeito).
-#
-# Verificados com uma chamada real (2026-08-31): google/gemini-3.1-flash-lite
-# respondeu 200; qwen/qwen3.5-flash-02-23 e x-ai/grok-4.5 recusaram só o PNG 1x1
-# do teste ("image dimensions too small"), o que prova que leem imagem.
-_VISION_MODELS: frozenset[str] = frozenset(
-    {
-        # OpenAI — a família 4.x lê imagem; a 3.5 não.
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-4.1",
-        "gpt-4.1-mini",
-        "gpt-4.1-nano",
-        "gpt-4-turbo",
-        "gpt-4-turbo-preview",
-        # Anthropic
-        "claude-3-opus-20240229",
-        "claude-3-sonnet-20240229",
-        "claude-3-haiku-20240307",
-        # Gemini
-        "gemini-2.5-pro-preview-03-25",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
-        # OpenRouter
-        "google/gemini-3.1-flash-lite",
-        "google/gemini-2.0-flash-001",
-        "anthropic/claude-3.5-sonnet",
-        "qwen/qwen3.5-flash-02-23",
-        "x-ai/grok-4.5",
-        "x-ai/grok-4.20",
-        # input_modalities = [file, image, text, audio, video] (consultado na API
-        # do gateway em 2026-09-02). O browser-use manda print a cada passo.
-        "google/gemini-2.5-flash",
-    }
-)
-
-
-#: Modelo padrão de cada provider — o que o agente usa quando ninguém escolheu.
-#:
-#: Fica no módulo (e não dentro de `get_default_model`) porque o painel precisa
-#: EXIBIR este mesmo valor como "padrão do cérebro". Duplicar a tabela é como se
-#: constrói uma tela que mostra um modelo e um runtime que usa outro.
-DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
-    "openai": "gpt-4-turbo-preview",
-    "anthropic": "claude-3-opus-20240229",
-    "ollama": "gemma4:e2b",
-    "deepseek": "deepseek-flash",
-    "gemini": "gemini-2.0-flash",
-    "grok": "grok-3-mini",
-    "groq": "llama-3.3-70b-versatile",
-    "openrouter": "google/gemini-3.1-flash-lite",
-}
-
-
-def provider_for_model(model_name: str | None) -> str | None:
-    """Return the provider that owns ``model_name`` (or None if unknown)."""
-    if not model_name:
-        return None
-    return _MODEL_TO_PROVIDER.get(model_name)
-
-
-def supports_vision(model_name: str | None) -> bool | None:
-    """O modelo aceita imagem? ``None`` quando ele não está no catálogo.
-
-    Os três estados importam. ``False`` é um NÃO conhecido (deepseek-flash) e
-    justifica barrar a escolha; ``None`` é um modelo que o operador digitou à mão
-    e sobre o qual não temos direito de opinar — deixa passar, e o fallback do
-    driver cobre se der errado.
-    """
-    if not model_name:
-        return None
-    if model_name in _VISION_MODELS:
-        return True
-    if model_name in _MODEL_TO_PROVIDER:
-        return False
-    return None
-
-
-def vision_models_by_provider() -> dict[str, list[str]]:
-    """Catálogo só dos modelos COM visão, agrupado por provider (dropdown do painel)."""
-    catalog: dict[str, list[str]] = {}
-    for model, provider in _MODEL_TO_PROVIDER.items():
-        if model in _VISION_MODELS:
-            catalog.setdefault(provider, []).append(model)
-    return catalog
-
-
-def models_by_provider() -> dict[str, list[str]]:
-    """Catalog of known model ids grouped by provider (for UI dropdowns).
-
-    Inverts :data:`_MODEL_TO_PROVIDER`. Order within each provider follows the
-    declaration order above. ``ollama`` models are local and depend on the host,
-    so they are advertised but never the safe default for intent classification.
-    """
-    catalog: dict[str, list[str]] = {}
-    for model, provider in _MODEL_TO_PROVIDER.items():
-        catalog.setdefault(provider, []).append(model)
-    return catalog
 
 
 class LLMRouter:
@@ -240,59 +59,90 @@ class LLMRouter:
         """Inicializa o router com providers configurados."""
         self.settings = get_settings()
         self._providers: dict[str, LLMProvider] = {}
-        self._initialize_providers()
+        # Impressão digital (adapter, base_url, chave) de cada instância — o
+        # `rebuild` só recria o provider cuja config mudou, e o resto mantém o
+        # pool keep-alive (e o cache de prefixo do endpoint).
+        self._fingerprints: dict[str, str] = {}
+        self.rebuild()
 
-    def _initialize_providers(self) -> None:
-        """Inicializa providers baseado nas configurações."""
-        # OpenAI
-        if self.settings.openai_api_key:
-            self._providers["openai"] = OpenAIProvider(
-                api_key=self.settings.openai_api_key
+    def rebuild(self, db_keys: dict[str, str] | None = None) -> None:
+        """(Re)monta os providers a partir do catálogo atual.
+
+        Chamado na subida (catálogo da semente, chaves do .env) e de novo a cada
+        gravação no painel, com as chaves decifradas do banco em ``db_keys``.
+        Troca o dict INTEIRO no fim: um turno em andamento segura a instância
+        que já pegou, e o próximo `get_provider` vê o catálogo novo. Nenhum
+        serviço guarda a instância desde o boot (todos chamam `get_provider*` por
+        chamada), então trocar aqui vale para o sistema todo sem reiniciar.
+        """
+        db_keys = db_keys or {}
+        built: dict[str, LLMProvider] = {}
+        prints: dict[str, str] = {}
+        for spec in catalog.current().provider_by_name.values():
+            if not spec.enabled:
+                continue
+            adapter = ADAPTERS.get(spec.adapter)
+            if adapter is None:
+                logger.warning("Provider '%s': adapter desconhecido '%s'", spec.name, spec.adapter)
+                continue
+            key = self._resolve_key(spec, db_keys)
+            if adapter.needs_key and not key:
+                continue
+            fingerprint = hashlib.sha256(
+                f"{spec.adapter}|{spec.base_url or ''}|{key or ''}".encode()
+            ).hexdigest()
+            instance = (
+                self._providers.get(spec.name)
+                if self._fingerprints.get(spec.name) == fingerprint
+                else None
             )
-
-        # Anthropic
-        if self.settings.anthropic_api_key:
-            self._providers["anthropic"] = ClaudeProvider(
-                api_key=self.settings.anthropic_api_key
-            )
-
-        # DeepSeek
-        if self.settings.deepseek_api_key:
-            self._providers["deepseek"] = DeepSeekProvider(
-                api_key=self.settings.deepseek_api_key
-            )
-
-        # Gemini
-        if self.settings.gemini_api_key:
-            self._providers["gemini"] = GeminiProvider(
-                api_key=self.settings.gemini_api_key
-            )
-
-        # Grok (xAI)
-        if self.settings.grok_api_key:
-            self._providers["grok"] = GrokProvider(
-                api_key=self.settings.grok_api_key
-            )
-
-        # Groq (groq.com) — ultra-fast LPU
-        if self.settings.groq_api_key:
-            self._providers["groq"] = GroqProvider(
-                api_key=self.settings.groq_api_key
-            )
-
-        # OpenRouter (openrouter.ai) — gateway unificado a vários vendors
-        if self.settings.openrouter_api_key:
-            self._providers["openrouter"] = OpenRouterProvider(
-                api_key=self.settings.openrouter_api_key,
-                base_url=self.settings.openrouter_base_url,
-            )
-
-        # Ollama — sempre disponível (não requer API key)
-        self._providers["ollama"] = OllamaProvider(
-            base_url=self.settings.ollama_base_url,
-        )
-
+            if instance is None:
+                try:
+                    instance = self._instantiate(spec, key)
+                except Exception as e:  # config ruim de UM provider não derruba os outros
+                    logger.error("Provider '%s' não pôde ser criado: %s", spec.name, e)
+                    continue
+            # Só onde a classe já tem a noção de modelo padrão (OpenAI/Anthropic
+            # caem num id fixo dentro do `complete`, e o padrão deles chega pelo
+            # `get_default_model`).
+            if spec.default_model and hasattr(instance, "model"):
+                instance.model = spec.default_model
+            built[spec.name] = instance
+            prints[spec.name] = fingerprint
+        self._providers = built
+        self._fingerprints = prints
         self._apply_default_model()
+
+    def _resolve_key(self, spec: ProviderSpec, db_keys: dict[str, str]) -> str | None:
+        """Chave do painel vence; a do .env é a reserva dos providers de fábrica.
+
+        A mesma regra mora em `modules.llm_catalog.store._key_source`, que diz ao
+        painel DE ONDE veio a chave.
+        """
+        key = db_keys.get(spec.name)
+        if key:
+            return key
+        field = ENV_KEY_FIELD.get(spec.name)
+        # Só com o adapter de fábrica: "openai" recriado como openai_compatible
+        # apontando para outro servidor não pode levar a chave da OpenAI junto.
+        if field and spec.adapter == spec.name:
+            env_key = getattr(self.settings, field, None)
+            if env_key:
+                return env_key
+        return None
+
+    def _instantiate(self, spec: ProviderSpec, key: str | None) -> LLMProvider:
+        if spec.adapter == "ollama":
+            return OllamaProvider(base_url=spec.base_url or self.settings.ollama_base_url)
+        if spec.adapter == "openrouter":
+            return OpenRouterProvider(
+                api_key=key, base_url=spec.base_url or self.settings.openrouter_base_url
+            )
+        if spec.adapter == "openai_compatible":
+            return OpenAICompatibleProvider(
+                api_key=key, base_url=spec.base_url, model=spec.default_model
+            )
+        return _ADAPTER_CLASSES[spec.adapter](api_key=key)
 
     def _apply_default_model(self) -> None:
         """Faz o provider DEFAULT honrar o ``DEFAULT_MODEL`` do env.
@@ -323,7 +173,7 @@ class LLMRouter:
             return
         padrao.model = modelo
 
-    def get_provider(self, provider_name: ProviderType | None = None) -> LLMProvider:
+    def get_provider(self, provider_name: ProviderType | str | None = None) -> LLMProvider:
         """
         Retorna um provider específico ou o default.
 
@@ -353,11 +203,11 @@ class LLMRouter:
     def get_provider_for_model(self, model_name: str | None) -> LLMProvider:
         """Retorna o provider correto para um nome de modelo.
 
-        Usa o mapeamento _MODEL_TO_PROVIDER para inferir o provider.
+        Usa o catálogo (`provider_for_model`) para inferir o provider.
         Fallback para o provider default se o modelo não for reconhecido.
         """
         if model_name:
-            provider_name = _MODEL_TO_PROVIDER.get(model_name)
+            provider_name = provider_for_model(model_name)
             if provider_name and provider_name in self._providers:
                 return self._providers[provider_name]
         return self.get_provider()
@@ -373,4 +223,4 @@ class LLMRouter:
             Nome do modelo padrão
         """
         name = provider_name or self.settings.default_provider
-        return DEFAULT_MODEL_BY_PROVIDER.get(name, self.settings.default_model)
+        return default_model_for(name) or self.settings.default_model

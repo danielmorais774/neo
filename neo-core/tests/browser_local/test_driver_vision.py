@@ -1428,6 +1428,52 @@ def test_so_pedido_explicito_liga_o_acompanhamento(pedido, acompanha):
     assert bool(_ASKS_TO_FOLLOW.search(pedido)) is acompanha
 
 
+@pytest.mark.parametrize(
+    "pedido,acompanha",
+    [
+        ("baixe o arquivo e aguarde a conclusão dele", True),
+        ("baixa a pasta e espera terminar", True),
+        ("exporte o relatório e aguarde o download terminar", True),
+        ("baixa a pasta Print", False),
+        # As mesmas frases em tarefa sem download. Medido nos 164 pedidos
+        # `browser_local` do banco em 05/11: 16 dos 32 que ligavam eram assim
+        # (questionário, rastreio de pedido, formulário), e os 16 que continuam
+        # ligando são todos downloads do Drive.
+        ("Avance até o fim e chegue na tela de resultado", False),
+        ("role a página para baixo até o final e leia os comentários", False),
+        ("aguarde a página carregar e clique em Entrar", False),
+        ("garanta que todas as perguntas sejam respondidas", False),
+    ],
+)
+def test_frase_de_espera_so_liga_o_acompanhamento_quando_o_pedido_fala_de_download(
+    pedido, acompanha
+):
+    from core.browser_local.driver import _pede_acompanhar_download
+
+    assert _pede_acompanhar_download(pedido) is acompanha
+
+
+@pytest.mark.asyncio
+async def test_o_contador_do_prompt_e_do_agente_e_nao_da_pagina():
+    """Job 7b73f755: o modelo leu "Passo 8 de no máximo 53" como o tamanho do
+    quiz, concluiu que estava no modo longo e reiniciou em loop. A página estava
+    em "Question 1 of 36"."""
+
+    async def act(action, args, timeout):
+        if action == "browser.claim":
+            return {"tab_ref": 42}
+        if action == "browser.snapshot":
+            return _snapshot()
+        return {"ok": True}
+
+    provider = _FakeProvider([{"action": "done", "args": {"answer": "ok"}}])
+    driver = BrowserLocalDriver(act=act, llm=_FakeLLM({}, provider), model="texto")
+    await driver.run("responda o questionário de 36 perguntas")
+    prompt = provider.calls[0]["messages"][1].content
+    assert "Passo 1 de no máximo" not in prompt
+    assert "contador SEU, não da página" in prompt.strip().splitlines()[-1]
+
+
 @pytest.mark.asyncio
 async def test_o_arquivo_a_meio_caminho_fica_registrado_para_o_vigia():
     acted, _ = await _driver_com_downloads(

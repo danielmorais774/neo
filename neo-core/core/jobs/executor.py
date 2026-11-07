@@ -82,6 +82,23 @@ def _urls_of(*texts: Any) -> set[str]:
     return found
 
 
+def _hosts_de(*texts: Any) -> set[str]:
+    """Os hosts citados (sem ``www.``), pela mesma normalização de ``_urls_of``."""
+    return {url.split("/", 1)[0].split("#", 1)[0] for url in _urls_of(*texts)} - {""}
+
+
+# Até quando a última tarefa diz onde está o trabalho desta conversa naquele
+# site (ver `_trabalho_no_navegador_dele`). A janela herdada caduca como a aba
+# (`_ABA_VALIDA_POR` do runner): tomar a tela dele horas depois sem ele pedir é
+# a falha que o modo headless veio evitar. O login, não: o headless que parou
+# nele não passa dali, e o Portal da sessão cb41834a voltou três horas depois.
+_JANELA_HERDADA_POR = timedelta(minutes=15)
+_LOGIN_DO_HEADLESS_VALE_POR = timedelta(hours=12)
+_URL_DE_LOGIN = re.compile(
+    r"(?:^|[/#!?._-])(?:login|signin|sign-in|logon|entrar|auth)(?:$|[/?#._-])", re.IGNORECASE
+)
+
+
 def _autoridade_do_turno() -> dict[str, Any] | None:
     """O que a autoridade do turno diz sobre quem pediu — serializável, para o spec.
 
@@ -438,8 +455,14 @@ class JobToolExecutor:
         pelo meu navegador local — caminho A" e, na mensagem seguinte, "nao foi,
         acessa o meu portifolio ai". A segunda frase não tem âncora e não havia job
         local para herdar: o portão rebaixou duas vezes e o Neo disse "abri no seu
-        navegador" sobre um job no servidor. O histórico só MANTÉM o local que o
-        cérebro escolheu — nunca promove.
+        navegador" sobre um job no servidor. O histórico de MENSAGENS só MANTÉM o
+        local que o cérebro escolheu — nunca promove.
+
+        Quem promove sem pedido na frase é um JOB local desta conversa, recente
+        (sessão b230a40d): "ainda tá lá, dá pra continuar" depois de um quiz que
+        rodava na aba dele foi parar no ``browser_task``, que não tem a aba nem o
+        progresso. Aí o servidor não é uma escolha, é perder o trabalho; e o local
+        decide a janela pelas mesmas regras de sempre (``_browser_local_task``).
 
         **TOCAR mídia é a exceção que não passa por essa balança** (sessão
         0939a295): play num headless de VPS não é uma versão pior do pedido, é o
@@ -508,6 +531,12 @@ class JobToolExecutor:
             return "browser_task"
         if asked and name == "browser_task":
             logger.info("[browser-gate] promovido para browser_local_task (pediu o navegador dele)")
+            return "browser_local_task"
+        if name == "browser_task" and self.device_id and await self._inherits_local():
+            logger.info(
+                "[browser-gate] promovido para browser_local_task "
+                "(continuação de tarefa local desta conversa)"
+            )
             return "browser_local_task"
         return name
 
@@ -583,6 +612,58 @@ class JobToolExecutor:
             if local_browser_requested(str(getattr(msg, "content", "") or "")):
                 return True
         return False
+
+    async def _trabalho_no_navegador_dele(self, start_url: str, texto: str) -> str | None:
+        """O trabalho desta conversa NESTE site está no navegador dele? Devolve o motivo.
+
+        O headless é outro navegador: não tem o login dele, nem a aba em que ele
+        está, nem o que ele acabou de fazer na página. Na sessão cb41834a (Portal)
+        três de cinco tarefas foram para lá porque a mensagem não dizia "no meu
+        navegador": "continuar sem recarregar a página" caiu no login do headless,
+        "vamos responder essa" e "monta um arquivo" também.
+
+        Duas evidências, as duas do banco de jobs da conversa e do mesmo site:
+        a última tarefa ali deixou aba no navegador dele (`tab_ref` positivo), ou a
+        do headless parou numa tela de login. Tarefa que morreu sem abrir aba não
+        diz onde o trabalho está e é pulada. Nunca levanta: sem banco, o default
+        de sempre.
+        """
+        if self.session_id is None or self.user_id is None:
+            return None
+        try:
+            recentes = await self.db.list_agent_jobs(self.user_id, limit=12)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[browser-local] histórico de jobs indisponível: %s", exc)
+            return None
+        alvos = _hosts_de(start_url, texto)
+        agora = datetime.utcnow()
+        for job in recentes:
+            if job.kind != "browser_local" or str(job.session_id) != str(self.session_id):
+                continue
+            quando = getattr(job, "finished_at", None) or getattr(job, "created_at", None)
+            idade = (agora - quando) if quando is not None else timedelta(0)
+            if idade > _LOGIN_DO_HEADLESS_VALE_POR:
+                break
+            sessao = (job.extra_metadata or {}).get("browser_session") or {}
+            try:
+                aba = int(sessao.get("tab_ref") or 0)
+            except (TypeError, ValueError):
+                aba = 0
+            if not aba:
+                continue
+            url = str(sessao.get("url") or (job.spec_json or {}).get("start_url") or "")
+            hosts = _hosts_de(url)
+            if alvos and hosts and not (alvos & hosts):
+                continue
+            site = next(iter(hosts), "este site")
+            if aba > 0:
+                if idade > _JANELA_HERDADA_POR:
+                    return None
+                return f"a última tarefa desta conversa em {site} foi no navegador dele"
+            if _URL_DE_LOGIN.search(url) or "login" in str(job.result_summary or "").lower():
+                return f"o navegador sem janela parou no login de {site}"
+            return None
+        return None
 
     async def _browser_job_duplicado(self, task: str, start_url: Any = None) -> "AgentJob | None":
         """Job de browser do SERVIDOR, desta conversa, ainda vivo, com o mesmo endereço.
@@ -690,6 +771,9 @@ class JobToolExecutor:
         # redação poderia trocar o texto que ele aprovou.
         if sessao.get("respostas_memoria"):
             spec["respostas_memoria"] = sessao["respostas_memoria"]
+        # E as abas que ela tinha abertas: a retomada continua com o mesmo conjunto.
+        if sessao.get("abas"):
+            spec["abas"] = sessao["abas"]
         if sessao.get("tab_ref"):
             spec["tab_ref"] = sessao["tab_ref"]
         # Se a aba sumiu, é este endereço que se reabre — e não about:blank.
@@ -1028,10 +1112,22 @@ class JobToolExecutor:
         # sem o custo que fez o portão existir.
         from core.browser_local.gate import local_browser_requested
 
-        quer_ver = local_browser_requested(self.user_message) or bool(
-            args.get("visible")
+        quer_ver = (
+            local_browser_requested(self.user_message)
+            or bool(args.get("visible"))
+            # "abra no meu navegador" vale para as mensagens seguintes da conversa:
+            # na sessão cb41834a, "monta um arquivo com as questões", quatro
+            # minutos depois, foi para o headless e morreu.
+            or await self._asked_local_recently()
         )
         headless = not quer_ver
+        if headless:
+            motivo = await self._trabalho_no_navegador_dele(
+                str(args.get("start_url") or ""), f"{task}\n{args.get('context') or ''}"
+            )
+            if motivo:
+                logger.info("[browser-local] no navegador dele, com janela: %s", motivo)
+                headless = False
         # O `device_id` do spec é o da SUPERFÍCIE resolvida, que pode não ser o
         # device do canal (pedido pelo celular apontando o navegador do macbook).
         # O `act` do runner é `broadcaster.request(device_id, …)`, então apontar
@@ -1073,6 +1169,12 @@ class JobToolExecutor:
         start_url = str(args.get("start_url") or "").strip()
         if start_url.startswith(("http://", "https://")):
             spec["start_url"] = start_url[:500]
+        # O que o cérebro faz quando o navegador terminar ("compare e diga qual
+        # compensa"): sem isto, o veredito pedido se perdia — a mensagem do job lista
+        # os itens, e ninguém ficava encarregado de concluir (job b8648f0e).
+        then = str(args.get("then") or "").strip()
+        if then:
+            spec["then"] = then[:4000]
         try:
             spec["max_steps"] = max(3, min(int(args.get("max_steps") or settings.browser_local_max_steps), 60))
         except (TypeError, ValueError):
@@ -1456,12 +1558,17 @@ async def cancel_job(db: Any, job_manager: Any, job: AgentJob) -> dict[str, Any]
     """Cancela um job — a mesma regra para a tool `job_cancel` e a tela de tarefas."""
     if job.status in TERMINAL_STATUSES:
         return {"ok": False, "error": f"job já está {job.status}.", "status": job.status}
+    estava = job.status
     await db.update_agent_job(
         job.id,
         status="cancelled",
         finished_at=datetime.utcnow(),
         result_summary=(job.result_summary or "Cancelado pelo usuário."),
     )
+    # Cancelar a tarefa que esperava um card de liberação encerra o card junto:
+    # senão ele seguia no painel, e aprová-lo não retomaria nada.
+    if estava == "waiting":
+        await _encerrar_card_da_espera(db, job)
     # Job de research ainda na fila: o runner nunca vai rodar, então a fase
     # fina da research_task precisa ser fechada aqui (terminal ⇒ terminal).
     if job.kind == "research":
@@ -1482,6 +1589,20 @@ async def cancel_job(db: Any, job_manager: Any, job: AgentJob) -> dict[str, Any]
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "job_id": str(job.id), "status": "cancelled"}
+
+
+async def _encerrar_card_da_espera(db: Any, job: AgentJob) -> None:
+    rid = ((job.extra_metadata or {}).get("browser_session") or {}).get("release_pending")
+    if not rid:
+        return
+    try:
+        from core.release.service import ReleaseService
+
+        await ReleaseService(db).decide(
+            rid, approved=False, decided_by=job.user_id, source="tarefa_cancelada"
+        )
+    except Exception as exc:  # noqa: BLE001 — já decidido ou vencido: nada a encerrar
+        logger.info("[jobs] card %s da tarefa cancelada %s não foi encerrado: %s", rid, job.id, exc)
 
 
 def _iso(dt: datetime | None) -> str | None:

@@ -44,6 +44,9 @@ class RunTrace:
     def __init__(self, root: Path | str, job_id: str) -> None:
         self.dir = Path(root) / str(job_id)
         self.path = self.dir / "trace.md"
+        #: Prefixo dos prints. Vazio no principal; `B-` no diário do subagente da
+        #: aba B, para os dois não sobrescreverem `03-tela.jpg` um do outro.
+        self.prefixo = ""
         self.ok = False
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -51,6 +54,15 @@ class RunTrace:
             self.ok = True
         except Exception as exc:  # noqa: BLE001 — diário quebrado não para a tarefa
             logger.warning("[BrowserLocal] não consegui abrir o diário: %s", exc)
+
+    def filho(self, rotulo: str) -> "RunTrace":
+        """O diário do subagente da aba `rotulo`: `trace-B.md`, na mesma pasta."""
+        filho = RunTrace.__new__(RunTrace)
+        filho.dir = self.dir
+        filho.path = self.dir / f"trace-{rotulo}.md"
+        filho.prefixo = f"{rotulo}-"
+        filho.ok = self.ok
+        return filho
 
     # ── escrita ──────────────────────────────────────────────────────────
 
@@ -122,7 +134,7 @@ class RunTrace:
             return None
         # O print do fim ganha nome próprio: é o que vai para o chat, e no
         # diário ele precisa ser achável sem contar passos.
-        name = (
+        name = self.prefixo + (
             f"{number:02d}-final.jpg" if final
             else f"{number:02d}-painel.jpg" if recorte
             else f"{number:02d}-tela.jpg"

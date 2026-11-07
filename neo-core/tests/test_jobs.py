@@ -653,6 +653,58 @@ async def test_dispatch_carries_delivered_files_to_the_chat_and_history():
     assert db.messages[0]["metadata"]["files"][0]["file_id"] == "f1"
 
 
+class _SessaoComMensagens(_FakeDB):
+    """O banco com as respostas que o turno agendado já gravou na sessão."""
+
+    def __init__(self, ja_na_sessao):
+        super().__init__()
+        self.ja_na_sessao = ja_na_sessao
+
+    async def fetch_session_messages(self, **kwargs):
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(content=c, created_at=t) for c, t in self.ja_na_sessao]
+
+
+def _continuacao_entregue(texto: str, comecou: datetime) -> AgentJob:
+    return AgentJob(
+        user_id=uuid4(), session_id=uuid4(), kind="scheduled_prompt", title="Continuação: AliExpress",
+        spec_json={}, status="completed", result_summary=texto, started_at=comecou,
+        extra_metadata={"texto_literal": texto},
+    )
+
+
+@pytest.mark.asyncio
+async def test_resposta_que_o_turno_agendado_ja_gravou_nao_e_gravada_de_novo():
+    """session-bd44cc03: a resposta da continuação saiu 2× no banco (turno + dispatcher),
+    e foi assim em 4 de 4 entregas de `scheduled_prompt` desde 14/09."""
+    from datetime import timedelta
+
+    comecou = datetime.utcnow() - timedelta(seconds=15)
+    texto = "Concluí a verificação. O anúncio 2 mantém o melhor preço por GB."
+    db = _SessaoComMensagens([(texto + "\n", comecou + timedelta(seconds=14))])
+    broker = _FakeBroker()
+    job = _continuacao_entregue(texto, comecou)
+    db.jobs[job.id] = job
+    await ProactiveDispatcher(db=db, broker=broker).dispatch(job)
+    assert db.messages == []
+    # Ao vivo a mensagem continua chegando: só a segunda gravação some.
+    assert db.notifications and db.notifications[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_mesmo_texto_de_antes_do_job_nao_conta_e_aviso_fixo_e_gravado():
+    """"Bom dia" de ontem, igual ao de hoje, não é a cópia deste turno."""
+    from datetime import timedelta
+
+    comecou = datetime.utcnow()
+    db = _SessaoComMensagens([("Bom dia.", comecou - timedelta(days=1))])
+    job = _continuacao_entregue("Bom dia.", comecou)
+    db.jobs[job.id] = job
+    await ProactiveDispatcher(db=db, broker=_FakeBroker()).dispatch(job)
+    assert [m["content"] for m in db.messages] == ["Bom dia."]
+
+
 @pytest.mark.asyncio
 async def test_scheduled_prompt_turn_keeps_the_files_it_delivered():
     from types import SimpleNamespace

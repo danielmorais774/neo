@@ -50,7 +50,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,17 @@ ACTIONS = {
     # e envie": na sessão e752a399 quatro dos cinco treinos do formulário foram
     # inventados e enviados. Ver `core/browser_local/respondedor.py`.
     "consultar": ("perguntas",),
+    # As ABAS (docs/browser-multi-aba-plan.md §3.3). Rodam no servidor, como
+    # `note`: o device recebe `focus_tab`/`close_tab`, nunca estes nomes.
+    "trocar_aba": ("aba",),
+    "fechar_aba": (),
+    # `{"ref": 27}` (o link da página) ou `{"url": …}`. Em segundo plano: o
+    # agente fica onde está (o clique do meio), e a lista não sai do lugar.
+    "abrir_aba": (),
+    # O PARALELO (docs/browser-multi-aba-plan.md §5). `ler_abas` lê várias abas
+    # de uma vez sem LLM por aba; `paralelo` põe um subagente em cada uma.
+    "ler_abas": ("abas",),
+    "paralelo": ("tarefas",),
     "done": ("answer",),
     "give_up": ("reason",),
 }
@@ -154,6 +165,34 @@ _SEM_GANHO_MAX = 12
 
 #: A cutucada vem antes, e é ela que deve resolver — a parada é a rede.
 _SEM_GANHO_AVISO = _SEM_GANHO_MAX - 4
+
+#: Nota ATUALIZADA também é produção, mas só com as três provas juntas: a nota
+#: ganhou >= `_NOTA_CRESCEU_MIN` palavras, o passo foi uma interação que deu certo
+#: (`_INTERAGE`) e a tela trouxe >= `_TELA_INEDITA_MIN` palavras nunca vistas no job.
+#:
+#: O job 379df104 (quiz de 36 perguntas) guardava as respostas numa nota só,
+#: crescendo a cada clique, e foi parado na 15ª como se girasse. Mas "a nota
+#: cresceu", sozinha ou com "a tela mudou", soltaria o b8dbde34: 12 passos de
+#: `wait_for` em "Carregando Questionário…", com o modelo narrando "ainda
+#: carregando" na nota (+6 palavras) e a página mudando o hash a cada passo.
+#: MEDIDO no replay dos 20 diários da VPS (2026-11-05): com as três provas, só o
+#: 379df104 muda de desfecho; o b8dbde34 para no mesmo passo e o loop da questão 10
+#: do 21c563c1 não ganha orçamento.
+#:
+#: E sem nota nenhuma: o clique que o device confirmou MARCADO (`checked`, o
+#: "→ SELECIONADO"), seguido de tela com palavras inéditas, é resposta dada e
+#: pergunta nova. O job 90b58ca3 (o mesmo quiz, uma hora depois) respondeu as
+#: perguntas 20 a 31 sem anotar nada e parou igual: anotar ou não é hábito do
+#: modelo, e os dois jobs que terminaram o quiz só passaram porque anotaram cada
+#: resposta como nota nova. Clique em link ("SAIU da tela") não entra: é ele que
+#: leva a páginas novas sem ser resposta. Mesmo replay: só os dois quizzes mudam.
+_NOTA_CRESCEU_MIN = 3
+_TELA_INEDITA_MIN = 4
+_INTERAGE = frozenset({"click", "click_text", "dblclick", "fill", "select", "press"})
+
+#: Palavra de TELA para a prova acima: só letras, 3+ caracteres. Número fica de
+#: fora de propósito — relógio, contador e "Pergunta 14 de 36" mudam sozinhos.
+_PALAVRA_DA_TELA = re.compile(r"[^\W\d_]{3,}")
 
 #: Mesma tela pela N-ésima vez COM O CADERNO VAZIO. É o outro desfecho que o teto
 #: fixo não distinguia: não "já tenho o que pediram e sigo conferindo", mas
@@ -328,8 +367,18 @@ _MAIN_ALEM_DA_TELA = 2500
 _EXTRACT_CHARS = 3500
 
 #: Teto de UMA anotação. Era 400, cortados em silêncio, e a nota é o que vai para
-#: o usuário: no job 45e85695 a URL pedida saiu "…amazon.com.br/dp/B0F".
-_NOTA_MAX = 1000
+#: o usuário: no job 45e85695 a URL pedida saiu "…amazon.com.br/dp/B0F". Depois
+#: 1000, e foi o mesmo defeito com item maior: no job d73fa72a cada questão do
+#: Portal (enunciado de ~1000 caracteres e cinco alternativas) foi cortada antes
+#: das alternativas. O modelo via a nota truncada, voltava à questão para
+#: completar, a nota nova tinha o mesmo começo e era tida como repetida, e ele
+#: percorreu as 10 questões duas vezes até o PARE. O corte, quando há, é
+#: marcado (`_NOTA_CORTADA`), e o caderno no prompt mostra a nota longa compacta
+#: (`_nota_no_prompt`), para o teto alto não inchar todo passo.
+_NOTA_MAX = 4000
+_NOTA_CORTADA = " …[CORTADA no teto da nota: anote o resto numa nota separada]"
+#: Acima disto a nota aparece no prompt por começo e fim.
+_NOTA_NO_PROMPT = 600
 
 #: Quantas anotações entram numa decisão. Só contém resposta que desandou: uma
 #: tela de listagem rende de 3 a 6 itens.
@@ -360,6 +409,30 @@ def _fichas(texto: str) -> set[str]:
         # Dígito sozinho fica: é ele que separa "PRODUTO 1" de "PRODUTO 4".
         if len(limpa := bruto.strip(".,;:()[]\"'—–-").casefold()) > 1 or limpa.isdigit()
     }
+
+
+def _nota_cortada(texto: str) -> str:
+    """A nota no teto, com o corte DITO: cortar calado é o que fazia o modelo voltar."""
+    texto = texto.strip()
+    if len(texto) <= _NOTA_MAX:
+        return texto
+    return texto[:_NOTA_MAX].rstrip() + _NOTA_CORTADA
+
+
+def _nota_no_prompt(nota: str) -> str:
+    """Como uma nota aparece no caderno do prompt.
+
+    Inteira até `_NOTA_NO_PROMPT`. Acima, começo e fim, e o tamanho guardado: o
+    começo diz qual item é, o fim mostra que ele terminou (a última alternativa,
+    o último campo) e o tamanho diz que não falta nada. A nota inteira continua no
+    caderno, que é o que vai para o usuário.
+    """
+    if len(nota) <= _NOTA_NO_PROMPT:
+        return nota
+    return (
+        f"{nota[:320].rstrip()} … {nota[-200:].lstrip()} "
+        f"[guardada INTEIRA no caderno: {len(nota)} caracteres — não precisa anotar de novo]"
+    )
 
 
 def _mesma_nota(a: str, b: str) -> bool:
@@ -449,6 +522,32 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 
+#: Controles que JOGAM FORA o progresso feito na página: recomeçar, voltar ao
+#: início, limpar o formulário. No job f9370b43 o agente respondeu as 36
+#: perguntas do 12axes, leu a etapa seguinte ("Identifying your archetype 1 of
+#: 6") como o quiz reiniciando e clicou em "Back to start": as 36 respostas se
+#: perderam. O rótulo é o sinal, como no `_SENSITIVE`.
+_DESFAZ_PROGRESSO = re.compile(
+    r"\b(restart|start\s+over|reset|recome[cç]\w*|reinici\w*|come[cç]ar\s+de\s+novo"
+    r"|voltar\s+(ao|para\s+o)\s+in[ií]cio|back\s+to\s+(the\s+)?(start|beginning)"
+    r"|limpar\s+(tudo|(o\s+)?formul[aá]rio|(as\s+)?respostas)|clear\s+(all|form|answers))\b",
+    re.IGNORECASE,
+)
+#: A resposta do `look` fala de ESTADO de controle? (ver `_com_estado_do_dom`)
+_FALA_DE_ESTADO = re.compile(
+    r"marcad|selecionad|habilitad|desabilitad|ativad|desativad|cinza|apagad|"
+    r"disabled|enabled|checked|selected",
+    re.IGNORECASE,
+)
+_FALA_DE_HABILITADO = re.compile(r"habilitad|desabilitad|cinza|apagad|disabled|enabled", re.IGNORECASE)
+#: Número citado na resposta da visão, sozinho ou em faixa ("51 a 59"). Não pega
+#: preço nem percentual: o número não pode encostar em vírgula, ponto ou `%`.
+_NUMERO_CITADO = re.compile(r"(?<![\d,.])(\d{1,3})(?:\s*(?:a|até|-|–)\s*(\d{1,3}))?(?![\d,.%])")
+
+#: Anotações no caderno a partir das quais existe progresso a perder, e quantas
+#: a mais rearmam o aviso depois de o modelo ter insistido.
+_PROGRESSO_MIN = 5
+
 #: O clique que ENTREGA um formulário. Não é `_SENSITIVE`: enviar um formulário
 #: não é irreversível por si — o que pede o olho do Daniel é o CONTEÚDO, quando
 #: foi o Neo quem o escreveu (`_check_revisao`). Na sessão e752a399 o "Enviar"
@@ -468,6 +567,108 @@ _ACTUATING = frozenset(
         "fill", "select", "press", "scroll",
     }
 )
+
+#: Ações que podem fazer a PÁGINA abrir outra aba (link `_blank`, `window.open`).
+#: O device devolve `abas_novas` no resultado delas.
+_PODE_ABRIR_ABA = frozenset({"click", "click_text", "dblclick", "press"})
+
+#: Abas vivas por tarefa. Acima disto, a aba que a página abrir é fechada na hora
+#: e o `abrir_aba` é recusado.
+_MAX_ABAS = 6
+#: "[aba C]" dentro de uma nota: ela já diz de qual aba veio.
+_MARCA_DE_ABA = re.compile(r"\[aba [A-Z][0-9]*\]")
+
+#: Ações que trabalham com ABAS (e não com a tela da aba ativa).
+_ACOES_DE_ABA = frozenset({"abrir_aba", "trocar_aba", "fechar_aba", "ler_abas", "paralelo"})
+
+#: Subagentes rodando ao mesmo tempo no `paralelo`, e o orçamento de cada um.
+_PARALELO_MAX = 3
+_PASSOS_FILHO = 6
+_PASSOS_FILHO_MAX = 10
+#: Texto por aba no `ler_abas`. Medido nas páginas de anúncio do job d77daa59:
+#: preço por volta do caractere 350, vendedor do 600, e frete/entrega só entre
+#: 1800 e 2350 — com 1500 o frete ficava de fora. É uma leitura só; depois o
+#: histórico encurta o passo.
+_LER_ABAS_CHARS = 3000
+#: O que o subagente NÃO faz: mexer em abas, abrir outro paralelo, consultar a
+#: memória do Daniel. O irreversível ele também não faz — para e devolve.
+_PROIBIDAS_AO_FILHO = frozenset(
+    {"paralelo", "ler_abas", "abrir_aba", "trocar_aba", "fechar_aba", "consultar"}
+)
+
+#: No headless o gerente de abas (desktop, `services/headless.rs`) fecha a mais
+#: antiga acima de 3 — e a mais antiga é a própria lista de onde a tarefa abriu.
+_MAX_ABAS_HEADLESS = 3
+
+
+@dataclass
+class Aba:
+    """Uma aba da tarefa. O modelo só vê o `rotulo` (A, B, C…), nunca o `tab_ref`.
+
+    `origem`: ``inicial`` (a que a tarefa recebeu — nunca é fechada por ela),
+    ``site`` (a página abriu) ou ``agente`` (o Neo abriu).
+    """
+
+    rotulo: str
+    tab_ref: int
+    origem: str
+    aberta_por: str | None = None
+    url: str = ""
+    titulo: str = ""
+    viva: bool = True
+    #: Por que o agente fechou (o `motivo` do `fechar_aba`). É a memória que
+    #: faltou no job e8092a4b: "não é a BC-250" ficou só no pensamento do passo,
+    #: e o mesmo anúncio foi reaberto mais duas vezes.
+    motivo: str = ""
+
+
+_URL_NA_TAREFA = re.compile(r"https?://[^\s'\"<>)\]]+")
+#: Segmento de caminho que IDENTIFICA a página (o id de um formulário, de um
+#: documento). Mesmo site com outro id é outro lugar.
+_ID_NO_CAMINHO = re.compile(r"[A-Za-z0-9_-]{16,}")
+
+
+def _url_da_tarefa(task: str) -> str:
+    achado = _URL_NA_TAREFA.search(str(task or ""))
+    return achado.group(0).rstrip(".,;:!?") if achado else ""
+
+
+def _mesmo_lugar(atual: str, alvo: str) -> bool:
+    """A aba já está onde a tarefa manda começar? (sem query; o id do caminho conta)"""
+    a, b = urlparse(str(atual or "")), urlparse(str(alvo or ""))
+    # `www.` não distingue site: `www.aliexpress.com` e `pt.aliexpress.com` são o mesmo.
+    ha = (a.hostname or "").lower().removeprefix("www.")
+    hb = (b.hostname or "").lower().removeprefix("www.")
+    if not ha or not hb:
+        return False
+    if not (ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)):
+        return False
+    return all(i in a.path for i in _ID_NO_CAMINHO.findall(b.path))
+
+
+def _url_curta(url: str, limite: int = 70) -> str:
+    """``pt.aliexpress.com/item/1005008976362329.html`` — sem esquema nem query."""
+    texto = str(url or "")
+    for prefixo in ("https://", "http://"):
+        if texto.startswith(prefixo):
+            texto = texto[len(prefixo):]
+    texto = texto.split("?")[0].split("#")[0]
+    return texto if len(texto) <= limite else texto[: limite - 1] + "…"
+
+
+def _sem_parametro_cortado(href: str) -> str:
+    """O link que o snapshot cortou, sem o último parâmetro (o que ficou pela metade).
+
+    Abrir o corte como veio é mandar um `%xx` partido ao site: na aba D do job
+    9a3223a4 (href cortado em `…110.02%`) a página do produto veio vazia, e a mesma
+    aba carregou na hora com o endereço limpo.
+    """
+    base, sep, consulta = href.split("#")[0].partition("?")
+    if not sep:
+        return base
+    consulta = consulta.rsplit("&", 1)[0] if "&" in consulta else ""
+    return f"{base}?{consulta}" if consulta else base
+
 
 # Controle que MATA um download em andamento. Não é "sensível" no sentido de
 # pedir confirmação — é simplesmente a ação errada quando fomos NÓS que
@@ -501,6 +702,51 @@ _ASKS_TO_FOLLOW = re.compile(
     r"|acompanh\w+\s+(o\s+)?download|tudo\s+ocorra?\s+bem",
     re.IGNORECASE,
 )
+
+# "Até o fim", "aguarde" e "garanta que" aparecem em tarefa de qualquer site: o
+# job 2611e76d (um questionário, sem download nenhum) ligou o acompanhamento por
+# "avance até o fim e chegue na tela de resultado". Essas frases só falam do
+# download quando o pedido fala de baixar alguma coisa. "Baixo" é direção.
+_FALA_DE_DOWNLOAD = re.compile(
+    r"\bbaix(?!os?\b)\w*|download|\bzip\b|\barquivo|\bexport\w*|\bpdf\b",
+    re.IGNORECASE,
+)
+
+
+def _pede_acompanhar_download(texto: str) -> bool:
+    return bool(_ASKS_TO_FOLLOW.search(texto) and _FALA_DE_DOWNLOAD.search(texto))
+
+
+_ABRE_THOUGHT = re.compile(r'\s*\{\s*"thought"\s*:\s*"')
+_DEPOIS_DO_THOUGHT = re.compile(r'"\s*,\s*"(?:anotar|action)"\s*:')
+
+
+def _consertar_aspas_do_thought(text: str) -> dict | None:
+    """Aspas sem escape no `thought` são o JSON inválido mais comum, e o mais bobo.
+
+    O `thought` é prosa e o modelo cita código nele: no job f9370b43 ele escreveu
+    `click({"ref": 5})` no meio do raciocínio, o parser parou no caractere 346, e
+    a decisão, que estava CERTA (responder a etapa nova do quiz), virou recusa.
+    Na nova rodada ele decidiu outra coisa e apagou as 36 respostas.
+
+    Só o `thought` é consertado: ele nunca vira ação. `action` e `args` têm de
+    sair do parser como vieram, senão o conserto inventaria argumento. As duas
+    pontas candidatas (a primeira e a última chave depois dele) cobrem o caso em
+    que o próprio raciocínio cita `"action":`.
+    """
+    abre = _ABRE_THOUGHT.match(text)
+    if not abre:
+        return None
+    pontas = [m.start() for m in _DEPOIS_DO_THOUGHT.finditer(text, abre.end())]
+    for fim in dict.fromkeys(pontas[:1] + pontas[-1:]):
+        miolo = re.sub(r'(?<!\\)"', r'\\"', text[abre.end():fim])
+        try:
+            decisao = json.loads(text[: abre.end()] + miolo + text[fim:], strict=False)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decisao, dict) and decisao.get("action"):
+            return decisao
+    return None
 
 # Falha do modelo de VISÃO que não adianta repetir: cota/crédito da chave e
 # modelo que simplesmente não aceita imagem. Tudo o mais (timeout, 5xx, rede,
@@ -552,6 +798,16 @@ def _acao_em_palavras(action: str, args: dict, alvo: str = "") -> str:
         return f"olhando a tela: {str(args.get('pergunta') or '')[:70]}"
     if action == "note":
         return "anotando no caderno"
+    if action == "trocar_aba":
+        return f"indo para a aba {str(args.get('aba') or '')[:4]}"
+    if action == "fechar_aba":
+        return "fechando a aba e voltando"
+    if action == "ler_abas":
+        return f"lendo {len(args.get('abas') or [])} abas de uma vez"
+    if action == "paralelo":
+        return f"trabalhando em {len(args.get('tarefas') or [])} abas ao mesmo tempo"
+    if action == "abrir_aba":
+        return f"abrindo {_url_curta(str(args.get('url') or ''), 60) or 'um link'} noutra aba"
     if action == "consultar":
         n = len(args.get("perguntas") or [])
         return f"consultando sua memória ({n} {'pergunta' if n == 1 else 'perguntas'})"
@@ -798,6 +1054,10 @@ class DriverResult:
     #: as herda, para enviar exatamente o que o Daniel conferiu — sem consultar
     #: de novo e correr o risco de outra redação.
     respostas: list[dict] = field(default_factory=list)
+    #: As abas da tarefa (só quando houve mais de uma): rótulo, endereço, quem
+    #: abriu, se ainda está aberta e qual é a entregue. É o que liga o "[aba B]"
+    #: das notas ao endereço onde o dado foi lido.
+    abas: list[dict] = field(default_factory=list)
 
 
 #: System prompt dos OLHOS. Um trabalho só: responder sobre a imagem.
@@ -961,6 +1221,24 @@ Ações e argumentos:
                                           OLHA a tela e responde à sua pergunta.
                                           Sem `pergunta` ele descreve o que há na
                                           tela — prefira perguntar algo específico
+- trocar_aba {"aba": "A"}                passa a agir na aba A (o bloco ABAS lista as
+                                          abertas; a ▶ é onde você está)
+- ler_abas {"abas": ["B", "C", "D"]}      lê as abas de uma vez (sem trocar de aba)
+            {"abas": ["B","C"], "busca": "frete"}  o Ctrl+F em cada uma
+- paralelo {"tarefas": [{"aba": "B", "objetivo": "preço da versão 16GB e frete"},
+                        {"aba": "C", "objetivo": "o mesmo"}]}
+                                          um subagente em cada aba, ao mesmo tempo;
+                                          as notas deles caem no seu caderno
+- abrir_aba {"ref": 27}                   abre o LINK 27 numa aba nova, em segundo
+                                          plano — você continua aqui
+            {"url": "https://..."}        o mesmo, com um endereço
+- fechar_aba {"motivo": "não é a placa"}  fecha a aba onde você está e VOLTA para a
+                                          que a abriu. O `motivo` (curto) fica na
+                                          lista de abas já fechadas — é como você
+                                          lembra por que não volta lá. Fechou sem
+                                          anotar nada? Diga o motivo. `{"aba": "B"}`
+                                          fecha outra. A aba em que a tarefa
+                                          começou não fecha
 - consultar {"perguntas": ["Nome da academia que você frequenta?",
                            "Coloque o treino de segunda-feira"]}
                                           pergunta à MEMÓRIA do Daniel e devolve a
@@ -981,6 +1259,21 @@ Ações e argumentos:
 - give_up   {"reason": "por que não deu"}         quando é impossível continuar
 
 Regras:
+- **ABAS: quando um clique abre outra aba, você vai junto.** O resultado do passo
+  diz "o clique abriu a aba B" e daí em diante tudo acontece na B. A aba de onde
+  você veio continua aberta. Terminou o que veio fazer na B e precisa da
+  anterior (o próximo item da lista, por exemplo)? `fechar_aba` fecha a B e te
+  devolve para lá. A resposta está na B e não precisa voltar? Conclua ali mesmo.
+  Nunca reabra pela URL o que já está aberto noutra aba;
+- **VÁRIOS itens de uma lista: abra TODOS primeiro — um `abrir_aba` por passo,
+  com o `ref` do link — e só depois trabalhe neles, todos de uma vez.** Para LER
+  (preço, frete, vendedor): `ler_abas`. Se cada um pede INTERAÇÃO (escolher a
+  versão, a capacidade ou a cor, calcular o frete, abrir "especificações"):
+  `paralelo`, um subagente por aba, cada um com o objetivo do que clicar e anotar.
+  A lista fica parada na aba dela: abrir a partir dela não recarrega a página nem
+  muda os números dos elementos. Visitar uma por uma (`trocar_aba`, anote,
+  `fechar_aba`) fica para um item só, ou para quando você mesmo precisa decidir
+  algo ali;
 - **formulário sobre o Daniel: resposta que a TAREFA não trouxe escrita vem do
   `consultar`, nunca da sua cabeça.** Treino, academia, preferência, histórico,
   objetivo: você não sabe, a memória dele sabe. Leia as perguntas na tela,
@@ -1084,6 +1377,11 @@ COMO LER A PÁGINA:
   nunca é clicável. O que está escrito ali não precisa de `look`;
 - `scroll` traz mais: essa seção acompanha a rolagem. O resto do texto da página,
   sem menus, vem nas seções seguintes;
+- `>>> AVISO NA TELA` é o que a página disse POR CIMA dela (toast, faixa,
+  "lembre-se de…"). Quando vem "APARECEU AGORA", é a resposta da página à sua
+  última ação: leia antes de agir de novo. Um aviso de que a etapa terminou
+  ("você respondeu todas", "salvo", "enviado") quer dizer que repetir a ação não
+  muda nada;
 - procurando algo específico, `extract {"busca": "termo"}` acha em qualquer parte
   da página, sem rolar, e te diz quando NÃO tem. "Não tem" também é resposta:
   anote "não informado" e siga, não procure de novo com outro nome;
@@ -1183,6 +1481,8 @@ class BrowserLocalDriver:
         respondedor: Any = None,
         respostas_previas: list[dict] | None = None,
         pedido: str = "",
+        abas_previas: list[dict] | None = None,
+        filho: bool = False,
     ) -> None:
         self._act = act
         # A memória por pergunta (`consultar`). Sem respondedor a ação responde
@@ -1204,6 +1504,25 @@ class BrowserLocalDriver:
         #: escreveu (o marcador, nunca o dado real) e de onde ele veio. É a
         #: matéria da conferência antes do "Enviar" (`_check_revisao`).
         self._preenchidos: list[dict] = []
+        #: As abas da tarefa, por rótulo, na ordem em que nasceram. A ATIVA é a
+        #: do `self._tab_ref` — é nela que toda ação acontece.
+        self._abas: dict[str, Aba] = {}
+        self._ativa = ""
+        #: Frase sobre aba nova que o último passo produziu (ver `_perform`).
+        self._aviso_aba = ""
+        #: O que aconteceu com as abas ENTRE os passos (a página fechou a ativa).
+        #: Vai uma vez no prompt do passo seguinte.
+        self._aviso_entre_passos = ""
+        #: Onde estava a aba reaproveitada quando a tarefa a pegou.
+        self._url_reaproveitada = ""
+        #: A tarefa PAROU para o Daniel (confirmação, liberação). Aí as abas
+        #: ficam abertas: a retomada continua com elas (`abas_previas`).
+        self._pausada = False
+        #: As abas da tarefa que parou, de `browser_session["abas"]`.
+        self._abas_previas = [a for a in (abas_previas or []) if isinstance(a, dict)]
+        #: Subagente do `paralelo`: trabalha na aba que o principal deu (já
+        #: conectada), sem reivindicar, sem sondar downloads e sem soltar.
+        self._filho = bool(filho)
         # Preenchimento escopado (docs/release-request-plan.md §7.2 / F3b): o
         # modelo escreve `«pks:campo»` num `fill` e QUEM substitui é o driver,
         # só se houver liberação aprovada para este domínio. Sem filler, o
@@ -1314,6 +1633,9 @@ class BrowserLocalDriver:
         # já foi avisado de que mandar baixar de novo duplica.
         self._download_done: list[str] = []
         self._redownload_warned = False
+        # Rótulo de recomeço já avisado → tamanho do caderno quando avisou
+        # (ver `_check_desfaz_progresso`).
+        self._avisos_de_recomeco: dict[str, int] = {}
         # Há um clique de download PENDENTE de conferência: disparamos um e
         # ainda não olhamos a pasta desde então. Enquanto isto estiver ligado, o
         # próximo clique de download é recusado — a única saída é chamar
@@ -1387,6 +1709,12 @@ class BrowserLocalDriver:
         #: TRÊS fontes de nota (o `note` do modelo, o auto-caderno do `extract` e
         #: a transcrição de painel) sem espalhar contabilidade por elas.
         self._notas_contadas = 0
+        #: As provas de "nota atualizada é produção" (ver `_NOTA_CRESCEU_MIN`):
+        #: o que o passo anterior fez e todas as palavras que a tela já mostrou.
+        self._nota_cresceu = False
+        self._interagiu = False
+        self._marcou = False
+        self._palavras_vistas: set[str] = set()
         #: Rodadas seguidas paradas numa tela de login. Uma é acidente de
         #: redirect e o modelo ainda pode sair dela; duas é parede.
         self._rodadas_na_parede = 0
@@ -1455,6 +1783,14 @@ class BrowserLocalDriver:
     # ── canal ────────────────────────────────────────────────────────────
 
     async def _call(self, action: str, args: dict | None = None) -> dict:
+        if self._filho:
+            # A aba é do principal: o filho não a reivindica (ela já está
+            # conectada), não a solta (o principal continua nela) e não sonda
+            # downloads (é do job, e o principal sonda).
+            if action == "browser.claim":
+                return {"tab_ref": self.tab_ref_pedido}
+            if action in ("browser.release", "browser.downloads"):
+                return {"ok": True, "files": [], "count": 0}
         short = action.replace("browser.", "")
         timeout = _STEP_TIMEOUTS.get(short, _DEFAULT_STEP_TIMEOUT)
         payload = dict(args or {})
@@ -1538,7 +1874,15 @@ class BrowserLocalDriver:
         # incondicionalmente; esta aqui é palpite tirado do texto da tarefa, e
         # palpite não tranca a porta antes de a tarefa começar.
         host = self._host_of(url)
-        if self._allowed_hosts and host and host not in self._allowed_hosts:
+        # Subdomínio do que está no escopo é o mesmo site: o AliExpress manda
+        # `aliexpress.com` para `pt.aliexpress.com`, e o escopo da tarefa (tirado do
+        # texto) só tinha `aliexpress.com` — o `navigate` para a página em que a aba
+        # JÁ estava foi recusado (job b8648f0e). O sufixo exige o ponto antes:
+        # `aliexpress.com.golpe.tld` não passa.
+        no_escopo = host in self._allowed_hosts or any(
+            host.endswith("." + h) for h in self._allowed_hosts if h
+        )
+        if self._allowed_hosts and host and not no_escopo:
             if not self._navegou:
                 logger.info(
                     "[BrowserLocal] escopo era %s; primeira navegação para %s liberada",
@@ -1560,6 +1904,8 @@ class BrowserLocalDriver:
         claim numa aba morta derruba o job inteiro em vez de simplesmente abrir
         uma nova. Aqui o `não` é barato — cai para aba nova e a tarefa segue.
         """
+        if self._filho:
+            return True  # a aba foi dada pelo principal, que acabou de usá-la
         try:
             resposta = await self._call(
                 "browser.tabs", {"mode": "headless"} if self.headless else {}
@@ -1579,6 +1925,7 @@ class BrowserLocalDriver:
             if self._is_blocked(url):
                 self._log("note", "a aba anterior foi para domínio proibido", "abro uma nova")
                 return False
+            self._url_reaproveitada = url
             self._log("note", f"reaproveitando a aba {tab_ref}", url or "(sem url)")
             return True
         self._log("note", f"a aba {tab_ref} não existe mais", "abro uma nova")
@@ -1599,6 +1946,763 @@ class BrowserLocalDriver:
         if self.allow_sensitive:
             return
         raise NeedsConfirmation(label.strip()[:120])
+
+    def _check_desfaz_progresso(self, label: str, snapshot: dict) -> None:
+        """Aviso ÚNICO antes de jogar fora o que já foi feito na página.
+
+        Recomeçar às vezes é o certo (modo errado, formulário que travou), então
+        insistir passa. O que não pode é recomeçar por ter lido mal a tela: a
+        numeração que volta a 1 com outro título é etapa nova, não reinício. O
+        aviso rearma quando o caderno cresce outra vez o bastante para haver o
+        que perder de novo.
+        """
+        if len(self.notes) < _PROGRESSO_MIN or not label or not _DESFAZ_PROGRESSO.search(label):
+            return
+        rotulo = label.strip().lower()[:80]
+        avisado = self._avisos_de_recomeco.get(rotulo)
+        if avisado is not None and len(self.notes) - avisado < _PROGRESSO_MIN:
+            return
+        self._avisos_de_recomeco[rotulo] = len(self.notes)
+        tela = next(
+            (l.strip() for l in str(snapshot.get("tela") or "").splitlines() if l.strip()), ""
+        )
+        raise ValueError(
+            f'"{label.strip()[:40]}" recomeça e JOGA FORA o que você já fez nesta página '
+            f"({len(self.notes)} anotações no caderno). A tela agora começa com «{tela[:120]}». "
+            'Numeração que volta a 1 com outro título ("etapa 1 de 6", "parte 2") é uma '
+            "ETAPA NOVA do mesmo fluxo, não a página reiniciando: siga nela. Só recomece "
+            "se a página disser que o progresso se perdeu — aí repita esta mesma ação"
+        )
+
+    # ── abas (docs/browser-multi-aba-plan.md) ────────────────────────────
+    #
+    # Job 3512cdd2: o clique no anúncio abriu o produto numa aba nova, e o agente
+    # seguiu na busca lendo "clique ok, a tela não mudou". Agora o device diz
+    # quais abas a ação abriu (`abas_novas`), a tarefa SEGUE para a nova, e a
+    # de origem continua aberta para voltar.
+
+    def _registrar_aba(
+        self, tab_ref: Any, *, origem: str, aberta_por: str | None = None,
+        url: str = "", titulo: str = "",
+    ) -> Aba:
+        n = len(self._abas)
+        rotulo = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[n] if n < 26 else f"Z{n}"
+        aba = Aba(rotulo=rotulo, tab_ref=tab_ref, origem=origem, aberta_por=aberta_por,
+                  url=str(url or ""), titulo=str(titulo or ""))
+        self._abas[rotulo] = aba
+        if not self._ativa:
+            self._ativa = rotulo
+        return aba
+
+    def _vivas(self) -> list[Aba]:
+        return [a for a in self._abas.values() if a.viva]
+
+    async def _adotar_abas(self, result: dict) -> str:
+        """As abas que a ação abriu viram abas da tarefa, e a tarefa vai para a nova."""
+        novas = [
+            n for n in (result.get("abas_novas") or [])
+            if isinstance(n, dict) and n.get("tab_ref") is not None
+        ]
+        if not novas:
+            sem = result.get("janela_sem_aba")
+            if isinstance(sem, dict) and sem.get("url"):
+                motivo = (
+                    "ela não chegou a abrir" if sem.get("gesto")
+                    else "o navegador bloqueou (janela aberta sem clique)"
+                )
+                return (
+                    f"a página tentou abrir outra janela ({_url_curta(sem['url'])}) e {motivo}; "
+                    f"você continua na aba {self._ativa}"
+                )
+            return ""
+        de = self._ativa
+        frases: list[str] = []
+        seguir: Aba | None = None
+        for nova in novas:
+            url = str(nova.get("url") or "")
+            if url.startswith(("http://", "https://")) and self._is_blocked(url):
+                await self._fechar_tab_ref(nova["tab_ref"])
+                frases.append(
+                    f"a página abriu {self._host_of(url)}, que está na lista de domínios "
+                    "proibidos — fechei"
+                )
+                continue
+            if len(self._vivas()) >= self._teto_de_abas():
+                await self._fechar_tab_ref(nova["tab_ref"])
+                frases.append(
+                    f"a página abriu mais uma aba e esta tarefa já tem {self._teto_de_abas()} abertas — "
+                    "fechei a nova; feche alguma com `fechar_aba` se precisar dela"
+                )
+                continue
+            ja_visto = self._ja_aberta(url)
+            aba = self._registrar_aba(
+                nova["tab_ref"], origem="site", aberta_por=de, url=url,
+                titulo=str(nova.get("title") or ""),
+            )
+            if ja_visto is not None:
+                frases.append(self._frase_de_repetida(ja_visto))
+            # Chegou por clique, como qualquer link: o domínio dela entra no escopo.
+            host = self._host_of(url)
+            if host:
+                self._allowed_hosts.add(host)
+            self._log("note", f"a aba {de} abriu a aba {aba.rotulo}", url or "(ainda sem endereço)")
+            seguir = aba
+        if seguir is not None:
+            await self._trocar_para(seguir.rotulo)
+            frases.insert(
+                0,
+                f"o clique abriu a aba {seguir.rotulo} ({_url_curta(seguir.url) or 'carregando'}). "
+                f"Você está NELA agora; a aba {de} continua aberta — `fechar_aba` fecha "
+                f"esta e volta para a {de}",
+            )
+        return "; ".join(frases)
+
+    def _ja_aberta(self, url: str) -> Aba | None:
+        """A aba desta tarefa que já esteve no mesmo endereço (sem a query)."""
+        alvo = _url_curta(url, limite=500)
+        if not alvo:
+            return None
+        return next(
+            (a for a in reversed(list(self._abas.values())) if _url_curta(a.url, limite=500) == alvo),
+            None,
+        )
+
+    def _marcar_vistos(self, texto: str) -> str:
+        """Marca, na PRÓPRIA linha do elemento, o link para endereço que a tarefa já abriu.
+
+        A lista de abas fechadas sozinha não segurou o modelo (reencenado no passo
+        7 do job e8092a4b com o modelo de produção: reabriu o anúncio errado 6 de 6
+        vezes). O aviso precisa estar onde a decisão acontece — no `[30]` em que
+        ele vai clicar. Com o motivo junto, 0 de 6.
+        """
+        alvos: list[tuple[str, str]] = []
+        for a in self._abas.values():
+            if a.origem == "inicial" or a.rotulo == self._ativa:
+                continue
+            caminho = urlparse(a.url).path if a.url else ""
+            if len(caminho) < 8:
+                continue
+            if a.viva:
+                # Sem "`trocar_aba` vai até ela", pelo mesmo motivo do `abrir_aba`.
+                nota = f"já aberto na aba {a.rotulo}"
+            elif a.motivo:
+                nota = f"já aberto na aba {a.rotulo}: {a.motivo}"
+            elif self._notas_da_aba(a.rotulo):
+                nota = f"já lido e anotado na aba {a.rotulo} — não precisa reabrir"
+            else:
+                nota = f"já aberto na aba {a.rotulo} e fechado sem nota"
+            alvos.append((caminho, nota))
+        if not alvos:
+            return texto
+        linhas = []
+        for linha in texto.split("\n"):
+            for caminho, nota in alvos:
+                if caminho in linha:
+                    linha = f"{linha} ⟪{nota}⟫"
+                    break
+            linhas.append(linha)
+        return "\n".join(linhas)
+
+    def _notas_da_aba(self, rotulo: str) -> int:
+        marca = f"[aba {rotulo}]"
+        return sum(1 for n in self.notes if marca in n)
+
+    def _frase_de_repetida(self, antes: Aba) -> str:
+        if antes.viva:
+            return (
+                f"⚠ este mesmo endereço já está aberto na aba {antes.rotulo} — "
+                f"`trocar_aba` vai até ela"
+            )
+        notas = self._notas_da_aba(antes.rotulo)
+        sobre = (
+            f"anotou {notas} {'item' if notas == 1 else 'itens'} dela" if notas
+            else "fechou SEM anotar nada"
+        )
+        motivo = f" (motivo: {antes.motivo})" if antes.motivo else ""
+        return (
+            f"⚠ você já abriu este mesmo endereço na aba {antes.rotulo} e {sobre}{motivo}. "
+            "Se não servia, feche esta e escolha OUTRO resultado — reabrir não muda a página"
+        )
+
+    async def _ir_para_a_url_da_tarefa(self, task: str) -> None:
+        """Sem `start_url`, a URL escrita na tarefa é o lugar de começar.
+
+        Job 65e940af (2026-11-01): a tarefa mandava "abrir a URL https://…/forms/
+        …viewform e preencher", o cérebro não passou `start_url`, e a aba
+        reaproveitada estava na tela "Sua resposta foi registrada" de OUTRO
+        formulário. O agente viu a confirmação, encerrou em 3 s e o Neo disse
+        "deu tudo certo". Só navega se a aba estiver noutro lugar: a que já está
+        no formulário certo não recarrega (apagaria o que já foi preenchido).
+        """
+        alvo = _url_da_tarefa(task)
+        if not alvo or self._is_blocked(alvo):
+            return
+        atual = self._url_reaproveitada if self._navegou else ""
+        if atual and _mesmo_lugar(atual, alvo):
+            return
+        try:
+            await self._call("browser.navigate", {"url": alvo})
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — o agente ainda pode navegar sozinho
+            self._log("note", "não consegui abrir a URL da tarefa", f"{alvo}: {exc}")
+            return
+        self._navegou = True
+        host = self._host_of(alvo)
+        if host:
+            self._allowed_hosts.add(host)
+        if self._ativa in self._abas:
+            self._abas[self._ativa].url = alvo
+        self._log(
+            "note", "abri a URL da tarefa",
+            alvo + (f" (a aba estava em {atual})" if atual else ""),
+        )
+
+    def _check_revisao_enter(self, snapshot: dict | None) -> None:
+        """Enter num formulário que o Neo preencheu ENVIA — confere antes, como o clique.
+
+        Só vale para formulário de verdade: dois campos ou mais preenchidos e um
+        botão de envio na página. Caixa de busca (um campo, sem "Enviar") segue.
+        """
+        if len(self._preenchidos) < 2:
+            return
+        elementos = (snapshot or {}).get("elements") or []
+        if not any(_ENVIO.search(str(i.get("text") or "")) for i in elementos):
+            return
+        self._check_revisao("Enter (enviar o formulário)")
+
+    def _teto_de_abas(self) -> int:
+        return _MAX_ABAS_HEADLESS if self.headless else _MAX_ABAS
+
+    def _validar_abrir_aba(self, args: dict, snapshot: dict) -> dict:
+        """`{"ref": N}` vira o endereço do link; `{"url": …}` passa pelo escopo."""
+        url = str(args.get("url") or "").strip()
+        por_link = False
+        if not url:
+            if args.get("ref") is None:
+                raise ValueError(
+                    '`abrir_aba` precisa de `ref` (um link da página) ou de `url`: '
+                    '{"ref": 27}'
+                )
+            item = next(
+                (i for i in (snapshot.get("elements") or []) if i.get("ref") == args.get("ref")),
+                None,
+            )
+            if item is None:
+                raise ValueError(f"não existe o elemento {args.get('ref')} nesta página")
+            href = str(item.get("href") or "").strip()
+            if not href or href.startswith(("javascript:", "#")):
+                raise ValueError(
+                    f"o elemento {args.get('ref')} não é um link com endereço — para ele, use `click`"
+                )
+            if item.get("href_cortado"):
+                href = _sem_parametro_cortado(href)
+            url = urljoin(str(snapshot.get("url") or ""), href)
+            por_link = True
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("só abro aba em endereço http(s)")
+        if self._is_blocked(url):
+            raise ValueError(
+                f"'{self._host_of(url)}' está na lista de domínios proibidos — não abro"
+            )
+        if not por_link:
+            # Endereço escrito pelo modelo: mesmo escopo do `navigate`. Link da
+            # página é clique, como hoje — o domínio dele não é palpite.
+            self._check_navigation(url)
+        teto = self._teto_de_abas()
+        if len(self._vivas()) >= teto:
+            raise ValueError(
+                f"esta tarefa já tem {teto} abas abertas — feche alguma com `fechar_aba` antes"
+            )
+        visto = self._ja_aberta(url)
+        if visto is not None and visto.viva:
+            raise ValueError(f"esse endereço já está aberto na aba {visto.rotulo} — use `trocar_aba`")
+        if visto is not None:
+            sobre = visto.motivo or (
+                "já foi lido e anotado" if self._notas_da_aba(visto.rotulo) else "fechado sem nota"
+            )
+            raise ValueError(
+                f"esse endereço já foi aberto na aba {visto.rotulo} ({sobre}) — não precisa "
+                "abrir de novo; escolha outro"
+            )
+        return {"url": url}
+
+    async def _acao_abrir_aba(self, url: str) -> str:
+        try:
+            resposta = await self._call("browser.open_tab", {"url": url})
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            texto = str(exc)
+            if "desconhecida" in texto or "não sabe executar" in texto:
+                raise ValueError(
+                    "este Neo Desktop ainda não abre aba por conta própria — use `click` no link"
+                ) from None
+            raise
+        tab = resposta.get("tab_ref") if isinstance(resposta, dict) else None
+        if tab is None:
+            raise ValueError("o navegador não abriu a aba")
+        final = str(resposta.get("url") or url)
+        if final.startswith(("http://", "https://")) and self._is_blocked(final):
+            await self._fechar_tab_ref(tab)
+            raise ValueError(
+                f"o link redirecionou para {self._host_of(final)}, que está na lista de domínios "
+                "proibidos — fechei"
+            )
+        aba = self._registrar_aba(
+            tab, origem="agente", aberta_por=self._ativa, url=final,
+            titulo=str(resposta.get("title") or ""),
+        )
+        host = self._host_of(final)
+        if host:
+            self._allowed_hosts.add(host)
+        self._log("note", f"abri a aba {aba.rotulo}", final)
+        # Sem "`trocar_aba` vai até ela": era o convite para visitar uma por uma, no
+        # lugar mais lido do prompt (o resultado do último passo). O caminho para a
+        # aba está no bloco ABAS.
+        return (
+            f"abri a aba {aba.rotulo} ({_url_curta(final)}) em segundo plano; você continua "
+            f"na {self._ativa}"
+        )
+
+    def _validar_ler_abas(self, args: dict) -> dict:
+        bruto = args.get("abas")
+        lista = [bruto] if isinstance(bruto, str) else bruto if isinstance(bruto, list) else []
+        rotulos: list[str] = []
+        vivas = {a.rotulo for a in self._vivas()}
+        for r in lista:
+            r = str(r or "").strip().upper()
+            if r and r not in rotulos:
+                rotulos.append(r)
+        fora = [r for r in rotulos if r not in vivas]
+        if not rotulos or fora:
+            raise ValueError(
+                "`ler_abas` precisa das abas abertas que você quer ler: "
+                + (f"«{', '.join(fora)}» não está aberta; " if fora else "")
+                + "abertas: " + (", ".join(sorted(vivas)) or "nenhuma")
+            )
+        saida: dict = {"abas": rotulos}
+        busca = str(args.get("busca") or "").strip()
+        if busca:
+            if len(busca) < 2:
+                raise ValueError("`busca` precisa de um termo de pelo menos 2 letras")
+            saida["busca"] = busca[:60]
+        return saida
+
+    def _validar_paralelo(self, args: dict) -> dict:
+        tarefas = args.get("tarefas")
+        if not isinstance(tarefas, list) or not tarefas:
+            raise ValueError(
+                '`paralelo` precisa de `tarefas`: [{"aba": "B", "objetivo": "o que ler ou fazer lá"}]'
+            )
+        vivas = {a.rotulo for a in self._vivas()}
+        limpas: list[dict] = []
+        for t in tarefas[: self._teto_de_abas()]:
+            if not isinstance(t, dict):
+                continue
+            rotulo = str(t.get("aba") or "").strip().upper()
+            objetivo = " ".join(str(t.get("objetivo") or "").split())[:300]
+            if rotulo not in vivas:
+                raise ValueError(f"a aba «{rotulo}» não está aberta — abertas: {', '.join(sorted(vivas))}")
+            if not objetivo:
+                raise ValueError(f"a tarefa da aba {rotulo} precisa de `objetivo`")
+            if any(x["aba"] == rotulo for x in limpas):
+                raise ValueError(f"a aba {rotulo} apareceu duas vezes — um subagente por aba")
+            limpas.append({"aba": rotulo, "objetivo": objetivo})
+        if not limpas:
+            raise ValueError("nenhuma tarefa válida em `tarefas`")
+        try:
+            passos = int(args.get("passos") or _PASSOS_FILHO)
+        except (TypeError, ValueError):
+            passos = _PASSOS_FILHO
+        return {"tarefas": limpas, "passos": max(2, min(passos, _PASSOS_FILHO_MAX))}
+
+    async def _manter_viva(self, tab_ref: Any, ligado: bool) -> None:
+        """Aba escondida trabalhando: sem isto o preço que carrega ao rolar não vem (F0)."""
+        try:
+            await self._call("browser.keep_alive", {"tab_ref": tab_ref, "ligado": ligado})
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — desktop antigo: segue sem
+            logger.debug("[BrowserLocal] keep_alive indisponível: %s", exc)
+
+    async def _acao_ler_abas(self, rotulos: list[str], busca: str | None) -> str:
+        """`extract` em várias abas ao mesmo tempo. Uma rodada de LLM, não N."""
+
+        async def ler(rotulo: str) -> str:
+            aba = self._abas[rotulo]
+            await self._manter_viva(aba.tab_ref, True)
+            pedido: dict = {"tab_ref": aba.tab_ref, "chars": _LER_ABAS_CHARS}
+            if busca:
+                pedido["busca"] = busca
+            try:
+                resposta = await self._call("browser.extract", pedido)
+                texto = " ".join(str(resposta.get("text") or "").split())[:_LER_ABAS_CHARS]
+                if busca and not int(resposta.get("achados") or 0):
+                    texto = f"NÃO achei «{busca}» nesta aba"
+            except StopRequested:
+                raise
+            except Exception as exc:  # noqa: BLE001 — uma aba ruim não derruba as outras
+                texto = f"não consegui ler: {str(exc)[:120]}"
+            finally:
+                if aba.rotulo != self._ativa:
+                    await self._manter_viva(aba.tab_ref, False)
+            return f"── aba {rotulo} ({_url_curta(aba.url) or 'sem endereço'}):\n{texto or '(vazia)'}"
+
+        blocos = await asyncio.gather(*(ler(r) for r in rotulos))
+        self._log("note", f"li {len(rotulos)} abas de uma vez", ", ".join(rotulos))
+        return (
+            "li as abas ao mesmo tempo. ANOTE o que serve, dizendo de qual aba veio — "
+            "isto aqui some do histórico:\n" + "\n\n".join(blocos)
+        )
+
+    def _novo_filho(self, aba: Aba, passos: int) -> "BrowserLocalDriver":
+        filho = BrowserLocalDriver(
+            act=self._act,
+            llm=self.llm,
+            model=self.model,
+            max_steps=passos,
+            blocked_domains=self.blocked,
+            confirm_sensitive=self.confirm_sensitive,
+            tab_ref=aba.tab_ref,
+            max_screenshots=0,
+            vision_model=self.vision_model,
+            trace=self.trace.filho(aba.rotulo) if self.trace is not None else None,
+            headless=self.headless,
+            filho=True,
+        )
+        filho._allowed_hosts = set(self._allowed_hosts)
+        return filho
+
+    async def _acao_paralelo(self, tarefas: list[dict], passos: int) -> str:
+        """Um subagente por aba, até `_PARALELO_MAX` ao mesmo tempo. O principal espera.
+
+        Esperar é de propósito: o ganho está na sobreposição das decisões de LLM
+        dos filhos (o que demora), e o principal agindo junto no mesmo navegador
+        só traria corrida. O que cada filho anotou entra no caderno daqui com a
+        aba de origem; o que ele não pôde fazer (irreversível, outra aba) volta
+        como frase, para o principal decidir.
+        """
+        vaga = asyncio.Semaphore(_PARALELO_MAX)
+        contexto = (
+            f"Você é um SUBAGENTE trabalhando só na aba {{rotulo}}, para uma tarefa maior: "
+            f"{(self._task_text or '')[:600]}\nSeu objetivo nesta aba está na TAREFA. Anote o que "
+            "achar (`anotar`/`note`) e termine com `done`. Não abra, troque nem feche abas, e "
+            "não faça nada irreversível (comprar, enviar, excluir): se o objetivo precisar disso, "
+            "termine com `done` dizendo o que falta."
+        )
+
+        async def um(tarefa: dict) -> tuple[dict, Any]:
+            aba = self._abas[tarefa["aba"]]
+            async with vaga:
+                filho = self._novo_filho(aba, passos)
+                await self._manter_viva(aba.tab_ref, True)
+                try:
+                    return tarefa, await filho.run(
+                        tarefa["objetivo"],
+                        context=contexto.format(rotulo=aba.rotulo),
+                        start_url=aba.url,
+                    )
+                finally:
+                    if aba.rotulo != self._ativa:
+                        await self._manter_viva(aba.tab_ref, False)
+
+        self._log("note", f"paralelo em {len(tarefas)} abas", ", ".join(t["aba"] for t in tarefas))
+        resultados = await asyncio.gather(*(um(t) for t in tarefas), return_exceptions=True)
+        linhas: list[str] = []
+        total_passos = 0
+        for tarefa, resultado in zip(tarefas, resultados):
+            rotulo = tarefa["aba"]
+            if isinstance(resultado, StopRequested):
+                raise resultado
+            if isinstance(resultado, BaseException):
+                linhas.append(f"- {rotulo}: não consegui — {str(resultado)[:160]}")
+                continue
+            _, saida = resultado
+            total_passos += len(saida.steps)
+            if saida.url:
+                self._abas[rotulo].url = saida.url
+            for nota in saida.notes:
+                self._anotar_de_outra_aba(rotulo, nota)
+            fecho = " ".join(str(saida.fecho or "").split())[:200]
+            if saida.status == "needs_confirmation":
+                linhas.append(
+                    f"- {rotulo}: parou antes de «{saida.pending}» (não desfaz) — se for o caso, "
+                    f"vá até a aba {rotulo} e faça você"
+                )
+            elif saida.status == "completed":
+                linhas.append(f"- {rotulo}: pronto, {len(saida.notes)} nota(s) — {fecho}")
+            else:
+                linhas.append(f"- {rotulo}: {saida.status} — {fecho}")
+        # Um filho pode ter mexido na aba ativa: a próxima tela é "nova".
+        self._last_fingerprint = None
+        self._reads_on_screen.clear()
+        return (
+            f"paralelo em {len(tarefas)} aba(s), {total_passos} passos dos subagentes. As notas "
+            "deles já estão no SEU caderno:\n" + "\n".join(linhas)
+        )
+
+    def _anotar_de_outra_aba(self, rotulo: str, texto: str) -> None:
+        """Nota de um subagente: entra com a aba dele, não com a ativa do principal."""
+        marca = f"[aba {rotulo}]"
+        texto = " ".join(str(texto or "").split())
+        if not texto:
+            return
+        if marca not in texto:
+            texto = f"{texto} {marca}"
+        for i, antiga in enumerate(self.notes):
+            if _mesma_nota(antiga, texto):
+                if len(texto) > len(antiga):
+                    self.notes[i] = texto
+                return
+        self.notes.append(texto)
+
+    async def _restaurar_abas(self) -> None:
+        """A retomada continua com as abas de antes, com os mesmos rótulos.
+
+        A ativa de antes é a que acabou de ser reivindicada (`self._tab_ref` —
+        nova, se a antiga sumiu e o endereço foi reaberto). As outras valem se
+        o navegador ainda as tem.
+        """
+        previas = [p for p in self._abas_previas if p.get("rotulo")]
+        if len(previas) < 2:
+            return
+        try:
+            resposta = await self._call("browser.session_tabs", {})
+            vivas = {t.get("tab_ref") for t in (resposta.get("tabs") or []) if isinstance(t, dict)}
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — sem a lista, fica só a ativa
+            logger.info("[BrowserLocal] sem a lista de abas para retomar: %s", exc)
+            vivas = set()
+        ativa = next((p for p in previas if p.get("entregue")), previas[-1])
+        self._abas = {}
+        for p in previas:
+            eh_ativa = p is ativa
+            tab = self._tab_ref if eh_ativa else p.get("tab_ref")
+            self._abas[str(p["rotulo"])] = Aba(
+                rotulo=str(p["rotulo"]),
+                tab_ref=tab,
+                origem=str(p.get("origem") or "site"),
+                aberta_por=p.get("aberta_por"),
+                url=str(p.get("url") or ""),
+                titulo=str(p.get("titulo") or ""),
+                viva=eh_ativa or (bool(p.get("viva")) and tab in vivas),
+                motivo=str(p.get("motivo") or ""),
+            )
+        self._ativa = str(ativa["rotulo"])
+        restauradas = ", ".join(a.rotulo for a in self._vivas())
+        self._log("note", "retomando com as abas de antes", restauradas)
+
+    async def _trocar_para(self, rotulo: str) -> None:
+        aba = self._abas[rotulo]
+        self._ativa = rotulo
+        self._tab_ref = aba.tab_ref
+        # Tela nova: o freio de "não mudou" e as leituras eram da aba anterior.
+        self._last_fingerprint = None
+        self._stuck = 0
+        self._reads_on_screen.clear()
+        try:
+            await self._call("browser.focus_tab", {})
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — sem foco, a troca de alvo basta
+            logger.debug("[BrowserLocal] foco na aba %s falhou: %s", rotulo, exc)
+
+    async def _fechar_tab_ref(self, tab_ref: Any) -> bool:
+        try:
+            await self._call("browser.close_tab", {"tab_ref": tab_ref})
+            return True
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — fechar é limpeza, nunca derruba
+            logger.info("[BrowserLocal] não consegui fechar a aba %s: %s", tab_ref, exc)
+            return False
+
+    def _destino_depois_de(self, aba: Aba) -> str:
+        """Para onde ir quando `aba` fecha: quem a abriu (subindo, se também fechou)."""
+        atual = aba.aberta_por
+        while atual and not (atual in self._abas and self._abas[atual].viva):
+            atual = self._abas[atual].aberta_por if atual in self._abas else None
+        if atual:
+            return atual
+        vivas = self._vivas()
+        return vivas[0].rotulo if vivas else aba.rotulo
+
+    async def _acao_trocar_aba(self, rotulo: str) -> str:
+        await self._trocar_para(rotulo)
+        return f"agora na aba {rotulo} ({_url_curta(self._abas[rotulo].url) or 'sem endereço'})"
+
+    async def _acao_fechar_aba(self, rotulo: str, motivo: str = "") -> str:
+        rotulo = rotulo or self._ativa
+        aba = self._abas[rotulo]
+        if aba.origem == "inicial":
+            raise ValueError(
+                f"a aba {rotulo} é onde a tarefa começou e não fecha. Para ir a outra, "
+                "use `trocar_aba`"
+            )
+        await self._fechar_tab_ref(aba.tab_ref)
+        aba.viva = False
+        aba.motivo = motivo
+        if rotulo != self._ativa:
+            return f"fechei a aba {rotulo}; você continua na {self._ativa}"
+        destino = self._destino_depois_de(aba)
+        await self._trocar_para(destino)
+        return (
+            f"fechei a aba {rotulo} e voltei para a {destino} "
+            f"({_url_curta(self._abas[destino].url) or 'sem endereço'})"
+        )
+
+    async def _conferir_abas(self) -> None:
+        """Entre um passo e outro: alguma aba sumiu? (o popup de login que se fecha)
+
+        Só com mais de uma aba viva — com uma, não há o que conferir, e a tarefa
+        de uma aba só continua exatamente como era.
+        """
+        if len(self._vivas()) < 2:
+            return
+        try:
+            resposta = await self._call("browser.session_tabs", {})
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 — desktop antigo: segue sem conferir
+            logger.debug("[BrowserLocal] lista de abas indisponível: %s", exc)
+            return
+        lista = resposta.get("tabs") if isinstance(resposta, dict) else None
+        if not isinstance(lista, list):
+            return
+        por_ref = {t.get("tab_ref"): t for t in lista if isinstance(t, dict)}
+        mortas: list[Aba] = []
+        for aba in self._vivas():
+            achada = por_ref.get(aba.tab_ref)
+            if achada is None:
+                aba.viva = False
+                mortas.append(aba)
+                continue
+            aba.url = str(achada.get("url") or aba.url)
+            aba.titulo = str(achada.get("title") or aba.titulo)
+        if not mortas:
+            return
+        nomes = ", ".join(a.rotulo for a in mortas)
+        ativa = self._abas.get(self._ativa)
+        if ativa is not None and not ativa.viva:
+            destino = self._destino_depois_de(ativa)
+            if destino != ativa.rotulo:
+                await self._trocar_para(destino)
+            self._aviso_entre_passos = (
+                f"a aba {nomes} fechou sozinha (a página fechou); você voltou para a aba {destino}"
+            )
+        else:
+            self._aviso_entre_passos = f"a aba {nomes} fechou sozinha (a página fechou)"
+        self._log("note", "aba fechou sozinha", self._aviso_entre_passos)
+
+    def _bloco_abas(self) -> str:
+        """O bloco ABAS do prompt. Vazio com uma aba só: nada muda para quem não usa."""
+        aviso, self._aviso_entre_passos = self._aviso_entre_passos, ""
+        vivas = self._vivas()
+        partes: list[str] = []
+        if aviso:
+            partes.append(f"ATENÇÃO: {aviso}.")
+        fechadas = [a for a in self._abas.values() if not a.viva and a.origem != "inicial"]
+        if fechadas:
+            linhas_f = []
+            for a in fechadas[-8:]:
+                notas = self._notas_da_aba(a.rotulo)
+                sobre = f"{notas} nota(s)" if notas else "sem nota"
+                motivo = f" — {a.motivo}" if a.motivo else ""
+                linhas_f.append(f"  {a.rotulo}  {_url_curta(a.url) or '(sem endereço)'} · {sobre}{motivo}")
+            partes.append(
+                "JÁ ABERTAS E FECHADAS nesta tarefa (não reabra o que não servia):\n"
+                + "\n".join(linhas_f)
+            )
+        if len(vivas) >= 2:
+            linhas = []
+            for a in vivas:
+                marca = "▶" if a.rotulo == self._ativa else " "
+                titulo = (a.titulo or "").strip()[:60]
+                de = f"  (aberta pela página da {a.aberta_por})" if a.aberta_por else ""
+                linhas.append(
+                    f"{marca} {a.rotulo}  {titulo + ' · ' if titulo else ''}"
+                    f"{_url_curta(a.url) or '(sem endereço)'}{de}"
+                )
+            partes.append(
+                "ABAS (você age na ▶; `trocar_aba` muda, `fechar_aba` fecha a ▶ e volta):\n"
+                + "\n".join(linhas)
+            )
+            # O caminho curto, ONDE a decisão acontece. A mesma regra no prompt
+            # de sistema: 1–2 de 6 vezes o agente lia todas de uma vez, e visitava
+            # uma por uma nas outras (3 passos por aba). Aqui: 5 de 6.
+            #
+            # E já com UMA aberta: sem isto ele abria um anúncio, ia até ele e
+            # voltava, um por um, e nunca tinha duas para trabalhar de uma vez (job
+            # 9a3223a4). Reencenado: sem a dica, 6/6 iam para a B; com ela, 6/6
+            # abriram a próxima. Com duas, 4/6 liam só as duas sem abrir a terceira;
+            # com o "falta abrir algum?", 6/6 abriram.
+            nao_lidas = [
+                a.rotulo for a in vivas
+                if a.rotulo != self._ativa and a.origem != "inicial" and not self._notas_da_aba(a.rotulo)
+            ]
+            if (
+                len(nao_lidas) == 1 and not self._filho
+                and self._abas[nao_lidas[0]].origem == "agente"
+                and self._abas[nao_lidas[0]].aberta_por == self._ativa
+            ):
+                r = nao_lidas[0]
+                partes.append(
+                    f"→ {r} aberta, ainda não lida. A tarefa pede outros itens desta lista? Abra-os "
+                    f"AGORA (`abrir_aba`), antes de visitar a {r}, e depois trabalhe em todos de uma vez."
+                )
+            elif len(nao_lidas) >= 2 and not self._filho:
+                lista = ", ".join(f'"{r}"' for r in nao_lidas)
+                tarefas = ", ".join(f'{{"aba": "{r}", "objetivo": "…"}}' for r in nao_lidas)
+                partes.append(
+                    f"→ ainda não lidas: {', '.join(nao_lidas)}. Falta abrir algum item que a tarefa "
+                    f"pede? Abra antes. Com todos abertos: para LER, `ler_abas {{\"abas\": [{lista}]}}` "
+                    "(sem `busca`: vem a página, com preço, frete e vendedor); se cada uma pede "
+                    "INTERAÇÃO (escolher a versão ou a capacidade, calcular o frete), "
+                    f"`paralelo {{\"tarefas\": [{tarefas}]}}`. Visitar uma por uma custa 3 passos por aba."
+                )
+        return "\n".join(partes)
+
+    def _com_origem(self, texto: str) -> str:
+        """Com mais de uma aba, a nota diz em qual foi lida (o endereço vai no rodapé)."""
+        if len(self._abas) < 2 or not self._ativa:
+            return texto
+        # Já diz de qual aba veio (o `ler_abas` manda dizer): não carimba a ativa
+        # por cima. "[aba C] [aba A]" mentia sobre a origem e tirava a C da contagem.
+        if _MARCA_DE_ABA.search(texto):
+            return texto
+        return f"{texto} [aba {self._ativa}]"
+
+    async def _fechar_auxiliares(self) -> None:
+        """No fim: fecha as abas que a tarefa abriu e não são a entregue (a ativa).
+
+        A inicial fica — é a do usuário, ou a da tarefa, como sempre foi. No
+        headless ela também fecha: soltar, lá, é fechar, e ninguém a vê.
+
+        Tarefa que PAROU para o Daniel não fecha nada no navegador dele: a
+        retomada continua com o mesmo conjunto (`_restaurar_abas`).
+        """
+        if self._pausada and not self.headless and not self._filho:
+            return
+        for aba in list(self._abas.values()):
+            if not aba.viva or aba.rotulo == self._ativa:
+                continue
+            # A inicial do FILHO é a aba do principal: não é dele para fechar.
+            if aba.origem == "inicial" and (not self.headless or self._filho):
+                continue
+            if await self._fechar_tab_ref(aba.tab_ref):
+                aba.viva = False
+
+    def _abas_para_fora(self) -> list[dict]:
+        if len(self._abas) < 2:
+            return []
+        return [
+            {"rotulo": a.rotulo, "tab_ref": a.tab_ref, "url": a.url, "titulo": a.titulo,
+             "origem": a.origem, "aberta_por": a.aberta_por, "viva": a.viva,
+             "motivo": a.motivo, "entregue": a.rotulo == self._ativa}
+            for a in self._abas.values()
+        ]
 
     # ── memória e conferência ────────────────────────────────────────────
 
@@ -1700,7 +2804,10 @@ class BrowserLocalDriver:
         do_neo = any(p["origem"] in ("memoria", "neo") for p in self._preenchidos)
         if not (da_memoria or do_neo):
             return
-        if self.allow_sensitive_label and label.strip().lower()[:120] == self.allow_sensitive_label[:120]:
+        # Retomada da conferência: o Daniel aprovou ENVIAR este formulário. Clicar
+        # em "Enviar" ou apertar Enter é o mesmo envio — exigir o mesmo gesto
+        # pararia de novo à toa.
+        if self.allow_sensitive_label and _ENVIO.search(self.allow_sensitive_label):
             return
         raise NeedsConfirmation(label.strip()[:120], revisao=True)
 
@@ -2053,6 +3160,20 @@ class BrowserLocalDriver:
                     f'\n>>> TEXTO COMPLETO DO PAINEL «{nome}» '
                     f"(ref {item.get('ref')}) — é isto que está escrito nele:\n{dentro}"
                 )
+
+        # O AVISO que a página pôs por cima dela (toast, faixa). Vem antes da tela
+        # e fora do teto dela: no job 21c563c1 "Você respondeu todas as questões,
+        # lembre-se de Finalizar" ficou oito passos na tela e nunca chegou ao
+        # modelo, porque era o último texto do DOM e a leitura estourava antes.
+        for aviso in snapshot.get("avisos") or []:
+            texto_aviso = str((aviso or {}).get("texto") or "").strip()
+            if not texto_aviso:
+                continue
+            lines.append(
+                "\n>>> AVISO NA TELA — "
+                + ("APARECEU AGORA, depois da sua última ação" if aviso.get("nova") else "por cima da página")
+                + f":\n{texto_aviso[:500]}"
+            )
 
         # O QUE ESTÁ NA TELA. Vem antes de tudo o que é lista, e é a seção que
         # torna o resto dispensável na maioria dos passos. Ver `NEO.ler` no device.
@@ -2668,7 +3789,7 @@ class BrowserLocalDriver:
 
     @property
     def _sem_ganho(self) -> int:
-        """Passos de atuação desde a última vez que o caderno cresceu.
+        """Passos de atuação desde a última produção (ver `_contabilizar_producao`).
 
         Vale ZERO enquanto o caderno está vazio: antes de existir algo para
         entregar, PROCURAR é o trabalho, e cortar aí seria cortar a tarefa. Quem
@@ -2696,7 +3817,16 @@ class BrowserLocalDriver:
             self._rodadas_na_parede += 1
         else:
             self._rodadas_na_parede = 0
-        if len(self.notes) > self._notas_contadas:
+        palavras = {
+            p.casefold() for p in _PALAVRA_DA_TELA.findall(str((snapshot or {}).get("tela") or ""))
+        }
+        ineditas = len(palavras - self._palavras_vistas)
+        self._palavras_vistas |= palavras
+        avancou = (
+            (self._nota_cresceu and self._interagiu) or self._marcou
+        ) and ineditas >= _TELA_INEDITA_MIN
+        self._nota_cresceu = self._interagiu = self._marcou = False
+        if len(self.notes) > self._notas_contadas or avancou:
             self._notas_contadas = len(self.notes)
             self._acting_no_ganho = self._acting_steps
             # Produção devolve passo ao orçamento (ver `_teto_de_passos`).
@@ -3433,7 +4563,61 @@ class BrowserLocalDriver:
         self._log("vision", self.vision_model, (time.monotonic() - started) * 1000, pergunta, answer)
         if not answer:
             return f"{_VISAO_SEM_RESPOSTA} — o modelo de visão respondeu vazio"
-        return answer[:_LOOK_MAX_CHARS]
+        return self._com_estado_do_dom(answer[:_LOOK_MAX_CHARS], snapshot)
+
+    @staticmethod
+    def _com_estado_do_dom(answer: str, snapshot: dict) -> str:
+        """A imagem contra o DOM, para o que o DOM sabe melhor: marcado e desabilitado.
+
+        No job 21c563c1 a visão disse "nenhuma alternativa está marcada" e "o
+        Responder está habilitado (azul claro)" de uma tela em que a alternativa 3
+        estava marcada e o Responder desabilitado, e o DOM dizia isso. O modelo
+        acreditou na imagem, concluiu que a resposta não tinha pegado e marcou a
+        alternativa 1. Azul claro é desabilitado nesse site; em outro é o
+        contrário. O atributo não tem essa ambiguidade.
+
+        Só entra quando a resposta fala de estado, e só para os números que ela
+        cita (inclusive "elementos 51 a 59") que existem na lista.
+        """
+        if not _FALA_DE_ESTADO.search(answer):
+            return answer
+        por_ref = {
+            e.get("ref"): e for e in (snapshot.get("elements") or []) if isinstance(e, dict)
+        }
+        citados: list[int] = []
+        for m in _NUMERO_CITADO.finditer(answer):
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.group(2) else a
+            if b < a or b - a > 15:
+                b = a
+            for n in range(a, b + 1):
+                if n not in citados:
+                    citados.append(n)
+        fala_de_habilitado = bool(_FALA_DE_HABILITADO.search(answer))
+        fatos: list[str] = []
+        for n in citados:
+            item = por_ref.get(n)
+            if not item:
+                continue
+            estado = []
+            if item.get("disabled"):
+                estado.append("DESABILITADO")
+            elif fala_de_habilitado and str(item.get("tag") or "") in ("button", "input", "select"):
+                estado.append("habilitado")
+            if item.get("checked") is not None:
+                estado.append("MARCADO" if item["checked"] else "desmarcado")
+            if not estado:
+                continue
+            nome = str(item.get("text") or "").strip()[:40]
+            fatos.append(f"[{n}]" + (f" «{nome}»" if nome else "") + " " + " e ".join(estado))
+            if len(fatos) >= 8:
+                break
+        if not fatos:
+            return answer
+        return (
+            f"{answer}\n⚠ Estado no DOM (para marcado e desabilitado é ele que vale, não a "
+            f"cor na imagem): {' · '.join(fatos)}"
+        )
 
     async def _auto_look_if_stuck(self, snapshot: dict) -> None:
         """Olha sozinho quando a tela empacou — o ponto cego conhecido do DOM.
@@ -3486,7 +4670,7 @@ class BrowserLocalDriver:
                 (
                     "SEU CADERNO ({}):\n{}".format(
                         len(self.notes),
-                        "\n".join(f"- {n}" for n in self.notes),
+                        "\n".join(f"- {_nota_no_prompt(n)}" for n in self.notes),
                     )
                     if self.notes
                     else "SEU CADERNO: vazio — nada coletado ainda."
@@ -3503,6 +4687,7 @@ class BrowserLocalDriver:
                     if self.respostas_da_memoria
                     else ""
                 ),
+                self._bloco_abas(),
                 (
                     f"ATENÇÃO: {self._acting_steps} passos e o caderno continua VAZIO. "
                     "Se a tarefa pede coletar/listar/comparar qualquer coisa, o que "
@@ -3536,7 +4721,7 @@ class BrowserLocalDriver:
                     if self._sem_ganho >= _SEM_GANHO_AVISO
                     else ""
                 ),
-                f"PÁGINA AGORA:\n{self._render(snapshot, self._panel_verdict)}",
+                f"PÁGINA AGORA:\n{self._marcar_vistos(self._render(snapshot, self._panel_verdict))}",
                 # Sem olhos, dizer isso UMA vez por passo é mais barato que
                 # deixá-lo gastar um passo pedindo `look` para ouvir "não deu".
                 (
@@ -3545,7 +4730,15 @@ class BrowserLocalDriver:
                     if not self.vision_model
                     else ""
                 ),
-                f"Passo {len(self.steps) + 1} de no máximo {self._teto_de_passos()}. Responda só o JSON.",
+                # O contador é do AGENTE e precisa dizer isso. "Passo N de no
+                # máximo M" é como questionário, cadastro e checkout escrevem o
+                # progresso DELES: no job 7b73f755 o modelo leu "Passo 8 de no
+                # máximo 53" como o tamanho do quiz, concluiu que estava no modo
+                # longo e reiniciou o quiz em loop. Estava na pergunta 1 de 36.
+                f"Seu orçamento nesta tarefa (contador SEU, não da página): ação "
+                f"{len(self.steps) + 1} de no máximo {self._teto_de_passos()}. O "
+                "progresso do site (pergunta, etapa, X de Y) é o que a PÁGINA mostra. "
+                "Responda só o JSON.",
             )
             if part
         )
@@ -3663,6 +4856,9 @@ class BrowserLocalDriver:
                     f"em {_ANSWER_MAX_CHARS} caracteres), porque o caderno viaja "
                     "em todo passo e é ELE que entrega os itens ao usuário"
                 ) from exc
+            consertada = _consertar_aspas_do_thought(text)
+            if consertada is not None:
+                return consertada
             raise ValueError(f"não entendi a resposta do modelo: {exc}") from exc
         if not isinstance(decision, dict):
             raise ValueError("a resposta do modelo não é um objeto")
@@ -3677,6 +4873,13 @@ class BrowserLocalDriver:
             raise ValueError(
                 f"ação '{action}' não existe. Use uma de: {', '.join(sorted(ACTIONS))}"
             )
+        # Argumento certo no lugar errado: `{"action": "paralelo", "tarefas": […]}`,
+        # fora do `args`. Reencenado no job 9a3223a4, foi assim em 1/6 das vezes
+        # sem a dica nova e em 6/6 com ela; recusar custava um passo e uma rodada
+        # de LLM para ele reemitir o mesmo conteúdo.
+        for chave in ACTIONS[action]:
+            if chave not in args and chave in decision:
+                args[chave] = decision[chave]
         # O `answer` só é OBRIGATÓRIO quando o caderno está vazio.
         #
         # Duas falhas de sinal oposto se resolvem nesta condicional. Em
@@ -3711,6 +4914,50 @@ class BrowserLocalDriver:
                         "`give_up` dizendo o que faltou"
                     )
                 raise ValueError(f"a ação '{action}' precisa do argumento '{required}'")
+
+        if self._filho and action in _PROIBIDAS_AO_FILHO:
+            raise ValueError(
+                f"subagente não usa `{action}`: você trabalha SÓ nesta aba. Se o objetivo "
+                "precisa de outra coisa, termine com `done` dizendo o que falta"
+            )
+
+        if action == "abrir_aba":
+            args = self._validar_abrir_aba(args, snapshot)
+
+        if action == "ler_abas":
+            args = self._validar_ler_abas(args)
+
+        if action == "paralelo":
+            args = self._validar_paralelo(args)
+
+        if action in ("trocar_aba", "fechar_aba"):
+            rotulo = str(args.get("aba") or self._ativa).strip().upper()
+            vivas = [a.rotulo for a in self._abas.values() if a.viva]
+            if rotulo not in vivas:
+                raise ValueError(
+                    f"não existe aba «{rotulo}» aberta nesta tarefa. Abas: "
+                    + (", ".join(vivas) or "só esta")
+                )
+            if action == "trocar_aba" and rotulo == self._ativa:
+                raise ValueError(f"você já está na aba {rotulo}")
+            args["aba"] = rotulo
+            if action == "fechar_aba" and args.get("motivo") is not None:
+                args["motivo"] = " ".join(str(args["motivo"]).split())[:160]
+            # Fechar sem anotar nada e sem dizer por quê é o que fez o job
+            # e8092a4b reabrir o mesmo anúncio três vezes: o "não serve" ficava só
+            # no pensamento do passo. Com o motivo, 0 de 6 reaberturas.
+            alvo = self._abas[rotulo]
+            if (
+                action == "fechar_aba"
+                and alvo.origem != "inicial"
+                and not args.get("motivo")
+                and not self._notas_da_aba(rotulo)
+            ):
+                raise ValueError(
+                    f"a aba {rotulo} vai fechar sem nenhuma nota: diga em `motivo` por que "
+                    'ela não serve (ex.: {"motivo": "não é o produto pedido"}) — é o que '
+                    "impede você de reabri-la depois"
+                )
 
         if action == "consultar":
             bruto = args.get("perguntas")
@@ -3916,6 +5163,7 @@ class BrowserLocalDriver:
                         "popup para dispensar e fechar costuma cancelar. Deixe o painel em paz "
                         'e espere com `downloads` {"wait_s": 30}'
                     )
+                self._check_desfaz_progresso(label, snapshot)
                 self._check_sensitive(label)
                 self._check_revisao(label)
 
@@ -3958,6 +5206,7 @@ class BrowserLocalDriver:
                     f'"{texto[:40]}" agora baixa o mesmo arquivo de novo. Chame '
                     '`downloads` {"wait_s": 30} antes'
                 )
+            self._check_desfaz_progresso(texto, snapshot)
             self._check_sensitive(texto)
             self._check_revisao(texto)
 
@@ -4238,7 +5487,7 @@ class BrowserLocalDriver:
         # O snapshot NOVO vai junto: é dele que sai o rótulo do campo na trava de
         # dado pessoal, e sem ele a refeita de um `fill` passaria sem conferência
         # justamente porque o elemento mudou de número.
-        return await self._perform(action, {**args, "ref": novo}, snapshot)
+        return await self._executar(action, {**args, "ref": novo}, snapshot)
 
     async def _resolver_placeholder(self, args: dict, snapshot: dict | None = None) -> dict:
         """Troca ``«pks:campo»`` pelo valor, se houver liberação para esta aba.
@@ -4539,7 +5788,9 @@ class BrowserLocalDriver:
         """Põe no caderno, se for dado novo. Devolve `nova`, `atualizada` ou `recusada`.
 
         Só `nova` faz o caderno crescer, e é o crescimento que conta como produção
-        (`_contabilizar_producao`). Reescrever o que já se tem não é progresso.
+        (`_contabilizar_producao`). Reescrever o que já se tem não é progresso; a
+        atualização que traz dado novo só arma uma das três provas de
+        `_NOTA_CRESCEU_MIN`.
         """
         if len(texto) < 4:
             return "recusada"
@@ -4549,9 +5800,12 @@ class BrowserLocalDriver:
         for i, antiga in enumerate(self.notes):
             if _mesma_nota(antiga, texto):
                 if len(texto) > len(antiga):
-                    self.notes[i] = texto
+                    if len(_fichas(texto) - _fichas(antiga)) >= _NOTA_CRESCEU_MIN:
+                        self._nota_cresceu = True
+                    self.notes[i] = self._com_origem(texto)
                     self._log("note", f"atualizei a nota {i + 1}", texto)
                 return "atualizada"
+        texto = self._com_origem(texto)
         self.notes.append(texto)
         self._log("note", f"anotou ({len(self.notes)})", texto)
         return "nova"
@@ -4569,7 +5823,7 @@ class BrowserLocalDriver:
         itens = bruto if isinstance(bruto, list) else [bruto] if isinstance(bruto, str) else []
         novos: list[str] = []
         for item in itens[:_ANOTAR_POR_PASSO]:
-            texto = str(item or "").strip()[:_NOTA_MAX]
+            texto = _nota_cortada(str(item or ""))
             if self._guardar_nota(texto) == "nova":
                 novos.append(texto)
         if novos:
@@ -4580,9 +5834,27 @@ class BrowserLocalDriver:
             )
 
     async def _perform(self, action: str, args: dict, snapshot: dict | None = None) -> str:
-        """Executa e devolve o detalhe para o histórico. Erro sobe como exceção."""
+        """Executa e devolve o detalhe para o histórico. Erro sobe como exceção.
+
+        Fino de propósito: o que a ação fez com as ABAS (a página abriu outra, e
+        agora a tarefa está nela) vale para qualquer ação, e entra aqui, uma vez.
+        """
+        self._aviso_aba = ""
+        detalhe = await self._executar(action, args, snapshot)
+        if action in _ACOES_DE_ABA or self._aviso_aba:
+            # Abrir, ler, visitar e fechar abas é progresso que NÃO muda a tela da
+            # lista — e voltar a ela depois de fechar um anúncio contava como
+            # "mesma tela de novo": três anúncios descartados seguidos matavam a
+            # tarefa por giro. Quem pega a troca de aba à toa é o `_sem_ganho`.
+            self._telas_vistas.clear()
+        if self._aviso_aba:
+            detalhe = f"{detalhe} — {self._aviso_aba}" if detalhe else self._aviso_aba
+        return detalhe
+
+    async def _executar(self, action: str, args: dict, snapshot: dict | None = None) -> str:
+        """O corpo do `_perform`."""
         if action == "note":
-            texto = str(args.get("texto") or "").strip()[:_NOTA_MAX]
+            texto = _nota_cortada(str(args.get("texto") or ""))
             estado = self._guardar_nota(texto)
             if estado == "recusada":
                 return (
@@ -4617,6 +5889,26 @@ class BrowserLocalDriver:
         if action == "consultar":
             return await self._consultar(list(args.get("perguntas") or []))
 
+        if action == "trocar_aba":
+            return await self._acao_trocar_aba(str(args.get("aba") or ""))
+
+        if action == "abrir_aba":
+            return await self._acao_abrir_aba(str(args.get("url") or ""))
+
+        if action == "ler_abas":
+            return await self._acao_ler_abas(list(args["abas"]), args.get("busca"))
+
+        if action == "paralelo":
+            return await self._acao_paralelo(list(args["tarefas"]), int(args["passos"]))
+
+        if action == "fechar_aba":
+            return await self._acao_fechar_aba(
+                str(args.get("aba") or ""), str(args.get("motivo") or "")
+            )
+
+        if action == "press" and str(args.get("key") or "").lower() == "enter":
+            self._check_revisao_enter(snapshot)
+
         # O que o MODELO escreveu («pks:cep»), guardado antes da troca: é isto que
         # a conferência mostra, nunca o valor real que vai para a página.
         escrito = dict(args) if action == "fill" else None
@@ -4643,6 +5935,8 @@ class BrowserLocalDriver:
             raise
         if escrito is not None:
             self._registrar_preenchimento(escrito, snapshot)
+        if action in _PODE_ABRIR_ABA and isinstance(result, dict):
+            self._aviso_aba = await self._adotar_abas(result)
         if action == "find":
             self._reads_on_screen.add(self._signature(action, args))
             return self._texto_dos_candidatos(str(args["texto"]), result)
@@ -4723,7 +6017,7 @@ class BrowserLocalDriver:
             # Amazon. Nota de moldura é pior que nota nenhuma, porque ocupa o
             # lugar da resposta no texto que vai para ele.
             if not repetido and not da_moldura and len(texto.strip()) >= 200:
-                self.notes.append(texto.strip()[:400])
+                self.notes.append(self._com_origem(texto.strip()[:400]))
                 self._log("note", f"anotou ({len(self.notes)})", "leitura do `extract`")
 
             if repetido:
@@ -4758,8 +6052,16 @@ class BrowserLocalDriver:
             # é a diferença entre "cliquei" e "ficou marcado".
             marcado = result.get("checked")
             sufixo = ""
-            if marcado is True:
+            # O controle SAIU da página no clique: não há estado para ler, e é
+            # prova de que a página reagiu (job f9370b43, ver `fimDoClique`).
+            if result.get("saiu"):
+                sufixo = (
+                    " → e o elemento SAIU da tela logo depois: a página reagiu ao clique "
+                    "(avançou ou trocou de etapa). Leia NA TELA AGORA antes de agir de novo"
+                )
+            elif marcado is True:
                 sufixo = " → SELECIONADO"
+                self._marcou = True
             elif marcado is False:
                 sufixo = (
                     " → mas NÃO ficou selecionado (o clique não pegou nesse elemento; "
@@ -4854,6 +6156,7 @@ class BrowserLocalDriver:
             outcome.fecho = outcome.summary
             outcome.summary = self._com_caderno(outcome.summary, outcome.status)
             outcome.notes = list(self.notes)
+            outcome.abas = self._abas_para_fora()
             return outcome
         finally:
             self._log(
@@ -4961,10 +6264,17 @@ class BrowserLocalDriver:
         if self._tab_ref is None:
             onde = "no navegador headless desta máquina" if self.headless else "no seu navegador"
             return DriverResult(status="failed", summary=f"Não consegui abrir uma aba {onde}.")
+        self._registrar_aba(
+            self._tab_ref, origem="inicial", url=start_url or reabrir_url or ""
+        )
+        if self._abas_previas:
+            await self._restaurar_abas()
+        if not start_url and not reabrir_url and not self._filho:
+            await self._ir_para_a_url_da_tarefa(task)
 
         last_url = start_url
         if self.follow_download is None:
-            self.follow_download = bool(_ASKS_TO_FOLLOW.search(f"{task}\n{context}"))
+            self.follow_download = _pede_acompanhar_download(f"{task}\n{context}")
         self._log(
             "note",
             "acompanhar o download até o fim?",
@@ -4987,6 +6297,7 @@ class BrowserLocalDriver:
             assento: dict = {}
             while step_number < self._teto_de_passos() and rodadas < self._teto_de_passos() * 2:
                 rodadas += 1
+                await self._conferir_abas()
                 snapshot = await self._snapshot(assento)
                 assento = {}
                 last_url = snapshot.get("url") or last_url
@@ -5032,6 +6343,15 @@ class BrowserLocalDriver:
                 try:
                     decision = await self._decide(task, context, snapshot)
                     await self._anotar_junto(decision)
+                    if not str(decision.get("action") or "").strip() and decision.get("anotar"):
+                        # Só anotou, sem dizer a ação. As notas já entraram: é um
+                        # passo de anotação, não um erro — contado como falha, ele
+                        # virou "2 passos falharam" na mensagem final (job b8648f0e).
+                        self.steps.append(
+                            Step("note", {}, True, "anotado; da próxima vez diga a ação junto da nota")
+                        )
+                        self._log("note", "passo só de anotação", "")
+                        continue
                     action, args = self._validate(decision, snapshot)
                 except (NeedsConfirmation, NeedsRelease):
                     raise
@@ -5158,6 +6478,7 @@ class BrowserLocalDriver:
                         detail = await self._retry_stale(action, args, alvo)
                     self.steps.append(Step(action, args, True, detail))
                     self._log("acted", action, args, True, detail, (time.monotonic() - started) * 1000)
+                    self._interagiu = action in _INTERAGE
                     assento = self._pedido_de_assento(action, args, snapshot)
                     # O RETORNO no painel. É a metade que a faixa de uma linha
                     # não tinha onde mostrar: a leitura do `extract`, a resposta
@@ -5233,6 +6554,7 @@ class BrowserLocalDriver:
                 screenshot_captions=legendas,
             )
         except NeedsConfirmation as exc:
+            self._pausada = True
             entrega, legendas = await self._fechar_prints()
             revisao = self._linhas_de_revisao() if exc.revisao else []
             if exc.revisao:
@@ -5262,6 +6584,7 @@ class BrowserLocalDriver:
                 respostas=[r.to_dict() for r in self.respostas_da_memoria.values()],
             )
         except NeedsRelease as exc:
+            self._pausada = True
             from core.release.sensitive import humano
 
             nomes = ", ".join(humano(c) for c in exc.campos) or "um dado seu"
@@ -5313,6 +6636,8 @@ class BrowserLocalDriver:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[BrowserLocal] delta de downloads falhou: %s", exc)
 
+            # As abas que a tarefa abriu e não são a entregue (a ativa) fecham.
+            await self._fechar_auxiliares()
             # Soltar a aba é obrigatório: debugger grudado estraga a aba do usuário.
             try:
                 await self._call("browser.release", {})

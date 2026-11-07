@@ -34,6 +34,24 @@ logger = logging.getLogger(__name__)
 #: toda classificação) estava pagando o raciocínio inteiro sem saber.
 _REASONING_DISABLED = {"reasoning": {"enabled": False}}
 
+#: Modelos que RECUSAM ``reasoning.enabled=false`` — o gateway responde
+#:     400 "Reasoning is mandatory for this endpoint and cannot be disabled."
+#: e o turno morre em "deu erro do meu lado" (medido 2026-11-06 com
+#: ``liquid/lfm-3-1.7b``, cadastrado pelo painel). ``disable_thinking`` é política
+#: do sistema inteiro (cérebro, classificador, afeto, navegador…), então um modelo
+#: assim quebraria TODAS essas chamadas. Aprende-se na primeira recusa: refaz uma
+#: vez sem o campo e, dali em diante, nem manda — custa um 400 por modelo por
+#: processo, em vez de uma flag a mais no cadastro que ninguém saberia marcar.
+_REASONING_MANDATORY: set[str] = set()
+
+
+def _is_reasoning_mandatory(exc: BaseException | None) -> bool:
+    while exc is not None:
+        if "reasoning is mandatory" in str(exc).lower():
+            return True
+        exc = exc.__cause__
+    return False
+
 #: Separador do "pin de provedor" nos IDs deste catálogo: ``vendor/modelo@slug``.
 #:
 #: O OpenRouter serve o MESMO modelo por vários provedores de infra, e eles não
@@ -183,16 +201,40 @@ class OpenRouterProvider(OpenAIProvider):
         return True
 
     @staticmethod
-    def _apply_reasoning_pref(kwargs: dict[str, Any]) -> None:
+    def _apply_reasoning_pref(kwargs: dict[str, Any], model: str) -> None:
         """Traduz a intenção ``disable_thinking`` para o campo ``reasoning`` da API.
 
         Consome a flag ANTES de subir para ``OpenAIProvider``, que a descartaria.
         Um ``extra_body`` vindo do chamador vence — quem foi explícito manda.
+        Modelo que exige raciocínio (``_REASONING_MANDATORY``) não recebe o campo.
         """
         if not kwargs.pop("disable_thinking", False):
             return
+        if model in _REASONING_MANDATORY:
+            return
         kwargs["extra_body"] = {**_REASONING_DISABLED, **(kwargs.get("extra_body") or {})}
         logger.debug("[OpenRouter] reasoning desligado nesta chamada (saída estruturada pedida)")
+
+    @staticmethod
+    def _drop_reasoning_disable(kwargs: dict[str, Any], model: str, exc: Exception) -> bool:
+        """O modelo exige raciocínio: tira o desligamento que NÓS pusemos e lembra.
+
+        Devolve True quando tirou (e vale repetir). Só mexe no campo exato de
+        ``_REASONING_DISABLED`` — um ``reasoning`` que o chamador mandou é dele.
+        """
+        extra = kwargs.get("extra_body") or {}
+        if extra.get("reasoning") != _REASONING_DISABLED["reasoning"]:
+            return False
+        if not _is_reasoning_mandatory(exc):
+            return False
+        _REASONING_MANDATORY.add(model)
+        kwargs["extra_body"] = {k: v for k, v in extra.items() if k != "reasoning"}
+        logger.warning(
+            "[OpenRouter] %s exige raciocínio (não aceita reasoning.enabled=false) — "
+            "refazendo com ele ligado, e assim fica para as próximas chamadas",
+            model,
+        )
+        return True
 
     async def complete(
         self,
@@ -205,7 +247,7 @@ class OpenRouterProvider(OpenAIProvider):
     ):
         """Completion via OpenRouter (usa mesma lógica da OpenAI)."""
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_reasoning_pref(kwargs)
+        self._apply_reasoning_pref(kwargs, model)
         try:
             return await super().complete(
                 messages=messages,
@@ -224,6 +266,17 @@ class OpenRouterProvider(OpenAIProvider):
                 **kwargs,
             )
         except LLMProviderError as e:
+            if self._drop_reasoning_disable(kwargs, model, e):
+                # Reentra pelo caminho inteiro (pin, escada de 429): o modelo já
+                # está limpo de `@slug` e o campo já saiu, então não há laço.
+                return await self.complete(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
             if self._relax_provider_pin(kwargs, e):
                 # `False` explícito: agora o fallback está liberado, então esperar
                 # volta a fazer sentido — a escada completa de 429 é a rede desta
@@ -253,8 +306,10 @@ class OpenRouterProvider(OpenAIProvider):
     ):
         """Streaming via OpenRouter."""
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_reasoning_pref(kwargs)
-        for tentativa in range(2):
+        self._apply_reasoning_pref(kwargs, model)
+        # Até 3 voltas: uma para tirar o desligamento de raciocínio que o modelo
+        # recusa, uma para afrouxar o pin lotado — cada conserto vale uma vez só.
+        for tentativa in range(3):
             emitiu = False
             try:
                 async for chunk in super().stream_complete(
@@ -278,7 +333,10 @@ class OpenRouterProvider(OpenAIProvider):
                 # Refazer só vale se NADA saiu ainda: repetir depois de ter
                 # mandado texto duplicaria a resposta na tela do usuário, e um
                 # provedor lotado costuma recusar ANTES do primeiro chunk.
-                if tentativa == 0 and not emitiu and self._relax_provider_pin(kwargs, e):
+                if tentativa < 2 and not emitiu and (
+                    self._drop_reasoning_disable(kwargs, model, e)
+                    or self._relax_provider_pin(kwargs, e)
+                ):
                     continue
                 yield StreamChunk(event=StreamEventType.ERROR, content=str(e))
                 raise LLMProviderError(

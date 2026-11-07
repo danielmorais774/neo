@@ -34,7 +34,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from db.models.agent_job import AgentJob
-from db.models.release_request import STATUS_APROVADA
+from db.models.release_request import STATUS_APROVADA, STATUS_EXPIRADA
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,8 @@ def spec_de_continuacao(parado: AgentJob, row: Any) -> dict[str, Any]:
         # O que a memória respondeu antes da parada: a continuação preenche com
         # isto em vez de consultar de novo (ver `BrowserLocalDriver._consultar`).
         "respostas_memoria": sessao.get("respostas_memoria"),
+        # As abas da tarefa parada (docs/browser-multi-aba-plan.md §7).
+        "abas": sessao.get("abas"),
         "retomada_de": str(parado.id),
         "release_id": str(row.id),
     }
@@ -160,6 +162,73 @@ async def continuar(db: Any, job_manager: Any, parado: AgentJob, row: Any) -> Ag
         row.id, parado.id, novo.id, spec.get("tab_ref"),
     )
     return novo
+
+
+async def encerrar_esperas_vencidas(
+    db: Any,
+    servico: Any,
+    announce: Callable[[Any, str], Awaitable[None]] | None = None,
+) -> int:
+    """Encerra a tarefa que espera um card de liberação que VENCEU.
+
+    A liberação vence preguiçosamente — só é marcada quando alguém a lê — e
+    nada avisava a tarefa: sem resposta em 15 min, ela ficava "esperando você"
+    para sempre na janela de Tarefas, e uma aprovação depois do prazo não a
+    retomava (o pedido já não vale). Aqui, `servico.get` marca o vencimento na
+    passagem, e a tarefa termina cancelada, com um aviso no chat.
+    """
+    try:
+        esperando = await db.list_agent_jobs(None, statuses=["waiting"], limit=50)
+    except Exception as exc:  # noqa: BLE001 — a varredura é conveniência
+        logger.debug("[release][job] varredura sem lista de tarefas: %s", exc)
+        return 0
+    encerradas = 0
+    for job in esperando or []:
+        if job.kind != "browser_local":
+            continue
+        rid = _sessao(job).get("release_pending")
+        if not rid:
+            continue
+        try:
+            row = await servico.get(rid)
+        except Exception:  # noqa: BLE001
+            continue
+        if row is None or row.status != STATUS_EXPIRADA:
+            continue
+        try:
+            await db.update_agent_job(job.id, status="cancelled")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[release][job] não encerrei a espera %s: %s", job.id, exc)
+            continue
+        encerradas += 1
+        logger.warning("[release][job] liberação %s venceu → tarefa %s cancelada", row.id, job.id)
+        if announce is not None:
+            from core.release.sensitive import humano
+
+            nomes = ", ".join(humano(str(c).split(":", 1)[-1]) for c in (row.campos or [])) or "o dado"
+            try:
+                await announce(
+                    row,
+                    f"⌛ O pedido para liberar {nomes} em {row.destino} venceu sem resposta, "
+                    f"então encerrei “{job.title}”. Se ainda quiser, é só me pedir de novo.",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[release][job] falha ao avisar o vencimento de %s", row.id)
+    return encerradas
+
+
+def build_varredura_de_vencidas(
+    *, db: Any, announce: Callable[[Any, str], Awaitable[None]] | None = None
+) -> Callable[[], Awaitable[int]]:
+    """A varredura com o serviço de liberação montado, para o JobManager rodar."""
+    from core.release.service import ReleaseService
+
+    servico = ReleaseService(db)
+
+    async def varrer() -> int:
+        return await encerrar_esperas_vencidas(db, servico, announce)
+
+    return varrer
 
 
 def build_job_resumer(
