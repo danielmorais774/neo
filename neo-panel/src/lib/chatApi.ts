@@ -8,6 +8,7 @@
 
 export { CORE_BASE } from '../lib/auth';
 import { CORE_BASE, currentUserId } from '../lib/auth';
+import type { ModelCatalog } from './chatTypes';
 
 // O `user_id` saiu daqui. Era um UUID fixo no fonte, e o core o aceitava como
 // verdade: qualquer pedido podia se dizer dono da memória de qualquer um
@@ -117,6 +118,13 @@ export function streamCommandResponse(
     onEvent,
     signal,
   );
+}
+
+/** Vitrine do seletor de provider/modelo — a mesma que o desktop consome. */
+export async function loadModelCatalog(): Promise<ModelCatalog> {
+  const res = await fetch(`${CORE_BASE}/api/v1/desktop/model-catalog`);
+  if (!res.ok) throw new Error(`Falha ao carregar os modelos (${res.status})`);
+  return res.json();
 }
 
 export async function loadSessionHistory(sessionId: string): Promise<any[]> {

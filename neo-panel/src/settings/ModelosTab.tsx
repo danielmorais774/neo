@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 
 interface ProviderInfo {
   name: string;
+  /** Rótulo do catálogo (aba Providers). Core antigo não manda. */
+  label?: string;
   available: boolean;
   models: string[];
   suggested: string | null;
@@ -59,6 +61,7 @@ const providersFor = (
   return only && only.length > 0 ? list.filter((p) => only.includes(p.name)) : list;
 };
 
+// Reserva para um core que ainda não manda `label` no catálogo.
 const PROVIDER_LABELS: Record<string, string> = {
   deepseek: 'DeepSeek',
   openai: 'OpenAI',
@@ -193,7 +196,7 @@ const RolePicker = ({
           >
             {providers.map((p) => (
               <option key={p.name} value={p.name}>
-                {PROVIDER_LABELS[p.name] ?? p.name}
+                {p.label ?? PROVIDER_LABELS[p.name] ?? p.name}
                 {p.available ? '' : ' — não configurado'}
               </option>
             ))}

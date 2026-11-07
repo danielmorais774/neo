@@ -59,78 +59,28 @@ export interface ChatMessage {
 
 export type ChatMode = 'agent' | 'plan' | 'ask';
 
-export type ProviderType =
-  | 'openai' | 'groq' | 'grok' | 'deepseek' | 'anthropic' | 'gemini' | 'ollama' | 'openrouter';
+// Catálogo do seletor de provider/modelo — vem do neo-core
+// (`GET /api/v1/desktop/model-catalog`, editado em Configurações → Providers).
+// Antes era um enum copiado do desktop, e os dois já tinham divergido do core.
+export interface CatalogModel {
+  id: string;
+  label: string;
+  description: string;
+  vision: boolean;
+}
 
-export const PROVIDER_OPTIONS: { value: ProviderType; label: string }[] = [
-  { value: 'openai', label: 'OpenAI — GPT-4o, GPT-4.1...' },
-  { value: 'groq', label: 'Groq — Llama-3.3, ultra-rápido' },
-  { value: 'grok', label: 'Grok (xAI) — Grok-3-mini, Grok-2...' },
-  { value: 'deepseek', label: 'DeepSeek — Flash, V4 Pro...' },
-  { value: 'anthropic', label: 'Anthropic — Claude 3...' },
-  { value: 'gemini', label: 'Gemini — Gemini 2.5 Pro...' },
-  { value: 'ollama', label: 'Ollama — Local (Gemma4...)' },
-  { value: 'openrouter', label: 'OpenRouter — Grok 4.5, DeepSeek V4 Flash...' },
-];
+export interface CatalogProvider {
+  name: string;
+  label: string;
+  description: string;
+  models: CatalogModel[];
+}
 
-export const MODELS_BY_PROVIDER: Record<ProviderType, { value: string; label: string }[]> = {
-  openai: [
-    { value: 'gpt-4.1', label: 'GPT-4.1 — mais capaz' },
-    { value: 'gpt-4.1-mini', label: 'GPT-4.1 Mini — rápido' },
-    { value: 'gpt-4.1-nano', label: 'GPT-4.1 Nano — mais rápido' },
-    { value: 'gpt-4o', label: 'GPT-4o — equilíbrio' },
-    { value: 'gpt-4o-mini', label: 'GPT-4o-mini — econômico' },
-  ],
-  groq: [
-    { value: 'llama-3.3-70b-versatile', label: 'Llama-3.3 70B — padrão (free)' },
-    { value: 'llama-3.1-8b-instant', label: 'Llama-3.1 8B Fast — ultra-rápido (free)' },
-    { value: 'llama3-70b-8192', label: 'Llama3 70B 8k — contexto longo (free)' },
-    { value: 'mixtral-8x7b-32768', label: 'Mixtral 8x7B — 32k tokens (free)' },
-    { value: 'gemma2-9b-it', label: 'Gemma2 9B — Google (free)' },
-  ],
-  grok: [
-    { value: 'grok-3-mini-fast', label: 'Grok-3 Mini Fast — mais rápido (free)' },
-    { value: 'grok-3-mini', label: 'Grok-3 Mini — rápido (free)' },
-    { value: 'grok-2-1212', label: 'Grok-2 — completo (free)' },
-    { value: 'grok-3', label: 'Grok-3 — mais capaz (pago)' },
-  ],
-  deepseek: [
-    { value: 'deepseek-flash', label: 'DeepSeek Flash — mais rápido (V4.1)' },
-    { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro — mais capaz' },
-    { value: 'deepseek-chat', label: 'DeepSeek Chat — uso geral' },
-    { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner — raciocínio lento' },
-  ],
-  anthropic: [
-    { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet — mais capaz' },
-    { value: 'claude-3-haiku-20240307', label: 'Claude 3 Haiku — rápido' },
-  ],
-  gemini: [
-    { value: 'gemini-2.5-pro-preview-03-25', label: 'Gemini 2.5 Pro — avançado' },
-    { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash — rápido' },
-    { value: 'gemini-2.0-flash-lite', label: 'Gemini Flash Lite — leve' },
-  ],
-  ollama: [
-    { value: 'gemma4:e2b', label: 'Gemma4 2B (Local) — ultra-leve' },
-    { value: 'gemma4:12b', label: 'Gemma4 12B (Local)' },
-    { value: 'phi4', label: 'Phi-4 (Local)' },
-  ],
-  openrouter: [
-    { value: 'x-ai/grok-4.5', label: 'Grok 4.5 — mais capaz (raciocínio)' },
-    { value: 'x-ai/grok-4.20', label: 'Grok 4.20 — equilíbrio, 2M contexto' },
-    { value: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite — econômico' },
-    // O sufixo `@fireworks` fixa o provedor de infra do gateway (o neo-core o
-    // consome e não manda para a API) — sem ele o mesmo modelo sai por outro
-    // provedor, com outro preço, outro teto de saída e outra velocidade.
-    //
-    // As DUAS entradas existem de propósito (ver o comentário longo no catálogo
-    // gêmeo do desktop, neo-desktop-tauri/src/lib/models.ts): pin = endpoint
-    // estável (e cache de prefixo que sobrevive); sem pin = qualquer endpoint
-    // livre, sem espera, mas sorteando velocidade e preço a cada chamada.
-    { value: 'deepseek/deepseek-v4.1-flash@fireworks', label: 'DeepSeek V4.1 Flash (Fireworks) — 1M contexto, 69-85 tok/s' },
-    { value: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash (auto) — sem pin, preço e velocidade variam' },
-    { value: 'deepseek/deepseek-v4-flash@baidu', label: 'DeepSeek V4 Flash (Baidu) — geração anterior, ~6x mais barato' },
-  ],
-};
+export interface ModelCatalog {
+  providers: CatalogProvider[];
+  /** O par que vale quando não há escolha (o DEFAULT_PROVIDER do core). */
+  default: { provider: string; model: string } | null;
+}
 
 function randomId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;

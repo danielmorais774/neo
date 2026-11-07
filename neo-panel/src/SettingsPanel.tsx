@@ -2,6 +2,7 @@ import { useState } from 'react';
 import Screen, { type TabDef } from './ui/Screen';
 import Icon from './ui/Icon';
 import ModelosTab from './settings/ModelosTab';
+import ProvidersTab from './settings/ProvidersTab';
 import VozTab from './settings/VozTab';
 import ArquivosTab from './settings/ArquivosTab';
 import SessionsTab from './SessionsTab';
@@ -12,6 +13,7 @@ const SettingsPanel = () => {
 
   const tabs: TabDef[] = [
     { id: 'modelos', label: 'Modelos', render: () => <ModelosTab reloadToken={reloadToken} /> },
+    { id: 'providers', label: 'Providers', render: () => <ProvidersTab reloadToken={reloadToken} /> },
     { id: 'voz', label: 'Voz', render: () => <VozTab reloadToken={reloadToken} /> },
     { id: 'arquivos', label: 'Arquivos', render: () => <ArquivosTab reloadToken={reloadToken} /> },
     { id: 'comunicacoes', label: 'Comunicações', render: () => <SessionsTab /> },

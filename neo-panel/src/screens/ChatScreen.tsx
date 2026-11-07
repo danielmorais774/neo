@@ -4,6 +4,7 @@ import ChatMessageBubble from '../ChatMessageBubble';
 import {
   streamChat,
   streamCommandResponse,
+  loadModelCatalog,
   loadSessionHistory,
   uploadAttachment,
   postMissionCommand,
@@ -13,12 +14,10 @@ import {
   makeMessage,
   normalizeHistoryMessage,
   parseMissionMarker,
-  PROVIDER_OPTIONS,
-  MODELS_BY_PROVIDER,
   type AttachmentRef,
   type ChatMessage,
   type ChatMode,
-  type ProviderType,
+  type ModelCatalog,
 } from '../lib/chatTypes';
 import './ChatScreen.css';
 
@@ -53,14 +52,35 @@ const ChatScreen = () => {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
   const [mode, setMode] = useState<ChatMode>('agent');
-  const [provider, setProvider] = useState<ProviderType>('openai');
-  const [model, setModel] = useState('gpt-4.1');
+  // Provider/modelo começam vazios e recebem o default do core quando o
+  // catálogo chega — a lista é a mesma do desktop (GET /desktop/model-catalog).
+  const [provider, setProvider] = useState('');
+  const [model, setModel] = useState('');
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(true);
 
   const sessionIdRef = useRef<string>(loadOrCreateSessionId());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadModelCatalog()
+      .then((data) => {
+        if (cancelled) return;
+        setCatalog(data);
+        const fallback = data.default;
+        if (fallback) {
+          setProvider((current) => current || fallback.provider);
+          setModel((current) => current || fallback.model);
+        }
+      })
+      .catch((err) => console.error('[ChatScreen] catálogo de modelos indisponível:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -334,6 +354,8 @@ const ChatScreen = () => {
     }
   };
 
+  const providerModels = catalog?.providers.find((p) => p.name === provider)?.models ?? [];
+
   return (
     <div className="neo-screen">
       <div className="neo-topbar">
@@ -428,19 +450,30 @@ const ChatScreen = () => {
             <select
               className="neo-select chat-select"
               value={provider}
-              disabled={isExecuting}
+              disabled={isExecuting || !catalog}
               onChange={(e) => {
-                const nextProvider = e.target.value as ProviderType;
+                const nextProvider = e.target.value;
                 setProvider(nextProvider);
-                const models = MODELS_BY_PROVIDER[nextProvider];
-                if (models?.length) setModel(models[0].value);
+                const first = catalog?.providers.find((p) => p.name === nextProvider)?.models[0];
+                if (first) setModel(first.id);
               }}
             >
-              {PROVIDER_OPTIONS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              {(catalog?.providers ?? []).map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.description ? `${p.label} — ${p.description}` : p.label}
+                </option>
+              ))}
             </select>
-            <select className="neo-select chat-select" value={model} disabled={isExecuting} onChange={(e) => setModel(e.target.value)}>
-              {(MODELS_BY_PROVIDER[provider] ?? MODELS_BY_PROVIDER.openai).map((m) => (
-                <option key={m.value} value={m.value}>{m.label}</option>
+            <select
+              className="neo-select chat-select"
+              value={model}
+              disabled={isExecuting || !catalog}
+              onChange={(e) => setModel(e.target.value)}
+            >
+              {providerModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.description ? `${m.label} — ${m.description}` : m.label}
+                </option>
               ))}
             </select>
           </div>
