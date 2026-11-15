@@ -32,7 +32,25 @@ interface RoleInfo {
   vision?: boolean;
   /** Providers que ESTE slot aceita; vazio/ausente = todos. */
   only_providers?: string[];
+  /**
+   * Modelos que o select deste slot oferece além do catálogo, por provider. O
+   * catálogo só é semeado com o banco vazio: sem isto, o modelo que o slot
+   * recomenda (o Haiku 5.5 do juiz da grade) só existiria como "Outro (digitar)".
+   */
+  suggested_models?: Record<string, string[]>;
+  /** Seção da aba ("Navegador local (o seu)"). Core antigo não manda: lista solta. */
+  group?: string;
 }
+
+/** Os cards agrupados por seção, na ordem em que o core os manda. */
+const emGrupos = (roles: RoleInfo[]): [string, RoleInfo[]][] => {
+  const grupos = new Map<string, RoleInfo[]>();
+  for (const role of roles) {
+    const nome = role.group ?? '';
+    grupos.set(nome, [...(grupos.get(nome) ?? []), role]);
+  }
+  return [...grupos.entries()];
+};
 
 interface ModelConfig {
   roles: RoleInfo[];
@@ -58,7 +76,15 @@ const providersFor = (
 ): ProviderInfo[] => {
   const list = role.vision ? vision : all;
   const only = role.only_providers;
-  return only && only.length > 0 ? list.filter((p) => only.includes(p.name)) : list;
+  const allowed = only && only.length > 0 ? list.filter((p) => only.includes(p.name)) : list;
+  const extra = role.suggested_models ?? {};
+  // As sugestões do slot vêm no topo; o que o catálogo já tem não se repete.
+  return allowed.map((p) => {
+    const sugeridos = extra[p.name] ?? [];
+    if (sugeridos.length === 0) return p;
+    const models = p.models ?? [];
+    return { ...p, models: [...sugeridos, ...models.filter((m) => !sugeridos.includes(m))] };
+  });
 };
 
 // Reserva para um core que ainda não manda `label` no catálogo.
@@ -366,18 +392,26 @@ const ModelosTab = ({ reloadToken }: { reloadToken: number }) => {
               successLabel={(c) => `Classificador de intenção agora usa ${c.provider} · ${c.model}`}
             />
 
-            {models?.roles.map((role) => (
-              <RolePicker
-                key={role.key}
-                title={role.label}
-                description={role.description}
-                providers={providersFor(role, models.providers, visionProviders)}
-                current={role.current}
-                onSave={saveRole(role.key)}
-                successLabel={(c) => `${role.label} agora usa ${c.provider} · ${c.model}`}
-                visionOnly={role.vision}
-              />
-            ))}
+            {models &&
+              emGrupos(models.roles).map(([grupo, roles]) => (
+                <div key={grupo || 'sem-grupo'}>
+                  {grupo && <h3 className="neo-h3">{grupo}</h3>}
+                  {roles.map((role) => (
+                    <RolePicker
+                      key={role.key}
+                      title={role.label}
+                      description={role.description}
+                      providers={providersFor(role, models.providers, visionProviders)}
+                      current={role.current}
+                      onSave={saveRole(role.key)}
+                      successLabel={(c) =>
+                        `${grupo ? `${grupo} — ` : ''}${role.label} agora usa ${c.provider} · ${c.model}`
+                      }
+                      visionOnly={role.vision}
+                    />
+                  ))}
+                </div>
+              ))}
 
             {error && <div className="neo-error">Erro: {error}</div>}
           </>
