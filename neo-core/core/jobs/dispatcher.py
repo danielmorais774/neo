@@ -62,6 +62,16 @@ _COMPOSE_SYSTEM = (
 )
 
 
+#: O dispatcher do processo. O runner do navegador é montado no boot ANTES de o
+#: dispatcher existir (`api/main.py`), e precisa dele no meio do job para
+#: `avisar`/`perguntar` no chat (docs/browser-conversa-plan.md §4.4).
+_ATUAL: "ProactiveDispatcher | None" = None
+
+
+def dispatcher_atual() -> "ProactiveDispatcher | None":
+    return _ATUAL
+
+
 class ProactiveDispatcher:
     """Redige e entrega a resposta proativa de um job concluído."""
 
@@ -81,6 +91,35 @@ class ProactiveDispatcher:
         #: Caderno de trabalho. ``None`` com a flag desligada — e aí o passo 3
         #: do dispatch simplesmente não acontece.
         self.working_memory = working_memory
+        global _ATUAL
+        _ATUAL = self
+
+    async def publicar_durante(self, job: AgentJob, texto: str) -> None:
+        """Uma mensagem do job NO MEIO do caminho: aviso ou pergunta.
+
+        Diferente do `dispatch`, não é o resultado: o job continua rodando, e
+        isto pode acontecer várias vezes. Vai VERBATIM (o agente já escreveu
+        para o Daniel; reescrever na persona atrasaria a pergunta e poderia
+        mudar o que ela pede), fica no histórico da sessão — o cérebro precisa
+        saber o que foi perguntado quando a resposta chegar pelo chat — e sai
+        pelos mesmos canais da entrega final.
+        """
+        corpo = (texto or "").strip()
+        if not corpo:
+            return
+        if job.session_id is not None:
+            try:
+                await self.db.save_message(
+                    session_id=job.session_id,
+                    role="assistant",
+                    content=corpo,
+                    user_id=job.user_id,
+                    metadata={"source": "agent_job_ao_vivo", "job_id": str(job.id), "kind": job.kind},
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[Dispatch] não guardei a mensagem ao vivo do job %s: %s", job.id, e)
+        notif = await self._create_notification(job, kind="chat_message", title=job.title, body=corpo)
+        await self._fanout(job, notif, corpo)
 
     async def dispatch(self, job: AgentJob) -> None:
         """Entrega o resultado do ``job`` (idempotente: só entrega uma vez)."""
@@ -188,6 +227,7 @@ class ProactiveDispatcher:
             return
         try:
             from core.working_memory import render_job_entry, render_job_summary
+            from core.working_memory.render import marcador_ao_vivo
 
             spec = job.spec_json or {}
             duracao = None
@@ -223,6 +263,11 @@ class ProactiveDispatcher:
                     status=job.status or "?",
                     summary=summary,
                 ),
+                # O resultado TOMA O LUGAR da entrada de acompanhamento ao vivo
+                # (o progresso que o runner foi reescrevendo): o placar final
+                # está no topo do resumo, e duas versões do mesmo placar
+                # confundiriam quem lê.
+                replace_marker=marcador_ao_vivo(str(job.id)),
             )
         except Exception as e:  # noqa: BLE001 — caderno nunca derruba a entrega
             logger.warning("[Dispatch] caderno não registrou o job %s: %s", job.id, e)
@@ -244,6 +289,9 @@ class ProactiveDispatcher:
                 saida.append(f"{nome} · {caminho}".strip(" ·"))
             elif item:
                 saida.append(str(item))
+        itens = str((job.extra_metadata or {}).get("itens_arquivo") or "")
+        if itens:
+            saida.append(f"{itens} (os itens coletados, íntegros — no sandbox)")
         return saida
 
     @staticmethod
@@ -277,6 +325,14 @@ class ProactiveDispatcher:
         fecho = str(entrega.get("fecho") or "").strip()
         itens = [str(i).strip() for i in (entrega.get("itens") or []) if str(i).strip()]
         return fecho, itens
+
+    @staticmethod
+    def _fecho_literal(job: AgentJob) -> str:
+        """O fecho que vai como está, sem redator (`entrega["literal"]`)."""
+        entrega = (job.extra_metadata or {}).get("entrega")
+        if isinstance(entrega, dict) and entrega.get("literal"):
+            return str(entrega.get("fecho") or "").strip()
+        return ""
 
     def _com_itens(self, texto: str, job: AgentJob) -> str:
         """Cola o bloco íntegro DEPOIS do redator — como o `_append_images`.
@@ -316,6 +372,11 @@ class ProactiveDispatcher:
         literal = str((job.extra_metadata or {}).get("texto_literal") or "").strip()
         if literal:
             return literal
+        # Idem para a entrega que declara o fecho LITERAL: ele já vem escrito
+        # para o usuário (o relatório do Claude Code). O redator o comprimia.
+        fecho_literal = self._fecho_literal(job)
+        if fecho_literal:
+            return fecho_literal
         summary = (job.result_summary or "").strip()
         fallback = self._fallback_text(job, summary)
         if self.llm is None:

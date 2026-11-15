@@ -33,6 +33,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def rotulo_de_memoria(ctx: Any, session_id: Any = None) -> str:
+    """``[memória · outra conversa · 05/11]`` — de onde e de quando veio a lembrança.
+
+    session-20cb02b6: "Arquivo no Desktop: questoes_portal_384523.txt — 10
+    questões…", de uma conversa de 05/11, entrou como "[memória]" num pedido sobre
+    outro arquivo, sem nada que dissesse que era de outra conversa. A lembrança
+    continua entrando; só passa a dizer de onde vem.
+    """
+    partes = ["memória"]
+    origem = getattr(ctx, "session_id", None)
+    if session_id is not None and origem is not None:
+        partes.append("desta conversa" if str(origem) == str(session_id) else "outra conversa")
+    quando = getattr(ctx, "created_at", None)
+    if quando is not None:
+        try:
+            partes.append(quando.strftime("%d/%m"))
+        except (AttributeError, ValueError):
+            pass
+    return "[" + " · ".join(partes) + "]"
+
+
 _WEEKDAY_NAMES = [
     "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
     "sexta-feira", "sábado", "domingo",
@@ -117,9 +139,11 @@ class PromptContextSelector:
         divergiu em silêncio da decisão real e calou a birra inteira. ``None``
         mantém a derivação antiga (caminho de preview/testes).
 
-        ``session_id`` só é usado pela camada WORKING_MEM: a nota tocada NESTA
-        sessão sobe no índice (é a tarefa em andamento). Sem ele o caderno ainda
-        aparece, só sem essa prioridade.
+        ``session_id`` vale para duas camadas: no WORKING_MEM a nota tocada NESTA
+        sessão sobe no índice (é a tarefa em andamento); no RETRIEVED cada
+        lembrança diz se é desta conversa ou de outra, e de quando. Sem ele o
+        caderno ainda aparece, só sem essa prioridade, e a lembrança sai sem a
+        origem.
 
         Returns:
             (system_prompt_text, all_candidates) — the second element is the
@@ -261,7 +285,7 @@ class PromptContextSelector:
             # a existência das notas. Então a poda é por NOTA, aqui, sacrificando
             # as de menor prioridade (o sort do store já deixou as certas no fim).
             index_text, kept = self._fit_working_index(
-                working_notes, truncated=working_page.truncated
+                working_notes, truncated=working_page.truncated, session_id=session_id
             )
             if index_text:
                 working_notes = kept
@@ -340,7 +364,7 @@ class PromptContextSelector:
         for ctx in (recovered_context or [])[:5]:
             if not ctx.content.strip():
                 continue
-            text = f"[memória] {ctx.content[:300]}"
+            text = f"{rotulo_de_memoria(ctx, session_id)} {ctx.content[:300]}"
             candidates.append(ContextCandidate(
                 layer=ContextLayer.RETRIEVED,
                 source="hybrid_search",
@@ -445,7 +469,7 @@ class PromptContextSelector:
             return None
 
     def _fit_working_index(
-        self, notes: list[Any], *, truncated: bool = False
+        self, notes: list[Any], *, truncated: bool = False, session_id: Any = None
     ) -> tuple[str, list[Any]]:
         """Renderiza o índice cabendo no budget da camada, podando as últimas notas.
 
@@ -463,7 +487,9 @@ class PromptContextSelector:
         budget = getattr(self._settings, "context_budget_working_mem", 700)
         kept = list(notes)
         while kept:
-            text = render_index(kept, truncated=truncated or len(kept) < len(notes))
+            text = render_index(
+                kept, truncated=truncated or len(kept) < len(notes), session_id=session_id
+            )
             if self._tc.count(text) <= budget:
                 return text, kept
             kept.pop()

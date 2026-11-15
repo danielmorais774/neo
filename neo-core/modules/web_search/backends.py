@@ -47,6 +47,16 @@ class SearchBackend(Protocol):
     ) -> list[SearchResult]: ...
 
 
+def _idioma_busca() -> str:
+    """``[web] idioma_busca`` do neo.toml."""
+    try:
+        from shared.ajustes import ajustes
+
+        return ajustes().web.idioma_busca
+    except Exception:  # noqa: BLE001 — ajuste ilegível: sem filtro de idioma
+        return "all"
+
+
 class SearxngBackend:
     """SearXNG self-hosted (serviço ``searxng`` no compose, sem porta publicada).
 
@@ -66,7 +76,10 @@ class SearxngBackend:
         params: dict = {
             "q": query,
             "format": "json",
-            "language": "pt-BR",
+            # `pt-BR` filtrava páginas em português no Google CSE (o único motor
+            # que responde da VPS; Brave/DuckDuckGo/Startpage dão CAPTCHA): busca
+            # em inglês voltava lixo ou nada (session-34d7f528). Ver [web] no neo.toml.
+            "language": _idioma_busca(),
             "categories": category if category in ("news", "science") else "general",
             "safesearch": 0,
         }

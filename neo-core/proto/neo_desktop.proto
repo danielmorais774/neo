@@ -152,6 +152,17 @@ message AgentResponse {
   // (endpoint aberto, agnóstico de cliente). Vazio quando nenhum file_save
   // rodou neste turno.
   repeated FileRef files = 6;
+  // Tarefas em segundo plano que ESTA resposta abriu (hoje: o Claude Code, por
+  // claude_task/claude_reply). O desktop ancora o processo no balão: a faixa
+  // some quando a tarefa acaba ou a conversa troca, e o botão no balão a acha de
+  // novo. O histórico (/desktop/session/{id}/history) traz o mesmo `jobs`.
+  repeated JobRef jobs = 7;
+}
+
+// Uma tarefa (agent_job) presa a uma resposta. `kind` é o do job (claude_code).
+message JobRef {
+  string id = 1;
+  string kind = 2;
 }
 
 // Referência a um arquivo gerado/catalogado (file_save), pronto pra download

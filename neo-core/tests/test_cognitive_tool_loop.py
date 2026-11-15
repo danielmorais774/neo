@@ -505,3 +505,67 @@ async def test_dedup_mantem_a_primeira_ocorrencia_e_a_ordem():
     out = _dedup_tools_by_name([a, b, c])
     assert [t.name for t in out] == ["x", "y"]
     assert out[0].tag == "primeira"
+
+
+@pytest.mark.asyncio
+async def test_rounds_depois_da_primeira_tool_usam_a_temperatura_de_oficina():
+    """[cerebro] no neo.toml: 0.9 na conversa, 0.3 depois que uma tool rodou.
+    Na session-20cb02b6 as 52 rodadas (código python-docx incluso) foram a 0.9."""
+    from shared.ajustes import ajustes
+
+    svc = _svc()
+    temps = []
+
+    class _Gravador(_ScriptedProvider):
+        async def complete(self, *, temperature=None, **kwargs):
+            temps.append(temperature)
+            return await super().complete(temperature=temperature, **kwargs)
+
+    provider = _Gravador([
+        _Resp(tool_calls=[ToolCall(id="1", name="search_pks", arguments={"query": "x"})]),
+        _Resp(content="pronto"),
+    ])
+    await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="oi")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=_FakeExecutor({}), slog=None, trace=None,
+    )
+    c = ajustes().cerebro
+    assert temps == [c.temperatura, c.temperatura_com_ferramentas]
+    assert c.temperatura_com_ferramentas < c.temperatura
+
+
+@pytest.mark.asyncio
+async def test_tarefa_usa_a_temperatura_de_oficina_desde_a_primeira_rodada():
+    """Session-a20f4722: a 1ª rodada é a que ESCOLHE a tool, e a 0.9 escolheu `find`
+    no Mac para um pedido da internet. Com `onde` de tarefa, 0.3 desde o começo."""
+    from shared.ajustes import ajustes
+
+    svc = _svc()
+    temps = []
+
+    class _Gravador(_ScriptedProvider):
+        async def complete(self, *, temperature=None, **kwargs):
+            temps.append(temperature)
+            return await super().complete(temperature=temperature, **kwargs)
+
+    provider = _Gravador([_Resp(content="pronto")])
+    await svc._run_cognitive_tool_loop(
+        provider=provider, messages=[Message(role=MessageRole.USER, content="baixa e junta")],
+        req_model=None, model_name="m", provider_name="p",
+        tools=cognitive_tools_for(uuid4()), tool_executor=_FakeExecutor({}), slog=None, trace=None,
+        tarefa=True,
+    )
+    assert temps == [ajustes().cerebro.temperatura_com_ferramentas]
+
+
+def test_aviso_de_rota_so_para_sandbox_no_cerebro():
+    from modules.desktop.ai_service import _AVISO_ROTA_SANDBOX, _aviso_rota
+    from shared import IntentType, RoutingDecision
+
+    sandbox = RoutingDecision(intent=IntentType.DIRECT_RESPONSE, onde="sandbox")
+    assert _aviso_rota(sandbox) == _AVISO_ROTA_SANDBOX
+    assert "run_command" in _AVISO_ROTA_SANDBOX
+    for onde in ("maquina", "navegador", "nenhum", None):
+        assert _aviso_rota(RoutingDecision(intent=IntentType.DIRECT_RESPONSE, onde=onde)) is None
+    assert _aviso_rota(RoutingDecision(intent=IntentType.CLIENT_TOOL, onde="sandbox")) is None

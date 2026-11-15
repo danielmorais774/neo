@@ -17,6 +17,10 @@ from sqlmodel import Field, SQLModel
 # Estados terminais — o dispatcher só entrega uma vez, ao alcançar um destes.
 TERMINAL_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled", "continued"})
 
+# Jobs cujo trabalho roda FORA do core e sobrevive a um reinício dele: no boot
+# voltam para a fila (o runner reata) em vez de virar 'failed'.
+REATTACHABLE_JOB_KINDS = frozenset({"claude_code", "claude_sessao", "comando_local"})
+
 
 class AgentJob(SQLModel, table=True):
     __tablename__ = "agent_job"

@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, llm_catalog, model_config, voice_config, file_edit_config, spotify, skills, research, files, connections, datasets, events, schedules, release
+from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, llm_catalog, model_config, voice_config, file_edit_config, claude_code_config, spotify, skills, research, files, connections, datasets, events, schedules, release
 from api.auth import assert_secret_configured, auth_mode, require_owner, require_principal
 from api.security import require_panel_jwt
 from core import (
@@ -239,6 +239,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Server-side: o neo-core roda comandos no container irmão via docker exec.
     _workbench_sandbox = None
     _job_manager = None
+    _faxina_task = None
     if settings.workbench_enabled:
         from core.workbench import WORKBENCH_TOOLS, WorkbenchExecutor, WorkbenchSandbox
 
@@ -255,6 +256,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.workbench_sandbox = _workbench_sandbox
         print(f"✅ Workbench sandbox wired (container={settings.workbench_container})")
+
+        # Faxina do /workspace: nada mais apagava o que o Neo baixa ou gera ali.
+        # Regras e liga/desliga em `[faxina]` no neo.toml (core/workbench/faxina.py).
+        from core.workbench.faxina import faxina_loop
+
+        _faxina_task = asyncio.create_task(
+            faxina_loop(_workbench_sandbox), name="faxina-workspace"
+        )
+        app.state.faxina_task = _faxina_task
 
         # Background jobs (workbench). Tools registered for LLM/router visibility;
         # neo_bash_background/job_* dispatch through a per-request JobToolExecutor,
@@ -273,6 +283,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.jobs_enabled:
             from core.jobs import JOB_TOOLS, JobManager, build_research_runner
 
+            # As tools do Claude entram sempre: quem liga e desliga é a chave do
+            # neo-panel (core/claude_code/chave.py), conferida por quem as lista
+            # (classificador, agente do SERVER_TOOL, cérebro) e por quem executa.
             _tool_registry.register_many(JOB_TOOLS)
             # Runner de deep_research (kind=research), injetado sem acoplar o
             # JobManager ao core/research (docs/web-search-deep-research-plan.md).
@@ -337,6 +350,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     # JobManager, então entra por getter tardio. Sem ele o
                     # `«pks:campo»` não resolve (e não vira valor por acidente).
                     get_pks_service=lambda: getattr(app.state, "pks_service", None),
+                    # O caderno também nasce depois: o progresso ao vivo da tarefa
+                    # é escrito nele enquanto o job roda.
+                    get_working_memory=lambda: getattr(app.state, "working_memory", None),
+                    # O cofre: conta nova que o agente cria tem a senha gerada e
+                    # guardada aqui, sem passar pelo modelo (F5).
+                    get_credential_store=lambda: getattr(app.state, "credential_store", None),
                     # O olho do driver. None = modo texto (o comportamento antigo).
                     vision_model=(
                         settings.browser_local_vision_model
@@ -381,6 +400,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     max_parts_per_doc=settings.deep_read_max_parts_per_doc,
                 )
                 print("✅ Deep read runner wired (leitura delegada de documentos)")
+            # Claude Code delegado (docs/claude-code-delegation-plan.md): o
+            # orquestrador é um só; o corpo (Mac do usuário) vem do spec do job.
+            # Montado SEMPRE: a chave do neo-panel liga sem reiniciar, e o
+            # CLAUDE_CODE_ENABLED do .env virou só o padrão dela.
+            from core.claude_code import Limites
+            from core.jobs import build_claude_runner
+
+            _claude_runner = build_claude_runner(
+                db=_db,
+                llm_router=_llm_router,
+                get_file_store=lambda: getattr(app.state, "file_store", None),
+                modelo_padrao=settings.claude_code_model,
+                max_turnos=settings.claude_code_max_turns,
+                diario_dir=settings.claude_code_trace_dir,
+                modo_permissao=settings.claude_code_permission_mode,
+                limites=Limites(
+                    rodada_s=float(settings.claude_code_round_timeout),
+                    parado_s=float(settings.claude_code_stall_timeout),
+                    fora_do_ar_s=float(settings.claude_code_offline_timeout),
+                ),
+            )
+            print(f"✅ Claude Code runner wired (modelo={settings.claude_code_model})")
+            # A volta de um pedido entregue numa sessão do Claude do Daniel
+            # (docs/ambiente-de-trabalho-plan.md §9.4). Só pergunta ao Mac.
+            from core.jobs import build_claude_sessao_runner
+
+            _claude_sessao_runner = build_claude_sessao_runner()
             _job_manager = JobManager(
                 db=_db,
                 sandbox=_workbench_sandbox,
@@ -393,6 +439,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 browser_local_runner=_browser_local_runner,
                 download_watch_runner=_download_watch_runner,
                 deep_read_runner=_deep_read_runner,
+                claude_runner=_claude_runner,
+                claude_sessao_runner=_claude_sessao_runner,
             )
             app.state.job_manager = _job_manager
             print("✅ JobManager created (background jobs)")
@@ -408,7 +456,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _file_store = build_file_store(db=_db, settings=settings, sandbox=_workbench_sandbox)
         _file_store.ensure_dirs()
         _tool_registry.register_many(FILE_TOOLS)
-        _tool_executor.register_module_executor("files", FilesExecutor(_file_store))
+        _tool_executor.register_module_executor("files", FilesExecutor(_file_store, llm=_llm_router))
         files.set_store(_file_store)
         app.state.file_store = _file_store
         _files_gc_task = asyncio.create_task(gc_loop(_file_store, settings.neo_files_gc_interval_s))
@@ -912,6 +960,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wire voice (TTS) config route (neo-panel → Settings page)
     voice_config.set_dependencies(_db)
     file_edit_config.set_dependencies(_db)
+    # Chave do Claude Code integrado (neo-panel): o que o painel gravou vence o .env.
+    from core.claude_code import chave as _chave_claude
+
+    await _chave_claude.carregar(_db)
+    claude_code_config.set_dependencies(
+        _db, runner_montado=getattr(app.state, "job_manager", None) is not None
+        and getattr(app.state.job_manager, "_claude_runner", None) is not None,
+    )
+    print(f"✅ Claude Code integrado: {'ligado' if _chave_claude.ligado() else 'desligado'} ({_chave_claude.origem()})")
 
     # Wire Spotify OAuth route (neo-panel → Music page)
     spotify.set_dependencies(_db)
@@ -983,6 +1040,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             print("✅ JobManager stopped")
         except Exception as e:
             print(f"⚠️ JobManager stop error: {e}")
+
+    if _faxina_task is not None:
+        _faxina_task.cancel()
+        try:
+            await _faxina_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        print("✅ Faxina do workspace stopped")
 
     if _files_gc_task is not None:
         _files_gc_task.cancel()
@@ -1082,6 +1147,7 @@ app.include_router(model_config.router, prefix="/api/v1", dependencies=[Depends(
 app.include_router(llm_catalog.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(file_edit_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(claude_code_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(datasets.install_router)
 app.include_router(datasets.router)
 app.include_router(events.router)

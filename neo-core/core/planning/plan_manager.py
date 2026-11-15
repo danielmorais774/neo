@@ -27,6 +27,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _pedido_literal(plan: "ExecutionPlan") -> str:
+    """O bloco com o pedido LITERAL do usuário, para quem refina passos (vazio sem ele)."""
+    pedido = (getattr(plan, "pedido", "") or "").strip()
+    if not pedido:
+        return ""
+    return (
+        f'Pedido do usuário (literal): "{pedido[:1500]}"\n'
+        "Caminhos, nomes e destinos citados nele valem exatamente como escritos.\n\n"
+    )
+
+
 class PlanStep(BaseModel):
     """A single step in an execution plan."""
 
@@ -52,7 +63,12 @@ class ExecutionPlan(BaseModel):
     """A multi-step execution plan for a complex user request."""
 
     id: str = Field(default_factory=lambda: str(uuid4())[:12])
-    goal: str  # Original user request
+    goal: str  # Resumo do objetivo escrito pelo PLANEJADOR (paráfrase, não o pedido)
+    #: O pedido do usuário, LITERAL. O `goal` é a paráfrase do planejador e perde o
+    #: que importa: na session-7b61bc5e o pedido dizia "compacta a pasta
+    #: projeto-loja em ~/Documents/work/projeto-loja.zip", o goal virou "compactar
+    #: diretório de trabalho", e o passo refinado gravou o zip na home.
+    pedido: str = ""
     steps: list[PlanStep] = Field(default_factory=list)
     current_step_index: int = 0
     status: Literal["active", "completed", "failed", "cancelled"] = "active"
@@ -410,6 +426,7 @@ class PlanManager:
 
             plan = ExecutionPlan(
                 goal=parsed.get("goal", user_message),
+                pedido=user_message,
                 steps=steps,
             )
 
@@ -452,7 +469,8 @@ class PlanManager:
 
         prompt = (
             f'Objetivo geral: "{plan.goal}"\n\n'
-            f"## Resultados dos passos anteriores\n{completed_context}\n\n"
+            + _pedido_literal(plan)
+            + f"## Resultados dos passos anteriores\n{completed_context}\n\n"
             f"## Passo atual (#{step.index + 1})\n"
             f"Descrição: {step.description}\n"
             f"Ferramenta: {step.tool_name}\n\n"
@@ -629,6 +647,8 @@ class PlanManager:
         )
 
         if subplan:
+            # O `user_message` daqui é o prompt do sub-plano; o pedido é o do pai.
+            subplan.pedido = parent_plan.pedido or subplan.pedido
             subplan.parent_plan_id = parent_plan.id
             subplan.parent_step_id = parent_step.id
             parent_step.subplan_id = subplan.id
@@ -751,7 +771,8 @@ class PlanManager:
 
         prompt = (
             f'Objetivo geral: "{plan.goal}"\n\n'
-            f"## 1. Estado Atual do Plano\n"
+            + _pedido_literal(plan)
+            + f"## 1. Estado Atual do Plano\n"
             + "\n".join(steps_view) + "\n\n"
             f"## 2. Último Resultado\n"
             f"Step {step_index + 1}: {current_step.description if current_step else '?'}\n"
@@ -769,6 +790,13 @@ class PlanManager:
         if memory_discoveries:
             prompt += f"## 4. Descobertas da Sessão\n{memory_discoveries}\n\n"
 
+        # O sistema do usuário e as regras de comando ("Como escrever o comando"):
+        # chegavam por parâmetro e eram descartados, então o passo refinado era
+        # escrito sem saber o SO, a pasta padrão nem as regras de shell (o `zip -r`
+        # sem `-q`, com caminho absoluto, da session-7b61bc5e). `refine_step` já usa.
+        if system_context:
+            prompt += f"## 5. Contexto do Sistema\n{system_context}\n\n"
+
         prompt += (
             "---\n\n"
             "## Instruções (responda em JSON com 2 seções)\n\n"
@@ -784,6 +812,9 @@ class PlanManager:
             "  (obrigatório se decision=continue e próximo step depende do anterior)\n"
             "- subplan_steps: [{description, tool_name, tool_arguments, requires_approval}] | null\n\n"
             "## Regras CRÍTICAS\n"
+            "- Caminho, nome de arquivo e DESTINO que o pedido do usuário cita valem exatamente\n"
+            "  como ele escreveu: o refined_step usa esses caminhos, absolutos. Nunca troque um\n"
+            "  destino citado por um nome relativo — sem `working_dir` o comando roda na home.\n"
             "- NUNCA pule steps do plano. Execute SEMPRE o próximo step pendente na ordem exata.\n"
             "- decision=continue significa executar o próximo step pendente — não altere a ordem sem razão técnica.\n"
             "- decision=finish SÓ se TODOS os steps estão com status ✓ e o goal foi atingido. NUNCA finalize com steps pendentes.\n"

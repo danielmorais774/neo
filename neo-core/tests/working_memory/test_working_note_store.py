@@ -356,3 +356,41 @@ async def test_quota_zero_desliga_o_enchimento(store):
         "nota-do-modelo-2", "nota-do-modelo-1", "nota-do-modelo-0",
     ]
     assert page.truncated is True
+
+
+# ── acompanhamento ao vivo de um job (replace_marker) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_progresso_ao_vivo_e_uma_entrada_reescrita_e_o_resultado_toma_o_lugar(store):
+    """Sessão dade900f: entre "abri o job" e o resultado, o caderno ficava parado.
+
+    O progresso entra como UMA entrada, reescrita a cada mudança; no fim o
+    resultado a substitui. A linha "abri o job … (job J1)" do backstop cita o
+    mesmo id e não pode sumir junto.
+    """
+    marcador = "(acompanhamento ao vivo do job J1)"
+    await store.append_auto(user_id=USER, session_id=SESSION, entry="abri o job 'Portal' (job J1)")
+    for n in (1, 2, 3):
+        await store.append_auto(
+            user_id=USER, session_id=SESSION,
+            entry=f"Em andamento\nProgresso — Questão: {n} de 10 respondidas\n{marcador}",
+            summary=f"[em andamento] Portal: {n} respondidas",
+            replace_marker=marcador,
+        )
+    nota = store.rows[(USER, f"sessao-{str(SESSION)[:8]}")]
+    assert nota.body.count(marcador) == 1
+    assert "3 de 10 respondidas" in nota.body and "1 de 10 respondidas" not in nota.body
+    assert nota.entry_count == 2
+    assert nota.summary == "[em andamento] Portal: 3 respondidas"
+
+    await store.append_auto(
+        user_id=USER, session_id=SESSION,
+        entry="Resultado do job de segundo plano (browser_local) — concluiu.\n10 de 10 respondidas",
+        replace_marker=marcador,
+    )
+    nota = store.rows[(USER, f"sessao-{str(SESSION)[:8]}")]
+    assert marcador not in nota.body
+    assert "abri o job 'Portal' (job J1)" in nota.body
+    assert nota.body.rstrip().endswith("10 de 10 respondidas")
+    assert nota.entry_count == 2

@@ -414,6 +414,10 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                         _is_diagnostic=pending.get("_is_diagnostic", False),
                         _followup_count=pending.get("_followup_count", 0),
                         _has_plan=pending.get("_has_plan", False),
+                        # Quem acompanha um comando que virou tarefa no computador
+                        # precisa saber QUAL computador (runner_comando_local).
+                        device_id=device_id,
+                        user_id=stream_user_id,
                     )
                     async for resp in with_keepalive(turn, liveness):
                         if resp is None:
@@ -614,6 +618,16 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         ]
 
     @staticmethod
+    def _jobs_pb(jobs: "list[dict] | None") -> "list[neo_desktop_pb2.JobRef]":
+        """Tarefas que a resposta abriu (core/claude_code/balao.py) — o desktop
+        põe o botão do processo no balão."""
+        return [
+            neo_desktop_pb2.JobRef(id=str(j.get("id") or ""), kind=str(j.get("kind") or ""))
+            for j in jobs or []
+            if j.get("id")
+        ]
+
+    @staticmethod
     def _segments_pb(segments: "list[dict] | None") -> "list[neo_desktop_pb2.SpeechSegment]":
         """Build repeated SpeechSegment protos from resolved segment dicts (voice
         imitation). A segment without a voice leaves it unset → renderer speaks it
@@ -705,6 +719,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     voice=NeoDesktopServicer._voice_pb(resp.voice),
                     segments=NeoDesktopServicer._segments_pb(getattr(resp, "segments", None)),
                     files=NeoDesktopServicer._files_pb(resp.metadata.get("files") if resp.metadata else None),
+                    jobs=NeoDesktopServicer._jobs_pb(resp.metadata.get("jobs") if resp.metadata else None),
                 ),
             )
 
@@ -725,6 +740,7 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                     is_final=False,
                     total_iterations=resp.iterations,
                     files=NeoDesktopServicer._files_pb(resp.metadata.get("files")),
+                    jobs=NeoDesktopServicer._jobs_pb(resp.metadata.get("jobs")),
                 ),
             )
 
@@ -959,6 +975,29 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
         return neo_desktop_pb2.UnregisterDeviceResponse(ok=True)
 
 
+def _message_size_options() -> list[tuple[str, int]]:
+    """Teto de mensagem nos dois sentidos, do `[grpc]` do neo.toml.
+
+    Sem opção, o grpc.aio aceita 4 MB. Na session-1bbdd7c5 o resultado de um
+    `zip -r` chegou com 4.194.528 bytes, 224 acima do limite: o servidor recusou a
+    mensagem com `ResourceExhausted` e o stream do turno inteiro caiu, sem o Neo
+    saber o que tinha rodado. O desktop agora corta cada resultado em 1 MB; isto é
+    a folga para o que vier de cliente antigo.
+    """
+    try:
+        from shared.ajustes import ajustes
+
+        mb = int(ajustes().grpc.mensagem_max_mb)
+    except Exception as exc:  # noqa: BLE001 — sem ajustes, o padrão seguro
+        logger.warning("[gRPC] teto de mensagem do neo.toml ilegível (%s); usando 16 MB", exc)
+        mb = 16
+    limite = mb * 1024 * 1024
+    return [
+        ("grpc.max_receive_message_length", limite),
+        ("grpc.max_send_message_length", limite),
+    ]
+
+
 async def serve(
     ai_service: AIService,
     port: int = 50051,
@@ -974,7 +1013,7 @@ async def serve(
     Returns:
         Running grpc.aio.Server instance.
     """
-    server = grpc.aio.server()
+    server = grpc.aio.server(options=_message_size_options())
     neo_desktop_pb2_grpc.add_NeoDesktopServiceServicer_to_server(
         NeoDesktopServicer(ai_service, notification_broker, skill_executor), server
     )

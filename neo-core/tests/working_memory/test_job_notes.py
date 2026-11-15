@@ -87,12 +87,47 @@ def test_job_sem_resumo_ainda_diz_o_que_houve():
     assert "sem devolver resumo" in entrada
 
 
-def test_resumo_gigante_e_truncado_com_marca_visivel():
-    # O teto é generoso de propósito (o corpo da nota é o lugar barato), mas
-    # existe: sem ele um job que despeja a página inteira comeria a nota.
-    entrada = _entrada(summary="x" * 40000)
-    assert "resumo do job truncado" in entrada
-    assert len(entrada) < 9000
+def test_dez_questoes_do_portal_entram_inteiras():
+    # Job f7794968: 16 792 caracteres. O teto de 8000 deixou no caderno Q1–Q4,
+    # a Q5 até "Fonte: PE" e nada da Q6 à Q10.
+    questoes = "\n".join(f"- Q{n} — Enunciado: {'palavra ' * 230}— SELECIONADA: alternativa 3." for n in range(1, 11))
+    assert len(questoes) > 16000
+    entrada = _entrada(summary=questoes)
+    assert "truncado" not in entrada
+    assert entrada.count("SELECIONADA: alternativa 3.") == 10
+
+
+def test_pedido_longo_entra_inteiro():
+    pedido = "Para cada questão capture o enunciado. " * 30 + "(4) se o enunciado tiver imagem, descreva."
+    entrada = render_job_entry(
+        title="t", kind="browser_local", status="completed", job_id="j", summary="ok", pedido=pedido
+    )
+    assert "(4) se o enunciado tiver imagem, descreva." in entrada
+
+
+def test_so_o_absurdo_e_cortado_e_o_corte_diz_onde_esta_o_resto():
+    # A rede existe para o job que despejasse a página inteira: sem ela, uma
+    # entrada sozinha expulsaria do corpo todas as anteriores da sessão.
+    entrada = render_job_entry(
+        title="t", kind="browser_local", status="completed", job_id="j",
+        summary="x" * 300_000, diario="logs/browser_local/j",
+    )
+    assert "[…resumo do job truncado — íntegro em logs/browser_local/j]" in entrada
+    assert len(entrada) < 110_000
+
+
+def test_entrada_ao_vivo_tem_o_marcador_que_o_resultado_substitui():
+    from core.working_memory.render import marcador_ao_vivo, render_job_progress_entry
+
+    entrada = render_job_progress_entry(
+        title="Portal", kind="browser_local", job_id="abc",
+        linhas=["Progresso — Questão: 3 de 10 respondidas", "- Questão 1 ✓ respondida — marquei «A»"],
+    )
+    assert entrada.startswith("Em andamento — job de segundo plano (browser_local): Portal")
+    assert marcador_ao_vivo("abc") in entrada
+    # O backstop do turno cita o mesmo id em "abri o job … (job abc)": o marcador
+    # não pode casar com aquela linha, senão ela some junto.
+    assert marcador_ao_vivo("abc") not in "abri o job 'Portal' via browser_local_task (job abc) — ele ainda"
 
 
 # ── a linha do índice (o que entra no prompt TODO turno) ────────────────────
@@ -203,6 +238,7 @@ class _JobFalso:
         # simplesmente não era escrita. Ver `test_falha_do_caderno_e_registrada`.
         self.started_at = kw.get("started_at", None)
         self.finished_at = kw.get("finished_at", None)
+        self.extra_metadata = kw.get("extra_metadata", {})
 
 
 class _CadernoFalso:
@@ -236,6 +272,28 @@ async def test_dispatcher_grava_o_resultado_do_job_no_caderno():
     assert chamada["session_id"] == job.session_id
     assert "258599465" in chamada["entry"]
     assert "258599465" in chamada["summary"]
+
+
+@pytest.mark.asyncio
+async def test_resultado_toma_o_lugar_do_acompanhamento_ao_vivo():
+    from core.working_memory.render import marcador_ao_vivo
+
+    caderno = _CadernoFalso()
+    job = _JobFalso()
+    await _dispatcher(caderno)._note_result(job)
+    assert caderno.chamadas[0]["replace_marker"] == marcador_ao_vivo(str(job.id))
+
+
+@pytest.mark.asyncio
+async def test_entrada_aponta_o_arquivo_integro_dos_itens():
+    caderno = _CadernoFalso()
+    job = _JobFalso()
+    job.extra_metadata = {"itens_arquivo": "/workspace/files/extrair-questoes-f7794968.txt"}
+    await _dispatcher(caderno)._note_result(job)
+    assert (
+        "Arquivo: /workspace/files/extrair-questoes-f7794968.txt (os itens coletados, íntegros"
+        in caderno.chamadas[0]["entry"]
+    )
 
 
 @pytest.mark.asyncio

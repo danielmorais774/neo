@@ -59,7 +59,19 @@ _BY_NAME: dict[str, frozenset[str]] = {
     "email_message": frozenset({_F, _L}),
     # Arquivo de terceiro tem texto de terceiro dentro (PDF com injection).
     "deep_read": frozenset({_F, _L}),
+    # Claude Code delegado: lê web e arquivos (o relatório que volta é fonte
+    # externa) e atua — no corpo local, na máquina do usuário, com rede livre.
+    # O portão NEGA em turno contaminado/agenda/de fora (gate.py).
+    "claude_task": frozenset({_F, _A}),
+    "claude_reply": frozenset({_A}),
+    # As sessões do Claude do Daniel: ler é dado dele (o que pediu, o que a
+    # sessão respondeu); entregar um pedido faz um agente agir na máquina dele.
+    "claude_sessoes": frozenset({_L}),
+    "claude_enviar": frozenset({_A}),
     "file_read": frozenset({_F, _L}),
+    # O que o modelo de visão lê na página renderizada pode ser texto de terceiro
+    # (o PDF anexado com injection vira imagem e volta como descrição).
+    "file_olhar": frozenset({_F, _L}),
     "read_user_file": frozenset({_F, _L}),
     # ── leitura privada ──────────────────────────────────────────────────
     "search_pks": frozenset({_L}),
@@ -117,6 +129,8 @@ _BY_NAME: dict[str, frozenset[str]] = {
     "tool_run": frozenset({_A}),  # dispatcher genérico: vale o pior caso
     "tool_find": frozenset(),
     "job_cancel": frozenset({_A}),
+    # Instrui o agente que está mexendo no navegador DELE: é atuação.
+    "job_falar": frozenset({_A}),
     "job_list": frozenset(),
     "job_status": frozenset(),
     "job_logs": frozenset(),

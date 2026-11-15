@@ -25,6 +25,13 @@ class CompletionResponse(ABC):
         """Retorna o motivo de término (stop, tool_calls, length, etc)."""
         pass
 
+    def reasoning_tokens(self) -> int | None:
+        """Tokens que o modelo gastou raciocinando; ``None`` se o provider não diz.
+
+        Saem do mesmo ``max_tokens`` da resposta — ver ``core/llm/teto_adaptativo``.
+        """
+        return None
+
 
 class LLMProvider(ABC):
     """Interface base para providers de LLM."""

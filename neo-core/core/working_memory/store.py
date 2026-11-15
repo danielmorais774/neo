@@ -67,6 +67,16 @@ class WorkingMemoryError(Exception):
         self.message = message
 
 
+def _sem_entradas_com(body: str, marker: str) -> tuple[str, int]:
+    """O corpo sem as entradas que contêm ``marker``. Devolve (corpo, quantas saíram)."""
+    head, entries = split_entries(body)
+    ficam = [e.rstrip() for e in entries if marker not in e]
+    tiradas = len(entries) - len(ficam)
+    if not tiradas:
+        return body, 0
+    return "\n\n".join([head.rstrip(), *ficam]), tiradas
+
+
 def slugify(raw: str) -> str:
     """Nome de nota estável: minúsculo, sem acento, só ``[a-z0-9-]``.
 
@@ -148,8 +158,15 @@ class WorkingMemoryStore:
         links: list[str] | None = None,
         origin: str = "model",
         now: datetime | None = None,
+        replace_marker: str | None = None,
     ) -> WorkingNote:
-        """Cria ou atualiza a nota ``slug`` do usuário. Devolve a nota salva."""
+        """Cria ou atualiza a nota ``slug`` do usuário. Devolve a nota salva.
+
+        ``replace_marker``: no modo append, a entrada que contém este texto sai
+        antes da nova entrar. É o que deixa o progresso de um job ser UMA entrada
+        reescrita a cada mudança (e trocada pelo resultado no fim), em vez de uma
+        entrada nova por questão.
+        """
         if user_id is None:
             raise WorkingMemoryError(
                 "no_user", "o caderno de trabalho precisa de um usuário identificado."
@@ -192,7 +209,11 @@ class WorkingMemoryStore:
                 note.body = f"{self._header(note, now)}\n\n{entry}"
                 note.entry_count = 1
             else:
-                note.body = f"{note.body.rstrip()}\n\n{entry}"
+                corpo = note.body.rstrip()
+                if replace_marker:
+                    corpo, tiradas = _sem_entradas_com(corpo, replace_marker)
+                    note.entry_count = max(0, int(note.entry_count or 0) - tiradas)
+                note.body = f"{corpo}\n\n{entry}"
                 note.entry_count = int(note.entry_count or 0) + 1
             # A sessão de origem acompanha o último toque: é o que faz a nota
             # subir no índice quando a tarefa é retomada numa sessão nova.
@@ -216,6 +237,7 @@ class WorkingMemoryStore:
         slug: str | None = None,
         title: str = "Trabalho desta sessão",
         summary: str | None = None,
+        replace_marker: str | None = None,
     ) -> WorkingNote | None:
         """Backstop determinístico do turno (§7) — sem LLM, best-effort.
 
@@ -241,6 +263,7 @@ class WorkingMemoryStore:
                 # algo que o modelo pode usar para decidir abrir a nota.
                 summary=summary or "registro automático do que foi executado nesta sessão",
                 origin="auto",
+                replace_marker=replace_marker,
             )
         except Exception as exc:  # noqa: BLE001 — caderno nunca derruba o turno
             logger.warning("[WorkingMemory] append automático falhou: %s", exc)

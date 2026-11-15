@@ -1196,17 +1196,23 @@ class AffectAppraiser:
         for provider_name, model in candidates:
             try:
                 provider = self._llm.get_provider(provider_name)
+                # Roda no modelo do CLASSIFICADOR. Se ele não deixa desligar o
+                # raciocínio (GLM-5.3-flash, MiniMax m3.1-flash), recebe o teto do
+                # roteador — e o `max_tokens` abre espaço para ele, senão o
+                # raciocínio comeria os 220 da resposta.
+                teto = _teto_raciocinio_do_classificador()
                 response = await provider.complete(
                     messages=messages,
                     tools=None,
                     model=model,
                     temperature=0.0,
-                    max_tokens=220,
+                    max_tokens=220 + (teto or 0),
                     # A saída é um JSON de 5 números: o raciocínio do modelo só
                     # compete por orçamento e por tempo com ela. Sem isto, medido
                     # em 2026-08-01 no qwen3.5-flash: 11-20s e até 3.995 tokens de
                     # reasoning por turno, estourando o teto de 25s do updater.
                     disable_thinking=True,
+                    teto_raciocinio=teto,
                 )
                 return self._parse(response.get_content() or "")
             except Exception as e:  # noqa: BLE001 - tenta o próximo provider
@@ -1252,3 +1258,13 @@ class AffectAppraiser:
             return AffectSignal.model_validate(data)
         except ValidationError:
             return AffectSignal()
+
+
+def _teto_raciocinio_do_classificador() -> int | None:
+    """``[roteador] teto_raciocinio`` do neo.toml (0 = sem teto)."""
+    try:
+        from shared.ajustes import ajustes
+
+        return ajustes().roteador.teto_raciocinio or None
+    except Exception:  # noqa: BLE001 — ajuste ilegível não derruba o afeto
+        return None

@@ -57,15 +57,68 @@ _GATE_REWROTE_NOTE: dict[tuple[str, str], str] = {
     ),
 }
 
-# Por quanto tempo um pedido explícito de "navegador local" continua valendo para
-# as mensagens seguintes da mesma conversa — a mesma régua da herança por job.
-_LOCAL_ASK_WINDOW = timedelta(minutes=10)
-_LOCAL_ASK_LOOKBACK = 3
+# Com janela ou sem: a escolha é da CONVERSA, lida do banco (`_modo_da_sessao`).
+# Os alcances (quantas mensagens/tarefas, quanto tempo vale um site) moram no
+# `config/neo.toml`, seção [navegador.janela].
+
+# As falas do Daniel que vão para o agente do navegador (`_falas_do_daniel`).
+_FALAS_JANELA = timedelta(minutes=60)
+_FALAS_LOOKBACK = 6
+_FALAS_MAX = 1500
 
 # Tarefa de browser no servidor repetida: mesmo endereço, mesma conversa, ainda na
 # fila ou rodando.
 _BROWSER_DUP_WINDOW = timedelta(minutes=20)
 _URL_RE = re.compile(r"https?://[^\s'\"<>()\[\]{}]+", re.IGNORECASE)
+
+_PALAVRAS_RE = re.compile(r"\w{3,}", re.UNICODE)
+
+
+def _recado_para_tarefa_viva(fala: Any, task: str, context: str = "") -> str:
+    """O que vai para a tarefa que está rodando: as palavras DELE, se houver.
+
+    A tarefa reescrita pelo cérebro só quando não há fala dele no turno (a
+    continuação automática, por exemplo).
+    """
+    fala = str(fala or "").strip()
+    if fala:
+        return fala
+    recado = f"Nova instrução: {task}"
+    if context:
+        recado += f"\n(contexto: {context[:600]})"
+    return recado
+
+
+def _mesma_tarefa(nova: Any, rodando: Any) -> bool:
+    """O pedido é a tarefa que JÁ está rodando, dita de novo?
+
+    Sobreposição de palavras (3+ letras) de 80% ou mais. É o caso do cérebro que
+    repete o `browser_local_task` achando que não pegou: virar "nova instrução"
+    faria o agente recomeçar o que está fazendo. Pedido diferente — "abre o AppDemo
+    também" — fica bem abaixo disso.
+    """
+    a = set(_PALAVRAS_RE.findall(str(nova or "").lower()))
+    b = set(_PALAVRAS_RE.findall(str(rodando or "").lower()))
+    if not a or not b:
+        return False
+    return len(a & b) / len(a | b) >= 0.8
+
+
+#: Nomes que o cérebro inventa para o `task` quando chama a tool de navegador sem
+#: o esquema na mesa. Sessão f6a0be50 (12/11): `browser_local_task {"tarefa": …}`
+#: voltou "task vazia.", e ele concluiu que a extensão estava offline.
+_APELIDOS_DO_TASK = ("tarefa", "instrucao", "instrucoes", "instrução", "instruções", "objetivo")
+
+
+def _task_do_apelido(nome: str, args: dict[str, Any]) -> dict[str, Any]:
+    """A tarefa escrita com outro nome de parâmetro vale como ``task``."""
+    if nome not in ("browser_task", "browser_local_task") or str(args.get("task") or "").strip():
+        return args
+    for apelido in _APELIDOS_DO_TASK:
+        valor = args.get(apelido)
+        if isinstance(valor, str) and valor.strip():
+            return {**args, "task": valor}
+    return args
 
 
 def _urls_of(*texts: Any) -> set[str]:
@@ -87,16 +140,123 @@ def _hosts_de(*texts: Any) -> set[str]:
     return {url.split("/", 1)[0].split("#", 1)[0] for url in _urls_of(*texts)} - {""}
 
 
-# Até quando a última tarefa diz onde está o trabalho desta conversa naquele
-# site (ver `_trabalho_no_navegador_dele`). A janela herdada caduca como a aba
-# (`_ABA_VALIDA_POR` do runner): tomar a tela dele horas depois sem ele pedir é
-# a falha que o modo headless veio evitar. O login, não: o headless que parou
-# nele não passa dali, e o Portal da sessão cb41834a voltou três horas depois.
-_JANELA_HERDADA_POR = timedelta(minutes=15)
-_LOGIN_DO_HEADLESS_VALE_POR = timedelta(hours=12)
+
+
+def _job_com_janela(job: Any) -> bool:
+    """A tarefa rodou (ou foi criada para rodar) no navegador DELE, com janela?
+
+    Duas provas, qualquer uma: a aba que ela deixou é do navegador dele
+    (`tab_ref` positivo; negativo é o headless) ou o spec nasceu sem headless.
+    Job antigo sem nenhuma das duas não conta — não diz onde rodou.
+    """
+    sessao = (getattr(job, "extra_metadata", None) or {}).get("browser_session") or {}
+    try:
+        if int(sessao.get("tab_ref") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return (getattr(job, "spec_json", None) or {}).get("headless") is False
+
+
+def _onde_roda(job: Any) -> dict[str, Any]:
+    """Onde a tarefa do navegador local roda, dito com todas as letras ao cérebro.
+
+    Sem isto ele adivinhava: na sessão 7bc7caa1 a tarefa rodava sem janela, de
+    propósito, e o Neo culpou uma extensão pareada que estava offline (que nem é
+    o caminho do navegador local — ele passa pelo desktop).
+    """
+    spec = getattr(job, "spec_json", None) or {}
+    sessao = (getattr(job, "extra_metadata", None) or {}).get("browser_session") or {}
+    try:
+        aba = int(sessao.get("tab_ref") or 0)
+    except (TypeError, ValueError):
+        aba = 0
+    sem_janela = aba < 0 or (aba == 0 and spec.get("headless") is True)
+    info: dict[str, Any] = {
+        "janela": not sem_janela,
+        "onde": (
+            "SEM JANELA (headless) na máquina do Daniel: roda de verdade, mas ele não "
+            "vê aba nenhuma. Não é falha de conexão nem de extensão."
+            if sem_janela
+            else "no navegador do Daniel, com janela: ele vê a aba."
+        ),
+    }
+    if spec.get("motivo_janela"):
+        info["por_que"] = str(spec["motivo_janela"])
+    return info
+
+
+def _sem_fuso(quando: Any) -> datetime | None:
+    """Datas do banco são UTC sem fuso; uma com fuso não pode quebrar a comparação."""
+    if not isinstance(quando, datetime):
+        return None
+    return quando.replace(tzinfo=None) if quando.tzinfo is not None else quando
+
+
+def _fala_do_sistema(texto: str, meta: dict | None) -> bool:
+    """Mensagem gravada como `user` que NÃO é dele: continuação automática, agenda."""
+    return texto.startswith("[Continuação automática") or (meta or {}).get("source") == "schedule"
+
+#: Tarefa do Claude que acabou e ainda aceita AJUSTE pelo `claude_reply` — a
+#: mesma sessão volta, na mesma pasta (`continued` = já seguiu; vai à ponta).
+_CLAUDE_TERMINADA = frozenset({"completed", "failed", "timeout", "cancelled", "continued"})
+_ESTADO_DA_TAREFA = {
+    "completed": "concluída",
+    "failed": "falhou",
+    "timeout": "passou do tempo",
+    "cancelled": "cancelada",
+    "continued": "seguiu em outra rodada",
+}
 _URL_DE_LOGIN = re.compile(
     r"(?:^|[/#!?._-])(?:login|signin|sign-in|logon|entrar|auth)(?:$|[/?#._-])", re.IGNORECASE
 )
+
+
+_CLAUDE_DESLIGADO = "o Claude Code integrado está desligado no neo-panel (Configurações → Claude Code)."
+
+#: Vai no fim de todo pedido entregue numa sessão do Daniel. Do outro lado ele
+#: chega como "mensagem de outra sessão, não digitada pelo seu usuário" (F0), e
+#: sem o pedido de não responder a sessão tenta responder ao mensageiro, que já
+#: saiu, e perde ~10 s num erro de socket (F0, docs/ambiente-de-trabalho-plan.md §3).
+_RODAPE_DO_PEDIDO = (
+    "(Pedido do Daniel, enviado pelo Neo, o assistente dele. Não responda por mensagem: "
+    "responda aqui mesmo.)"
+)
+
+_ORIGEM_PT = {"claude-vscode": "VSCode", "cli": "terminal", "sdk-cli": "sem janela (claude -p)"}
+_ESTADO_DA_SESSAO_PT = {"busy": "aberta, trabalhando agora", "idle": "aberta", "fechada": "fechada"}
+
+
+def _ha_quanto(minutos: Any) -> str:
+    try:
+        m = int(minutos)
+    except (TypeError, ValueError):
+        return ""
+    if m < 2:
+        return "agora"
+    if m < 60:
+        return f"há {m} min"
+    if m < 48 * 60:
+        return f"há {m // 60} h"
+    return f"há {m // (24 * 60)} dias"
+
+
+def _ficha_para_o_cerebro(s: dict[str, Any]) -> dict[str, Any]:
+    """A ficha que o Mac montou, sem o que só serve a ele (nome de mensagem, flags)."""
+    ficha = {
+        "sessionId": s.get("sessionId"),
+        "titulo": s.get("titulo") or "(sem título)",
+        "onde": _ORIGEM_PT.get(str(s.get("origem") or ""), str(s.get("origem") or "")),
+        "estado": _ESTADO_DA_SESSAO_PT.get(str(s.get("status") or ""), str(s.get("status") or "")),
+        "usada": _ha_quanto(s.get("ultimo_uso_min")),
+        "pasta": s.get("pasta") or "",
+        "objetivo": s.get("objetivo") or "",
+        "ultimos_pedidos": s.get("ultimos_pedidos") or [],
+        "ultima_resposta": s.get("ultima_resposta") or "",
+    }
+    if s.get("arquivos"):
+        ficha["arquivos"] = s["arquivos"]
+    return ficha
 
 
 def _autoridade_do_turno() -> dict[str, Any] | None:
@@ -162,7 +322,7 @@ class JobToolExecutor:
 
     async def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         start = asyncio.get_event_loop().time()
-        args = tool_call.arguments or {}
+        args = _task_do_apelido(tool_call.name, tool_call.arguments or {})
         name = await self._gate_browser(tool_call.name, args)
         if name == _NO_SERVER_PLAYBACK:
             logger.info("[browser-gate] recusado: play sem o navegador do usuário")
@@ -181,6 +341,14 @@ class JobToolExecutor:
                 result = await self._deep_research(args)
             elif name == "deep_read":
                 result = await self._deep_read(args)
+            elif name == "claude_task":
+                result = await self._claude_task(args)
+            elif name == "claude_reply":
+                result = await self._claude_reply(args)
+            elif name == "claude_sessoes":
+                result = await self._claude_sessoes(args)
+            elif name == "claude_enviar":
+                result = await self._claude_enviar(args)
             elif name == "browser_task":
                 result = await self._browser_task(args)
             elif name == "browser_local_task":
@@ -195,6 +363,8 @@ class JobToolExecutor:
                 result = await self._logs(args)
             elif name == "job_cancel":
                 result = await self._cancel(args)
+            elif name == "job_falar":
+                result = await self._job_falar(args)
             else:
                 raise ValueError(f"Tool de job desconhecida: {name}")
             aviso = _GATE_REWROTE_NOTE.get((tool_call.name, name))
@@ -334,7 +504,7 @@ class JobToolExecutor:
             return {"ok": False, "error": "browser_task está desligado na config."}
         task = str(args.get("task") or "").strip()
         if not task:
-            return {"ok": False, "error": "task vazia."}
+            return {"ok": False, "error": "task vazia: a tarefa vai no parâmetro `task`, por extenso."}
         # O navegador do SERVIDOR não tem preenchimento escopado: um `«pks:cep»`
         # seria digitado como texto e enviado assim. Dado pessoal em formulário é
         # trabalho do navegador dele, que troca o marcador na hora de digitar e
@@ -455,8 +625,13 @@ class JobToolExecutor:
         pelo meu navegador local — caminho A" e, na mensagem seguinte, "nao foi,
         acessa o meu portifolio ai". A segunda frase não tem âncora e não havia job
         local para herdar: o portão rebaixou duas vezes e o Neo disse "abri no seu
-        navegador" sobre um job no servidor. O histórico de MENSAGENS só MANTÉM o
-        local que o cérebro escolheu — nunca promove.
+        navegador" sobre um job no servidor.
+
+        **A escolha gruda na conversa** (sessão 7bc7caa1, pedido do Daniel): se
+        ela já trabalhou no navegador dele com janela — um pedido dele ou uma
+        tarefa que rodou lá —, todo pedido de navegador vai para lá, inclusive o
+        que o cérebro mandou para o servidor. Quem decide é o banco
+        (``_modo_da_sessao``), não o modelo; a saída é ele dizer "sem janela".
 
         Quem promove sem pedido na frase é um JOB local desta conversa, recente
         (sessão b230a40d): "ainda tá lá, dá pra continuar" depois de um quiz que
@@ -505,8 +680,12 @@ class JobToolExecutor:
             if await self._inherits_local():
                 logger.info("[browser-gate] local mantido por continuação da sessão")
                 return name
-            if await self._asked_local_recently():
-                logger.info("[browser-gate] local mantido: o usuário pediu o navegador dele há pouco")
+            modo, motivo_modo = await self._modo_da_sessao()
+            if modo == "janela":
+                logger.info(
+                    "[browser-gate] local mantido: a conversa trabalha no navegador dele (%s)",
+                    motivo_modo,
+                )
                 return name
             # ⚠️ Este rebaixamento era a coisa certa quando "local" queria dizer
             # "tomar a janela que ele está usando". Não quer mais: sem pedido
@@ -532,6 +711,15 @@ class JobToolExecutor:
         if asked and name == "browser_task":
             logger.info("[browser-gate] promovido para browser_local_task (pediu o navegador dele)")
             return "browser_local_task"
+        if name == "browser_task" and self.device_id:
+            modo, motivo_modo = await self._modo_da_sessao()
+            if modo == "janela":
+                logger.info(
+                    "[browser-gate] promovido para browser_local_task "
+                    "(a conversa trabalha no navegador dele, com janela: %s)",
+                    motivo_modo,
+                )
+                return "browser_local_task"
         if name == "browser_task" and self.device_id and await self._inherits_local():
             logger.info(
                 "[browser-gate] promovido para browser_local_task "
@@ -586,82 +774,186 @@ class JobToolExecutor:
                 return True
         return False
 
-    async def _asked_local_recently(self) -> bool:
-        """O usuário pediu o navegador DELE numa das últimas mensagens desta conversa?
+    async def _falas_do_daniel(self) -> str:
+        """As últimas falas do Daniel nesta conversa, em ordem, nas palavras dele.
 
-        Lê do banco pelo mesmo motivo de ``_inherits_local``, e por mais um: no passo
-        de continuação do ciclo, ``user_message`` é a ordem que o próprio Neo
-        sintetizou ("avisar o usuário quando…"), não a frase do usuário.
+        Só mensagens DELE: o "[Continuação automática…]" que o Neo grava como
+        user fica de fora. Janela e quantidade são de propósito curtas — é o
+        pedido em andamento, não a conversa inteira.
         """
+        atual = (self.user_message or "").strip()
         if self.session_id is None:
-            return False
+            return atual[:_FALAS_MAX]
         try:
             msgs = await self.db.fetch_session_messages(
-                self.session_id, limit=_LOCAL_ASK_LOOKBACK, roles=["user"]
+                self.session_id, limit=_FALAS_LOOKBACK, roles=["user"]
             )
-        except Exception as exc:  # noqa: BLE001 — sem histórico, o default é o servidor
-            logger.warning("[browser-gate] histórico da conversa indisponível: %s", exc)
-            return False
-        from core.browser_local.gate import local_browser_requested
-
-        cutoff = datetime.utcnow() - _LOCAL_ASK_WINDOW
+        except Exception as exc:  # noqa: BLE001 — sem histórico, a fala do turno
+            logger.debug("[browser-local] histórico indisponível para as falas: %s", exc)
+            return atual[:_FALAS_MAX]
+        cutoff = datetime.utcnow() - _FALAS_JANELA
+        falas: list[str] = []
         for msg in msgs or []:
             created = getattr(msg, "created_at", None)
             if created is not None and created < cutoff:
                 continue
-            if local_browser_requested(str(getattr(msg, "content", "") or "")):
-                return True
-        return False
+            meta = getattr(msg, "extra_metadata", None) or {}
+            texto = str(getattr(msg, "content", "") or "").strip()
+            if not texto or meta.get("source") == "schedule" or texto.startswith("[Continuação automática"):
+                continue
+            if texto not in falas:
+                falas.append(texto)
+        if atual and atual not in falas:
+            falas.append(atual)
+        # As mais recentes valem mais e cabem primeiro: corta pelo começo.
+        linhas = [f"- {f}" for f in falas]
+        while linhas and len("\n".join(linhas)) > _FALAS_MAX:
+            linhas.pop(0)
+        return "\n".join(linhas)
+
+    async def _modo_da_sessao(self) -> tuple[str | None, str]:
+        """Com janela ou sem? A ÚLTIMA escolha desta conversa, lida do banco.
+
+        Devolve ``("janela" | "sem_janela" | None, motivo)``. Quem decide é o
+        código, nunca o modelo: ele troca de ideia entre um turno e outro
+        (sessão 7bc7caa1: o Daniel pediu "no meu navegador local, quero ver
+        acontecendo", respondeu uma pergunta do Neo 17 minutos depois e a tarefa
+        foi para o headless — a janela de 10 minutos do pedido tinha passado, e
+        o cérebro escreveu "com janela visível" só na prosa da tarefa).
+
+        Os sinais, o mais recente vence:
+
+        * mensagem DELE pedindo o navegador dele (``local_browser_requested``) → janela;
+        * mensagem dele pedindo sem janela (``headless_requested``) → sem janela;
+        * tarefa desta conversa que rodou com janela (``_job_com_janela``) → janela.
+
+        Tarefa headless NÃO é sinal: ela é o padrão de quando ninguém escolheu,
+        e contar com ela faria um headless errado se perpetuar. Sem prazo: a
+        escolha vale pela conversa inteira, até ele dizer o contrário ou abrir um
+        chat novo. A frase do turno vem primeiro (no passo de continuação do
+        ciclo, ``user_message`` é a ordem que o Neo sintetizou — por isso a fala
+        do sistema é pulada). Nunca levanta: sem banco, sem escolha.
+        """
+        from core.browser_local.gate import headless_requested, local_browser_requested
+
+        atual = (self.user_message or "").strip()
+        if atual and not _fala_do_sistema(atual, None):
+            if headless_requested(atual):
+                return "sem_janela", "ele pediu sem janela nesta mensagem"
+            if local_browser_requested(atual):
+                return "janela", "ele pediu o navegador dele nesta mensagem"
+        if self.session_id is None:
+            return None, ""
+        from shared.ajustes import ajustes
+
+        cfg = ajustes().navegador.janela
+        sinais: list[tuple[datetime, str, str]] = []
+        try:
+            msgs = await self.db.fetch_session_messages(
+                self.session_id, limit=cfg.mensagens_lidas, roles=["user"]
+            )
+        except Exception as exc:  # noqa: BLE001 — sem histórico, sem escolha
+            logger.debug("[browser-gate] histórico da conversa indisponível: %s", exc)
+            msgs = []
+        for msg in msgs or []:
+            texto = str(getattr(msg, "content", "") or "").strip()
+            quando = _sem_fuso(getattr(msg, "created_at", None))
+            if not texto or quando is None or _fala_do_sistema(
+                texto, getattr(msg, "extra_metadata", None)
+            ):
+                continue
+            if headless_requested(texto):
+                sinais.append((quando, "sem_janela", f'ele pediu sem janela: "{texto[:60]}"'))
+            elif local_browser_requested(texto):
+                sinais.append((quando, "janela", f'ele pediu o navegador dele: "{texto[:60]}"'))
+        if self.user_id is not None:
+            try:
+                jobs = await self.db.list_agent_jobs(self.user_id, limit=cfg.tarefas_lidas)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[browser-gate] histórico de jobs indisponível: %s", exc)
+                jobs = []
+            for job in jobs or []:
+                if getattr(job, "kind", None) != "browser_local":
+                    continue
+                if str(getattr(job, "session_id", None)) != str(self.session_id):
+                    continue
+                quando = _sem_fuso(getattr(job, "created_at", None))
+                if quando is not None and _job_com_janela(job):
+                    titulo = str(getattr(job, "title", "") or "")[:60]
+                    sinais.append((quando, "janela", f'tarefa com janela nesta conversa: "{titulo}"'))
+        if not sinais:
+            return None, ""
+        _, modo, motivo = max(sinais, key=lambda sinal: sinal[0])
+        return modo, motivo
 
     async def _trabalho_no_navegador_dele(self, start_url: str, texto: str) -> str | None:
-        """O trabalho desta conversa NESTE site está no navegador dele? Devolve o motivo.
+        """O trabalho NESTE site está no navegador dele? Devolve o motivo.
 
         O headless é outro navegador: não tem o login dele, nem a aba em que ele
         está, nem o que ele acabou de fazer na página. Na sessão cb41834a (Portal)
         três de cinco tarefas foram para lá porque a mensagem não dizia "no meu
-        navegador": "continuar sem recarregar a página" caiu no login do headless,
-        "vamos responder essa" e "monta um arquivo" também.
+        navegador". Na 7bc7caa1 (Google Forms do AppDemo), o formulário tinha sido
+        preenchido até a página 8 no Edge dele, em OUTRA conversa, quatro horas
+        antes: o headless abriu a página 1 em branco, sem o login do Google.
 
-        Duas evidências, as duas do banco de jobs da conversa e do mesmo site:
-        a última tarefa ali deixou aba no navegador dele (`tab_ref` positivo), ou a
-        do headless parou numa tela de login. Tarefa que morreu sem abrir aba não
-        diz onde o trabalho está e é pulada. Nunca levanta: sem banco, o default
-        de sempre.
+        A última tarefa no MESMO site decide, de qualquer conversa dele, dentro
+        de `site_vale_por_horas` (neo.toml): deixou aba no navegador dele
+        (`tab_ref` positivo) → com janela; a do headless parou numa tela de
+        login → com janela; a do headless TERMINOU (`completed`) → segue sem; a
+        do headless que falhou ou foi cancelada não prova nada e é pulada. Da mesma
+        conversa, uma tarefa sem endereço também conta. Tarefa que morreu sem
+        abrir aba não diz onde o trabalho está e é pulada. Nunca levanta.
         """
-        if self.session_id is None or self.user_id is None:
+        if self.user_id is None:
             return None
+        from shared.ajustes import ajustes
+
+        cfg = ajustes().navegador.janela
         try:
-            recentes = await self.db.list_agent_jobs(self.user_id, limit=12)
+            recentes = await self.db.list_agent_jobs(self.user_id, limit=cfg.tarefas_lidas)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[browser-local] histórico de jobs indisponível: %s", exc)
             return None
         alvos = _hosts_de(start_url, texto)
         agora = datetime.utcnow()
+        vale_por = timedelta(hours=float(cfg.site_vale_por_horas))
         for job in recentes:
-            if job.kind != "browser_local" or str(job.session_id) != str(self.session_id):
+            if getattr(job, "kind", None) != "browser_local":
                 continue
-            quando = getattr(job, "finished_at", None) or getattr(job, "created_at", None)
+            mesma = self.session_id is not None and str(getattr(job, "session_id", None)) == str(
+                self.session_id
+            )
+            quando = _sem_fuso(getattr(job, "finished_at", None) or getattr(job, "created_at", None))
             idade = (agora - quando) if quando is not None else timedelta(0)
-            if idade > _LOGIN_DO_HEADLESS_VALE_POR:
+            if idade > vale_por:
                 break
-            sessao = (job.extra_metadata or {}).get("browser_session") or {}
+            sessao = (getattr(job, "extra_metadata", None) or {}).get("browser_session") or {}
             try:
                 aba = int(sessao.get("tab_ref") or 0)
             except (TypeError, ValueError):
                 aba = 0
             if not aba:
                 continue
-            url = str(sessao.get("url") or (job.spec_json or {}).get("start_url") or "")
+            url = str(sessao.get("url") or (getattr(job, "spec_json", None) or {}).get("start_url") or "")
             hosts = _hosts_de(url)
-            if alvos and hosts and not (alvos & hosts):
+            if mesma:
+                if alvos and hosts and not (alvos & hosts):
+                    continue
+            elif not (alvos and hosts and (alvos & hosts)):
+                # Outra conversa só fala pelo MESMO site, com endereço dos dois lados.
                 continue
             site = next(iter(hosts), "este site")
+            onde = "desta conversa" if mesma else "de outra conversa"
             if aba > 0:
-                if idade > _JANELA_HERDADA_POR:
-                    return None
-                return f"a última tarefa desta conversa em {site} foi no navegador dele"
-            if _URL_DE_LOGIN.search(url) or "login" in str(job.result_summary or "").lower():
+                return f"a última tarefa {onde} em {site} foi no navegador dele"
+            if _URL_DE_LOGIN.search(url) or "login" in str(getattr(job, "result_summary", "") or "").lower():
                 return f"o navegador sem janela parou no login de {site}"
+            if getattr(job, "status", None) != "completed":
+                # Sem janela que falhou ou foi cancelada não prova que o modo sem
+                # janela serve aqui — e esconderia o trabalho no navegador dele
+                # (7bc7caa1: o headless errado, cancelado, era o mais recente no
+                # Forms e tapava três tarefas com janela). Olha a anterior.
+                continue
             return None
         return None
 
@@ -699,6 +991,51 @@ class JobToolExecutor:
             elif " ".join(str(spec.get("task") or "").lower().split()) == alvo:
                 return job
         return None
+
+    def _tarefa_viva(self, job_id: Any = None) -> Any:
+        """A caixa de entrada da tarefa de navegador VIVA deste turno, ou None.
+
+        Pelo id quando vier (e for do mesmo usuário); senão a desta conversa; senão
+        a deste navegador. Ver ``core/browser_local/conversa.py``.
+        """
+        from core.browser_local import conversa as conversas
+
+        if job_id:
+            alvo = conversas.viva(job_id)
+            if alvo is not None and str(alvo.user_id or "") == str(self.user_id or ""):
+                return alvo
+        return conversas.da_sessao(self.session_id) or conversas.do_device(self.device_id)
+
+    async def _job_falar(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Recado para a tarefa que está rodando no navegador (docs/browser-conversa-plan.md §4.5)."""
+        texto = str(args.get("mensagem") or "").strip()
+        if not texto:
+            return {"ok": False, "error": "mensagem vazia — escreva o recado para a tarefa."}
+        alvo = self._tarefa_viva(str(args.get("job_id") or "").strip() or None)
+        if alvo is None or str(alvo.user_id or "") != str(self.user_id or ""):
+            return {
+                "ok": False,
+                "error": (
+                    "nenhuma tarefa está rodando no navegador agora — o recado só chega "
+                    "enquanto ela roda. Se ela PAROU esperando (waiting), continue com "
+                    "`browser_local_task`: `continue_job` para uma autorização, ou a tarefa "
+                    "de novo com a resposta dele no `context` (a aba continua onde ela parou)."
+                ),
+            }
+        esperava = alvo.pergunta.texto if alvo.pergunta is not None else ""
+        alvo.entregar(texto, "chat", autoriza=bool(args.get("autoriza")))
+        logger.info("[browser-local] recado do chat para o job %s: %s", alvo.job_id, texto[:120])
+        return {
+            "ok": True,
+            "job_id": alvo.job_id,
+            "entregue": True,
+            **({"respondeu_a": esperava} if esperava else {}),
+            "note": (
+                "Recado entregue à tarefa no navegador: ela lê no próximo passo e segue dali, "
+                "sem recomeçar nem fechar aba. Diga isso ao Daniel em UMA frase e encerre o "
+                "turno — o que ela fizer chega sozinho no chat."
+            ),
+        }
 
     async def _browser_local_em_curso(self) -> "AgentJob | None":
         """Job de navegador local ainda vivo NESTE device, se houver.
@@ -764,6 +1101,7 @@ class JobToolExecutor:
             "resume_pending": pendente,
             "confirm_sensitive_ok": True,
             "pedido": antigo.get("pedido"),
+            "falas": antigo.get("falas"),
             "autoridade": antigo.get("autoridade"),
         }
         # Parou para o Daniel CONFERIR o formulário: o que ele viu é o que vai.
@@ -1090,7 +1428,7 @@ class JobToolExecutor:
 
         task = str(args.get("task") or "").strip()
         if not task:
-            return {"ok": False, "error": "task vazia."}
+            return {"ok": False, "error": "task vazia: a tarefa vai no parâmetro `task`, por extenso."}
         recusa = self._recusar_dado_literal(
             task,
             str(args.get("context") or ""),
@@ -1110,24 +1448,38 @@ class JobToolExecutor:
         # janela. Isso dá o IP certo (que é o que destrava site brasileiro —
         # medido: o servidor sai por datacenter na França e leva 403/CAPTCHA)
         # sem o custo que fez o portão existir.
-        from core.browser_local.gate import local_browser_requested
-
-        quer_ver = (
-            local_browser_requested(self.user_message)
-            or bool(args.get("visible"))
-            # "abra no meu navegador" vale para as mensagens seguintes da conversa:
-            # na sessão cb41834a, "monta um arquivo com as questões", quatro
-            # minutos depois, foi para o headless e morreu.
-            or await self._asked_local_recently()
-        )
-        headless = not quer_ver
-        if headless:
-            motivo = await self._trabalho_no_navegador_dele(
+        #
+        # "Quis ver" é decidido AQUI, pelo banco, na ordem abaixo — o `visible`
+        # do cérebro só acrescenta, nunca tira (ele troca de ideia de um turno
+        # para o outro: na sessão 7bc7caa1 escreveu "com janela visível" na
+        # prosa da tarefa e não no parâmetro, e ela foi para o headless).
+        #   1. a escolha da conversa (`_modo_da_sessao`): a frase do turno, o
+        #      último pedido dele ou a última tarefa com janela — sem prazo;
+        #      "sem janela" dito por ele ganha de tudo, inclusive do `visible`;
+        #   2. o `visible` do cérebro;
+        #   3. onde está o trabalho neste site (`_trabalho_no_navegador_dele`).
+        modo, motivo_modo = await self._modo_da_sessao()
+        if modo == "sem_janela":
+            headless = True
+        elif modo == "janela":
+            headless = False
+        elif args.get("visible"):
+            headless = False
+            motivo_modo = "o cérebro pediu com janela"
+        else:
+            headless = True
+            motivo_modo = "ninguém pediu janela"
+            motivo_site = await self._trabalho_no_navegador_dele(
                 str(args.get("start_url") or ""), f"{task}\n{args.get('context') or ''}"
             )
-            if motivo:
-                logger.info("[browser-local] no navegador dele, com janela: %s", motivo)
+            if motivo_site:
                 headless = False
+                motivo_modo = motivo_site
+        logger.info(
+            "[browser-local] %s: %s",
+            "sem janela (headless)" if headless else "com janela",
+            motivo_modo,
+        )
         # O `device_id` do spec é o da SUPERFÍCIE resolvida, que pode não ser o
         # device do canal (pedido pelo celular apontando o navegador do macbook).
         # O `act` do runner é `broadcaster.request(device_id, …)`, então apontar
@@ -1151,6 +1503,15 @@ class JobToolExecutor:
         pedido = (self.user_message or "").strip()
         if pedido:
             spec["pedido"] = pedido[:500]
+        # O que o Daniel disse sobre o trabalho, nas palavras DELE, para o AGENTE
+        # ler (o `pedido` acima é só a mensagem do turno e serve à conferência).
+        # Sessão c469e4c7: o "qualquer decisão que for minha, me pergunta" ficou na
+        # 1ª mensagem; o job seguinte nasceu de "continue e tente de novo", com a
+        # tarefa do cérebro mandando preencher "respostas PROVISÓRIAS" — e o
+        # agente obedeceu, porque nunca viu a frase dele.
+        falas = await self._falas_do_daniel()
+        if falas:
+            spec["falas"] = falas
         # Headless é da MÁQUINA, não da superfície: extensão não inicia navegador.
         # Sem ele, cair para a aba visível é melhor que falhar — mesma escada de
         # sempre (fetch → headless → tela), só que agora escolhida por capacidade
@@ -1163,6 +1524,11 @@ class JobToolExecutor:
             headless = False
             spec["headless"] = False
             spec["headless_indisponivel"] = True
+            motivo_modo = f"{superficie.label} não roda sem janela"
+        # Por que foi com janela ou sem: o `job_status` devolve isto, e o
+        # cérebro para de adivinhar (na 7bc7caa1 ele culpou uma extensão
+        # pareada offline por uma tarefa que rodava, sem janela, de propósito).
+        spec["motivo_janela"] = motivo_modo[:200]
         context = str(args.get("context") or "").strip()
         if context:
             spec["context"] = context[:2000]
@@ -1197,6 +1563,36 @@ class JobToolExecutor:
         # que faz ele seguir esperando em vez de tentar outro caminho.
         emcurso = await self._browser_local_em_curso()
         if emcurso is not None:
+            # A tarefa que está rodando OUVE (docs/browser-conversa-plan.md §4.5): um
+            # pedido NOVO vira recado para ela, em vez de "espere". A MESMA tarefa
+            # pedida de novo continua sendo só "é esta" — o cérebro às vezes a
+            # repete achando que não pegou, e repetir a tarefa como "nova
+            # instrução" faria o agente recomeçar o que já está fazendo.
+            from core.browser_local import conversa as conversas
+
+            viva = conversas.viva(emcurso.id)
+            if viva is not None and not _mesma_tarefa(task, (emcurso.spec_json or {}).get("task")):
+                # O recado leva as palavras DELE. A reescrita do cérebro desviava: na
+                # sessão 74408e70 o "continue" virou uma tarefa nova com "respostas
+                # neutras mínimas de teste" — o contrário do que ele tinha pedido — e
+                # o "PARE e pergunte" dela foi lido como "pode parar".
+                viva.entregar(_recado_para_tarefa_viva(self.user_message, task, context), "chat")
+                logger.info("[browser-local] pedido novo virou recado para o job %s", emcurso.id)
+                return {
+                    "ok": True,
+                    "job_id": str(emcurso.id),
+                    "title": emcurso.title,
+                    "status": emcurso.status,
+                    "reused": True,
+                    "entregue_como_recado": True,
+                    "note": (
+                        "Já havia uma tarefa rodando no navegador dele — NÃO abri outra: "
+                        "mandei este pedido como RECADO para ela, que lê no próximo passo e "
+                        "se ajusta sem fechar a aba nem recomeçar (pode abrir outra aba se "
+                        "precisar). Diga isso ao Daniel em uma frase. Para TROCAR de tarefa "
+                        "de verdade: `job_cancel` e depois a nova."
+                    ),
+                }
             return {
                 "ok": True,
                 "job_id": str(emcurso.id),
@@ -1206,8 +1602,10 @@ class JobToolExecutor:
                 "note": (
                     "JÁ EXISTE uma tarefa sua rodando no navegador deste usuário — esta é "
                     "ela, não uma nova. Só existe UMA aba: disparar outra derruba a "
-                    "primeira no meio. Espere o resultado chegar; ele vem sozinho no chat."
+                    "primeira no meio. Espere o resultado chegar; ele vem sozinho no chat. "
+                    "Para mudar o que ela está fazendo, use `job_falar`."
                 ),
+                **_onde_roda(emcurso),
             }
 
         job = AgentJob(
@@ -1224,15 +1622,28 @@ class JobToolExecutor:
             self.jm.poke()
         except Exception:  # noqa: BLE001
             pass
+        if headless:
+            # A nota era a mesma nos dois modos, e o Neo prometeu "a aba vai abrir
+            # na sua tela agora" sobre uma tarefa sem janela (sessão 7bc7caa1).
+            nota = (
+                "Tarefa enfileirada SEM JANELA (headless) na máquina do usuário: ele NÃO "
+                "vai ver aba nenhuma abrir. Não diga que abriu na tela dele. Diga que está "
+                "rodando por trás e que você avisa quando terminar; se ele quiser "
+                "acompanhar, é pedir 'no meu navegador'."
+            )
+        else:
+            nota = (
+                "Tarefa enfileirada no navegador DO USUÁRIO, com janela — ele vai ver "
+                "acontecendo na tela dele. Diga que ele pode acompanhar e que você avisa "
+                "quando terminar."
+            )
         return {
             "ok": True,
             "job_id": str(job.id),
             "title": title,
             "status": "queued",
-            "note": (
-                "Tarefa enfileirada no navegador DO USUÁRIO — ele vai ver acontecendo na "
-                "tela dele. Diga que ele pode acompanhar e que você avisa quando terminar."
-            ),
+            "janela": not headless,
+            "note": nota,
         }
 
     async def _browser_screenshot(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1397,11 +1808,520 @@ class JobToolExecutor:
             criteria_checker=self.criteria_checker,
         ).enqueue(args)
 
+    # ------------------------------------------------------------------
+    # Claude Code delegado (docs/claude-code-delegation-plan.md)
+    # ------------------------------------------------------------------
+
+    def _claude_ligado(self) -> bool:
+        from core.claude_code import chave
+
+        return bool(chave.ligado() and getattr(self.jm, "_claude_runner", None) is not None)
+
+    async def _mac_do_claude(self) -> tuple[str, str]:
+        """O Mac onde o Claude roda: ``(device_id, "")`` ou ``("", motivo)``.
+
+        O do turno quando é um Mac com o canal de controle aberto (o caso normal:
+        ele está falando pelo desktop). Pedido de outro aparelho cai no único Mac
+        online; com dois, não se chuta.
+        """
+        from core.notifications.device_control import get_device_control_broadcaster
+
+        b = get_device_control_broadcaster()
+        try:
+            registros = await self.db.get_connected_devices(self.user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[claude] não consegui listar os devices: %s", exc)
+            registros = []
+        macs = [
+            r for r in registros
+            if str(getattr(r, "os_platform", "") or "").lower() in ("macos", "darwin")
+            and b.is_connected(r.device_id)
+        ]
+        if self.device_id and any(r.device_id == self.device_id for r in macs):
+            return self.device_id, ""
+        if len(macs) == 1:
+            return macs[0].device_id, ""
+        if not macs:
+            return "", "o desktop do Neo não está aberto em nenhum Mac agora — o Claude roda lá."
+        nomes = ", ".join(str(getattr(r, "display_name", None) or r.model) for r in macs[:5])
+        return "", f"há mais de um Mac conectado ({nomes}); fale do Mac em que quer rodar."
+
+    async def _claude_em_curso(self) -> "AgentJob | None":
+        try:
+            ativos = await self.db.list_agent_jobs(self.user_id, statuses=["queued", "running"], limit=20)
+        except Exception:  # noqa: BLE001
+            return None
+        return next((j for j in ativos if j.kind == "claude_code"), None)
+
+    async def _claude_task(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Enfileira a tarefa e volta na hora. A saúde do Mac é conferida AGORA:
+        "não está logado" tem que chegar neste turno, não minutos depois."""
+        if not self._claude_ligado():
+            return {"ok": False, "error": "o Claude Code integrado está desligado no neo-panel (Configurações → Claude Code)."}
+        objetivo = str(args.get("objetivo") or "").strip()
+        if not objetivo:
+            return {"ok": False, "error": "objetivo vazio: diga ao Claude o que é 'pronto'."}
+        onde = str(args.get("onde") or "auto").strip().lower()
+        if onde == "servidor":
+            return {
+                "ok": False,
+                "error": (
+                    "o Claude no servidor ainda não existe (F2 do plano). Ofereça rodar no Mac "
+                    "do Daniel (onde='local')."
+                ),
+            }
+        device_id, motivo = await self._mac_do_claude()
+        if not device_id:
+            return {"ok": False, "error": motivo}
+
+        from core.claude_code import CorpoLocal
+        from core.notifications.device_control import get_device_control_broadcaster
+        from shared.config import get_settings
+
+        pasta = str(args.get("pasta") or "").strip()
+        saude = await CorpoLocal(get_device_control_broadcaster(), device_id).saude(pasta=pasta)
+        if not saude.ok:
+            return {"ok": False, "error": saude.motivo}
+        if pasta and saude.pasta_ok is False:
+            # No mesmo turno, para o modelo corrigir: no job 21b91d36 a pasta
+            # inventada (`~/Projetos/…`) só falhou no Mac, um turno depois.
+            return {
+                "ok": False,
+                "error": (
+                    f"a pasta '{pasta}' não serve no Mac do Daniel ({saude.pasta_motivo or 'não existe'}). "
+                    "Se ele NÃO pediu essa pasta, chame claude_task de novo SEM `pasta` — o Neo cria "
+                    "uma nova em ~/Neo/claude/. Se ele pediu, diga que ela não existe e pergunte qual usar."
+                ),
+            }
+
+        em_curso = await self._claude_em_curso()
+        if em_curso is not None:
+            return {
+                "ok": True,
+                "job_id": str(em_curso.id),
+                "title": em_curso.title,
+                "status": em_curso.status,
+                "reused": True,
+                "note": (
+                    "Já existe uma tarefa do Claude em andamento — uma por vez. Para orientar essa, "
+                    "use claude_reply; para trocar, job_cancel e peça de novo."
+                ),
+            }
+
+        modelo = str(args.get("modelo") or "").strip().lower()
+        if modelo not in ("sonnet", "opus", "haiku"):
+            modelo = get_settings().claude_code_model
+        entregaveis = [str(e).strip() for e in args.get("entregaveis") or [] if str(e).strip()]
+        spec: dict[str, Any] = {
+            "objetivo": objetivo,
+            "contexto": str(args.get("contexto") or "").strip(),
+            "entregaveis": entregaveis[:20],
+            "pasta": pasta,
+            "corpo": "local",
+            "device_id": device_id,
+            "modelo": modelo,
+            "max_rodadas": 3,
+            "autoridade": _autoridade_do_turno(),
+        }
+        then = str(args.get("then") or "").strip()
+        if then:
+            spec["then"] = then
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="claude_code",
+            title=f"Claude: {objetivo[:200]}",
+            spec_json=spec,
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "job_id": str(job.id),
+            "corpo": "Mac do Daniel",
+            "claude_code": saude.versao,
+            "note": (
+                "Tarefa NA FILA para o Claude Code no Mac do Daniel — ainda NÃO começou. Na "
+                "primeira vez, o Mac mostra um pedido de confirmação e ela só começa quando ele "
+                "permitir. Diga isso (sem afirmar que já funcionou), que você acompanha e traz o "
+                "resultado; NÃO fique esperando."
+            ),
+        }
+
+    async def _claude_reply(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Rodando: a mensagem entra na fila do job. Parado esperando: nasce a
+        continuação, pela MESMA sessão do Claude (mesmo padrão da retomada do
+        navegador, que cria um job novo herdando o spec). Terminada: o mesmo, como
+        AJUSTE — antes era "peça uma tarefa nova", e a tarefa nova nascia sem a
+        memória do Claude e numa pasta nova, sem os arquivos de antes."""
+        if not self._claude_ligado():
+            return {"ok": False, "error": "o Claude Code integrado está desligado no neo-panel (Configurações → Claude Code)."}
+        mensagem = str(args.get("mensagem") or "").strip()
+        if not mensagem:
+            return {"ok": False, "error": "mensagem vazia."}
+        anterior = await self._get_owned(args.get("job_id"))
+        if anterior is None or anterior.kind != "claude_code":
+            return {"ok": False, "error": "não achei essa tarefa do Claude."}
+        interromper = bool(args.get("interromper"))
+
+        # A tarefa já seguiu numa continuação (ou num ajuste): o pedido vai para a
+        # PONTA da cadeia, senão nasciam dois ramos da mesma sessão.
+        if anterior.status not in ("queued", "running"):
+            ponta = await self._ponta_da_cadeia(anterior)
+            if ponta.id != anterior.id:
+                return await self._claude_reply({**args, "job_id": str(ponta.id)})
+
+        if anterior.status in ("queued", "running"):
+            meta = dict(anterior.extra_metadata or {})
+            caixa = list(meta.get("claude_mensagens") or [])
+            caixa.append({
+                "texto": mensagem[:4000],
+                "interromper": interromper,
+                "em": datetime.utcnow().isoformat(timespec="seconds"),
+            })
+            meta["claude_mensagens"] = caixa
+            await self.db.update_agent_job(anterior.id, extra_metadata=meta)
+            return {
+                "ok": True,
+                "job_id": str(anterior.id),
+                "note": (
+                    "Parei a rodada atual; a mensagem dele começa a próxima." if interromper
+                    else "A mensagem entra quando a rodada atual terminar."
+                ),
+            }
+
+        claude = (anterior.extra_metadata or {}).get("claude") or {}
+        ajuste = anterior.status in _CLAUDE_TERMINADA
+        if anterior.status != "waiting" and not ajuste:
+            return {"ok": False, "error": f"essa tarefa está em '{anterior.status}' e não aceita mensagem."}
+        estado = (anterior.spec_json or {}).get("claude") or {}
+        if not claude.get("session_id") or (ajuste and not (estado.get("sessao_iniciada") or claude.get("rodadas"))):
+            return {
+                "ok": False,
+                "error": (
+                    f"essa tarefa nem chegou a começar ({anterior.status}), então não há sessão do "
+                    "Claude para retomar. Para fazer, peça uma tarefa nova com claude_task."
+                ),
+            }
+        if ajuste:
+            em_curso = await self._claude_em_curso()
+            if em_curso is not None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"já tem uma tarefa do Claude rodando (job {em_curso.id}). Mande para ela com "
+                        f"claude_reply(job_id=\"{em_curso.id}\"), ou espere ela terminar."
+                    ),
+                }
+
+        from core.claude_code import Recusa, regra_de_permissao
+
+        antigo = dict(anterior.spec_json or {})
+        liberadas = list(antigo.get("liberadas") or [])
+        if args.get("liberar"):
+            for r in claude.get("recusas") or []:
+                regra = regra_de_permissao(Recusa(str(r.get("ferramenta") or ""), dict(r.get("entrada") or {})))
+                if regra and regra not in liberadas:
+                    liberadas.append(regra)
+        if ajuste:
+            instrucao = (
+                f"Esta tarefa tinha terminado ({_ESTADO_DA_TAREFA.get(anterior.status, anterior.status)}). "
+                f"Agora o Daniel pede, pelo Neo: {mensagem}"
+            )
+        else:
+            instrucao = f"O Daniel respondeu, pelo Neo: {mensagem}"
+        if args.get("liberar") and liberadas:
+            instrucao += (
+                "\n\nEle liberou estas ações, só nesta tarefa: "
+                + ", ".join(liberadas)
+                + ". Faça agora o que tinha ficado bloqueado e continue."
+            )
+        spec = {
+            **{k: v for k, v in antigo.items() if k not in ("claude", "then")},
+            "liberadas": liberadas,
+            "instrucao_inicial": instrucao,
+            "tarefa_id": claude.get("tarefa_id") or str(anterior.id),
+            "continuacao_de": str(anterior.id),
+            "autoridade": _autoridade_do_turno(),
+            "claude": {
+                "session_id": claude["session_id"],
+                "sessao_iniciada": True,
+                "cwd": claude.get("cwd") or antigo.get("pasta") or "",
+                "tarefa_id": claude.get("tarefa_id") or str(anterior.id),
+            },
+        }
+        # O combinado da tarefa pausada continua valendo; o da terminada, não: um
+        # ajuste é pedido novo ("cole a saída da partida" não é sobre o placar).
+        if antigo.get("then") and not ajuste:
+            spec["then"] = antigo["then"]
+        titulo = re.sub(r"( \((continuação|ajuste)\))+$", "", anterior.title or "Claude")
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="claude_code",
+            title=f"{titulo} ({'ajuste' if ajuste else 'continuação'})"[:256],
+            spec_json=spec,
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        if not ajuste:
+            # A terminada fica como terminou (o balão dela diz "concluída"); a
+            # cadeia é achada pelo `continuacao_de`.
+            await self.db.update_agent_job(anterior.id, status="continued")
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "job_id": str(job.id),
+            "liberadas": liberadas,
+            "note": (
+                "O Claude retoma a MESMA sessão, na mesma pasta, lembrando do que fez. "
+                if ajuste else "O Claude continua de onde parou, pela mesma sessão. "
+            ) + "Avise e NÃO fique esperando.",
+        }
+
+    # ------------------------------------------------------------------
+    # As sessões do Claude do DANIEL (docs/ambiente-de-trabalho-plan.md §9)
+    # ------------------------------------------------------------------
+
+    async def _pedir_ao_mac(
+        self, device_id: str, acao: str, args: dict[str, Any], timeout: float
+    ) -> tuple[dict[str, Any] | None, str]:
+        """``(resultado, "")`` ou ``(None, motivo)``: o canal fora do ar vira frase para o modelo."""
+        from core.notifications.device_control import (
+            DeviceOffline,
+            DeviceTimeout,
+            get_device_control_broadcaster,
+        )
+
+        try:
+            r = await get_device_control_broadcaster().request(device_id, acao, args, timeout=timeout)
+        except DeviceOffline:
+            return None, "o desktop do Neo não está conectado no Mac agora."
+        except DeviceTimeout:
+            return None, f"o Mac não respondeu a tempo ({acao})."
+        if not r.get("ok"):
+            return None, str(r.get("error") or f"{acao} falhou no Mac")
+        return r.get("result") or {}, ""
+
+    async def _claude_sessoes(self, args: dict[str, Any]) -> dict[str, Any]:
+        """As fichas das sessões do Daniel, enxutas para o cérebro escolher."""
+        if not self._claude_ligado():
+            return {"ok": False, "error": _CLAUDE_DESLIGADO}
+        device_id, motivo = await self._mac_do_claude()
+        if not device_id:
+            return {"ok": False, "error": motivo}
+        from shared.ajustes import ajustes
+
+        t = ajustes().trabalho
+        r, motivo = await self._pedir_ao_mac(
+            device_id,
+            "claude.sessoes",
+            {
+                "recentes_horas": t.sessoes_recentes_horas,
+                # As tarefas do próprio Neo saem da lista aqui: pede uma folga.
+                "max": t.sessoes_max + 10,
+                "objetivo_max": t.ficha_objetivo,
+                "pedido_max": t.ficha_pedido,
+                "pedidos": t.ficha_pedidos,
+                "resposta_max": t.ficha_resposta,
+                "arquivos_max": t.ficha_arquivos,
+            },
+            timeout=30,
+        )
+        if r is None:
+            return {"ok": False, "error": motivo}
+        # Tarefa que o Neo delegou (`~/Neo/claude/…`) é `claude_reply`, não daqui;
+        # aba nova sem conversa não tem assunto para casar com pedido nenhum.
+        sessoes = [
+            _ficha_para_o_cerebro(s)
+            for s in r.get("sessoes") or []
+            if not s.get("tarefa_do_neo") and not s.get("vazia")
+        ][: t.sessoes_max]
+        if not sessoes:
+            return {
+                "ok": True,
+                "sessoes": [],
+                "note": "Nenhuma sessão do Claude aberta no Mac, nem fechada nas últimas horas.",
+            }
+        return {
+            "ok": True,
+            "sessoes": sessoes,
+            "note": (
+                "Escolha pelo ASSUNTO do pedido, comparando com título, últimos pedidos, última "
+                "resposta e arquivos (o título pode estar velho: a sessão muda de assunto). Pedido "
+                "genérico vai para a usada por último. Se duas combinam, ou nenhuma, pergunte "
+                "citando os títulos. Depois: claude_enviar(sessao=<sessionId>, pedido=<o pedido>)."
+            ),
+        }
+
+    async def _claude_enviar(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Entrega o pedido numa sessão do Daniel e põe um job para trazer a resposta.
+
+        Aberta: o Mac entrega pelo SendMessage, e ela executa sozinha (F0). Fechada:
+        o orquestrador do ``claude_task`` a retoma com ``--resume``, na pasta dela.
+        Sem diálogo no Mac, decisão do Daniel (08/11): o Neo não depende dele
+        apertar nada. Quem guarda é o portão (pedido dele, turno limpo).
+        """
+        if not self._claude_ligado():
+            return {"ok": False, "error": _CLAUDE_DESLIGADO}
+        pedido = str(args.get("pedido") or "").strip()
+        if not pedido:
+            return {"ok": False, "error": "pedido vazio: escreva o que o Daniel quer, completo."}
+        try:
+            sessao = str(UUID(str(args.get("sessao") or "").strip()))
+        except ValueError:
+            return {
+                "ok": False,
+                "error": "sessão inválida: use o sessionId que a claude_sessoes devolveu (chame-a antes).",
+            }
+        device_id, motivo = await self._mac_do_claude()
+        if not device_id:
+            return {"ok": False, "error": motivo}
+        from shared.ajustes import ajustes
+
+        r, motivo = await self._pedir_ao_mac(
+            device_id,
+            "claude.enviar",
+            {"sessionId": sessao, "texto": f"{pedido}\n\n{_RODAPE_DO_PEDIDO}"},
+            timeout=ajustes().trabalho.envio_timeout_s,
+        )
+        if r is None:
+            return {"ok": False, "error": motivo}
+        if not r.get("entregue"):
+            if r.get("motivo") == "sessao_fechada":
+                return await self._claude_retomar_sessao(device_id, sessao, pedido, r)
+            return {"ok": False, "error": str(r.get("erro") or "o Mac não confirmou a entrega do pedido.")}
+
+        titulo = str(r.get("titulo") or r.get("nome") or sessao[:8])
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="claude_sessao",
+            title=f"Claude ({titulo[:60]}): {pedido[:160]}",
+            spec_json={
+                "device_id": device_id,
+                "sessao": sessao,
+                "nome": r.get("nome"),
+                "titulo": titulo,
+                # Relógio do Mac, o mesmo do registro que o job vai comparar.
+                "enviado_em": int(r.get("enviado_em") or 0),
+                "pedido": pedido[:2000],
+                "autoridade": _autoridade_do_turno(),
+            },
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        nota = f"Entregue na sessão “{titulo}”, que já está executando"
+        nota += (
+            ": ela estava no meio de um trabalho, e o pedido entrou nele."
+            if r.get("status") == "busy" else "."
+        )
+        if r.get("texto_igual") is False:
+            nota += " Atenção: o texto que chegou não é idêntico ao pedido; diga isso ao Daniel."
+        nota += (
+            " Diga ao Daniel para qual sessão mandou e que avisa quando ela terminar; NÃO fique "
+            "esperando e NÃO afirme o resultado."
+        )
+        return {"ok": True, "job_id": str(job.id), "sessao": titulo, "note": nota}
+
+    async def _claude_retomar_sessao(
+        self, device_id: str, sessao: str, pedido: str, r: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Sessão fechada (§9.5): o orquestrador do ``claude_task`` a retoma com
+        ``--resume``, na pasta dela, com o histórico. O Mac só responde
+        ``sessao_fechada`` depois de conferir que nenhum processo a segura."""
+        pasta = str(r.get("pasta") or "").strip()
+        titulo = str(r.get("titulo") or sessao[:8])
+        if not pasta:
+            return {"ok": False, "error": f"a sessão “{titulo}” está fechada e não achei a pasta dela no Mac."}
+        em_curso = await self._claude_em_curso()
+        if em_curso is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"a sessão “{titulo}” está fechada, e retomá-la usa o braço das tarefas do Claude, "
+                    "que já tem uma rodando (uma por vez). Espere ela terminar ou cancele."
+                ),
+            }
+        from shared.config import get_settings
+
+        job = AgentJob(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            kind="claude_code",
+            title=f"Claude ({titulo[:60]}): {pedido[:160]}",
+            spec_json={
+                "objetivo": f"Continuar a sessão “{titulo}” do Daniel com o pedido dele: {pedido}",
+                "contexto": "",
+                "entregaveis": [],
+                "pasta": pasta,
+                "corpo": "local",
+                "device_id": device_id,
+                "modelo": get_settings().claude_code_model,
+                "max_rodadas": 3,
+                "instrucao_inicial": f"Pedido do Daniel, enviado pelo Neo: {pedido}",
+                "autoridade": _autoridade_do_turno(),
+                "sessao_do_daniel": sessao,
+                "claude": {"session_id": sessao, "sessao_iniciada": True, "cwd": pasta},
+            },
+            status="queued",
+            notify_policy="chat",
+        )
+        job = await self.db.create_agent_job(job)
+        try:
+            self.jm.poke()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "job_id": str(job.id),
+            "sessao": titulo,
+            "fechada": True,
+            "note": (
+                f"A sessão “{titulo}” estava fechada: o Neo a retoma em segundo plano, na pasta "
+                f"dela ({pasta}), com o histórico. Diga isso ao Daniel e que avisa quando terminar; "
+                "não fique esperando."
+            ),
+        }
+
+    async def _ponta_da_cadeia(self, job: "AgentJob") -> "AgentJob":
+        """O job mais novo da cadeia de continuações e ajustes que começa em ``job``."""
+        try:
+            recentes = await self.db.list_agent_jobs(self.user_id, limit=50)
+        except Exception:  # noqa: BLE001 — sem a lista, responde ao job pedido
+            return job
+        seguinte = {
+            str((j.spec_json or {}).get("continuacao_de")): j
+            for j in sorted(recentes, key=lambda j: j.created_at or datetime.min)
+            if j.kind == "claude_code" and (j.spec_json or {}).get("continuacao_de")
+        }
+        atual = job
+        for _ in range(20):
+            proximo = seguinte.get(str(atual.id))
+            if proximo is None:
+                break
+            atual = proximo
+        return atual
+
     async def _status(self, args: dict[str, Any]) -> dict[str, Any]:
         job = await self._get_owned(args.get("job_id"))
         if job is None:
             return {"ok": False, "error": "job não encontrado."}
-        return {
+        resultado = {
             "ok": True,
             "job_id": str(job.id),
             "title": job.title,
@@ -1414,6 +2334,17 @@ class JobToolExecutor:
             # ("mostra de novo aquele print") sem rodar nada.
             "image_markers": image_markers((job.extra_metadata or {}).get("images")),
         }
+        progresso = str(getattr(job, "progress_note", "") or "")
+        if progresso:
+            resultado["progresso"] = progresso
+        if job.status == "running" and progresso.startswith("esperando você"):
+            # Viva e parada numa pergunta: o `running` sozinho fez o Neo achar
+            # que ela estava travada (sessão 7bc7caa1).
+            resultado["esperando_resposta"] = True
+            resultado["pergunta"] = progresso.split(":", 1)[-1].strip()
+        if getattr(job, "kind", None) == "browser_local":
+            resultado.update(_onde_roda(job))
+        return resultado
 
     async def _list(self, args: dict[str, Any]) -> dict[str, Any]:
         only_active = bool(args.get("only_active"))
@@ -1529,6 +2460,12 @@ async def read_job_logs(job: AgentJob, sandbox: Any, *, max_bytes: int | None = 
     Do sandbox vem o FIM do log (`read_tail`): num job longo, o começo é justamente
     a parte velha.
     """
+    if getattr(job, "kind", None) == "comando_local":
+        # Tarefa no computador do usuário: o log mora LÁ (services/local_jobs.rs) e
+        # vem ao vivo pelo canal de controle; terminada, fica o resumo.
+        from core.jobs.runner_comando_local import logs as _logs_comando_local
+
+        return await _logs_comando_local(job, max_bytes)
     if not job.log_path:
         # Na fila, ou comando adotado ainda rodando (a saída dele só existe no fim).
         return {

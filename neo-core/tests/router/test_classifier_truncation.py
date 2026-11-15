@@ -328,3 +328,69 @@ async def test_sem_destinatario_a_skill_pergunta_em_vez_de_barrar():
     router, _ = build_router([FakeResponse(_json.dumps(payload), finish_reason="stop")])
     decision = await router.classify("manda um oi pra ele")
     assert decision.intent == IntentType.WHATSAPP_MESSAGING
+
+
+# ── `{}` vazio e teto de raciocínio (session-a20f4722, 13/11) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_objeto_vazio_e_tratado_como_vazio_e_nao_como_prosa():
+    """O MiniMax m3.1-flash devolveu `{}` em 1 de 30 pedidos reais (2 tokens)."""
+    router, provider = build_router([
+        FakeResponse("{}", finish_reason="stop"),
+        FakeResponse(_GOOD_JSON, finish_reason="stop"),
+    ])
+
+    decision = await router.classify("quantos GB livres tem no meu disco?")
+
+    assert decision.intent == IntentType.CLIENT_TOOL
+    assert provider.calls[1]["max_tokens"] == _CLASSIFIER_MAX_TOKENS_RETRY
+    # Retentativa simples, sem o "PARE, você é classificador" do reparo de prosa.
+    assert len(provider.calls[1]["messages"]) == len(provider.calls[0]["messages"])
+
+
+def test_objeto_sem_intent_nao_conta_como_classificacao():
+    assert IntentRouter._carries_json("{}") is False
+    assert IntentRouter._carries_json('{"speech_act": "question"}') is False
+    assert IntentRouter._is_empty_object("{}") is True
+    assert IntentRouter._is_empty_object(_GOOD_JSON) is False
+
+
+@pytest.mark.asyncio
+async def test_classificador_pede_o_teto_de_raciocinio_do_neo_toml():
+    from shared.ajustes import ajustes
+
+    router, provider = build_router([
+        FakeResponse("", finish_reason="length"),
+        FakeResponse(_GOOD_JSON, finish_reason="stop"),
+    ])
+
+    await router.classify("quantos GB livres tem no meu disco?")
+
+    teto = ajustes().roteador.teto_raciocinio
+    assert teto > 0
+    assert provider.calls[0]["teto_raciocinio"] == teto
+    assert provider.calls[1]["teto_raciocinio"] == teto
+
+
+@pytest.mark.asyncio
+async def test_campo_onde_chega_na_decisao():
+    """Session-a20f4722: a regra mestra ficava só na explicação, que não chega ao cérebro."""
+    com_onde = _GOOD_JSON.replace('"tipo_tarefa": "simples"', '"tipo_tarefa": "simples", "onde": "Máquina"')
+    router, _ = build_router([FakeResponse(com_onde, finish_reason="stop")])
+    decision = await router.classify("quantos GB livres tem no meu disco?")
+    assert decision.onde == "maquina"
+
+
+@pytest.mark.asyncio
+async def test_onde_desconhecido_vira_none():
+    com_onde = _GOOD_JSON.replace('"tipo_tarefa": "simples"', '"tipo_tarefa": "simples", "onde": "nuvem"')
+    router, _ = build_router([FakeResponse(com_onde, finish_reason="stop")])
+    decision = await router.classify("quantos GB livres tem no meu disco?")
+    assert decision.onde is None
+
+
+def test_prompt_do_classificador_pede_o_campo_onde():
+    from core.router.intent_router import ROUTER_SYSTEM_PROMPT
+
+    assert '"onde": "sandbox"|"maquina"|"navegador"|"nenhum"' in ROUTER_SYSTEM_PROMPT

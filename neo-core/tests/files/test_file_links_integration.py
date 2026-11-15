@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.files.ledger import build_views, render_block, resolve_doc_key
+from core.files.ledger import build_views, render_block, resolve_doc_key, versao_provavel
 from core.router.intent_router import IntentRouter
 from modules.desktop.ai_service import AIService, AIServiceResponse
 from shared.types import IntentType, RoutingDecision
@@ -33,9 +33,12 @@ class _Ledger:
         return [r for r in self.rows if r.session_id == str(session_id) or (user_id and r.user_id == str(user_id))]
 
     async def record(self, *, user_id, session_id, action, name="", host_path=None, sandbox_path=None,
-                     file_id=None, sha256=None, size_bytes=None, status="ok", note=""):
+                     file_id=None, sha256=None, size_bytes=None, status="ok", note="", versao_de=None):
         eventos = await self.events(session_id, user_id)
-        chave = resolve_doc_key(eventos, action=action, host_path=host_path, sandbox_path=sandbox_path, file_id=file_id)
+        if action == "saved" and not versao_de:
+            versao_de = versao_provavel(eventos, sandbox_path=sandbox_path, session_id=session_id)
+        chave = resolve_doc_key(eventos, action=action, host_path=host_path, sandbox_path=sandbox_path,
+                                file_id=file_id, versao_de=versao_de)
         if action == "delivered" and host_path and name and name.rsplit(".", 1)[-1] != host_path.rsplit(".", 1)[-1]:
             status = "wrong_content"
         self.t += timedelta(minutes=1)
@@ -48,10 +51,10 @@ class _Ledger:
         return row
 
     async def views(self, session_id, user_id=None):
-        return build_views(await self.events(session_id, user_id))
+        return build_views(await self.events(session_id, user_id), session_id=session_id)
 
-    async def block(self, session_id, user_id=None):
-        return render_block(await self.views(session_id, user_id))
+    async def block(self, session_id, user_id=None, anchor_text=None):
+        return render_block(await self.views(session_id, user_id), anchor_text=anchor_text)
 
 
 class _Store:

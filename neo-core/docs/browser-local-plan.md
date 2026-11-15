@@ -2673,3 +2673,69 @@ quizzes mudam de desfecho; nos outros 18 a parada e o orçamento são os mesmos 
 Testes: o quiz de 20 perguntas sem anotar vai ao `done`; marcar de novo a mesma pergunta e
 clicar em links com telas novas param como antes; desligar a regra derruba só o teste dela.
 neo-core 3834. **Não exercitado: o quiz num job real.**
+
+### 2026-11-08 — O caderno que não mostrava o progresso (sessão `dade900f`, Portal)
+
+O Daniel abriu o caderno durante e depois de três jobs do Portal e não achou o que procurava:
+em que questão a tarefa estava, que alternativa ficou marcada, quantas faltavam. E a entrada do
+job de extração (`f7794968`) parava na Q5, em "Fonte: PE", com `[…resumo do job truncado]`,
+embora o arquivo na Área de Trabalho tivesse as 10 questões.
+
+**Três defeitos.**
+1. `render_job_entry` cortava o resumo do job em 8000 caracteres por PREFIXO. As 10 questões
+   somavam 16 792, e a Q6 até a Q10 sumiram do caderno. O "Pedido" também era cortado em 600.
+2. A entrada não apontava o .txt íntegro que o `_itens_em_arquivo` grava: o caminho só ia para a
+   continuação.
+3. Progresso escrito pelo modelo falha dos dois jeitos. Nos 20 diários da VPS, o `f43e2f02`
+   respondeu 36 perguntas (41 cliques "→ SELECIONADO") e não anotou nada, e o `50227807`
+   escreveu "P1..P29 já anotadas" 23 vezes. Entre "abri o job" e o resultado, o caderno ficava
+   parado (309 s no `9c9b5bae`).
+
+**Conserto.**
+- `core/browser_local/progresso.py`: o progresso é montado pelo CÓDIGO. O contador da página
+  ("Questão 7 de 10", "Pergunta 14 de 36", "arquétipo 2 de 6", presente nos 13 questionários
+  medidos) diz onde a tarefa está e o total. O "→ SELECIONADO" do device diz o que foi marcado.
+  **Marcada ≠ respondida**: respondida = clique de envio depois de marcar (Responder,
+  Confirmar, Próxima…), ou a página trocar de item logo depois da marcação (o 12axes avança
+  sozinho), ou, para quem só confere, a alternativa marcada com o botão de envio desabilitado
+  (é como o Portal mostra resposta salva). Sem contador, não há bloco: número inventado é pior
+  do que nenhum.
+- O placar vai para o prompt ("SEU PROGRESSO … NÃO anote isto"), para a faixa do chat
+  (`progress_note`) e para o caderno AO VIVO: uma entrada "Em andamento", reescrita a cada
+  mudança (`replace_marker` no `WorkingMemoryStore.write`), que o resultado do dispatcher
+  substitui no fim. No resultado, o bloco vai no TOPO do `result_summary`. O visor do desktop se
+  atualiza sozinho (3 s com job ao vivo, 10 s sem), sem piscar e sem tirar a rolagem do lugar.
+- Teto do resumo do job: 8000 → 100 000 (rede para o absurdo; o corte, se houver, diz onde está o
+  íntegro). Pedido inteiro. Linha `Arquivo:` com o .txt dos itens (`extra_metadata.itens_arquivo`).
+- O que pode ir para o caderno: narração recusada (`_NOTA_DE_NARRACAO`: "Avançando para a
+  Questão 8.", "vou refazer", "devo recomeçar o quiz"; nota que começa com o número da questão
+  não é olhada). A leitura do `look` e do `extract` fica presa à questão atual ("Questão 7 — a
+  tela mostrava: …"), com teto 1200 em vez de 400, e "não está visível" não vira nota. As notas
+  saem na ordem das questões (`ordenar_por_numero`), não na da coleta, que começa onde a aba
+  estava.
+
+**Medido.** Filtro de narração nas 268 notas dos 20 diários: recusa 8, as 8 são intenção.
+Replay do progresso nos 13 questionários (`trace.md` → `Progresso`): Portal `9c9b5bae` 10/10
+com as alternativas confirmadas; `d6effd71`, `f7794968`, `d73fa72a` e `52694b6e` 10/10 "já
+estava marcada"; 12axes `f43e2f02` (zero notas) 36/36 + arquétipo 7/7; `379df104` 14 + a 15ª
+marcada (é onde ele parou). O replay pegou um erro meu: no `9c9b5bae` o modelo voltou à Q1 e
+clicou de novo na alternativa já salva, e a v1 tratava isso como "desfez o envio". Testes:
+`tests/browser_local/test_progresso_da_tarefa.py` (16, inclusive um Portal de mentira dirigido
+pelo driver inteiro), store, dispatcher e manager. neo-core 4007. **Não exercitado: um job real
+com o caderno aberto ao vivo.** Risco conhecido: a entrada ao vivo e o backstop do turno
+escrevem na mesma nota sem trava. Escrita simultânea perde uma das duas, como já podia
+acontecer entre o backstop e o dispatcher.
+
+**Adendo, mesmo dia — página sem contador (opção "c", escolhida pelo Daniel).** O total vem do
+PEDIDO (`total_do_pedido`: "sao 10 questoes", "36 perguntas", "Short 36 questions"; "5
+alternativas" não conta; a fala dele antes da tarefa que o cérebro escreveu), e o código conta
+as marcações que o navegador confirmou: "3 de 10 questões marcadas (2 com envio confirmado)",
+uma linha por marcação. Sem número de questão, o cuidado é não contar a mesma duas vezes: duas
+marcações seguidas na mesma página, sem envio nem troca de página entre elas, são decididas no
+snapshot seguinte pelo próprio rádio — se marcar B desmarcou A, é a mesma questão remarcada e
+fica uma; se A continua marcada, são grupos diferentes (formulário de página única) e contam
+duas. Envio, troca de URL, sumiço do controle ou o controle voltando desmarcado (próxima
+questão com as mesmas alternativas) abrem a questão seguinte. Contador na página tem
+precedência. Sem contador e sem total no pedido, não há bloco. Testes: 7 novos (23 no arquivo).
+Os 13 diários da VPS têm todos contador, então o replay não muda; **o modo sem contador não foi
+exercitado em site real.** neo-core 4014.

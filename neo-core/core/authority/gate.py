@@ -68,6 +68,33 @@ _LEITURA_DE_WEB = frozenset({
 #: Os dois navegadores: leem a página E digitam nela.
 _NAVEGADORES = frozenset({"browser_task", "browser_local_task"})
 
+#: O sandbox tem internet: um `curl` nele é o MESMO GET que o `web_fetch` faria,
+#: sem passar pela regra de procedência. Na session-a20f4722 o `web_fetch` foi
+#: barrado e a rodada seguinte fez o mesmo pedido com `curl` no `neo_bash`. O
+#: motivo próprio abaixo só existe para MEDIR (no modo `revelacao` a atuação
+#: segue em sombra): `[authority][sombra] ... URL sem procedência no comando`.
+_SANDBOX_COM_REDE = frozenset({"neo_bash", "neo_bash_background"})
+
+
+def _urls_sem_procedencia(arguments: dict[str, Any] | None, authority: "TurnAuthority") -> list[str]:
+    """URLs escritas no comando do sandbox que não vieram de resultado nem de você.
+
+    URL com ``$`` (montada com variável do shell) conta como sem procedência: o
+    endereço real só existe na hora de rodar, e é assim que se monta o dado na
+    query sem a URL aparecer inteira no comando.
+    """
+    from core.authority.turn import _URL_RE
+
+    comando = str((arguments or {}).get("command") or "")
+    sem: list[str] = []
+    for bruta in _URL_RE.findall(comando):
+        url = bruta.rstrip(".,;:")
+        if "$" in url or not (
+            authority.url_has_provenance(url) or authority.url_is_short_form(url)
+        ):
+            sem.append(url)
+    return sem
+
 #: A saída de um `web_fetch` barrado por URL sem procedência. A genérica mandava chamar
 #: `solicitar_dado`, que não tem o que aprovar num GET público, e na sessão 455646dd o
 #: modelo traduziu isso para o usuário como "eu libero o acesso", uma opção que não
@@ -206,6 +233,18 @@ def evaluate(
         # verificar. Quem cria o turno é quem instala o objeto.
         return GateDecision(PERMITIR, "fora de turno", nome)
 
+    # As sessões do Claude do Daniel são o trabalho DELE (o que pediu, o que a
+    # sessão respondeu, os arquivos). Ler isso é só para ele, num pedido dele:
+    # nunca para mensagem de fora nem para a agenda
+    # (docs/ambiente-de-trabalho-plan.md §10). Vem antes do `is_sink` porque é
+    # leitura, e leitura passaria direto.
+    if nome == "claude_sessoes" and (authority.from_external or authority.unattended):
+        return GateDecision(
+            NEGAR,
+            "as sessões do Claude do Daniel só aparecem para ele, num pedido dele",
+            nome,
+        )
+
     if not is_sink(nome):
         return GateDecision(PERMITIR, "não é saída nem atuação", nome)
 
@@ -222,6 +261,24 @@ def evaluate(
                 "agendar prompt num turno com conteúdo de terceiro seria dar persistência à injeção",
                 nome,
             )
+
+    # Claude Code no Mac do Daniel (docs/claude-code-delegation-plan.md §9): um
+    # agente com rede livre, os arquivos e os logins dele é o melhor veículo de
+    # exfiltração que existe. Só nasce de pedido dele, em turno limpo — e a mesma
+    # regra vale para a mensagem que orienta uma tarefa já em curso. Não é card:
+    # não há liberação que torne seguro um Claude dirigido por texto de terceiro.
+    # (Na F2, o corpo do servidor afrouxa isto para contaminação só de web.)
+    # O `claude_enviar` é o mesmo risco com outra porta: o pedido vai para uma
+    # sessão do Claude que o Daniel já tem aberta, rodando em modo automático.
+    if nome in ("claude_task", "claude_reply", "claude_enviar") and (
+        authority.tainted or authority.from_external or authority.unattended
+    ):
+        return GateDecision(
+            NEGAR,
+            "o Claude Code roda na máquina do Daniel e só aceita pedido dele, num turno "
+            "sem conteúdo de terceiro e fora da agenda",
+            nome,
+        )
 
     # `web_fetch` num turno contaminado: PROCEDÊNCIA destrava. Sem esta regra a
     # pesquisa normal se auto-barraria — a primeira página contamina o turno e a
@@ -304,6 +361,16 @@ def evaluate(
                 nome,
                 saida=_SAIDA_URL_SEM_PROCEDENCIA,
             )
+        if nome in _SANDBOX_COM_REDE:
+            sem = _urls_sem_procedencia(arguments, authority)
+            if sem:
+                return GateDecision(
+                    SOLICITAR,
+                    f"URL sem procedência no comando do sandbox ({sem[0][:120]}), "
+                    f"depois de ler conteúdo de terceiro ({fontes})",
+                    nome,
+                    saida=_SAIDA_URL_SEM_PROCEDENCIA,
+                )
         acao = "revelar" if REVELACAO in classes else "atuar"
         return GateDecision(
             SOLICITAR,

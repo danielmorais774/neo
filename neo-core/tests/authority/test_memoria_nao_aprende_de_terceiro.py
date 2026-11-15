@@ -108,3 +108,37 @@ async def test_sem_autoridade_instalada_nao_muda_nada():
     """Job de background, boot, script: não há turno a classificar."""
     w = _Writer()
     assert await _service(w).learn(**_args(), assistant_response="ok") == [{"applied": True}]
+
+
+# ── Mensagem sintética (session-20cb02b6, 09/11) ─────────────────────────────
+# A continuação de job entra no laço como se fosse o usuário falando. O extrator
+# de política de comunicação guardou SETE resultados de job como "exemplos" no
+# bloco de Alta Prioridade — o "Extrair questões do Portal" estava ali quando o
+# Neo, numa conversa nova sobre outro arquivo, foi buscar aquelas questões.
+
+_CONTINUACAO = (
+    "[Continuação automática — não é mensagem do usuário. Uma tarefa sua em "
+    "segundo plano terminou.]\nJob: 'Extrair questões do Portal para .txt' "
+    "(job_id=f7794968), estado completed.\nResultado: Q1–Q10 extraídas. Responda "
+    "o combinado ao Daniel, você sabe o formato."
+)
+
+
+@pytest.mark.asyncio
+async def test_continuacao_de_job_nao_vira_memoria():
+    w = _Writer()
+    svc = _service(w)
+    args = {"user_id": uuid4(), "user_message": _CONTINUACAO}
+    assert await svc.learn(**args, assistant_response="ok") == []
+    assert await svc.learn(**args, assistant_response="ok", memory_target="system") == []
+    assert await svc.learn_before_response(**args) == {}
+    assert w.chamadas == []
+
+
+@pytest.mark.asyncio
+async def test_mensagem_dele_que_cita_continuacao_no_meio_aprende():
+    """Só o PREFIXO marca a mensagem sintética — ele falando do assunto é dele."""
+    w = _Writer()
+    msg = "vc deve responder curto quando vier [Continuação automática] de job"
+    saida = await _service(w).learn(user_id=uuid4(), user_message=msg, assistant_response="ok")
+    assert saida == [{"applied": True}]

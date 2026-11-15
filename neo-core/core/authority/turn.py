@@ -103,13 +103,36 @@ class TurnAuthority:
     #: o relatório da sombra contaria o dobro. Deduplicar por id (e não por
     #: nome) preserva a contagem de duas chamadas iguais no mesmo turno.
     gated_calls: set[str] = field(default_factory=set)
+    #: Há um lote de chamadas rodando (ver :func:`lote_de_chamadas`). A
+    #: contaminação que chega DENTRO dele fica em ``contaminacao_do_lote`` e só
+    #: vale quando o lote fecha.
+    em_lote: bool = False
+    contaminacao_do_lote: list[str] = field(default_factory=list)
 
     # ── escrita (só código, nunca o modelo) ──────────────────────────────
 
     def taint(self, source: str) -> None:
+        if self.em_lote:
+            if source not in self.contaminacao_do_lote:
+                self.contaminacao_do_lote.append(source)
+            return
         self.tainted = True
         if source and source not in self.taint_sources:
             self.taint_sources.append(source)
+
+    def abrir_lote(self) -> bool:
+        """Começa um lote; False se já havia um aberto (aninhar não reabre)."""
+        if self.em_lote:
+            return False
+        self.em_lote = True
+        return True
+
+    def fechar_lote(self) -> None:
+        """Fecha o lote e aplica a contaminação que chegou durante ele."""
+        self.em_lote = False
+        pendentes, self.contaminacao_do_lote = self.contaminacao_do_lote, []
+        for fonte in pendentes:
+            self.taint(fonte)
 
     def note_tool_result(self, tool_name: str, result: Any) -> None:
         """Registra o que um resultado de tool trouxe para o turno.
@@ -269,6 +292,31 @@ def turno_de_fundo(
         yield autoridade
     finally:
         reset_authority(token)
+
+
+@contextmanager
+def lote_de_chamadas() -> Iterator[None]:
+    """As chamadas de tool que o modelo mandou NA MESMA resposta.
+
+    O modelo decide o lote inteiro de uma vez, antes de ver qualquer resultado
+    dele. Se a 1ª chamada lê conteúdo de terceiro, esse conteúdo não pode ter
+    influenciado a 2ª, então ela não deve ser julgada como "decidida depois de
+    ler terceiro". Sem isto, na session-3229310a o `web_fetch` da lista de área
+    da Wikipédia, mandado junto com o da lista de população, foi barrado por
+    "URL sem procedência" e o modelo foi para o `curl` no sandbox.
+
+    A contaminação que chega durante o lote vale assim que ele fecha, inclusive
+    se uma chamada levantar exceção. As URLs vistas nos resultados entram na
+    hora, como sempre. Fora de turno, ou com um lote já aberto, não faz nada.
+    """
+    autoridade = _current.get()
+    if autoridade is None or not autoridade.abrir_lote():
+        yield
+        return
+    try:
+        yield
+    finally:
+        autoridade.fechar_lote()
 
 
 def note_tool_result(tool_name: str, result: Any) -> None:

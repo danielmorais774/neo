@@ -274,6 +274,24 @@ _MUSIC_NOUNS = (
 )
 _MUSIC_SERVICES = ("spotify", "youtube", "deezer", "soundcloud", "yt music")
 
+# ── verbo e objeto de mídia na MESMA frase (_music_object_near_verb) ─────────
+_MUSIC_SENTENCE = re.compile(r"[.!?;:\n]+")
+_MUSIC_WORD = re.compile(r"[a-z0-9]+")
+_MUSIC_ANY_VERB = frozenset(_MUSIC_PLAY_VERBS) | frozenset(_MUSIC_CONTROL_VERBS)
+# Quantas palavras antes/depois do verbo o objeto pode estar: "abaixa um pouco o
+# volume", "volta pro comeco do video", "a musica, para ela".
+_MUSIC_NOUN_AFTER = 6
+_MUSIC_NOUN_BEFORE = 3
+# "para avaliar", "para ver": preposição antes de infinitivo, não o verbo parar.
+_MUSIC_INFINITIVE = re.compile(r"^(ir|[a-z]+(ar|er|ir|or))$")
+_MUSIC_TAB_NOUNS = ("aba", "abas", "guia", "guias")
+_MUSIC_OBJECT_NOUNS = tuple(n for n in _MUSIC_NOUNS if n not in _MUSIC_TAB_NOUNS)
+# Verbos que só fazem sentido com SOM — os únicos que tornam a aba objeto de mídia.
+_MUSIC_SOUND_VERBS = frozenset({
+    "abaixa", "abaixar", "aumenta", "aumentar", "diminui", "diminuir", "baixa",
+    "baixar", "silencia", "silenciar", "muta", "mutar", "mute", "desmuta", "desmutar",
+})
+
 # ── "toca <faixa/artista>" — a ordem de play que não diz a palavra "música" ──
 #
 # O guard acima exige verbo + (substantivo de música OU serviço). A frase mais
@@ -419,6 +437,17 @@ _USER_MEDIA_ANCHORS = (
     "aba", "abas", "tab", "tabs", "guia", "guias",
 )
 
+#: Trabalho com ARQUIVO de áudio: baixar, juntar, converter, cortar. "baixa" é
+#: verbo de controle ("baixa o som" = abaixar o volume), então "baixa o som de
+#: connect USB do Windows, junta num mp3" virava pedido de música, pulava o
+#: classificador e tirava as tools da mesa (session-367b0103, 14/11). Medido nas
+#: 2747 mensagens reais de usuário: das 108 que o atalho pegava, só 2 tinham estas
+#: palavras, e as 2 eram falsos positivos.
+_MUSIC_FILE_WORK = re.compile(
+    r"\b(mp3|mp4|wav|ogg|m4a|flac|aac|arquivos?|download|"
+    r"junta|juntar|concatena|concatenar|converte|converter|"
+    r"corta|cortar|recorta|recortar|edita|editar)\b"
+)
 _MUSIC_COMPLAINT = re.compile(
     r"\bn[ãa]o\s+(mutou|pausou|pulou|tocou|parou|retomou|abaixou|aumentou)\b"
 )
@@ -695,6 +724,7 @@ Esta é a decisão que mais erra — resolva-a ANTES de escolher tool:
 - Calcular, gerar (uuid/hash/senha/QR code), converter formato, processar dados, rodar/testar código, baixar de uma URL e analisar → **DIRECT_RESPONSE**: o cérebro faz isso no PRÓPRIO sandbox, sem pedir permissão e sem depender da máquina do usuário estar ligada.
 - Arquivo que já existe no DISCO dele, info do SISTEMA/hardware dele, instalar/ABRIR um programa dele, abrir uma URL/universal link no computador dele → **CLIENT_TOOL**.
 - Na dúvida entre os dois: se a mensagem não fala do disco/sistema/app DELE, é DIRECT_RESPONSE.
+- Registre no campo `onde`: `sandbox`, `maquina` (disco/sistema/app dele), `navegador` (navegador logado dele) ou `nenhum` (só conversa).
 
 **Quem decide o trilho é a ORIGEM do conteúdo, nunca o destino.** Citar a pasta de destino ("põe na área de trabalho", "salva na pasta X") NÃO torna a tarefa CLIENT_TOOL — destino no disco dele é problema da ponte, não do trilho. Conteúdo que vem da INTERNET (baixar PDF/planilha/imagem, com ou sem link em mãos) é **DIRECT_RESPONSE** mesmo quando ele pede o arquivo no disco: o cérebro procura o endereço real com `web_search`, baixa no sandbox, publica com `file_save` e entrega com `save_generated_file` (que aceita caminho literal de pasta e cria a pasta). Só é CLIENT_TOOL quando o conteúdo JÁ ESTÁ na máquina dele. Você NUNCA escreve um `curl`/`wget` com URL que o usuário não citou — você não sabe o endereço de um arquivo que nunca viu, e um endereço plausível baixa um 404 salvo com extensão .pdf.
 
@@ -765,6 +795,7 @@ REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=impe
   "knowledge_keywords": [],
   "needs_plan": false,
   "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
+  "onde": "sandbox"|"maquina"|"navegador"|"nenhum",
   "skill_name": "whatsapp_messaging, home_assistant or null",
   "pipeline_plan": null,
   "gravity": "normal"|"alta"|"critica",
@@ -805,6 +836,25 @@ User: "usa a voz do Jarvis" → SERVER_TOOL, "config_set", {{"setting": "tts.voi
 User: "troca o engine pra qwen" → SERVER_TOOL, "config_set", {{"setting": "tts.engine", "value": "qwen"}}
 User: "quais vozes você tem?" → SERVER_TOOL, "voice_list"
 """
+
+
+_ONDE = frozenset({"sandbox", "maquina", "navegador", "nenhum"})
+
+
+def _onde(valor: Any) -> str | None:
+    """O campo ``onde`` do classificador, normalizado (``máquina`` → ``maquina``)."""
+    texto = str(valor or "").strip().lower().replace("á", "a")
+    return texto if texto in _ONDE else None
+
+
+def _teto_raciocinio() -> int | None:
+    """``[roteador] teto_raciocinio`` do neo.toml (0 = sem teto)."""
+    try:
+        from shared.ajustes import ajustes
+
+        return ajustes().roteador.teto_raciocinio or None
+    except Exception:  # noqa: BLE001 — ajuste ilegível não derruba a classificação
+        return None
 
 
 class IntentRouter:
@@ -1009,6 +1059,10 @@ class IntentRouter:
                 temperature=0.1,
                 max_tokens=_CLASSIFIER_MAX_TOKENS,
                 disable_thinking=True,
+                # Modelo que não deixa desligar o raciocínio recebe-o LIMITADO
+                # (o provider traduz). Sem isto o GLM-5.3-flash raciocinava até
+                # estourar o orçamento e a classificação chegava a 44 s.
+                teto_raciocinio=_teto_raciocinio(),
                 # Saída JSON nativa. O reparo abaixo existe porque o
                 # classificador escorrega para o modo conversa quando o
                 # histórico vem em turnos user/assistant — e responder ao
@@ -1038,7 +1092,15 @@ class IntentRouter:
             #      e ele responde ao usuário (sessão 69feab87: chegou a inventar
             #      uma lista de chaves SSH). Aí sim o remédio é mandar parar.
             if not self._carries_json(raw_text):
-                if self._was_truncated(response) or not raw_text.strip():
+                # `{}` também é "vazio": o MiniMax m3.1-flash devolveu o objeto
+                # vazio em 1 de 30 pedidos reais no Nebius (4 de 30 no
+                # DigitalOcean), com 2 tokens de saída. Não é prosa — o reparo
+                # "PARE, você é classificador" seria o remédio errado.
+                if (
+                    self._was_truncated(response)
+                    or not raw_text.strip()
+                    or self._is_empty_object(raw_text)
+                ):
                     logger.warning(
                         "Router: resposta do classificador truncada/vazia (finish_reason=length "
                         "ou conteúdo vazio) — retentando com orçamento de %d tokens",
@@ -1051,6 +1113,7 @@ class IntentRouter:
                         temperature=0.0,
                         max_tokens=_CLASSIFIER_MAX_TOKENS_RETRY,
                         disable_thinking=True,
+                        teto_raciocinio=_teto_raciocinio(),
                     )
                     roomier_text = roomier.get_content() or ""
                     if self._carries_json(roomier_text):
@@ -1106,6 +1169,7 @@ class IntentRouter:
                         temperature=0.0,
                         max_tokens=_CLASSIFIER_MAX_TOKENS_RETRY,
                         disable_thinking=True,
+                        teto_raciocinio=_teto_raciocinio(),
                     )
                     repaired_text = repaired.get_content() or ""
                     if self._carries_json(repaired_text):
@@ -1138,7 +1202,8 @@ class IntentRouter:
                 ],
                 "raw_response": raw_text,
             }
-            decision = self._bias_local_browser(decision, user_message)
+            decision = self._bias_local_browser(decision, user_message, system_context)
+            decision = self._bias_claude_code(decision, user_message)
             return self._apply_affect_bias(decision, affect_force_brain)
 
         except Exception as e:
@@ -1150,7 +1215,8 @@ class IntentRouter:
                 {"role": m.role.value if hasattr(m.role, 'value') else str(m.role), "content": m.content[:4000]}
                 for m in messages
             ], "error": str(e)}
-            fallback = self._bias_local_browser(fallback, user_message)
+            fallback = self._bias_local_browser(fallback, user_message, system_context)
+            fallback = self._bias_claude_code(fallback, user_message)
             return self._apply_affect_bias(fallback, affect_force_brain)
 
     def _resolve_artifact_paths(
@@ -1260,12 +1326,16 @@ class IntentRouter:
         them biased the classifier toward HA and invited ``entity_id`` hallucination
         (Workstream A — see docs/intent-routing-redesign.md).
         """
+        from core.claude_code import chave
+
         tools = [
             t
             for t in self.tool_registry.get_all()
             if t.execution == execution_type
             and not t.name.startswith(_SKILL_OWNED_TOOL_PREFIXES)
             and t.name not in _BRAIN_ONLY_CLIENT_TOOLS
+            # chave do Claude desligada no painel: o classificador nem as vê
+            and (t.name not in chave.TOOLS or chave.ligado())
         ]
         if not tools:
             return ""
@@ -1387,6 +1457,28 @@ class IntentRouter:
             tool_name = None
             tool_arguments = None
             raw_command = None
+
+        # `browser_local_task` só existe no cognitivo, então quem atende é ele,
+        # com ou sem plano. A guarda de catálogo logo abaixo não roda quando vem
+        # `needs_plan=true`, e aí o planner refazia o pedido do zero a partir da
+        # mensagem crua, sem saber da tool. Na sessão d9fae447, "eu limpei o
+        # formulario para vc preencher do zero" virou `ls`, `find`,
+        # `cat ~/Documents/form.html` e um `python3 -c "...selenium..."` no Mac
+        # dele, e a tool certa, com os argumentos certos, foi jogada fora.
+        # O sinal `navegador_do_usuario` continua ligado: o cognitivo recebe o
+        # aviso de abrir o navegador nesta resposta.
+        needs_plan = bool(data.get("needs_plan", False))
+        if pediu_navegador and intent in (IntentType.CLIENT_TOOL, IntentType.SERVER_TOOL):
+            logger.warning(
+                "Router: %s/browser_local_task (needs_plan=%s) — devolvendo ao "
+                "cognitivo, que é onde a tool existe",
+                intent.value, needs_plan,
+            )
+            intent = IntentType.DIRECT_RESPONSE
+            tool_name = None
+            tool_arguments = None
+            raw_command = None
+            needs_plan = False
 
         # Falha fechada: o prompt e o catálogo real de client tools podem divergir
         # (uma tool foi removida do catálogo mas o classificador ainda "lembra" dela
@@ -1641,8 +1733,9 @@ class IntentRouter:
             raw_command=raw_command,
             needs_memory=data.get("needs_memory", True),
             knowledge_keywords=knowledge_keywords,
-            needs_plan=data.get("needs_plan", False) or needs_plan_forced,
+            needs_plan=needs_plan or needs_plan_forced,
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
+            onde=_onde(data.get("onde")),
             skill_name=data.get("skill_name"),
             pipeline_plan=pipeline_plan,
             speech_act=speech_act,
@@ -1687,7 +1780,7 @@ class IntentRouter:
         return decision
 
     def _bias_local_browser(
-        self, decision: RoutingDecision, user_message: str
+        self, decision: RoutingDecision, user_message: str, system_context: str | None = None
     ) -> RoutingDecision:
         """Pediu o navegador DELE? Então quem atende é o cognitivo, e ponto.
 
@@ -1706,20 +1799,43 @@ class IntentRouter:
         (``scripts/eval_browser_gate.py``: 15 marcações em ~1700 mensagens, zero
         falso positivo), então promover essas poucas ao cérebro é barato.
         """
-        if decision.intent in (IntentType.COGNITIVE, IntentType.DIRECT_RESPONSE):
-            return decision
         from shared.config import get_settings
 
         if not getattr(get_settings(), "browser_local_enabled", False):
             return decision
+        from core.browser_local.conversa import MARCA_DO_BLOCO
         from core.browser_local.gate import local_browser_requested
 
-        if not local_browser_requested(user_message):
+        tarefa_viva = bool(system_context) and MARCA_DO_BLOCO in system_context
+        pediu_local = local_browser_requested(user_message)
+        # Pediu com todas as letras: o cognitivo recebe o aviso de abrir o
+        # navegador nesta resposta, mesmo quando o classificador não escolheu a
+        # tool. Na sessão d9fae447 o pedido dizia "no meu navegador local", o
+        # classificador devolveu sem tool e o cérebro leu no caderno a auditoria
+        # de OUTRA conversa: respondeu "corrijo as divergências?" em vez de abrir
+        # o form. Com tarefa viva não, porque aí o caminho é `job_falar`. E só
+        # com ordem: o portão também casa pergunta ("por que meu navegador local
+        # travou?"), e o aviso manda abrir o navegador agora.
+        if pediu_local and not tarefa_viva and getattr(decision, "speech_act", None) == "imperative":
+            decision.navegador_do_usuario = True
+        if decision.intent in (IntentType.COGNITIVE, IntentType.DIRECT_RESPONSE):
+            return decision
+
+        # Tarefa VIVA no navegador desta conversa e o classificador quer abrir
+        # OUTRO navegador: quem fala com a tarefa que está rodando (`job_falar`)
+        # é o cognitivo. Sem isto, "abre o AppDemo também" virava um job novo no
+        # servidor enquanto a tarefa dele esperava (docs/browser-conversa-plan.md).
+        outro_navegador = tarefa_viva and str(
+            decision.tool_name or ""
+        ) in ("browser_task", "browser_local_task")
+        if not (pediu_local or outro_navegador):
             return decision
 
         logger.info(
-            "Intent: %s → COGNITIVE (pediu o navegador dele; conf=%.2f)",
-            decision.intent.value, decision.confidence,
+            "Intent: %s → COGNITIVE (%s; conf=%.2f)",
+            decision.intent.value,
+            "tarefa viva no navegador dele" if outro_navegador else "pediu o navegador dele",
+            decision.confidence,
         )
         decision.intent = IntentType.COGNITIVE
         decision.skill_name = None
@@ -1730,6 +1846,42 @@ class IntentRouter:
         decision.explanation = (
             "Roteado ao núcleo cognitivo: o pedido é para o navegador do próprio "
             "usuário, e a tool que abre a tela dele (browser_local_task) só existe lá."
+        )
+        return decision
+
+    def _bias_claude_code(
+        self, decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """Falou do Claude? Então quem atende é o cognitivo.
+
+        ``claude_task`` mora no cérebro (docs/claude-code-delegation-plan.md §7).
+        O desvio que este viés fecha é o do CLIENT_TOOL: "roda o Claude no meu Mac"
+        tem cara de `run_command` e viraria um `claude -p` cru no terminal dele,
+        com card de aprovação e sem orquestração nenhuma. A âncora é larga de
+        propósito — promover ao cérebro uma frase que só CITA o Claude é
+        inofensivo, porque o cérebro é o caminho geral.
+        """
+        if decision.intent in (IntentType.COGNITIVE, IntentType.DIRECT_RESPONSE):
+            return decision
+        from core.claude_code import chave
+
+        if not chave.ligado():
+            return decision
+        if not re.search(r"\bclaude\b", _strip_accents((user_message or "").lower())):
+            return decision
+        logger.info(
+            "Intent: %s → COGNITIVE (falou do Claude; conf=%.2f)",
+            decision.intent.value, decision.confidence,
+        )
+        decision.intent = IntentType.COGNITIVE
+        decision.skill_name = None
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.needs_memory = True
+        decision.explanation = (
+            "Roteado ao núcleo cognitivo: o pedido cita o Claude, e a tool que delega a "
+            "ele (claude_task) só existe lá."
         )
         return decision
 
@@ -1865,15 +2017,36 @@ class IntentRouter:
         markdown, ou embutido em prosa) — usado ANTES do parse para decidir se vale a
         retentativa de reparo em vez de degradar direto pro fallback.
         """
+        obj = cls._json_object(text)
+        # Um objeto sem `intent` não classifica nada: o parse cairia no padrão
+        # DIRECT_RESPONSE calado. É o `{}` vazio de alguns upstreams.
+        return obj is not None and "intent" in obj
+
+    @classmethod
+    def _is_empty_object(cls, text: str) -> bool:
+        """O classificador devolveu um objeto JSON VAZIO (``{}``)?"""
+        obj = cls._json_object(text)
+        return obj is not None and not obj
+
+    @classmethod
+    def _json_object(cls, text: str) -> dict | None:
+        """O objeto JSON de ``text`` (direto, cercado por markdown ou no meio de prosa)."""
         stripped = (text or "").strip()
         if not stripped:
-            return False
+            return None
         if stripped.startswith("```"):
             stripped = stripped.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         try:
-            return isinstance(json.loads(stripped), dict)
+            obj = json.loads(stripped)
         except json.JSONDecodeError:
-            return cls._extract_embedded_json(stripped) is not None
+            embutido = cls._extract_embedded_json(stripped)
+            if embutido is None:
+                return None
+            try:
+                obj = json.loads(embutido)
+            except json.JSONDecodeError:
+                return None
+        return obj if isinstance(obj, dict) else None
 
     def _is_training_message(self, message: str) -> bool:
         """True when the message is an explicit Neo training message."""
@@ -2081,6 +2254,9 @@ class IntentRouter:
         compact = " ".join(normalized.split())
         if not compact:
             return False
+        # Mexer num ARQUIVO de áudio não é tocar nem controlar: o classificador decide.
+        if _MUSIC_FILE_WORK.search(compact.lower()):
+            return False
         # Unambiguous resume phrases ("dá play de novo", "volta a tocar") → music
         # even without a media noun, so they reach the cognitive music handoff
         # instead of run_command (session-e54f, "Da play de novo" → osascript).
@@ -2100,13 +2276,53 @@ class IntentRouter:
         )
         if not has_verb:
             return False
-        has_noun = cls._token_hits(compact, list(_MUSIC_NOUNS)) >= 1
-        has_service = any(svc in compact for svc in _MUSIC_SERVICES)
-        if has_noun or has_service:
+        if cls._music_object_near_verb(normalized):
             return True
         # Última camada: a ordem de play que nomeia a FAIXA, não a palavra
         # "música" ("toca duality do slipknot"). Ver _is_music_play_order.
         return cls._is_music_play_order(compact)
+
+    @classmethod
+    def _music_object_near_verb(cls, normalized: str) -> bool:
+        """O verbo de mídia tem o objeto de mídia PERTO, na mesma frase?
+
+        Antes bastava o verbo e o substantivo aparecerem em qualquer lugar da
+        mensagem, e um pedido longo juntava as duas pontas por acaso. Sessões
+        41a690ba, f6a0be50 e 294e4ec5 (12/11): "…espera com a ABA aberta. Os
+        requisitos… PARA avaliar de verdade…" virou turno de música, e o turno de
+        música tira o `browser_local_task` da mesa — o pedido de preencher um
+        formulário no navegador dele morreu três vezes em "a extensão está
+        offline". Três travas, todas só ESTREITANDO (nada que era não-música vira
+        música):
+
+        * a frase: verbo e objeto na mesma frase, o substantivo a poucas palavras;
+        * "para" seguido de infinitivo ("para avaliar") é preposição, não "parar";
+        * aba/guia só é objeto de mídia com verbo de SOM ("silencia essa guia",
+          "abaixa… dessa aba"): "volta para a aba do formulário" é navegação.
+        """
+        for frase in _MUSIC_SENTENCE.split(normalized):
+            palavras = _MUSIC_WORD.findall(frase)
+            if not palavras:
+                continue
+            tem_servico = any(svc in frase for svc in _MUSIC_SERVICES)
+            for i, palavra in enumerate(palavras):
+                if palavra not in _MUSIC_ANY_VERB:
+                    continue
+                seguinte = palavras[i + 1] if i + 1 < len(palavras) else ""
+                if palavra == "para" and _MUSIC_INFINITIVE.match(seguinte):
+                    continue
+                if tem_servico:
+                    return True
+                janela = " ".join(
+                    palavras[max(0, i - _MUSIC_NOUN_BEFORE) : i + 1 + _MUSIC_NOUN_AFTER]
+                )
+                if cls._token_hits(janela, list(_MUSIC_OBJECT_NOUNS)) >= 1:
+                    return True
+                if palavra in _MUSIC_SOUND_VERBS and cls._token_hits(
+                    janela, list(_MUSIC_TAB_NOUNS)
+                ) >= 1:
+                    return True
+        return False
 
     @classmethod
     def _is_music_play_order(cls, compact: str) -> bool:

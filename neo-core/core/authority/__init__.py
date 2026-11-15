@@ -43,6 +43,7 @@ from core.authority.turn import (
     bind_authority,
     canonical_url,
     current_authority,
+    lote_de_chamadas,
     note_tool_result,
     principal_from_metadata,
     reset_authority,
@@ -88,6 +89,7 @@ __all__ = [
     "is_private_read",
     "is_sink",
     "known",
+    "lote_de_chamadas",
     "note_tool_result",
     "principal_from_metadata",
 ]

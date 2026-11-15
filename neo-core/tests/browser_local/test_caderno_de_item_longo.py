@@ -124,6 +124,11 @@ async def test_pedido_de_arquivo_grava_os_itens_inteiros_e_a_continuacao_aponta_
     assert "diário do passo a passo" not in conteudo, "rodapé não é coleta"
     texto = next(j for j in db.jobs.values() if j.kind == "scheduled_prompt").spec_json["action"]["texto"]
     assert f"/workspace/{caminho}" in texto and "file_save" in texto
+    # E o caderno também fica sabendo (job f7794968: o arquivo existia e a nota
+    # do job não dizia onde).
+    meta = db.jobs[job.id].extra_metadata
+    assert meta["itens_arquivo"] == f"/workspace/{caminho}"
+    assert meta["entrega"]["fecho"] == "Extraí as 10 questões.", "o resto da coluna fica"
 
 
 @pytest.mark.asyncio

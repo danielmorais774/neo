@@ -294,6 +294,48 @@ class Settings(BaseSettings):
         description="Documentos aceitos numa chamada de deep_read.",
     )
 
+    # Claude Code delegado (docs/claude-code-delegation-plan.md). Default OFF: no
+    # corpo local é o Claude Code do Mac do usuário, com a cota da assinatura dele.
+    claude_code_enabled: bool = Field(
+        default=False,
+        description="PADRÃO da chave do Claude Code integrado (claude_task/claude_reply). "
+        "Quem manda é o neo-panel (Configurações → Claude Code), que grava em "
+        "user_preference e vale na hora; isto só vale enquanto o painel nunca mexeu "
+        "(core/claude_code/chave.py). Requer jobs_enabled.",
+    )
+    claude_code_model: str = Field(
+        default="sonnet",
+        description="Modelo padrão do Claude Code (alias da CLI: sonnet, opus, haiku).",
+    )
+    claude_code_max_turns: int = Field(
+        default=60, ge=5, le=500,
+        description="--max-turns de cada rodada.",
+    )
+    claude_code_round_timeout: int = Field(
+        default=3600, ge=60, le=6 * 3600,
+        description="Teto (s) de uma rodada; estourou, o orquestrador para o processo.",
+    )
+    claude_code_stall_timeout: int = Field(
+        default=900, ge=60, le=3600,
+        description="Rodada sem nenhum byte novo no stream por este tempo (s) é parada.",
+    )
+    claude_code_permission_mode: str = Field(
+        default="auto",
+        description="Modo de permissão do Claude no Mac: 'auto' (o classificador da "
+        "Anthropic libera o que é seguro; o arriscado vira pergunta ao Daniel) ou "
+        "'acceptEdits' (só editar dentro da pasta; todo comando vira pergunta).",
+    )
+    claude_code_trace_dir: str = Field(
+        default="logs/claude_code",
+        description="Diário de cada tarefa do Claude (um diretório por job, trace.md com "
+        "uma linha por passo) — é o que a janela Tarefas mostra. Vazio desliga. Guarda as "
+        "20 mais recentes.",
+    )
+    claude_code_offline_timeout: int = Field(
+        default=6 * 3600, ge=300, le=48 * 3600,
+        description="Mac fora do ar por mais que isto (s) põe a tarefa em espera.",
+    )
+
     # Browser Agent — subagente browser-use no backend (docs/browser-agent-plan.md)
     browser_agent_enabled: bool = Field(
         default=False,

@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 _EVIDENCIA_TOKENS = 1500
 #: Alvos por linha de relação no bloco do dono (ele tem dezenas).
 _DONO_POR_RELACAO = 12
+#: Começo das mensagens que o PRÓPRIO Neo põe no lugar da do usuário (o fim de um
+#: job reentra no laço como turno novo). Não foram escritas por ele, então não
+#: dizem nada sobre como ele quer ser atendido.
+_PREFIXOS_SINTETICOS = ("[Continuação automática",)
 
 
 class PKSService:
@@ -137,6 +141,22 @@ class PKSService:
             return ""
         return ", ".join(autoridade.taint_sources[:3]) or "conteúdo externo"
 
+    @staticmethod
+    def _mensagem_sintetica(user_message: str) -> bool:
+        """A "mensagem do usuário" deste turno foi escrita pelo próprio Neo?
+
+        Medido na session-20cb02b6 (09/11): o bloco de Alta Prioridade
+        `neo-communication-preferences` carregava, como "exemplos", SETE
+        resultados de job ("Job: 'Extrair questões do Portal para .txt'… Q1–Q10
+        extraídas…"). A continuação de job entra no laço como turno novo, o texto
+        dela tem "você"/"responder", e o extrator de política de comunicação a
+        guardou como se fosse ele ensinando. Resultado: o conteúdo de um job antigo
+        passou a ir em TODO prompt, e numa conversa nova sobre outro arquivo o Neo
+        foi buscar aquelas questões.
+        """
+        texto = (user_message or "").lstrip()
+        return any(texto.startswith(p) for p in _PREFIXOS_SINTETICOS)
+
     async def learn_before_response(
         self,
         *,
@@ -145,6 +165,9 @@ class PKSService:
         memory_target: str = "user",
         source_message_id: str | None = None,
     ) -> dict[str, Any]:
+        if self._mensagem_sintetica(user_message):
+            logger.info("[pks] aprendizado automático pulado (pré-resposta): mensagem sintética do Neo")
+            return {}
         fontes = self._turno_contaminado()
         if fontes:
             logger.warning(
@@ -178,6 +201,9 @@ class PKSService:
         # `confirmed_save` = ele mandou guardar (pks_remember). Só o automático
         # é recusado — ver `_turno_contaminado`.
         if not confirmed_save and not forget:
+            if self._mensagem_sintetica(user_message):
+                logger.info("[pks] aprendizado automático pulado: mensagem sintética do Neo")
+                return []
             fontes = self._turno_contaminado()
             if fontes:
                 logger.warning(

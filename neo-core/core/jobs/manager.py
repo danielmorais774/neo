@@ -74,6 +74,8 @@ class JobManager:
         download_watch_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
         scheduled_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
         deep_read_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
+        claude_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
+        claude_sessao_runner: "Callable[[AgentJob], Awaitable[dict]] | None" = None,
     ) -> None:
         self.db = db
         self.sandbox = sandbox
@@ -98,6 +100,12 @@ class JobManager:
         # Leitura delegada de documentos (docs/deep-read-plan.md): subagentes
         # leem no sandbox e escrevem notas + síntese, fora do contexto do cérebro.
         self._deep_read_runner = deep_read_runner
+        # Claude Code delegado (docs/claude-code-delegation-plan.md): o processo
+        # roda fora do core e o job sobrevive a reinício (REATTACHABLE_JOB_KINDS).
+        self._claude_runner = claude_runner
+        # A volta de um pedido entregue numa sessão do Claude do DANIEL
+        # (docs/ambiente-de-trabalho-plan.md §9.4): espera ela terminar no Mac.
+        self._claude_sessao_runner = claude_sessao_runner
         self._sem = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._active: dict[str, asyncio.Task] = {}
@@ -218,6 +226,11 @@ class JobManager:
 
     async def _run_job(self, job: AgentJob) -> None:
         """Roda um job já reivindicado (status=running) até um estado terminal."""
+        if job.kind == "comando_local":
+            # Reatado depois de um reinício do core. Só consulta o computador a cada
+            # poucos segundos: não ocupa vaga do pool (mesma regra da adoção).
+            await self._run_comando_local(job)
+            return
         async with self._sem:
             terminal: dict = {"status": "failed", "result_summary": "Falha desconhecida."}
             try:
@@ -233,6 +246,10 @@ class JobManager:
                     terminal = await self._download_watch_runner(job)
                 elif job.kind == "deep_read" and self._deep_read_runner is not None:
                     terminal = await self._deep_read_runner(job)
+                elif job.kind == "claude_code" and self._claude_runner is not None:
+                    terminal = await self._claude_runner(job)
+                elif job.kind == "claude_sessao" and self._claude_sessao_runner is not None:
+                    terminal = await self._claude_sessao_runner(job)
                 elif job.kind.startswith("scheduled_") and self._scheduled_runner is not None:
                     terminal = await self._scheduled_runner(job)
                 else:
@@ -271,7 +288,9 @@ class JobManager:
             # O navegador é a exceção: o que ele entrega SÃO os itens (preço, link,
             # vendedor), colados íntegros pelo dispatcher. Silenciar trocaria a lista
             # pela paráfrase da continuação — ela vem logo depois, só com a conclusão.
-            if job.kind != "browser_local":
+            # O Claude Code também: o relatório dele vai literal. Silenciado, o do
+            # job 8f83b37c virou "Arquivos salvos e disponíveis para download."
+            if job.kind not in ("browser_local", "claude_code", "claude_sessao"):
                 terminal = {**terminal, "notify_policy": "silent"}
         updated = None
         try:
@@ -355,6 +374,15 @@ class JobManager:
         arquivo_dos_itens = (
             await self._itens_em_arquivo(job, terminal) if job.kind == "browser_local" else ""
         )
+        if arquivo_dos_itens:
+            # Para o caderno também, e não só para a continuação: a entrada do job
+            # (`_note_result`) aponta o arquivo íntegro ao lado do achado. No job
+            # f7794968 o arquivo existia e a nota não dizia onde.
+            # Escrever a chave SOBRESCREVE a coluna inteira: sem o terminal ter
+            # trazido a sua, parte-se da que o job já tinha.
+            if terminal.get("extra_metadata") is None:
+                terminal["extra_metadata"] = dict(job.extra_metadata or {})
+            terminal["extra_metadata"]["itens_arquivo"] = arquivo_dos_itens
         # O turno de continuação nasce SEM a skill que o job usou (session-1fcaa440:
         # ignorou o aviso do script e resumiu em vez de montar o arquivo). Quem sabe
         # qual skill é o próprio comando.
@@ -377,6 +405,12 @@ class JobManager:
                 if job.kind == "browser_local" else ""
             )
             + (
+                "O relatório do Claude, a lista de arquivos e o comando para retomar JÁ "
+                "foram entregues ao usuário, íntegros, numa mensagem logo antes desta. "
+                "Faça SÓ o combinado, sem repetir o relatório.\n"
+                if job.kind == "claude_code" else ""
+            )
+            + (
                 f"Os itens coletados JÁ estão gravados, íntegros, em `{arquivo_dos_itens}`. "
                 "Se o combinado é um arquivo, entregue ESTE com file_save (ajuste o formato com "
                 "neo_bash, se precisar). Não reescreva o conteúdo à mão: ele não cabe numa "
@@ -389,7 +423,8 @@ class JobManager:
             + "\n"
             "Se o combinado é entregar um arquivo, grave-o (neo_write_file) e entregue com "
             "file_save — o botão de download vai junto desta mensagem. Na resposta, diga em "
-            "poucas frases o que entregou; NÃO cole o conteúdo inteiro no chat."
+            "poucas frases o que entregou; NÃO cole o arquivo inteiro no chat. Se o combinado "
+            "pede para MOSTRAR um trecho (uma saída, um resultado), cole esse trecho."
         )
         try:
             continuation = await self.db.create_agent_job(
@@ -528,6 +563,77 @@ class JobManager:
         except Exception as e:  # noqa: BLE001
             logger.warning("[Jobs] log do comando adotado %s não foi gravado: %s", job.id, e)
         return terminal
+
+    # ------------------------------------------------------------------
+    # Comando que virou tarefa no computador do usuário (run_command)
+    # ------------------------------------------------------------------
+
+    async def adopt_local_command(
+        self,
+        *,
+        user_id,
+        session_id,
+        device_id: str,
+        tarefa: dict,
+    ) -> AgentJob:
+        """Abre o job que acompanha uma tarefa que o DESKTOP adotou.
+
+        O comando nasceu num turno (já aprovado pela política ou pelo card), passou
+        do orçamento de primeiro plano ainda trabalhando e o desktop o manteve vivo
+        em segundo plano (``services/local_jobs.rs``). Daqui ele é um job comum:
+        janela Tarefas, cancelamento, reata depois de reload e aviso no chat ao fim.
+        Como o comando adotado no sandbox, não ocupa o semáforo — o trabalho já
+        estava rodando antes de o JobManager saber dele.
+        """
+        from core.jobs.runner_comando_local import KIND, progresso, titulo
+
+        now = datetime.utcnow()
+        try:
+            decorrido = max(0, int(tarefa.get("elapsed_s") or 0))
+        except (TypeError, ValueError):
+            decorrido = 0
+        comando = str(tarefa.get("command") or "")
+        job = await self.db.create_agent_job(
+            AgentJob(
+                user_id=user_id,
+                session_id=session_id,
+                kind=KIND,
+                title=titulo(comando)[:256],
+                spec_json={
+                    "device_id": str(device_id),
+                    "tarefa_id": str(tarefa.get("id")),
+                    "command": comando,
+                    "cwd": tarefa.get("cwd"),
+                    "max_runtime_s": tarefa.get("max_runtime_s"),
+                    # Onde o log mora NO COMPUTADOR do usuário. Fica só lá.
+                    "log_local": tarefa.get("log_path"),
+                },
+                status="running",
+                notify_policy="chat",
+                started_at=now - timedelta(seconds=decorrido),
+                heartbeat_at=now,
+                progress_note=progresso(tarefa),
+                extra_metadata={"origin": "run_command_local"},
+            )
+        )
+        job_id = str(job.id)
+        waiter = asyncio.create_task(self._run_comando_local(job), name=f"job-{job_id}")
+        self._active[job_id] = waiter
+        waiter.add_done_callback(lambda _t, jid=job_id: self._active.pop(jid, None))
+        return job
+
+    async def _run_comando_local(self, job: AgentJob) -> None:
+        from core.jobs import runner_comando_local
+
+        try:
+            terminal = await runner_comando_local.acompanhar(job, db=self.db)
+        except asyncio.CancelledError:
+            # job_cancel marcou 'cancelled' e o runner já parou a tarefa no computador.
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[Jobs] acompanhamento do comando local %s quebrou", job.id)
+            terminal = {"status": "failed", "result_summary": f"Erro ao acompanhar a tarefa: {e}"}
+        await self._settle(job, terminal)
 
     async def _run_sandbox_task(self, job: AgentJob) -> dict:
         spec = job.spec_json or {}

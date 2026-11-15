@@ -198,9 +198,27 @@ class WebSearchExecutor:
         if isinstance(result, FetchError):
             return asdict(result)
         # Delimitado: conteúdo web é dado, não instrução (anti prompt-injection).
+        # Os links vão DENTRO do delimitador: são da página, não nossos. E é por
+        # aparecerem num resultado de tool que ganham procedência no portão
+        # (`TurnAuthority.note_tool_result`) — o próximo `web_fetch` numa delas
+        # passa, em vez de ser barrado e virar `curl` no sandbox.
+        corpo = result.text
+        links = getattr(result, "links", None) or []
+        if links:
+            corpo += "\n\nLinks da página (mídia primeiro, depois o mesmo site):\n" + "\n".join(
+                f"- {u}" for u in links
+            )
+        # Depois dos links, e não antes: os links são o caminho do download
+        # (o MP3 do myinstants) e não podem ir para o fim de um bloco grande.
+        tabelas = getattr(result, "tabelas", None) or []
+        if tabelas:
+            corpo += (
+                "\n\nTabelas da página (uma linha por linha da tabela, células "
+                "separadas por |):\n" + "\n\n".join(tabelas)
+            )
         return {
             "title": result.title,
-            "text": f'<web_content url="{result.url}">\n{result.text}\n</web_content>',
+            "text": f'<web_content url="{result.url}">\n{corpo}\n</web_content>',
             "truncated": result.truncated,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }

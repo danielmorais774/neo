@@ -1,6 +1,8 @@
 # Claude Code acoplado ao Neo (`claude_task`): plano
 
-> Status: **SÓ PLANO (07/11/2026)**. Nada implementado.
+> Status: **F0 local medida e F1 (orquestrador + corpo local) implementada e LIGADA
+> em produção em 07/11/2026** (`CLAUDE_CODE_ENABLED=true`). Falta o E2E pelo chat.
+> Registro em §13.
 > Medido nesta sessão: CLI `2.1.302`; a conta do Daniel está logada como
 > `claude.ai`, `subscriptionType: "pro"` (`claude auth status`).
 > Fontes: code.claude.com/docs/en/authentication, /legal-and-compliance,
@@ -293,9 +295,10 @@ O desktop é a última linha, como o `command_policy.rs` é para o `run_command`
   `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`,
   `bypassPermissions`, `--mcp-config`, `--plugin-dir`/`--plugin-url` e `--add-dir`
   fora da pasta.
-- **Permissões:** `--permission-mode auto` (este Claude Code aqui já roda em modo
-  auto na conta dele; a F0 confirma se vale em `-p`), com `acceptEdits` como reserva.
-  Junto vai `--permission-prompts none`: o que pediria aprovação é **negado na hora**
+- **Permissões:** `--permission-mode acceptEdits`. O `auto` funciona em `-p`, mas
+  **medido na F0, ele deixou escrever fora da pasta** (`/tmp/neo-f0-fora.txt`): ele
+  julga risco, não lugar. Por isso o desktop recusa `auto`. Junto vai
+  `--permission-prompts none`: o que pediria aprovação é **negado na hora**
   e registrado em `permission_denials`. Quem pergunta ao Daniel é o orquestrador
   (§6, passo 6), igual nos dois corpos. A rodada nunca fica parada esperando um
   prompt que ninguém vê.
@@ -398,8 +401,9 @@ Um job `kind="claude_code"`, com `spec_json.corpo = "local" | "servidor"` (e
    ```
    Mais as flags de cada corpo:
    - servidor: `--permission-mode bypassPermissions`;
-   - local: `--permission-mode auto --permission-prompts none`, mais as
-     `--allowedTools` que o Daniel liberou nesta tarefa.
+   - local: `--permission-mode acceptEdits --permission-prompts none`, mais as
+     `--allowedTools` que o Daniel liberou nesta tarefa (a regra do comando exato,
+     `Bash(npm install)`; escrita fora da pasta não se libera daqui).
 
    O `session_id` e a identificação da rodada ficam no `spec_json`.
 4. **Acompanhamento.** A cada tick, `corpo.ler(rodada, offset)`. O `stream.py`
@@ -607,3 +611,275 @@ Stdin `stream-json` para conversa ao vivo. MCP **só leitura** do Neo para o Cla
 - Toda leitura de resultado passa pelos tetos que já existem: relatório cortado em
   silêncio foi o defeito da síntese do `deep_read`
   ([[neo-deep-read-delegated-reading]]).
+
+## §13. Registro de execução
+
+### F0 local (07/11/2026, CLI 2.1.302, conta Pro)
+
+Medido à mão no Mac, com rodadas de `haiku`/`sonnet` (custo estimado < US$ 0,10).
+Os streams, com caminhos trocados e sem eventos de hook, viraram fixtures em
+`tests/claude_code/fixtures/`.
+
+| Item | Resultado |
+|---|---|
+| (a) `auto` em `-p` | Funciona, mas **escreveu fora da pasta** sem perguntar. Trocado por `acceptEdits` (§4.3). |
+| (a) `acceptEdits` + `--permission-prompts none` | Negou o `python3` e a escrita em `/tmp`; as duas em `permission_denials` com a entrada exata; relatório `precisa_de_voce`. |
+| Recusa na hora | Evento `system/permission_denied` no meio do stream. **Ele traz só o `tool_use_id`**: a entrada (comando, caminho) vem do `tool_use` anterior, e o `stream.py` cruza os dois. |
+| `--allowedTools "Bash(sleep:*)"` | Liberou `sleep 6` e negou `echo … && sleep …`: a regra casa o comando inteiro. |
+| (b) `result` | `structured_output` (com `--json-schema`), `permission_denials`, `num_turns`, `total_cost_usd`, `terminal_reason`, `api_error_status`. |
+| (b) `rate_limit_event` | `rate_limit_info.unifiedWindows.five_hour.utilization` (0,14 → 0,17 no teste) e `seven_day` (0,36), com `resetsAt`. É o "volta às HH:MM". O formato do erro de limite estourado não foi visto; o código trata `api_error_status == 429` ou `status` fora de `allowed`. |
+| `init` | `apiKeySource: "none"` = assinatura. `--strict-mcp-config` zera `mcp_servers` (sem ele vinham os conectores Gmail/Calendar/Docs do claude.ai). |
+| (c) `kill -9` + `--resume` | Mesma sessão; ele conferiu a pasta e criou só o que faltava (`p4`–`p6`). |
+| (e) pai sai | O processo destacado com saída em arquivo seguiu sozinho. |
+| `claude purge` | Apaga o estado do **projeto inteiro** (a pasta), não de uma sessão. No Mac **não pode** rodar: levaria o histórico do Claude dele naquele projeto. No servidor serve, porque cada job tem a sua pasta. |
+| Variáveis herdadas (`CLAUDECODE`…) | Não quebraram nada visível (o `messaging_socket_path` do filho era o dele próprio). O desktop limpa mesmo assim, como higiene. |
+| (f) Keychain pelo app | O teste `rodada_real_lanca_le_e_colhe` (Rust, `--ignored`) rodou pelo caminho do desktop com o ambiente limpo e saiu `apiKeySource: none`. Falta ver lançado pelo app aberto fora do terminal. |
+
+Não medidos: (d) quanto uma tarefa típica come da janela (o job grava a
+`utilization` de cada rodada, então mede-se em produção); erro de limite real.
+
+### F1 (07/11/2026) — implementada, sem E2E
+
+- **Core:** `core/claude_code/` (`stream.py`, `corpo.py`, `corpo_local.py`,
+  `orquestrador.py`) e `core/jobs/runner_claude.py`.
+  - tools `claude_task`/`claude_reply` (`core/jobs/tools.py`, executor);
+  - `REATTACHABLE_JOB_KINDS`: no boot, o job `claude_code` volta para a fila e
+    reata, em vez de virar `failed`;
+  - portão `NEGAR` em turno contaminado, da agenda ou de fora;
+  - viés do roteador `_bias_claude_code` (citou o Claude → cérebro, para não
+    virar `run_command`);
+  - flag `CLAUDE_CODE_ENABLED`, que também tira as tools do registry e do
+    conjunto cognitivo.
+- **Continuação:** o `claude_reply` sobre tarefa `waiting` cria um job novo com a
+  mesma sessão (o padrão da retomada do navegador). Sobre tarefa rodando, a
+  mensagem entra em `extra_metadata["claude_mensagens"]`; com `interromper`, a
+  rodada para.
+- **Desktop:** `services/claude_cli.rs`, com as 7 ações. A confirmação fica em
+  `claude-runs/confirmadas.json` por tarefa (as continuações não perguntam de
+  novo). Uma confirmação que chega depois de 170 s é recusada, porque o core
+  desiste aos 180 s.
+- **Testes:** 40 no orquestrador e no stream contra as fixtures, mais tools,
+  portão e roteador; 4 no Rust, e 1 `--ignored` com rodada real.
+
+**Ligado em 07/11/2026:** `CLAUDE_CODE_ENABLED=true` no `.env` da RAIZ +
+`docker compose up -d --no-deps neo-core`. Resultado: `healthy` e "Claude Code
+runner wired (modelo=sonnet)". O `tauri dev` recompilou e reiniciou o desktop
+sozinho quando o Rust mudou: o executável em uso já tinha o `claude_cli`.
+
+**E2E pendente:** "pede pro Claude, no meu Mac, …" pelo chat do desktop.
+
+### Visibilidade (07/11/2026)
+
+Pedido do Daniel: ver o que o Claude está fazendo pela interface, sem poluir o
+chat e sem gerar saída grande no Neo.
+
+- **Diário** (`Diario` em `core/jobs/runner_claude.py`): uma linha por passo, com
+  hora, em `logs/claude_code/<job>/trace.md`.
+  - inclui o "💬" (a primeira linha do que o Claude diz que vai fazer), o
+    início e o fim de cada rodada (com a cota) e as recusas;
+  - teto de 256 KB por tarefa; só as 20 tarefas mais recentes ficam em disco;
+  - o `job.log_path` aponta para cá, então a rota de log e a `job_logs` leem o FIM
+    sem mudança nenhuma;
+  - não guarda conteúdo de arquivo nem saída de comando.
+- **Faixa no chat** (`ClaudeBar.tsx`): uma linha acima do campo de mensagem, só
+  enquanto há tarefa do Claude na fila, rodando ou esperando o Daniel. Mostra o
+  último passo e o tempo; fica âmbar quando espera resposta. Não vira mensagem: a
+  conversa segue com o pedido e o resultado. Consulta a lista de jobs a cada 4 s
+  com tarefa viva e a cada 30 s sem. É da conversa onde a tarefa nasceu
+  (`job.session_id` = sessão aberta, espelhada no `ChatPage` nos três lugares que
+  chamam `resetAgent`): "Novo chat" a esconde, voltar à conversa a mostra — é
+  só lá que o aviso do `claude_reply` existe.
+- **Faixa expansível**: clicar na linha abre uma caixa logo abaixo dela com o fim
+  do diário (o mesmo `getJobLogs` da janela Tarefas, ~6 KB). O diário só é buscado
+  com a caixa aberta, e aberta ou fechada fica guardada em
+  `localStorage["neo.chat.claudeBox"]`.
+- **Janela Tarefas abre na tarefa**: o botão "ver ›" da faixa chama
+  `open_jobs_window(job_id)`. Com a janela fechada, a tarefa vai na URL; com ela
+  aberta, num evento `jobs-focus`. O log dessa tarefa aparece como "Atividade do
+  Claude".
+- **Botão no balão** (`ClaudeNoBalao.tsx`): a resposta que pediu a tarefa e a que
+  entrega o resultado ganham uma pílula "Claude · ver o processo". Ela abre ali a
+  mesma linha + diário da faixa (`ClaudeProcesso.tsx`, compartilhado), acompanha
+  a cada 4 s se a tarefa ainda está viva e não consulta nada enquanto fechada. É
+  o jeito de achar o processo depois que a faixa some. O vínculo vem do core,
+  por três caminhos com o mesmo resultado (`core/claude_code/balao.py`):
+  - ao vivo: `AgentResponse.jobs` (campo 7 do proto, `JobRef{id, kind}`), tirado
+    do `tool_trace` da resposta (`claude_task`, e `claude_reply` que guarda o id
+    da continuação no trace);
+  - histórico: `/desktop/session/{id}/history` devolve `jobs` a partir do
+    `tool_trace` salvo, então respostas de antes do campo também ganham o botão;
+    e a entrega gravada pelo dispatcher (`source=agent_job`, `kind=claude_code`);
+  - entrega ao vivo: a notificação `chat_message` já trazia `job_id` e
+    `kind_detail`.
+  Gotcha: o Rust usa o código gerado guardado em `src-tauri/src/grpc_gen/`, não o
+  do `OUT_DIR`. Mudou o proto, copie o `neo.desktop.rs` do build para lá. O
+  Python usa o `neo_desktop_pb2.py` da raiz do neo-core, gerado pelo
+  `grpc_tools` do `.venv` (gencode 6.31.1, roda no protobuf 7.35 do container).
+
+**1º teste real da faixa (job `decc8224`, 07/11):** três defeitos, todos corrigidos.
+
+- **A faixa parecia aparecer só DEPOIS do trabalho.** A rodada inteira levou 13 s
+  (6 s até lançar, 7 s de trabalho), e a faixa, sem tarefa visível, só consultava
+  a cada 30 s: achou a tarefa já esperando o Daniel. Agora ela consulta na hora
+  em que cada turno começa e termina (prop `ocupado`) e fica a 4 s por 2 min
+  depois. **Esse conserto não pegou na 1ª versão** (job `0a33cb31`, 25 s,
+  faixa aos 18 s): o `ocupado` vinha do `isLoading`, que nada liga no desktop;
+  o turno é o `isExecuting`. O log de acesso do core mostrou as consultas em
+  22:05:43 e 22:06:13, 30 s cravados atravessando o turno. Medir pelo
+  `GET /desktop/jobs` no `docker logs -t` antes de supor o ritmo.
+- **"rodou `python3 hello.py`" num comando NEGADO.** A nota nasce do `tool_use`, que
+  é o pedido, antes do resultado. As notas foram para o gerúndio ("rodando",
+  "escrevendo"). Além disso, o banco só grava uma nota a cada 3 s, e a recusa no
+  mesmo segundo se perdia: agora a nota pulada fica pendente e é gravada na volta
+  seguinte.
+- **O "Fim:" do diário quebrou em várias linhas** (o resumo tem parágrafos): o
+  `Diario` junta tudo numa linha.
+
+**A resposta do Daniel não chegava ao Claude (job `decc8224`, 07/11).** A pausa
+chegou ao chat às 19:54, ele respondeu "pode rodar" às 20:00, e o **roteador
+classificou como `run_command`**. O Neo rodou `cd ~/Neo/claude/decc8224 && python3
+hello.py` no terminal dele, respondeu "oi", e a tarefa ficou em `waiting` para
+sempre. O `_bias_claude_code` só pega frase que cita "Claude".
+
+Corrigido:
+
+- **Desvio antes do roteador** (`[INTENT-OVERRIDE]` no `ai_service`, ao lado do de
+  esclarecimento pendente): com uma tarefa `claude_code` em `waiting` NESTA
+  sessão, há menos de 12 h, a mensagem vai ao cérebro.
+- **Aviso ao cérebro** (`_nota_claude_esperando`, no fim do prompt): job_id,
+  pergunta, ações negadas e a regra "chame `claude_reply`, liberar=true se ele
+  autorizou; NÃO execute você mesmo". Assunto diferente é atendido normalmente.
+- **Modo `auto` como padrão no Mac** (`CLAUDE_CODE_PERMISSION_MODE`, opção
+  `acceptEdits`). É a escolha do Daniel: com `acceptEdits`, até rodar o script da
+  própria pasta virava pergunta. O desktop aceita `auto` e continua recusando
+  `bypassPermissions`. O diálogo deixou de prometer "só nesta pasta", porque o
+  `auto` julga risco, não lugar.
+- **Não adotado:** o Neo decidir sozinho o que liberar. Seria o modelo barato do
+  Neo julgando segurança de comando, e é o texto que pode chegar contaminado. O
+  `auto` é o classificador da Anthropic, feito para isso.
+
+### Auditoria: o que o Claude disse × o que chegou (job `8f83b37c`, 07/11)
+
+Comparada a transcrição do próprio Claude Code no Mac
+(`~/.claude/projects/-Users-daniel-Neo-claude-8f83b37c/<sessão>.jsonl`) com o
+diário e com o chat.
+
+**Completo:** o único texto que ele escreveu durante o trabalho; o
+`result_summary` no banco (744 caracteres, sem corte); os dois arquivos
+recolhidos. O raciocínio (4 blocos) já vem VAZIO na transcrição dele: o Claude
+Code não guarda o texto do thinking, então não há o que mostrar.
+
+**Cortado no diário:**
+- "Fim:" em 400 caracteres, bem em cima de "Não testei o modo de dois jogadores
+  nem o reinício";
+- os 4 comandos em 100 caracteres; o 2º terminava em `> RELATORIO.md; rm
+  saida.txt`, uma exclusão que o diário não mostrou;
+- a saída dos comandos nunca entrava (a partida de teste, 1.185 caracteres).
+
+**Perdido no chat (o pior):** com `then`, a entrega do próprio job era
+silenciada e só a continuação falava. O turno de continuação (modelo barato, sem
+ninguém olhando) gastou 8 chamadas com `file_save` em caminhos que não existiam,
+chamou `claude_task` de novo (o portão barrou, certo) e respondeu "Arquivos
+salvos e disponíveis para download." — 44 caracteres. Os itens íntegros (lista
+de arquivos, `claude --resume`) caíram junto com o silêncio, e a regra "NÃO cole
+o conteúdo inteiro" contradizia o combinado "cole a saída da partida".
+
+Corrigido:
+- **Entrega literal**: `entrega["literal"]` no runner; o dispatcher entrega o
+  fecho como está, sem redator (`_fecho_literal`). No `completed` abre com "O
+  Claude terminou. O relatório dele:"; pausa e falhas já vinham escritas pelo
+  orquestrador.
+- **`then` não cala o Claude** (`_settle`, como o `browser_local`); a
+  continuação ouve que relatório, arquivos e comando de retomada JÁ foram
+  entregues e faz só o combinado. A regra genérica virou "não cole o ARQUIVO
+  inteiro; se o combinado pede para mostrar um trecho, cole o trecho".
+- O resumo da continuação diz que os arquivos recolhidos estão no catálogo, não
+  no `/workspace` (`file_stage` primeiro).
+- **Diário inteiro**: texto do Claude inteiro numa linha; comandos inteiros até
+  4.000 caracteres, cortados no MEIO acima disso (o fim aparece); saída de cada
+  comando como bloco `↳ saída (n linhas):` com as linhas recuadas por `│`
+  (60 linhas / 4.000 caracteres, começo e fim); erro de outra ferramenta como
+  `↳ erro em X`. Resultado de comando negado não repete a recusa. A saída é só
+  do diário: o runner não a põe no `progress_note`, que a faixa mostra (cortado
+  em 300).
+
+**Botão "terminal"** (faixa e balão): abre o Terminal do Mac em `cd <pasta> &&
+claude --resume <sessão>`. O core manda `claude: {session_id, cwd, rodando}` em
+cada job `claude_code` com sessão começada (`_claude_retomar`); o botão espera
+enquanto a tarefa está com o Neo (`rodando`), porque duas cópias na mesma sessão
+se atropelam. No Mac (`claude_cli::abrir_no_terminal`): a sessão tem que ser um
+UUID que existe em `~/.claude/projects` desta máquina e a pasta passa pelo
+`conferir_pasta`; o comando vai entre aspas de shell num `.command` aberto com
+`open -a Terminal`, que se apaga ao rodar e deixa um shell na pasta quando o
+Claude sai. Não é AppleScript porque o `do script` pede permissão de Automação, e
+no `tauri dev` cada build é outra assinatura.
+
+### Ajuste numa tarefa terminada (07/11)
+
+Antes, o `claude_reply` só valia com a tarefa rodando ou parada esperando. Com
+ela terminada, recusava ("peça uma tarefa nova"), e a tarefa nova nascia em
+**sessão nova** (o Claude sem lembrar do que fez) e **pasta nova** (sem os
+arquivos de antes).
+
+Agora:
+- **`claude_reply` aceita tarefa terminada** (concluída, falhou, passou do
+  tempo, cancelada) e retoma a MESMA sessão, na mesma pasta, com o mesmo
+  `tarefa_id` (o Mac não pergunta de novo). Título "(ajuste)"; o `then` antigo
+  NÃO vai junto (pedido novo); a terminada fica com o status dela.
+- Recusa quando a tarefa nem começou (recusada no Mac: não há sessão) e quando
+  outra tarefa do Claude está rodando (manda para ela).
+- **Ponta da cadeia**: resposta a uma tarefa que já seguiu num ajuste ou
+  continuação vai para a mais nova (`continuacao_de`), sem abrir dois ramos da
+  mesma sessão.
+- **Aviso ao cérebro** (`_nota_claude_recente`): só quando a mensagem CITA o
+  Claude, aponta a tarefa mais nova da conversa (até 7 dias) e manda
+  `claude_reply` para ajuste e `claude_task` só para trabalho novo. Ajuste sem
+  citar o Claude o Neo resolve sozinho — escolha do Daniel: não gasta a cota do
+  Claude sem ele pedir.
+- **Sessão aberta no Terminal**: o `claude.start` com `--resume` confere no `ps`
+  se há um Claude INTERATIVO (sem `-p`) com aquela sessão; se houver, não lança
+  e a falha diz "feche o Claude lá e me peça de novo".
+
+### Chave no neo-panel (07/11)
+
+**Configurações → Claude Code** liga e desliga o Claude Code integrado, sem
+reiniciar (`api/routes/claude_code_config.py`, GET/PUT `/api/v1/claude-code-config`,
+JWT do painel). A chave mora em `core/claude_code/chave.py`:
+- grava em `user_preference` global (service="neo", category="claude-code",
+  key="enabled") e atualiza o valor em memória — o core é um processo só
+  (uvicorn com o gRPC dentro), então vale no turno seguinte;
+- `CLAUDE_CODE_ENABLED` do `.env` virou só o PADRÃO, enquanto o painel nunca
+  gravou (a aba mostra quem decide);
+- o runner e as tools são montados SEMPRE (com `JOBS_ENABLED`); quem confere a
+  chave é quem lista (classificador `_format_tools`, agente do SERVER_TOOL
+  `_server_tool_toolset`, cérebro `_claude_code_available`, viés do roteador) e
+  quem executa (`_claude_ligado`, com erro que aponta o painel);
+- desligado: nada novo vai ao Claude (tarefa, resposta, ajuste); o que já roda
+  termina sozinho. Sem runner (jobs desligados), o PUT recusa ligar (409).
+
+### Duas tarefas que morreram antes de começar (sessão 5efdf38d, 08/11)
+
+- **`40852ae7` (02:31): ninguém permitiu.** O `claude.start` chegou (a pasta
+  `~/Neo/claude/40852ae7` nasceu às 23:31:15), ficou no diálogo de confirmação e o
+  core desistiu aos 180 s com "o Mac não respondeu". O diálogo não tem janela-mãe
+  e o app não vinha para a frente: no macOS, alerta de app em segundo plano abre
+  atrás da janela em uso. Não deu para provar — o log do desktop era UM arquivo
+  de 40 KB (padrão do `tauri-plugin-log`) e já tinha descartado esse trecho.
+- **`21b91d36` (13:10): pasta inventada.** "tenta de novo pq deu erro" não cita o
+  Claude, foi SERVER_TOOL direto, e o classificador pôs `pasta=/Users/daniel/
+  Projetos/revolucao-industrial-claude` (nem `~/Projetos` existe). Morreu no Mac
+  em 1 s, um turno depois. O "Dessa vez foi" do Neo veio antes de a tarefa
+  começar.
+
+Corrigido:
+- antes do diálogo, a janela do Neo vem para a frente (`set_focus` ativa o app)
+  e sai uma notificação "O Claude quer começar";
+- o `claude.start` sem resposta diz "ninguém permitiu no Mac em 3 minutos… pode
+  ter aberto atrás de outra janela";
+- `claude.health` aceita `pasta` e responde se ela serve (mesmas regras do start,
+  sem criar nada); o `claude_task` confere NO MESMO TURNO e devolve ao modelo
+  "chame de novo SEM `pasta`". Desktop antigo não responde a pasta e segue como
+  antes. A descrição de `pasta` diz "que JÁ EXISTE, nunca invente";
+- o aviso do `claude_task` diz "na fila, ainda NÃO começou";
+- rodada que não lançou não conta ("nenhuma rodada chegou a rodar");
+- log do desktop: 5 MB × 5 arquivos (`KeepSome(5)`).

@@ -45,6 +45,46 @@ _REASONING_DISABLED = {"reasoning": {"enabled": False}}
 _REASONING_MANDATORY: set[str] = set()
 
 
+def _provedores_ignorados() -> tuple[str, ...]:
+    """``[openrouter] provedores_ignorados`` do neo.toml (vazio se ilegível)."""
+    try:
+        from shared.ajustes import ajustes
+
+        return tuple(p for p in ajustes().openrouter.provedores_ignorados if p)
+    except Exception:  # noqa: BLE001 — ajuste ilegível não derruba a chamada
+        return ()
+
+
+def _exige_raciocinio(model: str) -> bool:
+    """O modelo recusa ``reasoning.enabled=false``?
+
+    O conjunto aprendido mora na memória do processo e some a cada ``--reload``:
+    cada reinício pagava um 400 na primeira chamada de cada modelo (o primeiro
+    turno da session-a20f4722 levou um). Os já conhecidos vêm de
+    ``[openrouter] raciocinio_obrigatorio`` no ``neo.toml``.
+    """
+    if model in _REASONING_MANDATORY:
+        return True
+    try:
+        from shared.ajustes import ajustes
+
+        return model in ajustes().openrouter.raciocinio_obrigatorio
+    except Exception:  # noqa: BLE001 — ajuste ilegível não derruba a chamada
+        return False
+
+
+def _raciocinio_com_teto(teto: int) -> dict[str, Any]:
+    """O campo que LIMITA o raciocínio de um modelo que não deixa desligá-lo.
+
+    Sem isto, ``disable_thinking`` num modelo assim virava "raciocínio sem
+    limite": na session-a20f4722 o classificador (GLM-5.3-flash) raciocinou até
+    estourar 2048 tokens, voltou vazio, e a nova tentativa com 4096 levou o turno
+    a 44 s só de classificação. Medido em 13/11 com 30 pedidos reais: com
+    ``max_tokens`` o MiniMax m3.1-flash fecha com zero tokens de raciocínio.
+    """
+    return {"reasoning": {"max_tokens": int(teto)}}
+
+
 def _is_reasoning_mandatory(exc: BaseException | None) -> bool:
     while exc is not None:
         if "reasoning is mandatory" in str(exc).lower():
@@ -135,6 +175,28 @@ class OpenRouterProvider(OpenAIProvider):
         return bare
 
     @staticmethod
+    def _apply_provider_ignore(kwargs: dict[str, Any]) -> None:
+        """Tira do roteamento os provedores de ``[openrouter] provedores_ignorados``.
+
+        Vai em ``provider.ignore``: o gateway segue escolhendo entre todos os
+        outros, nada fica fixado. Roda DEPOIS de ``_split_provider_pin``: chamada
+        com provedor fixado (``order``/``only``) já escolheu e fica como está. Um
+        ``ignore`` que o chamador já mandou é somado, não trocado.
+        """
+        ignorar = _provedores_ignorados()
+        if not ignorar:
+            return
+        extra = dict(kwargs.get("extra_body") or {})
+        pref = extra.get("provider")
+        if isinstance(pref, dict) and (pref.get("order") or pref.get("only")):
+            return
+        pref = dict(pref) if isinstance(pref, dict) else {}
+        atuais = list(pref.get("ignore") or [])
+        pref["ignore"] = atuais + [p for p in ignorar if p not in atuais]
+        extra["provider"] = pref
+        kwargs["extra_body"] = extra
+
+    @staticmethod
     def _pin_is_locked(kwargs: dict[str, Any]) -> bool:
         """Esta chamada tem um pin de provedor TRANCADO (sem fallback)?
 
@@ -201,26 +263,39 @@ class OpenRouterProvider(OpenAIProvider):
         return True
 
     @staticmethod
-    def _apply_reasoning_pref(kwargs: dict[str, Any], model: str) -> None:
+    def _apply_reasoning_pref(
+        kwargs: dict[str, Any], model: str, teto: int | None = None
+    ) -> None:
         """Traduz a intenção ``disable_thinking`` para o campo ``reasoning`` da API.
 
         Consome a flag ANTES de subir para ``OpenAIProvider``, que a descartaria.
         Um ``extra_body`` vindo do chamador vence — quem foi explícito manda.
-        Modelo que exige raciocínio (``_REASONING_MANDATORY``) não recebe o campo.
+
+        Modelo que exige raciocínio não aceita o desligamento. Com ``teto`` (o
+        ``teto_raciocinio`` de quem chama), ele recebe o raciocínio LIMITADO; sem
+        teto, não recebe campo nenhum, como antes — o navegador, por exemplo, não
+        passa teto porque a decisão dele depende do raciocínio.
         """
         if not kwargs.pop("disable_thinking", False):
             return
-        if model in _REASONING_MANDATORY:
+        extra = kwargs.get("extra_body") or {}
+        if _exige_raciocinio(model):
+            if teto:
+                kwargs["extra_body"] = {**_raciocinio_com_teto(teto), **extra}
+                logger.debug("[OpenRouter] %s: raciocínio limitado a %d tokens", model, teto)
             return
-        kwargs["extra_body"] = {**_REASONING_DISABLED, **(kwargs.get("extra_body") or {})}
+        kwargs["extra_body"] = {**_REASONING_DISABLED, **extra}
         logger.debug("[OpenRouter] reasoning desligado nesta chamada (saída estruturada pedida)")
 
     @staticmethod
-    def _drop_reasoning_disable(kwargs: dict[str, Any], model: str, exc: Exception) -> bool:
+    def _drop_reasoning_disable(
+        kwargs: dict[str, Any], model: str, exc: Exception, teto: int | None = None
+    ) -> bool:
         """O modelo exige raciocínio: tira o desligamento que NÓS pusemos e lembra.
 
         Devolve True quando tirou (e vale repetir). Só mexe no campo exato de
         ``_REASONING_DISABLED`` — um ``reasoning`` que o chamador mandou é dele.
+        Com ``teto``, troca o desligamento pelo raciocínio limitado.
         """
         extra = kwargs.get("extra_body") or {}
         if extra.get("reasoning") != _REASONING_DISABLED["reasoning"]:
@@ -228,11 +303,14 @@ class OpenRouterProvider(OpenAIProvider):
         if not _is_reasoning_mandatory(exc):
             return False
         _REASONING_MANDATORY.add(model)
-        kwargs["extra_body"] = {k: v for k, v in extra.items() if k != "reasoning"}
+        sem_campo = {k: v for k, v in extra.items() if k != "reasoning"}
+        kwargs["extra_body"] = {**sem_campo, **_raciocinio_com_teto(teto)} if teto else sem_campo
         logger.warning(
             "[OpenRouter] %s exige raciocínio (não aceita reasoning.enabled=false) — "
-            "refazendo com ele ligado, e assim fica para as próximas chamadas",
+            "refazendo com ele ligado%s, e assim fica para as próximas chamadas "
+            "(conhecido de antemão se estiver em [openrouter] raciocinio_obrigatorio)",
             model,
+            f" e limitado a {teto} tokens" if teto else "",
         )
         return True
 
@@ -246,8 +324,10 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Completion via OpenRouter (usa mesma lógica da OpenAI)."""
+        teto = kwargs.pop("teto_raciocinio", None)
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_reasoning_pref(kwargs, model)
+        self._apply_provider_ignore(kwargs)
+        self._apply_reasoning_pref(kwargs, model, teto)
         try:
             return await super().complete(
                 messages=messages,
@@ -266,7 +346,7 @@ class OpenRouterProvider(OpenAIProvider):
                 **kwargs,
             )
         except LLMProviderError as e:
-            if self._drop_reasoning_disable(kwargs, model, e):
+            if self._drop_reasoning_disable(kwargs, model, e, teto):
                 # Reentra pelo caminho inteiro (pin, escada de 429): o modelo já
                 # está limpo de `@slug` e o campo já saiu, então não há laço.
                 return await self.complete(
@@ -305,8 +385,10 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ):
         """Streaming via OpenRouter."""
+        teto = kwargs.pop("teto_raciocinio", None)
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_reasoning_pref(kwargs, model)
+        self._apply_provider_ignore(kwargs)
+        self._apply_reasoning_pref(kwargs, model, teto)
         # Até 3 voltas: uma para tirar o desligamento de raciocínio que o modelo
         # recusa, uma para afrouxar o pin lotado — cada conserto vale uma vez só.
         for tentativa in range(3):
@@ -334,7 +416,7 @@ class OpenRouterProvider(OpenAIProvider):
                 # mandado texto duplicaria a resposta na tela do usuário, e um
                 # provedor lotado costuma recusar ANTES do primeiro chunk.
                 if tentativa < 2 and not emitiu and (
-                    self._drop_reasoning_disable(kwargs, model, e)
+                    self._drop_reasoning_disable(kwargs, model, e, teto)
                     or self._relax_provider_pin(kwargs, e)
                 ):
                     continue

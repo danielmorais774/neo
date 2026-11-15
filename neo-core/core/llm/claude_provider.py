@@ -67,6 +67,7 @@ class ClaudeProvider(LLMProvider):
             # não parâmetro da API: aqui não há o que traduzir (o extended thinking
             # do Claude é opt-in), então some antes de virar 400 no corpo.
             kwargs.pop("disable_thinking", None)
+            kwargs.pop("teto_raciocinio", None)
 
             # Mesma história: `response_format` é da API da OpenAI (o
             # classificador o usa para não ter como escorregar para prosa).
@@ -122,6 +123,7 @@ class ClaudeProvider(LLMProvider):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Streaming completion with Claude — yields StreamChunk events."""
+        kwargs.pop("teto_raciocinio", None)
         try:
             system_content: str | None = None
             claude_messages: list[dict[str, Any]] = []

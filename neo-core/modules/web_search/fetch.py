@@ -17,8 +17,8 @@ import asyncio
 import ipaddress
 import logging
 import threading
-from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from dataclasses import dataclass, field
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import httpx
 
@@ -95,6 +95,16 @@ class FetchedPage:
     text: str
     truncated: bool
     url: str
+    #: Endereços da página (mídia primeiro, depois o mesmo site, depois o resto),
+    #: absolutos e sem repetição. O texto extraído não traz endereço nenhum, e
+    #: sem eles o cérebro ia raspar o HTML no sandbox com curl + grep para
+    #: achar a próxima página (session-a20f4722, 3 rodadas).
+    links: list[str] = field(default_factory=list)
+    #: Tabelas de DADOS da página em texto, uma string por tabela (ver
+    #: `_tabelas_sync`). O trafilatura descarta tabela com muito link, e é assim
+    #: que vêm as listas da Wikipédia: sem elas o cérebro raspava o wikitext com
+    #: regex no sandbox (24 das 29 rodadas da session-607c5313).
+    tabelas: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,8 +168,66 @@ async def _host_is_private(host: str) -> bool:
 _EXTRACT_LOCK = threading.Lock()
 
 
-def _extract_sync(html: str) -> tuple[str, str]:
-    """(title, text) via trafilatura — síncrono, roda em to_thread (serializado)."""
+#: Metas que apontam a MÍDIA da página (o som de um botão, o vídeo de um post).
+_MIDIA_META = ("og:audio", "og:audio:url", "og:audio:secure_url", "og:video",
+               "og:video:url", "og:video:secure_url", "twitter:player:stream")
+
+
+def _links_sync(html: str, base_url: str, limite: int) -> list[str]:
+    """Os endereços da página, absolutos: mídia, conteúdo do mesmo site, conteúdo
+    de fora e, por último, os menus.
+
+    Os menus (``<nav>``, ``<header>``, ``<footer>``) vão para o fim porque se repetem
+    em toda página do site e comiam o teto: na busca do myinstants eram os 23
+    primeiros links, e os resultados vinham depois. Roda dentro do
+    ``_EXTRACT_LOCK`` (lxml, ver acima). Fica de fora o que não é endereço
+    navegável: âncora da própria página, ``javascript:``, ``mailto:``.
+    """
+    if limite <= 0:
+        return []
+    import lxml.html
+
+    try:
+        doc = lxml.html.fromstring(html)
+    except Exception:  # noqa: BLE001 — HTML que o lxml não engole fica sem links
+        return []
+    proprio = urldefrag(base_url)[0]
+    host = (urlparse(base_url).hostname or "").lower()
+    midia: list[str] = []
+    mesmo_site: list[str] = []
+    outros: list[str] = []
+    menus: list[str] = []
+    vistos: set[str] = set()
+
+    def _guardar(bruto: str | None, destino: list[str] | None) -> None:
+        bruto = (bruto or "").strip()
+        if not bruto or bruto.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return
+        absoluto = urldefrag(urljoin(base_url, bruto))[0]
+        if urlparse(absoluto).scheme not in ("http", "https") or absoluto == proprio:
+            return
+        if absoluto in vistos:
+            return
+        vistos.add(absoluto)
+        if destino is None:
+            destino = mesmo_site if (urlparse(absoluto).hostname or "").lower() == host else outros
+        destino.append(absoluto)
+
+    for meta in doc.iter("meta"):
+        nome = (meta.get("property") or meta.get("name") or "").lower()
+        if nome in _MIDIA_META:
+            _guardar(meta.get("content"), midia)
+    for tag in ("audio", "video", "source"):
+        for el in doc.iter(tag):
+            _guardar(el.get("src"), midia)
+    for a in doc.iter("a"):
+        no_menu = next(a.iterancestors("nav", "header", "footer"), None) is not None
+        _guardar(a.get("href"), menus if no_menu else None)
+    return (midia + mesmo_site + outros + menus)[:limite]
+
+
+def _extract_sync(html: str, base_url: str = "", links_max: int = 0) -> tuple[str, str, list[str]]:
+    """(title, text, links) via trafilatura + lxml — síncrono, roda em to_thread (serializado)."""
     import trafilatura
 
     with _EXTRACT_LOCK:
@@ -171,7 +239,181 @@ def _extract_sync(html: str) -> tuple[str, str]:
                 title = meta.title or ""
         except Exception:  # noqa: BLE001
             title = ""
-    return title, text
+        links = _links_sync(html, base_url, links_max) if base_url else []
+    return title, text, links
+
+
+def _links_max() -> int:
+    """``[web] links_max`` do neo.toml."""
+    try:
+        from shared.ajustes import ajustes
+
+        return ajustes().web.links_max
+    except Exception:  # noqa: BLE001 — ajuste ilegível: sem links, como antes
+        return 0
+
+
+def _tabelas_max() -> int:
+    """``[web] tabelas_max`` do neo.toml."""
+    try:
+        from shared.ajustes import ajustes
+
+        return ajustes().web.tabelas_max
+    except Exception:  # noqa: BLE001 — ajuste ilegível: sem tabelas, como antes
+        return 0
+
+
+#: Tabela que é navegação ou aviso, não dado: as caixas "veja também" da
+#: Wikipédia (navbox, sidebar) e as de manutenção (ambox, mbox, metadata).
+_TABELA_NAO_E_DADO = ("navbox", "sidebar", "metadata", "ambox", "mbox", "toc")
+
+#: O que some de dentro da célula: nota de rodapé ("[1]"), CSS/JS embutido e a
+#: chave de ordenação escondida que a Wikipédia põe antes do número.
+_LIXO_DA_CELULA = (
+    ".//sup[contains(@class,'reference')] | .//style | .//script"
+    " | .//*[contains(translate(@style,' ',''),'display:none')]"
+    " | .//*[contains(@class,'sortkey')]"
+)
+
+
+def _linhas_da_tabela(tabela) -> list[list[str]]:
+    """As linhas da tabela como listas de células já limpas; sem as colunas vazias."""
+    linhas: list[list[str]] = []
+    for tr in tabela.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"):
+        celulas = []
+        for cel in tr.xpath("./th | ./td"):
+            for lixo in cel.xpath(_LIXO_DA_CELULA):
+                lixo.drop_tree()
+            celulas.append(" ".join(cel.text_content().split()).replace("|", "/"))
+        if any(celulas):
+            linhas.append(celulas)
+    largura = max((len(l) for l in linhas), default=0)
+    # Coluna vazia em toda linha (a da setinha de "subiu/desceu", que é imagem)
+    # só ocupa espaço.
+    vazias = {
+        i for i in range(largura)
+        if all(i >= len(l) or not l[i] for l in linhas)
+    }
+    return [[c for i, c in enumerate(l) if i not in vazias] for l in linhas]
+
+
+def _linhas_com_dado(linhas: list[list[str]]) -> int:
+    """Quantas linhas, fora o cabeçalho, têm letra ou número em alguma célula.
+
+    O player do winhistory.de (os sons do Windows) é uma tabela por som com
+    "Streaming | MP3 | Wave" em cima e só ícones embaixo: 19 delas, nenhum dado.
+    """
+    return sum(
+        1 for l in linhas[1:] if any(any(ch.isalnum() for ch in c) for c in l)
+    )
+
+
+def _ja_esta_no_texto(linhas: list[list[str]], texto_normalizado: str) -> bool:
+    """O trafilatura já pôs esta tabela no texto? Então ela não entra de novo.
+
+    Ele guarda a tabela com pouco link (as da lista de área da Wikipédia) e
+    descarta a com muito link (a de população). Só a descartada precisa vir
+    aqui; a guardada aparece com um ``max_chars`` maior, e repetir gastaria
+    contexto. A amostra são células curtas (nome, número) do começo e do fim da
+    tabela: as longas mudam de formato entre os dois extratores (nota de
+    rodapé, espaço), e o fim pega tabela guardada só pela metade.
+    """
+    corpo = linhas[1:]
+    amostra = {
+        c for l in corpo[:3] + corpo[-3:] for c in l if 3 <= len(c) <= 40
+    }
+    if not amostra:
+        return False
+    presentes = sum(1 for c in amostra if c in texto_normalizado)
+    return presentes >= max(1, int(len(amostra) * 0.8))
+
+
+def _tabelas_sync(html: str, limite: int, texto: str = "") -> list[str]:
+    """As tabelas de DADOS da página em texto, até ``limite`` caracteres no total.
+
+    Uma string por tabela: a legenda, quantas linhas tem, e cada linha com as
+    células separadas por ``|``. Fica de fora a tabela que é navegação ou aviso
+    (`_TABELA_NAO_E_DADO`), a de layout (tabela dentro de tabela), a de menos
+    de 2 linhas × 2 colunas, a sem dado fora do cabeçalho (só ícone), a repetida
+    e a que o trafilatura já pôs no ``texto`` (o texto
+    INTEIRO, antes do corte do ``max_chars``). Tabela que não cabe inteira avisa
+    quantas linhas ficaram de fora.
+
+    Não toma o ``_EXTRACT_LOCK``: quem chama é que segura (ver
+    `_extract_tables_sync`), como no `_links_sync`.
+    """
+    if limite <= 0 or "<table" not in html.lower():
+        return []
+    import lxml.html
+
+    try:
+        doc = lxml.html.fromstring(html)
+    except Exception:  # noqa: BLE001 — HTML que o lxml não engole fica sem tabelas
+        return []
+    blocos: list[str] = []
+    usado = 0
+    sobraram = 0
+    esgotou = False
+    texto_normalizado = " ".join((texto or "").split())
+    vistas: set[str] = set()
+    for tabela in doc.iter("table"):
+        classe = (tabela.get("class") or "").lower()
+        if any(c in classe for c in _TABELA_NAO_E_DADO):
+            continue
+        if (tabela.get("role") or "").lower() in ("presentation", "navigation"):
+            continue
+        if tabela.xpath(".//table") or next(tabela.iterancestors("table"), None) is not None:
+            continue
+        if next(tabela.iterancestors("nav", "header", "footer"), None) is not None:
+            continue
+        legenda_el = tabela.find("caption")
+        legenda = " ".join(legenda_el.text_content().split()) if legenda_el is not None else ""
+        linhas = _linhas_da_tabela(tabela)
+        if len(linhas) < 2 or max(len(l) for l in linhas) < 2:
+            continue
+        if not _linhas_com_dado(linhas):
+            continue
+        assinatura = "\n".join(" | ".join(l) for l in linhas)
+        if assinatura in vistas:
+            continue
+        vistas.add(assinatura)
+        if texto_normalizado and _ja_esta_no_texto(linhas, texto_normalizado):
+            continue
+        if esgotou:
+            sobraram += 1
+            continue
+        cabeca = f"Tabela {len(blocos) + 1}" + (f" ({legenda})" if legenda else "")
+        cabeca += f" — {len(linhas)} linhas:"
+        partes = [cabeca]
+        gasto = len(cabeca) + 1
+        cabe = 0
+        for linha in linhas:
+            texto_linha = " | ".join(linha)
+            if usado + gasto + len(texto_linha) + 1 > limite:
+                break
+            partes.append(texto_linha)
+            gasto += len(texto_linha) + 1
+            cabe += 1
+        # Cabeçalho sem nenhuma linha de dado não diz nada: a tabela conta
+        # como "não coube", e a partir da primeira cortada o teto acabou.
+        if cabe < 2:
+            esgotou = True
+            sobraram += 1
+            continue
+        usado += gasto
+        if cabe < len(linhas):
+            esgotou = True
+            partes.append(f"(… mais {len(linhas) - cabe} linhas desta tabela não couberam)")
+        blocos.append("\n".join(partes))
+    if sobraram and blocos:
+        blocos[-1] += f"\n(+ {sobraram} tabela(s) da página não couberam)"
+    return blocos
+
+
+def _extract_tables_sync(html: str, limite: int, texto: str = "") -> list[str]:
+    """`_tabelas_sync` dentro do ``_EXTRACT_LOCK`` (lxml, ver acima). Roda em to_thread."""
+    with _EXTRACT_LOCK:
+        return _tabelas_sync(html, limite, texto)
 
 
 def _extract_pdf_sync(data: bytes) -> tuple[str, str]:
@@ -302,7 +544,9 @@ async def fetch_readable(url: str, *, max_chars: int = 8000) -> FetchedPage | Fe
 
         html = body.decode(resp.encoding or "utf-8", errors="replace")
         try:
-            title, text = await asyncio.to_thread(_extract_sync, html)
+            title, text, links = await asyncio.to_thread(
+                _extract_sync, html, current, _links_max()
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning("[web_fetch] extração falhou para %s: %s", current, e)
             return FetchError("fetch_failed", f"Falha na extração de texto: {e}")
@@ -312,7 +556,20 @@ async def fetch_readable(url: str, *, max_chars: int = 8000) -> FetchedPage | Fe
                 "js_required",
                 "Página sem texto extraível (provável render por JavaScript). Tente outra fonte.",
             )
+        # Tabela é extra: falhar aqui devolve a página como antes, sem tabelas.
+        tabelas: list[str] = []
+        limite_tabelas = _tabelas_max()
+        if limite_tabelas > 0:
+            try:
+                tabelas = await asyncio.to_thread(
+                    _extract_tables_sync, html, limite_tabelas, text
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[web_fetch] tabelas falharam para %s: %s", current, e)
         truncated = len(text) > max_chars
-        return FetchedPage(title=title, text=text[:max_chars], truncated=truncated, url=current)
+        return FetchedPage(
+            title=title, text=text[:max_chars], truncated=truncated, url=current, links=links,
+            tabelas=tabelas,
+        )
 
     return FetchError("fetch_failed", f"Redirects demais (>{_MAX_REDIRECTS}).")

@@ -316,7 +316,10 @@ JOB_TOOLS: list[ToolSchema] = [
                     "true = abrir na TELA do usuário (ele vê cada passo). Só quando "
                     "ele quiser acompanhar, ou quando o resultado depende de ele ver "
                     "ou ouvir. O padrão (false) roda sem janela na mesma máquina — "
-                    "mesmo IP, sem atrapalhar o que ele está fazendo."
+                    "mesmo IP, sem atrapalhar o que ele está fazendo. Se esta "
+                    "conversa já trabalhou no navegador dele com janela, a tarefa vai "
+                    "com janela sozinha; se ele disse 'sem janela', vai sem — o "
+                    "resultado diz qual (`janela`)."
                 ),
                 required=False,
             ),
@@ -334,7 +337,11 @@ JOB_TOOLS: list[ToolSchema] = [
                     "pergunta pela memória do Daniel'. Quem executa lê as perguntas "
                     "na tela, consulta a memória pergunta por pergunta e para antes "
                     "de enviar para ele conferir. Escreva literal só o que o Daniel "
-                    "DITOU nesta conversa."
+                    "DITOU nesta conversa. CONTA em site: NÃO escreva senha nem "
+                    "e-mail inventado (nada de mailinator) — escreva só 'crie a conta "
+                    "com o e-mail do Neo' ou 'entre com a conta do cofre'. Quem "
+                    "executa usa o e-mail do Neo, gera a senha e a guarda no cofre; "
+                    "senha escrita na tarefa é recusada no campo."
                 ),
                 required=True,
             ),
@@ -423,6 +430,161 @@ JOB_TOOLS: list[ToolSchema] = [
         },
     ),
     ToolSchema(
+        name="claude_task",
+        description=(
+            "DELEGA uma tarefa ao Claude Code (o agente de programação da Anthropic) no Mac do "
+            "Daniel, com o login que ele já fez lá. Use quando ele PEDIR o Claude ('faz com o "
+            "Claude', 'pede pro Claude', 'usa o Claude Code'). O Claude trabalha numa pasta do Mac "
+            "(um projeto dele, ou uma pasta nova), em rodadas; você acompanha, e no fim recebe o "
+            "relatório para trabalhar em cima. Volta na hora com um job_id: avise que mandou e que "
+            "traz o resultado — NÃO fique esperando. Gasta a cota da assinatura do Daniel, então "
+            "não use para o que você resolve sozinho. Ações que precisam de permissão (instalar "
+            "pacote, git push, escrever fora da pasta) são negadas e viram uma pergunta para ele. "
+            "Ajuste ou continuação de um trabalho que o Claude JÁ fez nesta conversa NÃO é tarefa "
+            "nova: é `claude_reply` no job dele (mesma sessão, mesma pasta)."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=30,
+        parameters={
+            "objetivo": ToolParameter(
+                type="string",
+                description=(
+                    "O que é 'pronto', completo e autossuficiente: o Claude não vê esta conversa. "
+                    "Ex.: 'No projeto neo-panel, a aba Providers não mostra o erro do 409 dentro do "
+                    "formulário; faça o erro aparecer no formulário e rode os testes.'"
+                ),
+                required=True,
+            ),
+            "pasta": ToolParameter(
+                type="string",
+                description=(
+                    "Pasta de trabalho NO MAC do Daniel, que JÁ EXISTE (ex.: um projeto dele, "
+                    "'~/Documents/projects/neo/neo-panel'). Só preencha quando ele disser a pasta ou "
+                    "for um projeto conhecido — NUNCA invente caminho. Trabalho novo = deixe VAZIO: "
+                    "o Neo cria uma pasta nova em ~/Neo/claude/. Nada fora do home dele."
+                ),
+                required=False,
+            ),
+            "contexto": ToolParameter(
+                type="string",
+                description="O que você sabe e o Claude precisa (decisões, restrições, nomes). Nunca senha nem dado sensível.",
+                required=False,
+            ),
+            "entregaveis": ToolParameter(
+                type="array",
+                items={"type": "string"},
+                description="O que deve existir no fim (ex.: ['testes passando', 'RELATORIO.md']).",
+                required=False,
+            ),
+            "onde": ToolParameter(
+                type="string",
+                enum=["auto", "local", "servidor"],
+                description="Onde o Claude roda. Por enquanto só existe 'local' (o Mac); 'auto' = local.",
+                required=False,
+            ),
+            "modelo": ToolParameter(
+                type="string",
+                enum=["sonnet", "opus", "haiku"],
+                description="Padrão sonnet. Opus só se ele pedir: gasta bem mais da cota.",
+                required=False,
+            ),
+            "then": ToolParameter(
+                type="string",
+                description=(
+                    "O que VOCÊ faz com o resultado quando o Claude terminar (ex.: 'resuma o que mudou "
+                    "e entregue o RELATORIO.md'). Com `then`, os arquivos do relatório são trazidos "
+                    "para você ler; sem ele, o Daniel recebe só o relatório."
+                ),
+                required=False,
+            ),
+        },
+    ),
+    ToolSchema(
+        name="claude_reply",
+        description=(
+            "Manda a resposta, a orientação ou um AJUSTE do Daniel para uma tarefa do Claude Code "
+            "(`claude_task`), pela MESMA sessão e pasta — o Claude lembra do que fez. Parada "
+            "esperando ele (pergunta ou permissão): continua de onde parou. Rodando: a mensagem "
+            "entra na próxima rodada (ou para a atual, com interromper=true). Já terminada: o "
+            "Claude retoma a sessão com o pedido novo (ajuste, correção, mais um passo)."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=20,
+        parameters={
+            "job_id": ToolParameter(type="string", description="ID do job do claude_task", required=True),
+            "mensagem": ToolParameter(
+                type="string",
+                description="O que o Daniel disse, com as palavras dele.",
+                required=True,
+            ),
+            "liberar": ToolParameter(
+                type="boolean",
+                description=(
+                    "true SÓ se o Daniel autorizou as ações que o Claude pediu (as listadas na pausa). "
+                    "Libera exatamente aquelas, só nesta tarefa."
+                ),
+                required=False,
+            ),
+            "interromper": ToolParameter(
+                type="boolean",
+                description="true = para a rodada atual agora (ex.: 'para', 'muda tudo').",
+                required=False,
+            ),
+        },
+    ),
+    # As sessões do Claude que o DANIEL usa no Mac — não as tarefas que o Neo
+    # delega (docs/ambiente-de-trabalho-plan.md §9).
+    ToolSchema(
+        name="claude_sessoes",
+        description=(
+            "Lista as sessões do Claude Code que o DANIEL está usando no Mac (no VSCode ou num "
+            "terminal) e as que ele fechou há pouco: título, pasta, o 1º pedido, os últimos "
+            "pedidos, o começo da última resposta, os arquivos que ela editou e há quanto tempo "
+            "foi usada. Chame antes de `claude_enviar`, quando ele pedir algo para 'o Claude que "
+            "eu estava usando', 'a sessão do VSCode', 'o Claude do projeto X', ou quiser saber o "
+            "que está aberto. NÃO são as tarefas que você delegou (essas são `claude_task` e "
+            "`claude_reply`)."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=30,
+        parameters={},
+    ),
+    ToolSchema(
+        name="claude_enviar",
+        description=(
+            "Entrega um pedido do Daniel numa sessão do Claude Code DELE (uma da `claude_sessoes`), "
+            "e ela executa sozinha: ele não precisa apertar Enter. Aberta, o pedido aparece ao vivo "
+            "nela (VSCode ou terminal); se ela estiver no meio de um trabalho, entra nele. Fechada, "
+            "o Neo a retoma em segundo plano, na pasta dela. Escolha a sessão pelo ASSUNTO do "
+            "pedido (título, últimos pedidos, última resposta, arquivos), não só pela mais recente; "
+            "pedido genérico ('continua', 'roda os testes', 'terminou?') vai para a usada por "
+            "último. Se duas combinam, ou nenhuma, NÃO chute: pergunte citando os títulos. Volta "
+            "na hora: diga para QUAL sessão mandou (o título) e que avisa quando ela terminar — "
+            "não fique esperando."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=150,
+        parameters={
+            "sessao": ToolParameter(
+                type="string",
+                description="O sessionId da sessão, como a `claude_sessoes` devolveu. Nunca invente.",
+                required=True,
+            ),
+            "pedido": ToolParameter(
+                type="string",
+                description=(
+                    "O pedido do Daniel, completo e com as palavras dele, resolvendo 'isso'/'aquilo': "
+                    "a sessão não vê esta conversa. Nunca senha nem dado sensível."
+                ),
+                required=True,
+            ),
+        },
+    ),
+    ToolSchema(
         name="job_status",
         description="Consulta o estado de um job em background (fila/rodando/concluído/falhou) e o resumo do resultado.",
         module="jobs",
@@ -457,6 +619,44 @@ JOB_TOOLS: list[ToolSchema] = [
             "tail": ToolParameter(
                 type="integer",
                 description="Quantidade de bytes finais do log a retornar (opcional)",
+                required=False,
+            ),
+        },
+    ),
+    ToolSchema(
+        name="job_falar",
+        description=(
+            "Fala com a tarefa que está RODANDO agora no navegador do Daniel, sem pará-la: "
+            "repassa o que ele disse no chat, responde a pergunta que ela fez, corrige o "
+            "rumo, manda abrir outro site noutra aba. Ela lê no próximo passo e se ajusta — "
+            "sem recomeçar e sem fechar aba. Quando o contexto mostrar 'Tarefa rodando "
+            "AGORA no navegador' e o Daniel falar dela, use ISTO, e não uma nova "
+            "browser_local_task."
+        ),
+        module="jobs",
+        execution="server-side",
+        timeout=15,
+        parameters={
+            "mensagem": ToolParameter(
+                type="string",
+                description=(
+                    "O recado PARA a tarefa (o agente do navegador), em português: o que o "
+                    "Daniel quer, com as palavras dele quando importarem, e o que você sabe "
+                    "que ajuda (qual credencial do cofre usar, qual critério seguir)."
+                ),
+                required=True,
+            ),
+            "job_id": ToolParameter(
+                type="string",
+                description="ID da tarefa (opcional: sem ele, vai para a que roda nesta conversa)",
+                required=False,
+            ),
+            "autoriza": ToolParameter(
+                type="boolean",
+                description=(
+                    "true SÓ quando o Daniel autorizou com todas as letras a ação que a "
+                    "tarefa segurou para ele conferir (enviar o formulário, confirmar)."
+                ),
                 required=False,
             ),
         },

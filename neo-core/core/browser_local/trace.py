@@ -162,9 +162,11 @@ class RunTrace:
     def no_shot(self, reason: str) -> None:
         self._write(f"\n- print: **não tirado** — {reason}\n")
 
-    def thought(self, model: str, ms: float, decision: dict, raw: str = "") -> None:
+    def thought(
+        self, model: str, ms: float, decision: dict, raw: str = "", *, orcamento: str = ""
+    ) -> None:
         body = (
-            f"\n- modelo: `{model}` · {ms:.0f}ms\n"
+            f"\n- modelo: `{model}` · {ms:.0f}ms" + (f" · {orcamento}" if orcamento else "") + "\n"
             f"- pensou: {decision.get('thought') or '(nada)'}\n"
             f"- escolheu: `{decision.get('action')}` "
             f"{json.dumps(decision.get('args') or {}, ensure_ascii=False)}\n"

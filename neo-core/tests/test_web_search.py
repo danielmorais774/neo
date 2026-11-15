@@ -147,6 +147,11 @@ async def test_searxng_sends_science_category_and_json_format(monkeypatch):
     assert captured["params"]["format"] == "json"
     assert "time_range" not in captured["params"]  # recency 'any' não filtra
     assert results[0].url == "https://arxiv.org/abs/1"
+    # Session-34d7f528: com `pt-BR` o Google CSE só devolvia página em português e
+    # "Windows XP error sound wav" voltava zero. O idioma vem de [web] no neo.toml.
+    from shared.ajustes import ajustes
+
+    assert captured["params"]["language"] == ajustes().web.idioma_busca == "all"
 
 
 # ── guard SSRF do fetch ─────────────────────────────────────────────────────

@@ -350,12 +350,44 @@ async def test_quase_repetido_volta_pro_cerebro_em_vez_de_rodar_ou_morrer():
 
 
 @pytest.mark.asyncio
-async def test_terceira_volta_no_mesmo_ponto_encerra():
-    """O empurrão é bom duas vezes; na terceira é laço e o turno fecha."""
+async def test_terceira_volta_no_mesmo_ponto_responde_com_o_que_ja_tem():
+    """O empurrão é bom duas vezes; na terceira é laço: não despacha, e a resposta
+    sai das saídas que o turno já tem (session-1bbdd7c5), sem tool nenhuma."""
     from modules.desktop.ai_service import _MAX_REPEAT_NUDGES
 
     svc = _svc()
-    steps = [{"command": _R10, "ok": True, "output": "...", "tool": "run_command"}]
+    recebido = []
+
+    async def formatar(user_message, command, output, **kw):
+        recebido.append(output)
+        return "Os 3 .md estão na pasta."
+
+    svc._format_tool_result = formatar
+    steps = [{"command": _R10, "ok": True, "output": "RESUMO.md\nFICHAS.md", "tool": "run_command"}]
+    steps += [
+        {"command": f"ls -la {_A}/*.md {_A}/*.json {_A}/*.csv {_A}/extra{i}/",
+         "ok": False, "kind": "nudge", "tool": "run_command", "error": "x"}
+        for i in range(_MAX_REPEAT_NUDGES)
+    ]
+    car = ClientActuationRequested("run_command", {"command": _R11}, "tc")
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=uuid4(), user_message="cria os 3 .md", user_id=None,
+        metadata={}, trace=None, slog=None, depth=3, steps=steps,
+    ))
+
+    assert not any(r.command_request for r in out)
+    assert out[-1].is_final
+    assert out[-1].message == "Os 3 .md estão na pasta."
+    assert "RESUMO.md" in recebido[0]
+
+
+@pytest.mark.asyncio
+async def test_terceira_volta_no_mesmo_ponto_encerra():
+    """Sem saída aproveitável no turno, a terceira volta fecha com a parada."""
+    from modules.desktop.ai_service import _MAX_REPEAT_NUDGES
+
+    svc = _svc()
+    steps = [{"command": _R10, "ok": True, "output": "", "tool": "run_command"}]
     # Cada volta com uma string DIFERENTE: repetir letra por letra já cai na guarda
     # de igualdade, que é outra porta. O que se mede aqui é o reembaralhamento.
     steps += [

@@ -124,10 +124,13 @@ def _anterior(session_id, *, tab, url, minutos, resultado=""):
 _PORTAL = "https://portal.exemplo.edu.br/#!/app/portal/aluno/questionario/384523"
 
 
-async def _spec_da_tarefa(mensagem, anteriores, *, task=f"extrair as questões de {_PORTAL}"):
+async def _spec_da_tarefa(
+    mensagem, anteriores, *, task=f"extrair as questões de {_PORTAL}", session_id=None
+):
     from core.jobs.executor import JobToolExecutor
 
-    session_id = anteriores[0].session_id if anteriores else uuid4()
+    if session_id is None:
+        session_id = anteriores[0].session_id if anteriores else uuid4()
     ex = JobToolExecutor(
         db=_DB(anteriores), job_manager=SimpleNamespace(poke=lambda: None),
         user_id=uuid4(), session_id=session_id, user_message=mensagem, device_id="device-1",
@@ -169,22 +172,39 @@ async def test_headless_que_parou_no_login_manda_a_proxima_para_o_navegador_dele
 
 
 @pytest.mark.asyncio
-async def test_janela_herdada_caduca():
-    """Horas depois, sem ele pedir, não se toma a tela dele de novo."""
+async def test_janela_gruda_na_conversa():
+    """Regra do Daniel (13/11, sessão 7bc7caa1): conversa que trabalhou no
+    navegador dele com janela segue com janela — sem prazo, até ele dizer
+    "sem janela". Antes caducava em 15 minutos e o trabalho ia para o headless,
+    que não tem o login nem o que ele fez na página."""
     sessao = uuid4()
     spec = await _spec_da_tarefa(
-        "extrai as questões", [_anterior(sessao, tab=1976622394, url=_PORTAL, minutos=45)]
+        "extrai as questões", [_anterior(sessao, tab=1976622394, url=_PORTAL, minutos=45 * 60)]
     )
-    assert spec["headless"] is True
+    assert spec["headless"] is False
 
 
 @pytest.mark.asyncio
-async def test_outro_site_nao_herda():
+async def test_janela_da_conversa_vale_para_outro_site():
+    """"Todo pedido que precisar de navegador já deve usar esse padrão": o site
+    novo também vai com janela, porque a escolha é da CONVERSA."""
     sessao = uuid4()
     spec = await _spec_da_tarefa(
         "procura o preço do teclado",
         [_anterior(sessao, tab=1976622394, url=_PORTAL, minutos=1)],
         task="preço do teclado em https://www.kabum.com.br",
+    )
+    assert spec["headless"] is False
+
+
+@pytest.mark.asyncio
+async def test_outra_conversa_noutro_site_nao_herda():
+    """De OUTRA conversa, só o mesmo site fala — e este é outro."""
+    spec = await _spec_da_tarefa(
+        "procura o preço do teclado",
+        [_anterior(uuid4(), tab=1976622394, url=_PORTAL, minutos=1)],
+        task="preço do teclado em https://www.kabum.com.br",
+        session_id=uuid4(),
     )
     assert spec["headless"] is True
 

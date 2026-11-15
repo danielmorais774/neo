@@ -35,6 +35,7 @@ from db.async_client import AsyncPostgresClient
 from db.models import ConversationMessage, Mission
 from modules.desktop import AIService, AIServiceResponse, DesktopService
 from modules.desktop.ai_service import CYCLE_PROGRESS_MARKER
+from core.claude_code.balao import tarefas_da_mensagem
 from shared import NeoError
 from shared.types import MessageType, MissionCommandPayload
 
@@ -231,6 +232,12 @@ def _serialize_chat_message(
     files_payload = _files_payload(metadata.get("files"))
     if files_payload:
         payload["files"] = files_payload
+    # O botão do processo do Claude no balão: as tarefas que esta resposta abriu
+    # (do tool_trace salvo — o mesmo que ao vivo vai no AgentResponse.jobs) ou a
+    # tarefa cujo resultado ela entrega.
+    jobs_payload = tarefas_da_mensagem(metadata)
+    if jobs_payload:
+        payload["jobs"] = jobs_payload
 
     if is_whatsapp_inbound:
         contact_label = (
@@ -1177,6 +1184,9 @@ def _serialize_job(job: Any, *, full: bool = False) -> dict[str, Any]:
         "continuation_of": spec.get("continuation_of"),
         "has_log": bool(job.log_path),
     }
+    retomar = _claude_retomar(job)
+    if retomar:
+        payload["claude"] = retomar
     if full:
         payload.update({
             "result_summary": job.result_summary or "",
@@ -1186,6 +1196,30 @@ def _serialize_job(job: Any, *, full: bool = False) -> dict[str, Any]:
             "spec": spec,
         })
     return payload
+
+
+def _claude_retomar(job: Any) -> dict[str, Any] | None:
+    """Pasta e sessão de uma tarefa do Claude Code — o botão "Terminal" do desktop.
+
+    Com isso o desktop abre o Terminal do Mac em `cd <pasta> && claude --resume
+    <sessão>`. `rodando`: a tarefa ainda está com o Neo (numa rodada ou entre
+    duas). Duas cópias do Claude escrevendo na mesma sessão se atropelam, então
+    o botão espera ela parar.
+    O desktop confere tudo de novo antes de abrir (claude_cli.rs).
+    """
+    if job.kind != "claude_code":
+        return None
+    estado = (job.spec_json or {}).get("claude") or {}
+    final = (job.extra_metadata or {}).get("claude") or {}
+    sessao = str(final.get("session_id") or estado.get("session_id") or "")
+    pasta = str(final.get("cwd") or estado.get("cwd") or "")
+    if not sessao or not pasta or not (final or estado.get("sessao_iniciada")):
+        return None
+    return {
+        "session_id": sessao,
+        "cwd": pasta,
+        "rodando": job.status in ("queued", "running"),
+    }
 
 
 async def _owned_job_or_404(

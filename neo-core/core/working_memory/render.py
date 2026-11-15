@@ -59,6 +59,12 @@ _INDEX_HEADER = (
     "está aqui — abra a nota com `wm_read` usando o nome entre [[ ]]."
 )
 
+# Só entra quando alguma linha sai marcada: o índice paga tokens todo turno.
+_OUTRA_CONVERSA = (
+    "Nota de «outra conversa» é de OUTRO pedido: se ele pede para fazer agora, "
+    "faça, em vez de responder com o que está nela."
+)
+
 _INDEX_FOOTER = (
     "Concluiu algo neste turno que vai fazer falta depois (número apurado, "
     "estrutura de um arquivo, decisão tomada, caminho de artefato)? Grave com "
@@ -73,14 +79,28 @@ def render_index(
     *,
     now: datetime | None = None,
     truncated: bool = False,
+    session_id: Any = None,
 ) -> str:
-    """Índice para o system prompt. String vazia quando não há nota ativa."""
+    """Índice para o system prompt. String vazia quando não há nota ativa.
+
+    Com ``session_id``, a nota tocada em OUTRA conversa sai marcada. O índice
+    mistura as conversas de propósito (o trabalho de ontem ajuda hoje), mas a
+    linha não dizia de onde vinha: na sessão d9fae447 o pedido novo de preencher
+    o form encontrou ``[[sessao-898e8fc0]]`` — a auditoria de outra conversa,
+    sob o título "seu caderno da tarefa atual" — e o cérebro respondeu
+    "corrijo as divergências?" em vez de abrir o navegador.
+    """
     if not notes:
         return ""
     lines = [_INDEX_HEADER]
     for note in notes:
         when = format_when(note.updated_at, now)
         summary = (note.summary or note.title or "").strip()
+        dela = getattr(note, "session_id", None)
+        if session_id is not None and dela is not None and str(dela) != str(session_id):
+            if lines[0] == _INDEX_HEADER:
+                lines[0] = f"{_INDEX_HEADER} {_OUTRA_CONVERSA}"
+            when = f"outra conversa, {when}"
         line = f"- [[{note.slug}]] · {when}"
         if summary:
             line += f" · {summary}"
@@ -282,12 +302,17 @@ def render_step_summary(entry: dict[str, Any]) -> str:
     return _uma_linha(f"último passo: {texto}", 240)
 
 
-# Teto do resumo do job dentro da entrada. Generoso de propósito: o corpo da
-# nota tem 32 KB e o `wm_read` traz as últimas entradas inteiras, enquanto os
-# 160 caracteres do `render_auto_entry` são para uma LINHA de tool_trace. Foi
-# justamente o teto curto que transformou "reclamação 258599465, monitor
-# Alienware Fast IPS 280 Hz, status Em réplica" em "{'ok': True, 'job_id': ...".
-_JOB_SUMMARY_CHARS = 8000
+# Teto do resumo do job dentro da entrada. NÃO é um teto de trabalho: é a rede
+# para o absurdo (um job que despejasse a página inteira expulsaria do corpo,
+# de 256 KB, todas as entradas anteriores da sessão).
+#
+# Já foi 160 (transformou "reclamação 258599465, monitor Alienware Fast IPS
+# 280 Hz" em "{'ok': True, 'job_id': ...") e depois 8000, que cortou o job
+# f7794968 na metade: as 10 questões do Portal somavam 16 792 caracteres e o
+# caderno ficou com Q1–Q4, a Q5 até "Fonte: PE" e nada da Q6 à Q10. O corpo da
+# nota é o lugar barato — quem paga prompt é a linha do índice (240) e o
+# `wm_read` (`TAIL_MAX_CHARS`), e os dois têm teto próprio.
+_JOB_SUMMARY_CHARS = 100_000
 
 # Uma URL que o trabalho alcançou vale mais que o texto em volta: é o endereço
 # exato para retomar sem refazer a navegação. O runner do navegador local já a
@@ -328,7 +353,10 @@ def render_job_entry(
     if not texto:
         texto = "(o job terminou sem devolver resumo)"
     elif len(texto) > _JOB_SUMMARY_CHARS:
-        texto = texto[:_JOB_SUMMARY_CHARS].rstrip() + "\n[…resumo do job truncado]"
+        # Se um dia cortar, diz onde está o resto: corte calado é o que faz o
+        # turno seguinte reabrir o navegador atrás do que já foi apurado.
+        onde = f" — íntegro em {diario}" if diario else ""
+        texto = texto[:_JOB_SUMMARY_CHARS].rstrip() + f"\n[…resumo do job truncado{onde}]"
 
     desfecho = {
         "completed": "concluiu",
@@ -347,7 +375,9 @@ def render_job_entry(
         # O que foi PEDIDO, não só o que voltou. Sem isto, uma entrada de job
         # que falhou não diz o que ele tentava fazer — e o turno seguinte repete
         # a mesma tentativa por não saber que ela já foi feita.
-        linhas.append(f"Pedido: {_uma_linha(pedido, 600)}")
+        # Inteiro: o teto de 600 cortava justamente o fim do pedido, onde
+        # costumam estar as restrições ("(4) se o e…" no job f7794968).
+        linhas.append(f"Pedido: {_uma_linha(pedido, _JOB_SUMMARY_CHARS)}")
     url = _TAB_URL_RE.search(summary or "")
     if url:
         # Repetida numa linha própria mesmo já estando no corpo: é o dado que o
@@ -374,6 +404,34 @@ def render_job_entry(
     linhas.append("")
     linhas.append(texto)
     return "\n".join(linhas)
+
+
+def marcador_ao_vivo(job_id: str) -> str:
+    """A linha que identifica a entrada de acompanhamento de um job.
+
+    Única e estável: é por ela que a entrada é reescrita a cada mudança do
+    progresso e, no fim, trocada pelo resultado (`replace_marker`). O id
+    sozinho não serve — a linha "abri o job … (job <id>)" do backstop do turno
+    também o cita, e sumiria junto.
+    """
+    return f"(acompanhamento ao vivo do job {job_id})"
+
+
+def render_job_progress_entry(*, title: str, kind: str, job_id: str, linhas: list[str]) -> str:
+    """Entrada do caderno ENQUANTO o job roda: o progresso, reescrito a cada mudança.
+
+    Antes, entre "abri o job" e o resultado, o caderno ficava parado — 309 s no
+    job 9c9b5bae, que respondeu as 10 questões do Portal sem que nada aparecesse
+    nele. Quando o job acaba, o resultado (`render_job_entry`) toma o lugar
+    desta entrada.
+    """
+    return "\n".join(
+        [
+            f"Em andamento — job de segundo plano ({kind}): {title}",
+            *linhas,
+            f"{marcador_ao_vivo(job_id)} — o resultado substitui esta entrada quando ele terminar",
+        ]
+    )
 
 
 def _uma_linha(texto: str, teto: int) -> str:

@@ -457,20 +457,52 @@ async def test_passo_de_continuacao_le_a_frase_do_usuario_no_banco():
 
 
 @pytest.mark.asyncio
-async def test_pedido_velho_nao_segura_a_janela():
-    """Pedido de 30 min atrás não vale mais como "quero ver".
+async def test_pedido_velho_da_conversa_segura_a_janela():
+    """Pedido de 30 min atrás, NA MESMA CONVERSA, ainda vale como "quero ver".
 
-    O destino continua sendo a máquina dele (origem certa); o que caduca é a
-    JANELA — e sem pedido vivo o modo é headless.
+    Antes caducava em 10 minutos (sessão 7bc7caa1: ele respondeu uma pergunta
+    do Neo 17 minutos depois e a tarefa foi para o headless). A escolha é da
+    conversa inteira, até ele dizer "sem janela".
     """
     ex = _com_historico("acessa o site", ["no meu navegador local"], minutos=30)
     assert await ex._gate_browser("browser_local_task") == "browser_local_task"
+    result = await ex._browser_local_task({"task": "acessa o site", "title": "t"})
+    assert result["ok"] is True
+    assert ex.db.criados[-1].spec_json["headless"] is False
+    assert result["janela"] is True
 
 
 @pytest.mark.asyncio
-async def test_historico_so_mantem_nunca_promove():
-    """Quem escolheu o servidor fica no servidor: o histórico não toma o Chrome dele."""
+async def test_historico_da_conversa_promove_o_servidor():
+    """Pedido do Daniel (13/11): conversa que pediu o navegador dele usa o
+    navegador dele em TODO pedido de navegador — também quando o cérebro
+    escolheu o servidor. Antes o histórico só mantinha, nunca promovia."""
     ex = _com_historico("B", ["entao acessa pelo meu navegador local"])
+    assert await ex._gate_browser("browser_task") == "browser_local_task"
+
+
+@pytest.mark.asyncio
+async def test_historico_nao_promove_sem_maquina_no_canal():
+    """Sem device no canal (painel/WhatsApp) não há navegador dele para onde ir."""
+    ex = _com_historico("B", ["entao acessa pelo meu navegador local"])
+    ex.device_id = None
+    assert await ex._gate_browser("browser_task") == "browser_task"
+
+
+@pytest.mark.asyncio
+async def test_sem_janela_depois_desfaz_a_promocao():
+    """A saída é dele: "faz sem janela" depois do pedido tira a janela da conversa."""
+    ex = _com_historico("B", ["entao acessa pelo meu navegador local"], minutos=20)
+    msgs_antigas = await ex.db.fetch_session_messages(ex.session_id)
+    depois = SimpleNamespace(
+        role="user", content="daqui pra frente faz sem janela",
+        created_at=datetime.utcnow() - timedelta(minutes=5),
+    )
+
+    async def _fetch(session_id, limit=50, roles=None, **kw):
+        return [*msgs_antigas, depois]
+
+    ex.db.fetch_session_messages = _fetch
     assert await ex._gate_browser("browser_task") == "browser_task"
 
 

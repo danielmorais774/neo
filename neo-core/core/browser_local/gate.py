@@ -250,6 +250,44 @@ _MEDIA_WORDS = (
 )
 
 
+# ── o pedido contrário: SEM janela ──────────────────────────────────────────
+#
+# Depois que a conversa trabalhou no navegador dele com janela, todo pedido de
+# navegador vai para lá (`_modo_da_sessao` no executor) — a escolha gruda. A
+# saída é dele, com todas as letras, e é esta lista. Fechada de propósito,
+# porque a QUEIXA usa as mesmas palavras do pedido e diz o contrário:
+#
+# * "no meu navegador local, acho que vc fez via headless" (corpus de produção)
+#   e "fez sem janela de novo" pedem a JANELA. Por isso "sem janela"/"headless"
+#   só contam depois de um verbo no imperativo/presente ("faz sem janela",
+#   "pode ser headless"), nunca no passado ("fez", "foi", "abriu");
+# * "não abre a aba" fica de fora: é tanto "não abra" quanto "não está abrindo";
+# * "segundo plano"/"background" ficam de fora: é como o próprio Neo chama um
+#   job ("uma tarefa sua em segundo plano terminou", que volta como mensagem),
+#   e "deixa rodando em segundo plano" quer dizer "não espera", não "sem janela".
+_VERBO_DO_PEDIDO = (
+    r"(?:faz|faca|fazer|roda|rode|rodar|pode|podes|usa|use|usar|abra|abrir|vai|va|"
+    r"segue|siga|continua|continue|deixa|deixe|prefiro|quero|melhor|tenta|tente)"
+)
+
+_SEM_JANELA_RE = re.compile(
+    # "faz sem janela", "usa o meu navegador, mas sem janela", "pode ser headless"
+    rf"\b{_VERBO_DO_PEDIDO}\b(?:\s+\S+){{0,4}}?\s+(?:sem\s+janela|(?:em\s+|no\s+modo\s+)?headless)\b"
+    # "sem janela dessa vez" / "headless, por favor" abrindo a mensagem
+    r"|^(?:sem\s+janela|headless)\b"
+    # "sem abrir o navegador", "sem me mostrar a aba"
+    r"|\bsem\s+(?:me\s+)?(?:abrir|mostrar)\s+(?:(?:o|a|meu|minha|nenhum|nenhuma)\s+){0,2}"
+    r"(?:navegador|aba|janela|browser|chrome|edge|brave)\b"
+    # "não precisa abrir o navegador", "não quero que abra a janela", "não abra a aba"
+    r"|\bnao\s+(?:precisa\s+(?:de\s+)?|precisas\s+|quero\s+que\s+(?:voce\s+|vc\s+)?)?"
+    r"(?:abrir|abra|abras|mostrar|mostre)\s+(?:(?:o|a|meu|minha)\s+){0,2}"
+    r"(?:navegador|aba|janela|browser|chrome|edge|brave)\b"
+    # "não preciso ver acontecendo", "não quero acompanhar na tela"
+    r"|\bnao\s+(?:preciso|quero|precisa)\s+(?:de\s+)?(?:ver|acompanhar)\s+"
+    r"(?:acontecendo|ao\s+vivo|na\s+tela|a\s+tela|o\s+navegador|a\s+aba|a\s+janela)\b"
+)
+
+
 def _normalize(text: str) -> str:
     """Minúsculas, sem acento, espaços colapsados — o usuário escreve torto."""
     lowered = (text or "").lower()
@@ -346,6 +384,18 @@ def local_browser_requested(user_message: str) -> bool:
     if has_browser and _has_word(text, _WATCH_WORDS):
         return True
     return False
+
+
+def headless_requested(user_message: str) -> bool:
+    """O usuário pediu, com todas as letras, para NÃO abrir janela (headless)?
+
+    É a saída da janela que gruda na conversa — e, na mesma frase, ganha do
+    pedido de navegador: "usa o meu navegador, mas sem janela" é sem janela.
+    """
+    text = _normalize(user_message)
+    if not text:
+        return False
+    return bool(_SEM_JANELA_RE.search(text))
 
 
 def media_playback_requested(text: str) -> bool:

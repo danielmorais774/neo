@@ -500,9 +500,12 @@ def test_done_cabe_no_orcamento_de_uma_tarefa_rica():
     ~1.650 caracteres e o teto antigo (700) mal cobria isso somado ao pensamento
     e ao andaime do JSON.
     """
-    from core.browser_local.driver import _ANSWER_MAX_CHARS, _DECISAO_MAX_TOKENS
+    from core.browser_local.driver import _ANSWER_MAX_CHARS
+    from shared.ajustes import Ajustes
 
-    assert _DECISAO_MAX_TOKENS >= 1500
-    # O pedido tem de caber FOLGADO no teto, como o `_words_for` da pesquisa:
-    # ~2,1 caracteres por token em pt-BR, e o resto do orçamento é do `thought`.
-    assert _ANSWER_MAX_CHARS * 3 < _DECISAO_MAX_TOKENS * 2.1
+    decisao = Ajustes().navegador.decisao
+    assert decisao.piso >= 1500
+    # O pedido tem de caber FOLGADO na reserva da resposta, como o `_words_for`
+    # da pesquisa: ~2,1 caracteres por token em pt-BR, e o resto da reserva é do
+    # `thought` e do JSON. O raciocínio do modelo tem o orçamento dele à parte.
+    assert _ANSWER_MAX_CHARS * 3 < decisao.reserva_resposta * 2.1

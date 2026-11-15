@@ -631,7 +631,9 @@ async def test_continuation_tells_the_turn_to_read_the_job_skill_and_deliver_a_f
     cont = next(j for j in db.jobs.values() if j.kind == "scheduled_prompt")
     texto = cont.spec_json["action"]["texto"]
     assert 'skill_read(name="ocr-video")' in texto
-    assert "file_save" in texto and "NÃO cole o conteúdo inteiro" in texto
+    assert "file_save" in texto and "NÃO cole o arquivo inteiro" in texto
+    # ...mas o combinado que pede para MOSTRAR um trecho vence (job 8f83b37c).
+    assert "cole esse trecho" in texto
 
 
 @pytest.mark.asyncio
@@ -723,3 +725,47 @@ async def test_scheduled_prompt_turn_keeps_the_files_it_delivered():
     terminal = await _run_prompt(job, {"texto": "faça"}, {}, _AI(), None, None)
     assert terminal["extra_metadata_patch"]["files"][0]["file_id"] == "f1"
     assert terminal["extra_metadata_patch"]["texto_literal"] == "Pronto."
+
+
+# ── Claude Code: o relatório vai literal e a continuação não o cala (job 8f83b37c) ──
+def _job_claude(**kw) -> AgentJob:
+    base = dict(
+        user_id=uuid4(), session_id=uuid4(), kind="claude_code", title="Claude: jogo da velha",
+        spec_json={"objetivo": "jogo da velha"}, status="completed", notify_policy="chat",
+        result_summary="Criei o jogo. Não testei o modo de dois jogadores.",
+        extra_metadata={"entrega": {
+            "fecho": "O Claude terminou. O relatório dele:\n\nCriei o jogo. Não testei o modo de dois jogadores.",
+            "itens": ["Arquivos: `jogo_da_velha.py`", "Para abrir no terminal: `cd /x && claude --resume s`"],
+            "literal": True,
+        }},
+    )
+    base.update(kw)
+    return AgentJob(**base)
+
+
+@pytest.mark.asyncio
+async def test_relatorio_do_claude_chega_sem_redator_e_com_os_itens():
+    db, broker = _FakeDB(), _FakeBroker()
+    prov = _ComposeProvider()
+    disp = ProactiveDispatcher(db=db, broker=broker, llm_router=_ComposeLLM(prov))
+    job = _job_claude()
+    db.jobs[job.id] = job
+    await disp.dispatch(job)
+    assert prov.prompts == []  # o redator nem foi chamado
+    texto = db.messages[0]["content"]
+    assert "Não testei o modo de dois jogadores." in texto
+    assert "claude --resume s" in texto and "jogo_da_velha.py" in texto
+
+
+@pytest.mark.asyncio
+async def test_then_nao_cala_a_entrega_do_claude():
+    db = _FakeDB()
+    jm = JobManager(db=db, sandbox=_WritableSandbox(SandboxResult(0, "", "")), dispatcher=_RecDispatcher(), tick_interval=1)
+    jm.set_scheduled_runner(lambda job: None)
+    job = _job_claude(status="running", spec_json={"objetivo": "x", "then": "cole a saída da partida de teste"})
+    db.jobs[job.id] = job
+    await jm._settle(job, {"status": "completed", "result_summary": "Criei o jogo."})
+    assert job.notify_policy == "chat"
+    cont = next(j for j in db.jobs.values() if j.kind == "scheduled_prompt")
+    texto = cont.spec_json["action"]["texto"]
+    assert "JÁ foram entregues" in texto and "sem repetir o relatório" in texto

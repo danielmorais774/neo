@@ -34,7 +34,9 @@ VAULT_TOOLS: list[ToolSchema] = [
             "que precisa de login ('entra na minha conta do X', 'preciso de um "
             "email') para descobrir se existe credencial e QUAL é a certa; depois "
             "passe o RÓTULO dela para quem vai usar (ex.: browser_task com "
-            "credentials=['github-pessoal'])."
+            "credentials=['github-pessoal']). Para `browser_local_task` não precisa: "
+            "a tarefa acha sozinha o login do cofre pelo DOMÍNIO do site quando a "
+            "aba chega nele. Nunca peça senha no chat."
         ),
         module="vault",
         execution="server-side",
@@ -96,30 +98,52 @@ class VaultToolExecutor:
             }
         kind = str(args.get("kind") or "").strip().lower() or None
         query = str(args.get("query") or "").strip().lower() or None
-        infos = await self._store.list()
-        out = []
-        for info in infos:
-            if kind and info.kind != kind:
-                continue
+        infos = [i for i in await self._store.list() if not kind or i.kind == kind]
+
+        def _casa(info: Any) -> bool:
             haystack = " ".join(
                 [info.label, info.kind, info.description or "", str(info.fields or "")]
             ).lower()
-            if query and query not in haystack:
-                continue
-            out.append({
+            return query in haystack
+
+        achadas = [i for i in infos if _casa(i)] if query else infos
+        # Filtro sem resultado NÃO é cofre vazio. Na sessão a20f4722 o cérebro
+        # procurou "appdemo", a conta do AppDemo está guardada pelo DOMÍNIO
+        # (sistema-exemplo.vercel.app), veio `count: 0`, e ele respondeu "o
+        # cofre está vazio" e pediu e-mail e senha no chat. Quando o texto não
+        # casa, devolve o mesmo que a chamada sem filtro e diz por quê.
+        sem_casar = bool(query) and not achadas and bool(infos)
+        if sem_casar:
+            achadas = infos
+        out = [
+            {
                 "label": info.label,
                 "kind": info.kind,
                 "description": info.description,
                 # Campos NÃO secretos: usuário do login, endereço da caixa, domínio.
                 **{k: v for k, v in (info.fields or {}).items()},
-            })
+            }
+            for info in achadas
+        ]
+        note = (
+            "O segredo NUNCA aparece aqui. Para usar uma destas, cite o 'label' "
+            "para a tool que executa (browser_task credentials=[...], email_*); "
+            "quem decifra é o servidor, no momento do uso. `browser_local_task` "
+            "acha sozinha o login pelo DOMÍNIO do site: não precisa citar nada. "
+            "Nunca peça e-mail ou senha no chat."
+        )
+        if sem_casar:
+            note = (
+                f"Nenhuma credencial tem «{query}» no texto, mas o cofre NÃO está vazio: "
+                f"estas são todas as {len(infos)}"
+                + (f" do tipo {kind}" if kind else "")
+                + ". Conta de site criada pelo Neo leva o DOMÍNIO no rótulo e no campo "
+                "`domain`, não o nome do sistema. " + note
+            )
         return {
             "ok": True,
             "count": len(out),
+            **({"filtro_sem_resultado": query} if sem_casar else {}),
             "credentials": out,
-            "note": (
-                "O segredo NUNCA aparece aqui. Para usar uma destas, cite o 'label' "
-                "para a tool que executa (browser_task credentials=[...], email_*); "
-                "quem decifra é o servidor, no momento do uso."
-            ),
+            "note": note,
         }

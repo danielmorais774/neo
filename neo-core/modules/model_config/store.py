@@ -69,6 +69,14 @@ class RoleSpec:
     #: base_url. Oferecer "deepseek" ali seria oferecer um 404 — o modelo iria
     #: para o gateway errado e a tarefa morreria longe de quem escolheu.
     only_providers: tuple[str, ...] = ()
+    #: Modelos que o select DESTE slot oferece no provider padrão dele, além do
+    #: catálogo. O catálogo só é semeado com o banco vazio: um modelo novo que o
+    #: slot recomenda não apareceria na lista até alguém cadastrá-lo à mão.
+    sugeridos: tuple[str, ...] = ()
+    #: Seção da aba Modelos. O painel agrupa os cards por ela, na ordem em que
+    #: aparecem aqui — antes eram uma lista solta, e o select do navegador do
+    #: SERVIDOR ficava no meio dos três do navegador local.
+    grupo: str = ""
 
     def accepts(self, provider: str) -> bool:
         """O slot aceita este provider? (sem restrição = aceita todos)"""
@@ -103,9 +111,12 @@ _BRAIN_PROVIDER, _BRAIN_MODEL = _brain_env_default()
 # The roles the panel exposes. Defaults mirror shared/config.py (the env-driven
 # values these subsystems used before this became runtime-configurable) so an
 # empty DB behaves exactly like before.
+_LOCAL = "Navegador local (o seu)"
+
 ROLES: dict[str, RoleSpec] = {
     "cognitive": RoleSpec(
         key="cognitive",
+        grupo="Cérebro",
         label="Cérebro — agente principal",
         description=(
             "O loop que lê a conversa, decide as tools e escreve a resposta. "
@@ -123,6 +134,7 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "memory_planner": RoleSpec(
         key="memory_planner",
+        grupo="Memória",
         label="Planejador de memória (PKS)",
         description=(
             "Subagente que estrutura o que é gravado no PKS (entidade, campos, "
@@ -133,6 +145,7 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "research_volume": RoleSpec(
         key="research_volume",
+        grupo="Pesquisa",
         label="Deep Research — volume (barato)",
         description=(
             "Modelo do VOLUME da pesquisa profunda: intake/plan/triagem/"
@@ -143,6 +156,7 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "research_writer": RoleSpec(
         key="research_writer",
+        grupo="Pesquisa",
         label="Deep Research — redator (forte)",
         description=(
             "Modelo FORTE da pesquisa: escreve por seção, faz resumo executivo/"
@@ -153,6 +167,7 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "document_reader": RoleSpec(
         key="document_reader",
+        grupo="Documentos",
         label="Leitura de documentos — subagentes (deep_read)",
         description=(
             "Lê cada parte de um documento procurando o que o cérebro pediu "
@@ -168,7 +183,8 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "browser_local": RoleSpec(
         key="browser_local",
-        label="Navegador local — passo a passo",
+        grupo=_LOCAL,
+        label="Passo a passo",
         description=(
             "Decide UMA ação por vez no navegador do usuário (um JSON curto por "
             "passo, 25 chamadas por tarefa). É volume puro: use o barato."
@@ -176,9 +192,53 @@ ROLES: dict[str, RoleSpec] = {
         default_provider="deepseek",
         default_model="deepseek-flash",
     ),
+    "browser_local_vision": RoleSpec(
+        key="browser_local_vision",
+        grupo=_LOCAL,
+        label="Olho (visão)",
+        description=(
+            "Modelo que OLHA o print da tela a cada passo, com o número de cada "
+            "elemento desenhado em cima. Sem ele o driver decide só pelo texto do "
+            "DOM e não percebe que a ação anterior não fez nada. Precisa aceitar "
+            "imagem — o DeepSeek NÃO aceita (400 'does not support image')."
+        ),
+        # Não é o gpt-4.1-mini de antes: aquela chave ficou sem crédito e o
+        # driver rodou cego por dois jobs inteiros. Este foi verificado contra a
+        # API em 2026-08-31 e é o mais barato com visão entre as chaves ativas.
+        default_provider="openrouter",
+        default_model="google/gemini-3.1-flash-lite",
+        vision=True,
+    ),
+    "browser_local_judge": RoleSpec(
+        key="browser_local_judge",
+        grupo=_LOCAL,
+        # A chave continua `browser_local_judge`: é ela que guarda a escolha do
+        # Daniel no banco. Só o nome e a descrição deixaram de falar daquele
+        # formulário (sessão 8e17b81e: "parece que só foi feito para esse form").
+        label="Raciocínio (juiz)",
+        description=(
+            "Modelo FORTE que o passo a passo chama quando precisa DECIDIR com "
+            "critério, em qualquer site: avaliar itens contra critérios (grade de "
+            "avaliação, rubrica, conformidade) a partir da página, das outras abas e "
+            "do caderno, com o porquê de cada resposta. Pergunta sobre você "
+            "(opinião, experiência, dado pessoal) ele não responde: devolve para a "
+            "memória ou para você. Tetos de raciocínio em [navegador.julgamento] no "
+            "neo.toml."
+        ),
+        default_provider="openrouter",
+        default_model="anthropic/claude-haiku-5.5",
+        # Do mais barato ao mais forte (OpenRouter, 11/2026, por milhão de tokens
+        # de entrada/saída): Haiku US$ 0,10/0,50 · Sonnet 2/10 · Opus 4/20.
+        sugeridos=(
+            "anthropic/claude-haiku-5.5",
+            "anthropic/claude-sonnet-5.5",
+            "anthropic/claude-opus-5.5",
+        ),
+    ),
     "browser_agent": RoleSpec(
         key="browser_agent",
-        label="Navegador do servidor — subagente (browser-use)",
+        grupo="Navegador do servidor (VPS)",
+        label="Subagente (browser-use)",
         description=(
             "Dirige o Chromium do SERVIDOR (tool browser_task), não o da sua "
             "máquina. Roda no container neo-browser-agent, que fala só com o "
@@ -193,22 +253,6 @@ ROLES: dict[str, RoleSpec] = {
         default_model="google/gemini-2.5-flash",
         vision=True,
         only_providers=("openrouter",),
-    ),
-    "browser_local_vision": RoleSpec(
-        key="browser_local_vision",
-        label="Navegador local — olho (visão)",
-        description=(
-            "Modelo que OLHA o print da tela a cada passo, com o número de cada "
-            "elemento desenhado em cima. Sem ele o driver decide só pelo texto do "
-            "DOM e não percebe que a ação anterior não fez nada. Precisa aceitar "
-            "imagem — o DeepSeek NÃO aceita (400 'does not support image')."
-        ),
-        # Não é o gpt-4.1-mini de antes: aquela chave ficou sem crédito e o
-        # driver rodou cego por dois jobs inteiros. Este foi verificado contra a
-        # API em 2026-08-31 e é o mais barato com visão entre as chaves ativas.
-        default_provider="openrouter",
-        default_model="google/gemini-3.1-flash-lite",
-        vision=True,
     ),
 }
 
@@ -362,11 +406,15 @@ def build_catalog(
         {
             "key": spec.key,
             "label": spec.label,
+            "group": spec.grupo,
             "description": spec.description,
             "current": current.get(spec.key, spec.default),
             "default": spec.default,
             "vision": spec.vision,
             "only_providers": list(spec.only_providers),
+            "suggested_models": (
+                {spec.default_provider: list(spec.sugeridos)} if spec.sugeridos else {}
+            ),
         }
         for spec in ROLES.values()
     ]

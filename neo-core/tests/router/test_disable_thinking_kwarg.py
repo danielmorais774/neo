@@ -86,7 +86,9 @@ async def test_openrouter_translates_into_reasoning_field():
     """Não pode herdar o "engolir" da OpenAI: aqui a flag tem tradução."""
     params = await _params_for(OpenRouterProvider(api_key="k"), disable_thinking=True)
 
-    assert params["extra_body"] == _REASONING_DISABLED
+    # O extra_body também leva o filtro de provedor (`[openrouter]
+    # provedores_ignorados`); aqui o que importa é a tradução da flag.
+    assert params["extra_body"]["reasoning"] == _REASONING_DISABLED["reasoning"]
     assert "disable_thinking" not in params
 
 
@@ -114,7 +116,8 @@ async def test_absent_flag_changes_nothing():
 async def test_openrouter_absent_flag_changes_nothing():
     params = await _params_for(OpenRouterProvider(api_key="k"))
 
-    assert "extra_body" not in params
+    # Sem a flag, nada de raciocínio; o filtro de provedor vai sempre.
+    assert "reasoning" not in (params.get("extra_body") or {})
 
 
 # ── response_format: mesma regra, outro parâmetro ───────────────────────────

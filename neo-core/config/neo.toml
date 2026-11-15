@@ -1,0 +1,240 @@
+# Ajustes do Neo — os números de comportamento que você pode adaptar.
+#
+# Segredos, endereços e liga/desliga de feature ficam no .env da raiz. Aqui
+# ficam tetos, limiares e fatores. Os valores abaixo são os padrões: mude o que
+# quiser, e apagar uma linha volta ao padrão.
+#
+# Vale na próxima chamada, sem reiniciar. Arquivo com erro não derruba nada: o
+# Neo segue com a última versão boa e avisa no log (procure "[ajustes]").
+#
+# Padrões, faixas válidas e validação: neo-core/shared/ajustes.py.
+
+
+[teto_adaptativo]
+# Como o teto de saída aprende quanto cada modelo raciocina antes de responder.
+# É o cálculo do timeout do TCP: teto = média + desvios × desvio + reserva.
+# Teto não é gasto: o provedor cobra o que o modelo gera, não o teto.
+
+# Peso de cada medida nova na média (0 a 1). Maior reage mais rápido e oscila mais.
+peso_media = 0.125
+# Peso de cada medida nova no desvio (0 a 1).
+peso_desvio = 0.25
+# Quantos desvios acima da média o teto fica. Maior corta menos e espera mais
+# no pior passo.
+desvios = 4.0
+# Num corte, o raciocínio real era MAIOR que o medido: a medida entra
+# multiplicada por este fator.
+fator_corte = 1.5
+# Passo cortado pelo raciocínio é repetido com o teto multiplicado por este
+# fator (até o máximo do uso), antes de virar recusa.
+fator_escada = 2.0
+
+
+[navegador.decisao]
+# Cada passo do agente do navegador: o JSON com o pensamento e a ação.
+
+# Tokens guardados para a resposta. O maior JSON medido foi 356 (job 9c9b5bae).
+reserva_resposta = 600
+# Menor teto: o ponto de partida antes de aprender e o chão depois.
+piso = 2000
+# Teto absoluto. Cada 1000 tokens de raciocínio somam ~5 s: 6000 ≈ 30 s no
+# pior passo.
+maximo = 6000
+
+
+[navegador.conversa]
+# A tarefa no navegador conversa com você enquanto roda: recebe o que você
+# escreve no painel da aba ou no chat, avisa e pergunta sem parar o trabalho.
+# Ver docs/browser-conversa-plan.md.
+
+# Quanto tempo (min) a tarefa espera a sua resposta a uma pergunta, com a aba
+# aberta e tudo na memória. Passou disso, ela para como antes (a aba fica onde
+# estava e o próximo pedido continua dali).
+espera_min = 10.0
+# Esperando, de quanto em quanto tempo (s) olha o painel da aba.
+espera_intervalo_s = 2.0
+# Avisos no chat por tarefa, e o mínimo de passos entre dois seguidos.
+avisos_max = 6
+avisos_intervalo_passos = 3
+# Passos que cada mensagem sua devolve ao orçamento da tarefa (instrução nova é
+# trabalho novo), e o teto absoluto de passos de uma tarefa.
+passos_por_mensagem = 15
+passos_teto = 150
+# Maior mensagem aceita, em caracteres.
+mensagem_max = 1500
+# Enquanto você escreve no painel da aba, o agente não mexe na página (senão o
+# cursor sai do campo). Até quantos segundos ele espera, por ação.
+digitando_espera_max_s = 90.0
+
+
+[navegador.julgamento]
+# Grade de avaliação num formulário (avaliar requisitos, critérios × opções): o
+# agente do navegador não julga. Ele chama um JUIZ mais forte, que lê a página,
+# as anotações e o texto das outras abas (o sistema avaliado) e devolve, por
+# célula, a resposta e o porquê. Ver docs/browser-conversa-plan.md §4.6.
+
+# O MODELO do juiz se escolhe no neo-panel: Configurações → Modelos →
+# "Navegador local — juiz da grade de avaliação" (padrão: Haiku 5.5).
+# Tokens de raciocínio por chamada (0 = sem raciocínio) e teto da resposta.
+raciocinio_max = 4000
+resposta_max = 4000
+# Quanto texto entra, em caracteres: a página julgada e cada OUTRA aba aberta.
+pagina_max = 12000
+evidencia_por_aba = 4000
+# Quanto tempo (s) a tarefa espera o juiz responder.
+timeout_s = 150.0
+
+
+[navegador.janela]
+# Com janela (você vê a aba no seu navegador) ou sem janela (headless, na sua
+# máquina, invisível)? Quem decide é o código, pelo que a conversa já fez,
+# nunca o modelo sozinho:
+#   1. a sua mensagem agora ("no meu navegador" → com janela; "sem janela" /
+#      "não precisa abrir o navegador" → sem);
+#   2. a ÚLTIMA escolha desta conversa: um pedido seu antigo ou uma tarefa que
+#      já rodou com janela nela. Vale pela conversa inteira, até você dizer o
+#      contrário ou abrir um chat novo;
+#   3. o site: se a última tarefa nele (de qualquer conversa) foi com janela,
+#      ou se a sem janela parou no login, a próxima vai com janela.
+# Sem nada disso, sem janela.
+
+# Quantas mensagens suas, desta conversa, são lidas para achar a última escolha.
+mensagens_lidas = 300
+# Quantas tarefas recentes suas (de todas as conversas) são lidas.
+tarefas_lidas = 60
+# Por quanto tempo (h) a última tarefa num site decide a próxima no mesmo site.
+site_vale_por_horas = 12.0
+
+[trabalho]
+# O Neo nas sessões do Claude Code que você usa no Mac (VSCode ou terminal):
+# ele lista, escolhe a do assunto e entrega o pedido. Ver
+# docs/ambiente-de-trabalho-plan.md.
+
+# A lista de sessões: as abertas sempre, e as fechadas cuja conversa mexeu nas
+# últimas N horas, até o máximo.
+sessoes_recentes_horas = 24.0
+sessoes_max = 15
+# A ficha de cada sessão, que o cérebro lê para escolher: cortes em caracteres
+# do 1º pedido, de cada um dos últimos pedidos e da última resposta, e quantos
+# pedidos e arquivos entram. Maior escolhe melhor e gasta mais tokens (com os
+# padrões, ~1.500 para 9 sessões).
+ficha_objetivo = 160
+ficha_pedido = 120
+ficha_pedidos = 3
+ficha_resposta = 200
+ficha_arquivos = 5
+# Quanto o Neo espera o Mac entregar o pedido, em segundos. O mensageiro (um
+# claude -p) leva ~10 s.
+envio_timeout_s = 120
+# Depois de entregar: de quanto em quanto tempo (s) olha se a sessão terminou,
+# até quando (min) acompanha, e quantos caracteres da resposta vão para o chat.
+retorno_intervalo_s = 5.0
+retorno_timeout_min = 30
+retorno_resposta_max = 6000
+# Mac fora do ar enquanto acompanha: desiste depois destes minutos.
+fora_do_ar_min = 10
+
+
+[cerebro]
+# O laço do cérebro em cada turno: a resposta e as rodadas de tool.
+
+# Temperatura do primeiro round — a conversa, onde a persona aparece.
+temperatura = 0.9
+# Temperatura das rodadas depois que uma tool rodou no turno: ali o modelo
+# escreve código, comando e argumento de tool, e variação é erro. A resposta
+# final de um turno que usou tool também sai com esta.
+temperatura_com_ferramentas = 0.3
+# Rodadas SEGUIDAS só com chamada repetida (mesma tool, mesmos argumentos) antes
+# de a próxima rodada ir sem tools, pedindo a resposta com o que já tem.
+repeticoes_seguidas_max = 3
+# Quanto do resultado anterior volta no aviso de chamada repetida, em
+# caracteres (a chamada repetida leva a metade disto).
+repeticao_trecho_max = 800
+
+
+[roteador]
+# O classificador de intenção, que roda antes de todo turno.
+
+# Teto de raciocínio do modelo do classificador quando ele não deixa desligar
+# o raciocínio (GLM-5.3-flash, MiniMax m3.1-flash). Sem teto, o raciocínio
+# comia a resposta inteira e a classificação chegava a 44 s. 0 = sem teto.
+teto_raciocinio = 300
+
+
+[openrouter]
+# Modelos que recusam desligar o raciocínio ("Reasoning is mandatory"). O
+# Neo aprende sozinho na primeira recusa, mas esquece a cada reinício; os
+# daqui nem tentam desligar (e recebem o teto de quem pediu um).
+raciocinio_obrigatorio = [
+    "z-ai/glm-5.3-flash",
+    "minimax/minimax-m3.1-flash",
+]
+# Provedores que o OpenRouter nunca usa, pelo nome da tag deles na lista de
+# endpoints do modelo (open-inference/fp4 → "open-inference"). NÃO fixa
+# provedor: ele continua escolhendo entre todos os outros. Chamada com
+# provedor fixado (modelo@slug) não recebe o filtro.
+provedores_ignorados = ["open-inference"]
+
+
+[web]
+# Leitura de páginas da web (web_fetch).
+
+# Quantos links da página voltam junto com o texto (os do mesmo site
+# primeiro). Sem eles o Neo raspava o HTML no sandbox para achar a próxima
+# página. 0 = não devolve links.
+links_max = 40
+# Quantos caracteres de TABELA da página voltam, somando todas, depois dos
+# links (cada linha com as células separadas por |). O extrator de texto
+# descarta as listas da Wikipédia, e o Neo raspava o código da página com
+# regex. 0 = não devolve tabelas.
+tabelas_max = 4000
+# Idioma que a busca pede ao SearXNG. "all" deixa a consulta puxar o idioma
+# (em português continua vindo site brasileiro). "pt-BR" restringia a páginas
+# em português e busca técnica em inglês voltava lixo ou nada.
+idioma_busca = "all"
+
+
+[faxina]
+# Limpeza automática do /workspace do sandbox. Sem ela nada apagava o que o
+# Neo baixa ou gera ali (o teste do Sintel deixou 1,6 GB). O que foi entregue
+# com file_save continua no catálogo: a faxina só tira a cópia do sandbox.
+
+# Liga a limpeza periódica.
+ligada = true
+# De quanto em quanto tempo ela passa.
+intervalo_horas = 6
+# Arquivo a partir deste tamanho (MB) é "grande": download, vídeo, zip...
+grande_mb = 20
+# ...e é apagado depois de ficar este tempo (horas) sem ser modificado.
+grande_horas = 24
+# Anexos seus copiados para /workspace/files saem depois deste tempo (horas),
+# de qualquer tamanho: é conteúdo pessoal. 0 = desligado. ATENÇÃO: nem todo
+# arquivo ali tem original no catálogo (em 14/11, 19 de 31 não tinham: o do
+# catálogo já tinha expirado, ou nunca foi para lá). Ligar apaga a única cópia.
+anexos_horas = 0
+
+
+[comando_no_computador]
+# Comandos que o Neo roda no seu computador. Um comando que passa do tempo
+# abaixo ainda trabalhando (um zip grande, uma cópia) não morre mais: vira
+# tarefa em segundo plano, o Neo responde na hora e avisa no chat quando
+# terminar. Dá para acompanhar e parar em Configurações → Tarefas em background.
+
+# Segundos em primeiro plano antes de virar tarefa. 0 desliga (o comando morre
+# aos 120 s, como antes).
+segundo_plano_apos_s = 90
+# Teto total de uma tarefa, em minutos, contado do início. Passou, ela é
+# encerrada. O desktop não passa de 6 h (360).
+teto_min = 120
+# Intervalo da conferência da tarefa: começa no mínimo e dobra até o máximo.
+conferir_min_s = 5
+conferir_max_s = 30
+# Minutos que o computador pode ficar sem responder no meio da tarefa antes de
+# o Neo desistir de acompanhar.
+fora_do_ar_min = 10
+
+
+[grpc]
+# Maior mensagem entre o desktop e o Neo, em MB. Só vale depois de reiniciar o
+# neo-core. O desktop já corta cada resultado em 1 MB: isto é a folga.
+mensagem_max_mb = 16

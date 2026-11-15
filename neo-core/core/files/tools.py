@@ -111,7 +111,8 @@ FILE_TOOLS: list[ToolSchema] = [
             "Guarda no CATÁLOGO um arquivo que VOCÊ produziu no sandbox (/workspace), "
             "para o usuário poder baixar/consultar depois. Use quando o usuário disser "
             "'guarda isso' ou quando um job gerar um resultado que vale manter. "
-            "retention='perm' não expira; 'temp' some depois do TTL. A interface do "
+            "Guarda sem prazo; só vira temporário se o usuário pedir (aí é "
+            "`file_set_retention`). A interface do "
             "cliente já renderiza um botão de download pra este arquivo sozinha — só "
             "confirme em uma frase curta. Você NÃO tem uma URL pública: NUNCA "
             "construa/adivinhe um link de download (nem domínio, nem path)."
@@ -129,9 +130,15 @@ FILE_TOOLS: list[ToolSchema] = [
                 type="string", description="Nome para o catálogo (default: o do arquivo)",
                 required=False,
             ),
-            "retention": ToolParameter(
-                type="string", description="perm (guarda) ou temp (expira). Default perm.",
-                enum=["perm", "temp"], required=False,
+            "versao_de": ToolParameter(
+                type="string",
+                description=(
+                    "Se este arquivo é uma VERSÃO NOVA de um documento da conversa (o anexo "
+                    "dele preenchido, um relatório corrigido): o caminho no sandbox ou o "
+                    "file_id da versão que você abriu. Liga as versões no registro — \"esse "
+                    "arquivo\" passa a ser este."
+                ),
+                required=False,
             ),
         },
     ),
@@ -166,6 +173,32 @@ FILE_TOOLS: list[ToolSchema] = [
             "file_id": ToolParameter(type="string", description="id do arquivo", required=True),
             "retention": ToolParameter(
                 type="string", description="Nova retenção", enum=["temp", "perm"], required=True,
+            ),
+        },
+    ),
+    ToolSchema(
+        name="file_olhar",
+        description=(
+            "OLHA imagens que você gerou no sandbox (a página de um documento renderizada "
+            "em PNG, um gráfico) e devolve o que está visível: logo, campos preenchidos ou "
+            "vazios, formatação desigual, texto cortado. Use antes de entregar um documento "
+            "editado — o texto extraído não mostra nada disso. Você não enxerga imagem; "
+            "esta tool enxerga por você."
+        ),
+        module="files",
+        execution="server-side",
+        timeout=90,
+        parameters={
+            "imagens": ToolParameter(
+                type="array",
+                description="Caminhos no sandbox (PNG/JPG), até 4. Ex.: as 'paginas' do docx_renderizar.py",
+                required=True,
+                items={"type": "string"},
+            ),
+            "pergunta": ToolParameter(
+                type="string",
+                description="O que conferir (ex.: 'os campos Acadêmico, R.A. e Prazo estão preenchidos? o logo está no topo?')",
+                required=True,
             ),
         },
     ),

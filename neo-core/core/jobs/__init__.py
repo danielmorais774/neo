@@ -16,6 +16,8 @@ from core.jobs.runner_browser import build_browser_runner
 from core.jobs.runner_browser_local import build_browser_local_runner
 from core.jobs.runner_download_watch import build_download_watch_runner
 from core.jobs.runner_deep_read import build_deep_read_runner
+from core.jobs.runner_claude import build_claude_runner
+from core.jobs.runner_claude_sessao import build_claude_sessao_runner
 from core.jobs.tools import JOB_TOOLS, JOB_TOOL_NAMES
 
 __all__ = [
@@ -27,6 +29,8 @@ __all__ = [
     "build_browser_local_runner",
     "build_download_watch_runner",
     "build_deep_read_runner",
+    "build_claude_runner",
+    "build_claude_sessao_runner",
     "JOB_TOOLS",
     "JOB_TOOL_NAMES",
 ]

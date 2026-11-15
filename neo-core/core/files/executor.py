@@ -20,11 +20,29 @@ from core.files.store import FileStore, FileStoreError
 logger = logging.getLogger(__name__)
 
 
+#: Imagens por chamada do file_olhar e teto de cada uma: uma página de documento
+#: a 70 dpi tem ~60 KB; 4 MB é folga para print de tela, não para foto de câmera.
+_OLHAR_MAX_IMAGENS = 4
+_OLHAR_MAX_BYTES = 4 * 1024 * 1024
+_OLHAR_TIPOS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+_OLHAR_SISTEMA = (
+    "Você confere, para outro assistente que NÃO enxerga imagens, páginas de um documento "
+    "(ou imagens) geradas antes de entregar ao usuário. Responda em português, em tópicos "
+    "curtos: 1) o que está visível no topo (logo, cabeçalho, título); 2) cada campo de "
+    "formulário e o valor que aparece — diga VAZIO quando não houver valor; 3) problemas: "
+    "texto cortado ou sobreposto, formatação desigual entre blocos parecidos, imagem "
+    "faltando, página em branco; 4) a resposta à pergunta. Transcreva valores exatamente "
+    "como aparecem. Não invente o que não dá para ler: diga 'ilegível'."
+)
+
+
 class FilesExecutor:
     """Executor server-side das tools file_*."""
 
-    def __init__(self, store: FileStore) -> None:
+    def __init__(self, store: FileStore, llm: Any = None) -> None:
         self._store = store
+        # Só o file_olhar usa: sem roteador de LLM, ele recusa com motivo.
+        self._llm = llm
         self._user_id: UUID | None = None
         self._session_id: UUID | None = None
 
@@ -40,6 +58,8 @@ class FilesExecutor:
             return {"error": exc.code, "message": exc.message}
 
     async def _dispatch(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        if tool_name == "file_olhar":
+            return await self._olhar(arguments)
         if tool_name == "file_list":
             return await self._list(arguments)
         if tool_name == "file_info":
@@ -60,7 +80,11 @@ class FilesExecutor:
             entry = await self._store.harvest(
                 str(arguments.get("path") or ""),
                 name=arguments.get("name"),
-                retention=str(arguments.get("retention") or "perm"),
+                # Sempre `perm`: era o modelo que escolhia, e ele trocava de
+                # turno para turno (session-a20f4722: o 2º dos 3 MP3 entregues
+                # saiu `temp` sem ninguém pedir e sumiria em 7 dias). Arquivo que
+                # o usuário quer descartar passa por `file_set_retention`.
+                retention="perm",
                 user_id=self._user_id,
                 session_id=self._session_id,
             )
@@ -163,3 +187,55 @@ class FilesExecutor:
                 "file_stage e processe no sandbox com neo_bash."
             )
         return payload
+
+    async def _olhar(self, arguments: dict[str, Any]) -> Any:
+        """Manda as imagens do sandbox para o modelo de visão e devolve o que ele viu.
+
+        O cérebro (DeepSeek) só lê texto. Sem isto o Neo conferia documento por
+        texto extraído, que não mostra o logo apagado do cabeçalho nem "parece que
+        só jogou e deixou lá" (session-20cb02b6). Lê pelo mesmo resolvedor do
+        file_save: preso ao /workspace, sem seguir symlink para fora.
+        """
+        import base64
+
+        from shared.config import get_settings
+        from shared.types import Message, MessageRole
+
+        if self._llm is None:
+            return {"error": "sem_visao", "message": "visão indisponível neste core (sem roteador de LLM)."}
+        caminhos = arguments.get("imagens") or []
+        if isinstance(caminhos, str):
+            caminhos = [caminhos]
+        pergunta = str(arguments.get("pergunta") or "").strip()
+        if not caminhos or not pergunta:
+            return {"error": "bad_args", "message": "passe 'imagens' (caminhos no sandbox) e 'pergunta'."}
+        imagens: list[str] = []
+        for bruto in list(caminhos)[:_OLHAR_MAX_IMAGENS]:
+            real = self._store.resolve_workspace_path(str(bruto))
+            tipo = _OLHAR_TIPOS.get(real.suffix.lower())
+            if tipo is None:
+                raise FileStoreError("bad_format", f"{bruto!r} não é PNG/JPG/WEBP — renderize antes.")
+            if not real.is_file():
+                raise FileStoreError("not_found", f"não existe {bruto!r} no workspace.")
+            if real.stat().st_size > _OLHAR_MAX_BYTES:
+                raise FileStoreError("too_large", f"{bruto!r} passa de 4 MB — renderize com menos dpi.")
+            imagens.append(f"data:{tipo};base64,{base64.b64encode(real.read_bytes()).decode()}")
+
+        modelo = get_settings().browser_local_vision_model
+        provider = self._llm.get_provider_for_model(modelo)
+        resposta = await provider.complete(
+            messages=[
+                Message(role=MessageRole.SYSTEM, content=_OLHAR_SISTEMA),
+                Message(role=MessageRole.USER, content=pergunta, images=imagens),
+            ],
+            model=modelo,
+            temperature=0.1,
+            max_tokens=900,
+            # Sem isto o qwen/gemini via OpenRouter raciocina e a resposta vem vazia
+            # (ver a triagem do navegador local).
+            disable_thinking=True,
+        )
+        texto = (resposta.get_content() or "").strip()
+        if not texto:
+            return {"error": "visao_vazia", "message": "o modelo de visão respondeu vazio — tente de novo uma vez."}
+        return {"ok": True, "modelo": modelo, "imagens": len(imagens), "o_que_se_ve": texto}

@@ -103,6 +103,21 @@ async def _resolve_models(
     return step, eye
 
 
+async def _resolver_juiz(db: Any) -> tuple[str, str]:
+    """(provider, modelo) do juiz da grade — o slot `browser_local_judge` do painel."""
+    from modules.model_config.store import ROLES
+
+    padrao = ROLES["browser_local_judge"]
+    try:
+        from modules.model_config import get_model_config
+
+        cfg = await get_model_config(db, "browser_local_judge")
+        return cfg.get("provider") or padrao.default_provider, cfg.get("model") or padrao.default_model
+    except Exception as exc:  # noqa: BLE001 — config nunca derruba o job
+        logger.warning("[BrowserLocal] config do juiz indisponível (%s); usando o padrão", exc)
+        return padrao.default_provider, padrao.default_model
+
+
 # Quanto tempo uma aba deixada por outra tarefa ainda conta como "a aba desta
 # conversa". Curto de propósito: continuidade é sobre o que acabou de acontecer.
 # Depois disso o usuário quase certamente usou o navegador para outra coisa, e
@@ -323,7 +338,7 @@ def _respostas_para_sessao(outcome: Any) -> dict:
     com uma consulta nova que poderia redigir diferente do que o Daniel viu.
     """
     respostas = list(getattr(outcome, "respostas", None) or [])
-    if respostas and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release"):
+    if respostas and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release", "needs_answer"):
         return {"respostas_memoria": respostas}
     return {}
 
@@ -400,7 +415,7 @@ def _frase_das_abas(outcome: Any) -> str:
 def _abas_para_sessao(outcome: Any) -> dict:
     """As abas de uma tarefa PARADA, para a retomada continuar com elas."""
     abas = [a for a in (getattr(outcome, "abas", None) or []) if isinstance(a, dict)]
-    if len(abas) >= 2 and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release"):
+    if len(abas) >= 2 and getattr(outcome, "status", "") in ("needs_confirmation", "needs_release", "needs_answer"):
         return {"abas": abas}
     return {}
 
@@ -565,6 +580,9 @@ def _estado_final(outcome: Any, pedido_liberacao: dict | None) -> str:
         return "completed"
     if (pedido_liberacao or {}).get("id") or getattr(outcome, "pending", ""):
         return "waiting"
+    # Perguntou e a resposta não veio no prazo: está esperando, não falhou.
+    if outcome.status == "needs_answer":
+        return "waiting"
     return "failed"
 
 
@@ -629,6 +647,8 @@ def build_browser_local_runner(
     vision_model: str | None = None,
     trace_dir: str = "",
     get_pks_service: Callable[[], Any] | None = None,
+    get_working_memory: Callable[[], Any] | None = None,
+    get_credential_store: Callable[[], Any] | None = None,
 ) -> Callable[[AgentJob], Awaitable[dict]]:
     """Fecha as dependências e devolve ``run_browser_local_job(job) -> dict``."""
 
@@ -742,6 +762,30 @@ def build_browser_local_runner(
             except Exception:  # noqa: BLE001
                 pass
 
+        caderno = get_working_memory() if get_working_memory else None
+
+        async def on_progresso(linhas: list[str], resumo: str) -> None:
+            """O progresso da tarefa no caderno, AO VIVO — uma entrada só, reescrita.
+
+            O resultado do job chega ao caderno pelo dispatcher, no fim; até lá o
+            Daniel não tinha como ver, pelo caderno, em que questão a tarefa
+            estava e o que já tinha marcado.
+            """
+            if caderno is None or job.user_id is None:
+                return
+            from core.working_memory.render import marcador_ao_vivo, render_job_progress_entry
+
+            titulo = job.title or "(sem título)"
+            await caderno.append_auto(
+                user_id=job.user_id,
+                session_id=job.session_id,
+                entry=render_job_progress_entry(
+                    title=titulo, kind=job.kind or "browser_local", job_id=str(job.id), linhas=linhas
+                ),
+                summary=f"[em andamento] {titulo}: {resumo}",
+                replace_marker=marcador_ao_vivo(str(job.id)),
+            )
+
         try:
             await db.update_agent_job(
                 job.id,
@@ -812,6 +856,7 @@ def build_browser_local_runner(
         # trocar o olho do navegador — que é justamente o que se quer trocar
         # depressa quando uma chave fica sem crédito.
         step_model, eye_model = await _resolve_models(db, model, vision_model)
+        juiz_provider, juiz_modelo = await _resolver_juiz(db)
 
         # Em qual aba. O `spec` manda quando o cérebro pediu continuidade; sem
         # ele, a aba que a última tarefa deste device deixou aberta.
@@ -848,6 +893,77 @@ def build_browser_local_runner(
         pks_service = get_pks_service() if get_pks_service else None
         filler = _build_filler(db, pks_service, liberacoes)
 
+        # A CONVERSA (docs/browser-conversa-plan.md): a caixa de entrada deste
+        # job enquanto ele roda. O painel da aba e o chat (`job_falar`) escrevem
+        # nela; `avisar`/`perguntar` escrevem no chat pelo dispatcher.
+        from core.browser_local import conversa as conversas
+
+        caixa = conversas.abrir(
+            job.id,
+            user_id=job.user_id,
+            session_id=job.session_id,
+            device_id=device_id,
+            titulo=job.title or "",
+        )
+
+        async def falar_no_chat(texto: str) -> None:
+            from core.jobs.dispatcher import dispatcher_atual
+
+            dispatcher = dispatcher_atual()
+            if dispatcher is None:
+                raise RuntimeError("o chat não está ligado neste processo")
+            await dispatcher.publicar_durante(job, texto)
+
+        async def on_avisar(texto: str) -> None:
+            await falar_no_chat(texto)
+
+        async def on_perguntar(pergunta: str, opcoes: list[str]) -> None:
+            corpo = f"❓ {pergunta}"
+            if opcoes:
+                corpo += "\n\n" + " · ".join(f"**{o}**" for o in opcoes)
+            corpo += (
+                "\n\n_(a tarefa está esperando, com a aba aberta: responda aqui ou no "
+                "painel da aba)_"
+            )
+            await falar_no_chat(corpo)
+            try:
+                await db.update_agent_job(
+                    job.id,
+                    progress_note=f"esperando você: {pergunta[:150]}",
+                    heartbeat_at=datetime.utcnow(),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        async def on_mensagem(mensagem: Any) -> None:
+            """O que ele escreveu no PAINEL entra no histórico da conversa.
+
+            O cérebro lê o histórico, não a caixa: sem isto, no próximo turno ele
+            não saberia que o Daniel mandou "avalie pelos critérios" pela aba.
+            """
+            if job.session_id is None:
+                return
+            await db.save_message(
+                session_id=job.session_id,
+                role="user",
+                content=(
+                    f"[pelo painel do navegador, para a tarefa «{job.title}» — já entregue "
+                    f"a ela] {mensagem.texto}"
+                ),
+                user_id=job.user_id,
+                metadata={"source": "painel_navegador", "job_id": str(job.id)},
+            )
+
+        # O cofre desta tarefa (F5): conta nova ganha senha gerada e guardada; a
+        # senha nunca passa pelo modelo. Getter pelo mesmo motivo do PKS.
+        from core.browser_local.cofre import Cofre
+
+        cofre = Cofre(
+            get_credential_store() if get_credential_store else None,
+            job_id=job.id,
+            titulo=str(job.title or ""),
+        )
+
         driver = BrowserLocalDriver(
             act=act,
             llm=llm_router,
@@ -861,6 +977,7 @@ def build_browser_local_runner(
             allow_sensitive_label=str(spec.get("resume_pending") or ""),
             tab_ref=aba,
             on_progress=on_progress,
+            on_progresso=on_progresso,
             max_screenshots=max_screenshots,
             vision_model=eye_model,
             trace=trace,
@@ -881,6 +998,14 @@ def build_browser_local_runner(
             # Retomada: as abas que a tarefa tinha quando parou.
             abas_previas=list(spec.get("abas") or []),
             pedido=str(spec.get("pedido") or ""),
+            falas=str(spec.get("falas") or ""),
+            conversa=caixa,
+            on_avisar=on_avisar,
+            on_perguntar=on_perguntar,
+            on_mensagem=on_mensagem,
+            cofre=cofre,
+            juiz_modelo=juiz_modelo,
+            juiz_provider=juiz_provider,
         )
 
         try:
@@ -905,6 +1030,10 @@ def build_browser_local_runner(
                 "status": "failed",
                 "result_summary": f"A tarefa no seu navegador falhou: {exc}",
             }
+        finally:
+            # O driver acabou: a caixa fecha junto. Mensagem que chegar agora não
+            # tem quem leia — o `job_falar` passa a responder "não está rodando".
+            conversas.fechar(job.id)
 
         # Onde a aba parou fica registrado ANTES de montar o resumo: é o que a
         # próxima tarefa lê para continuar dali em vez de abrir aba nova. O
@@ -966,6 +1095,25 @@ def build_browser_local_runner(
         conclusao = _frase_da_conclusao(outcome)
         if conclusao:
             fecho.append(conclusao)
+        # O que foi para o cofre, como FATO (o rótulo tem de chegar igual): é
+        # assim que ele acha a conta depois no neo-panel.
+        for linha in cofre.relato:
+            summary += f"\n\n🔐 {linha}"
+            itens.append(f"🔐 {linha}")
+
+        # A pergunta que ficou sem resposta no prazo (docs/browser-conversa-plan.md
+        # §4.4): a tarefa já não ouve, então a resposta volta por um pedido novo
+        # — que reaproveita a aba onde ela parou.
+        if getattr(outcome, "status", "") == "needs_answer":
+            pergunta = str(getattr(outcome, "pergunta", "") or "")
+            espera = (
+                f"⏸ PAREI ESPERANDO A SUA RESPOSTA: «{pergunta[:600]}». Quando o Daniel "
+                "responder, chame `browser_local_task` com a mesma tarefa e a resposta dele "
+                "no `context` — a aba continua onde eu parei."
+            )
+            summary += f"\n\n{espera}"
+            itens.append(espera)
+            fecho.append("⏸ Fiz uma pergunta e parei esperando a sua resposta.")
 
         # Instrução acionável para o cérebro. Sem ela ele reimprovisa a tarefa
         # do zero quando o usuário autoriza — foi o que produziu três jobs

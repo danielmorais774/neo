@@ -121,3 +121,30 @@ Validado: 14 testes em `tests/test_rotation_transport_file_delivery.py`; em prod
 registro de uma sessão antiga aparece na nova pelo usuário e a entrega nova cai no
 mesmo documento.
 
+
+## §8. Terceira rodada: dois anéis e versões (2026-11-10, session-20cb02b6)
+
+O R6 trouxe o contrário do problema: numa conversa NOVA, sobre o template MAPA de
+Processos de Software que ele anexou, o bloco "ARQUIVOS DESTA CONVERSA" mostrava um
+TXT de questões de semiótica de outra conversa (08/11), com a regra "na dúvida, o
+gerado mais recente". O Neo batizou o anexo de `questoes.docx`, no turno 2 reabriu o
+original em branco (perdendo o turno 1) e no turno 3 propôs encher o template com
+aquelas questões. O TXT chegou por 5 canais; este registro era o principal.
+
+| # | Canal / defeito | Conserto |
+|---|---|---|
+| A1 | registro de 72 h sob "desta conversa" + "o mais recente" | dois anéis em `render_block`: desta conversa (uso livre) e de OUTRAS (só entra citado pelo nome/assunto — `ancorado` — ou quando esta não tem documento nenhum, como "pergunte qual"). Citado = `adopted` e vira desta nos turnos seguintes. "faz isso" depois de uma pergunta do Neo cita o que a pergunta citou (`texto_de_ancora`) |
+| A2 | anexo aparecia como "gerado por você, file_id=None (?)" | evento `attached` gravado no manifesto do anexo (`_record_attachments`): origem "veio DELE", `original_file_id`/`original_sandbox_path` na visão |
+| A3 | `questoes_preenchido.docx` era outro documento, sem ligação com o anexo | `file_save(versao_de=…)` + palpite pelo nome com UM candidato (`versao_provavel`): a versão preenchida é a versão 2 do anexo, e "esse arquivo" passa a ser ela |
+| A4 | o Neo LEU o TXT com `cd /workspace/files && head …` sem ninguém avisar | `FileLedger.nota_de_origem` via `annotate_result` do laço: `file_read`/`file_stage`/`neo_read_file`/`neo_bash` que tocam documento de outra conversa recebem "⚠ ORIGEM: … confirme antes de usar no entregável" |
+| A5 | "[memória]" sem origem | `rotulo_de_memoria`: `[memória · outra conversa · 05/11]` |
+| A6 | resultados de job gravados como "exemplo de estilo" no bloco de Alta Prioridade | `PKSService._mensagem_sintetica` pula o aprendizado de "[Continuação automática"; limpeza do que já entrou: `scripts/pks_limpar_exemplos_de_job.py` (dry-run por padrão) |
+
+Junto, para o mesmo caso: skill `docx` (map/preencher/conferir/renderizar), tool
+`file_olhar` (visão), guarda de valor afirmado (`core/files/conferencia.py`) e
+temperatura `[cerebro]` no `neo.toml`. Testes: `tests/files/test_ledger_aneis.py`,
+`test_conferencia_de_valor.py`, `test_file_olhar.py`, `tests/skills/test_docx_scripts.py`.
+
+Não coberto: sandbox por conversa (o `ls` de `/workspace/files` continua mostrando
+tudo — o aviso de origem cobre o USO, não a visão); projetos (memória compartilhada
+por assunto, à la ChatGPT/Claude Projects).

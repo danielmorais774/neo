@@ -69,6 +69,53 @@ NAO_MUSICA = [
 ]
 
 
+#: O pedido de 12/11 que virou turno de música em TRÊS sessões (41a690ba,
+#: f6a0be50, 294e4ec5): "PARA avaliar" (preposição) + "ABA aberta" (outra frase).
+#: O turno de música tira o `browser_local_task` da mesa, e o cérebro respondeu
+#: "a extensão do Edge está offline" — com o navegador ligado.
+PEDIDO_DO_FORMULARIO = (
+    "Preenche esse formulário no meu navegador local, quero ver acontecendo:\n"
+    "https://docs.google.com/forms/d/e/1FAIpQLSfFaF2zgl2RJ2LO9WtEtpQTVkuSwCq_0YkzK5v9zfMm_q3YXg/viewform\n\n"
+    "Me avisa aqui do que ele trata assim que entender. Qualquer decisão que for minha, me "
+    "pergunta e espera com a aba aberta. Os requisitos que ele avalia são do sistema AppDemo: para "
+    "avaliar de verdade, cria uma conta de teste no AppDemo com e-mail descartável, entra no sistema "
+    "e confere cada RF lá antes de responder. Não clica em Enviar no final."
+)
+
+NAVEGACAO_COM_ABA = [
+    PEDIDO_DO_FORMULARIO,
+    # o recado que ele manda com a tarefa do navegador rodando
+    "volta para a aba do formulário e responde o RF-03",
+    "pode continuar na outra aba",
+    "para de mexer nessa aba, deixa que eu faço",
+    "passa pra aba do AppDemo e confere o cadastro",
+    # "para" + infinitivo é preposição, mesmo com o objeto de mídia na frase
+    "abre o formulário para ver o vídeo da aula",
+]
+
+MUSICA_COM_OBJETO_PERTO = [
+    "para a musica",
+    "volta o video",
+    "aumenta o som ai",
+    "passa pra proxima musica",
+    "abaixa um pouco o volume do spotify",
+    "quero ouvir uma musica do linkin park",
+    "toca alguma coisa do metallica no spotify",
+    "coloca uma musica do meu mix para tocar ai",
+    "silencia essa guia",
+]
+
+
+@pytest.mark.parametrize("frase", NAVEGACAO_COM_ABA)
+def test_aba_e_para_soltos_no_pedido_nao_viram_musica(frase):
+    assert IntentRouter._is_music_request(frase) is False
+
+
+@pytest.mark.parametrize("frase", MUSICA_COM_OBJETO_PERTO)
+def test_verbo_com_objeto_de_midia_perto_continua_musica(frase):
+    assert IntentRouter._is_music_request(frase) is True
+
+
 @pytest.mark.parametrize("frase", MUSICA)
 def test_pedido_de_musica_e_reconhecido(frase):
     assert IntentRouter._is_music_request(frase) is True
@@ -179,3 +226,29 @@ def test_outra_skill_nao_e_afetada():
         "_msg": "como vai estar o tempo amanha",
     })
     assert decisao.skill_hint != "music"
+
+
+# ── Arquivo de áudio não é música (session-367b0103, 14/11) ─────────────────
+# "baixa" é verbo de controle ("baixa o som" = volume), e o pedido de baixar e
+# juntar dois MP3 virava música: pulava o classificador e perdia as tools.
+
+
+@pytest.mark.parametrize("msg", [
+    "baixa o som de connect e de disconnect USB do Windows 10, junta os dois num mp3 "
+    "só com 250 ms entre eles e me manda aqui",
+    "baixa essa musica pra mim em mp3",
+    "converte esse audio pra wav",
+    "corta os 10 primeiros segundos desse som",
+])
+def test_trabalho_com_arquivo_de_audio_nao_e_musica(msg):
+    assert IntentRouter._is_music_request(msg) is False
+
+
+@pytest.mark.parametrize("msg", [
+    "baixa o som",
+    "abaixa o volume do PC da Sala pra 20",
+    "coloca um rock para tocar no youtube",
+    "pausa a musica agora do youtube",
+])
+def test_controle_e_play_continuam_musica(msg):
+    assert IntentRouter._is_music_request(msg) is True

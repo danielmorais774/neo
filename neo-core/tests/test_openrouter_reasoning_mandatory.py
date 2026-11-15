@@ -166,3 +166,81 @@ async def test_erro_que_nao_e_de_raciocinio_continua_subindo():
     with pytest.raises(Exception, match="model not found"):
         await provider.complete(_MSGS, model="x/y", disable_thinking=True)
     assert len(quebrado.calls) == 1 and not orp._REASONING_MANDATORY
+
+
+# ── Teto de raciocínio (session-a20f4722) ───────────────────────────────────
+#
+# Desligar não dá, mas LIMITAR dá. Sem teto, o classificador no GLM-5.3-flash
+# raciocinou até estourar os 2048 tokens, voltou vazio e a nova tentativa levou
+# a classificação a 44 s.
+
+
+class _Aceita(_Gateway):
+    async def create(self, **params):
+        self.calls.append(params)
+        if (params.get("extra_body") or {}).get("reasoning") == _REASONING_DISABLED["reasoning"]:
+            raise RuntimeError(_MANDATORY)
+        return _completion("ok")
+
+
+def _com(gateway_cls):
+    provider, _ = _provider()
+    gateway = gateway_cls()
+    provider.client.chat.completions = gateway
+    return provider, gateway
+
+
+@pytest.mark.asyncio
+async def test_modelo_conhecido_recebe_o_teto_sem_pagar_o_400():
+    """Listado em [openrouter] raciocinio_obrigatorio: nem tenta desligar."""
+    provider, gateway = _com(_Aceita)
+    await provider.complete(
+        _MSGS, model="minimax/minimax-m3.1-flash@nebius", disable_thinking=True, teto_raciocinio=300
+    )
+    assert len(gateway.calls) == 1, "modelo conhecido não deveria levar o 400 de aprendizado"
+    assert gateway.calls[0]["extra_body"]["reasoning"] == {"max_tokens": 300}
+    assert gateway.calls[0]["extra_body"]["provider"]["order"] == ["nebius"]
+    assert "teto_raciocinio" not in gateway.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_sem_teto_modelo_conhecido_segue_sem_campo():
+    """Quem não pede teto (o navegador) continua como antes: raciocínio livre."""
+    provider, gateway = _com(_Aceita)
+    await provider.complete(_MSGS, model="z-ai/glm-5.3-flash", disable_thinking=True)
+    assert "reasoning" not in (gateway.calls[0].get("extra_body") or {})
+
+
+@pytest.mark.asyncio
+async def test_aprendido_na_recusa_refaz_ja_com_o_teto():
+    provider, gateway = _com(_Aceita)
+    await provider.complete(
+        _MSGS, model="liquid/lfm-3-1.7b", disable_thinking=True, teto_raciocinio=250
+    )
+    assert gateway.calls[0]["extra_body"]["reasoning"] == {"enabled": False}
+    assert gateway.calls[1]["extra_body"]["reasoning"] == {"max_tokens": 250}
+    # Na próxima chamada o modelo já é conhecido: vai direto com o teto.
+    await provider.complete(
+        _MSGS, model="liquid/lfm-3-1.7b", disable_thinking=True, teto_raciocinio=250
+    )
+    assert gateway.calls[2]["extra_body"]["reasoning"] == {"max_tokens": 250}
+
+
+@pytest.mark.asyncio
+async def test_teto_nao_mexe_em_quem_deixa_desligar():
+    provider, gateway = _com(_Aceita)
+    await provider.complete(
+        _MSGS, model="google/gemini-3.1-flash-lite", disable_thinking=True, teto_raciocinio=300
+    )
+    assert gateway.calls[0]["extra_body"]["reasoning"] == {"enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_stream_tambem_leva_o_teto():
+    provider, gateway = _provider()
+    async for _ in provider.stream_complete(
+        _MSGS, model="minimax/minimax-m3.1-flash", disable_thinking=True, teto_raciocinio=300
+    ):
+        pass
+    assert gateway.calls[0]["extra_body"]["reasoning"] == {"max_tokens": 300}
+    assert "teto_raciocinio" not in gateway.calls[0]

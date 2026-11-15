@@ -10,11 +10,12 @@ It uses IntentRouter to classify messages and dispatches to the correct handler:
 import asyncio
 import json
 import logging
+import posixpath
 import re
 import time
 import unicodedata
 from collections.abc import AsyncIterator
-from datetime import date, datetime  # date kept for _build_legacy_prompt fallback
+from datetime import date, datetime, timedelta  # date kept for _build_legacy_prompt fallback
 from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
@@ -36,8 +37,10 @@ from core.authority import (
     current_authority,
     enforce_inline_images,
     is_actuation,
+    lote_de_chamadas,
     principal_from_metadata,
 )
+from core.claude_code.balao import tarefas_do_balao
 from core.liveness import touch_progress
 from core.llm.router import LLMRouter, provider_for_model
 from core.pks import PKSService
@@ -74,6 +77,7 @@ from shared import (
     ToolCall,
     get_settings,
 )
+from shared.ajustes import ajustes
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +224,9 @@ _INLINE_IMAGE_INSTRUCTION = (
     "- O caminho tem que ser REAL: só use um que apareça nesta conversa (mensagem do "
     "usuário, saída de um comando, anexo). NUNCA invente ou adivinhe caminho/nome — se "
     "não souber, ache primeiro (ex.: `ls`/`find`) ou pergunte.\n"
+    "- Imagem que VOCÊ gerou no sandbox (`/workspace/...`) NÃO existe na máquina dele: "
+    "o caminho do sandbox vira cartão de erro. Publique com `file_save` e mostre com "
+    "`[[IMAGE:file:<file_id>]]`, usando o `file_id` que ele devolveu.\n"
     "- A URL também tem que ser REAL: só use uma que VOCÊ viu num resultado de tool "
     "(web_search/web_fetch/browser_task) nesta conversa. Montar URL de imagem por "
     "dedução é o mesmo erro de inventar caminho — o usuário vê um cartão de erro.\n"
@@ -227,6 +234,144 @@ _INLINE_IMAGE_INSTRUCTION = (
     "marcador por imagem (várias linhas = várias imagens). O marcador não é falado nem "
     "lido em voz alta — é substituído pela imagem."
 )
+
+#: `[[IMAGE:/workspace/…]]`: caminho do SANDBOX num marcador de imagem.
+_IMAGEM_DO_SANDBOX = re.compile(r"\[\[IMAGE:\s*(/workspace/[^\]|]+?)\s*(\|[^\]]*)?\]\]")
+
+
+def _imagens_do_sandbox_para_catalogo(
+    texto: str, arquivos: list[dict[str, Any]] | None
+) -> tuple[str, list[str]]:
+    """Troca `[[IMAGE:/workspace/…]]` por `[[IMAGE:file:<id>]]` do arquivo publicado.
+
+    O marcador é resolvido no Mac, e `/workspace` só existe no sandbox da VPS:
+    na session-b3ccdf21 o cérebro publicou as bandeiras com `file_save`, tinha o
+    `file_id` na mão e escreveu o caminho do sandbox, e o Daniel viu o cartão
+    "Não achei o arquivo". O desktop já desenha `file:<id>` pelo catálogo.
+
+    Casa pelo caminho que o `file_save` recebeu e, sem ele, pelo nome do arquivo
+    quando só um publicado tem aquele nome. Sem correspondência o marcador fica
+    como está: o cartão de erro é a falha visível de propósito. Devolve o texto e
+    os caminhos trocados.
+    """
+    if "[[IMAGE:" not in (texto or "") or not arquivos:
+        return texto, []
+    por_caminho: dict[str, str] = {}
+    por_nome: dict[str, str | None] = {}
+    for arq in arquivos:
+        fid = str(arq.get("file_id") or "").strip()
+        if not fid:
+            continue
+        caminho = str(arq.get("path") or "").strip()
+        if caminho:
+            por_caminho[posixpath.normpath(caminho)] = fid
+        nome = str(arq.get("name") or "").strip()
+        if nome:
+            # Dois publicados com o mesmo nome: pelo nome não dá para saber qual.
+            por_nome[nome] = None if (nome in por_nome and por_nome[nome] != fid) else fid
+    trocados: list[str] = []
+
+    def _troca(m: re.Match) -> str:
+        caminho = posixpath.normpath(m.group(1).strip())
+        fid = por_caminho.get(caminho) or por_nome.get(posixpath.basename(caminho))
+        if not fid:
+            return m.group(0)
+        trocados.append(caminho)
+        return f"[[IMAGE:file:{fid}{(m.group(2) or '').rstrip()}]]"
+
+    return _IMAGEM_DO_SANDBOX.sub(_troca, texto), trocados
+
+
+# Download no sandbox com URL que não veio de busca nem do Daniel, e que falhou.
+# Sem aviso o modelo chuta OUTRA URL de memória: no corpus de produção, 15 vezes
+# em que a URL de memória falhou, só 2 foram para o `web_search` (as duas depois
+# de 3 ou mais chutes); 4 terminaram sem o arquivo, 2 delas prometendo "vou
+# buscar" sem buscar. Reenvio do request real do Big Buck Bunny (session-7ea5427a,
+# rodada depois do 404): 5/5 chutaram de novo sem o aviso, 5/5 foram ao
+# `web_search` com ele.
+_AVISO_URL_DE_MEMORIA = (
+    "(aviso do sistema) A URL desse download NÃO veio de nenhum resultado de busca "
+    "nesta conversa: você montou de memória, e ela falhou (404/403 ou arquivo que não é o "
+    "esperado). Não tente outra URL de cabeça. Ache o endereço real com `web_search` "
+    "(e `web_fetch` na página, que devolve os links dela) e baixe o link que aparecer lá."
+)
+
+#: Marcas de que o download NÃO veio, nas formas que o corpus de produção mostra
+#: (104 downloads do cérebro): status HTTP de erro (`curl -w '%{http_code}'` no
+#: começo da linha, `HTTP/2 404`, `HTTP 403`, `http=403`, `HTTP Error 403` do
+#: urllib, `"code":404`/`"status":504` de API), página de erro no lugar do
+#: arquivo (`<title>Wikimedia Error</title>`, o `file` dizendo HTML/XML) e as
+#: mensagens do curl/wget. Número solto NÃO conta: "404" dentro de um id de foto
+#: do Flickr enganava.
+_DOWNLOAD_FALHOU = re.compile(
+    r"(?m)^\s*(?:HTTP/\d(?:\.\d)?\s+)?[45]\d\d(?:\s|$)"
+    r"|HTTP/\d(?:\.\d)?\s+[45]\d\d\b"
+    r"|\bHTTP\s+[45]\d\d\b"
+    r"|\bhttp(?:_code|_status)?\s*[=:]\s*[45]\d\d\b"
+    r"|HTTP Error [45]\d\d"
+    r"|\"(?:code|status)\"\s*:\s*[45]\d\d\b"
+    r"|<title>[^<]{0,80}(?:error|erro|forbidden|not found|denied|too many requests|blocked)[^<]{0,80}</title>"
+    r"|\bERROR [45]\d\d\b"
+    r"|\b404: Not Found|\b403 Forbidden|Access Denied"
+    r"|: (?:HTML|XML 1\.0) document"
+    r"|curl: \(\d+\)|Could not resolve host|Name or service not known"
+    r"|urllib\.error\.(?:HTTPError|URLError)",
+    re.IGNORECASE,
+)
+#: O download VEIO: com uma destas no resultado, a falha de outra URL do mesmo
+#: comando não pede busca (o Big Buck Bunny testou três de uma vez e duas deram 200).
+_DOWNLOAD_VEIO = re.compile(
+    # "200 Connection established" é o proxy do sandbox abrindo o túnel, não o
+    # servidor: o 403 de verdade vem na linha seguinte (session-5efdf38d).
+    r"(?m)^\s*(?:HTTP/\d(?:\.\d)?\s+)?2\d\d(?:\s|$)(?! *Connection established)"
+    r"|HTTP/\d(?:\.\d)?\s+2\d\d\b(?! Connection established)"
+    r"|\bHTTP\s+2\d\d\b"
+    r"|\bhttp(?:_code|_status)?\s*[=:]\s*2\d\d\b"
+    r"|: (?:ISO Media|JPEG image|PNG image|GIF image|RIFF|Audio file|MPEG|Zip archive|PDF document)",
+    re.IGNORECASE,
+)
+
+
+#: Código de saída do curl/wget que é "o servidor não entregou": wget 8 (resposta
+#: de erro do servidor; com `-q` é a ÚNICA marca, sem nenhuma saída) e 4 (rede);
+#: curl 22 (`-f`, HTTP ≥ 400), 6 (host), 7 (conexão), 28 (tempo), 35 e 56 (TLS/recv).
+_SAIDA_DE_DOWNLOAD_QUE_FALHOU = frozenset({4, 6, 7, 8, 22, 28, 35, 56})
+
+
+def _download_falhou(resultado: Any) -> bool:
+    """O `neo_bash` de download devolveu sinal de que o arquivo não veio (e nenhum de que veio)."""
+    if not isinstance(resultado, dict):
+        return False
+    saida = f"{resultado.get('stdout') or ''}\n{resultado.get('stderr') or ''}"
+    if _DOWNLOAD_VEIO.search(saida):
+        return False
+    if _DOWNLOAD_FALHOU.search(saida):
+        return True
+    comando = str(resultado.get("command") or "")
+    return (
+        resultado.get("exit_code") in _SAIDA_DE_DOWNLOAD_QUE_FALHOU
+        and re.search(r"\b(?:curl|wget)\b", comando) is not None
+    )
+
+
+def _urls_de_memoria(nome: str, argumentos: Any) -> list[str]:
+    """URLs do comando do sandbox sem procedência (nem resultado de tool, nem o Daniel).
+
+    Tem que rodar ANTES de executar: o resultado do `neo_bash` repete o comando, e
+    depois dele toda URL do comando já "apareceu num resultado".
+    """
+    if nome not in ("neo_bash", "neo_bash_background"):
+        return []
+    autoridade = current_authority()
+    if autoridade is None:
+        return []
+    try:
+        from core.authority.gate import _urls_sem_procedencia
+
+        return _urls_sem_procedencia(argumentos if isinstance(argumentos, dict) else {}, autoridade)
+    except Exception:  # noqa: BLE001 — o aviso é extra, nunca custa o round
+        return []
+
 
 _CLARIFICATION_INSTRUCTION = (
     "## Esclarecimento quando faltar contexto\n"
@@ -504,7 +649,9 @@ _PENDING_PROMISE = re.compile(
 # o bug: o workbench pede exatamente isso pra trabalho demorado.
 _LEGITIMATE_DEFERRAL_TOOLS = {
     "neo_bash_background", "job_status", "job_list", "job_logs", "job_cancel",
+    "job_falar",
     "deep_research", "deep_read", "browser_task", "browser_local_task",
+    "claude_task", "claude_reply", "claude_enviar",
 }
 
 
@@ -951,6 +1098,59 @@ def _claims_downloadable_delivery(text: str) -> bool:
 # Ver memória deepseek-empty-response-reasoning e ResearchAgent._complete.
 _EMPTY_RETRY_MAX_TOKENS_CEILING = 16384
 
+# Rodada final SEM tools (teto de rodadas, ou o modelo travado repetindo a mesma
+# chamada). Sem avisar, o modelo segue o trabalho e tenta chamar tool: na
+# session-3229310a o DeepSeek v4.1 flash (CoreWeave) gerou ~930 tokens e o
+# provedor entregou só "\n\n", duas vezes, e o Daniel recebeu uma bolha vazia.
+# Reenvio do payload real: 3/3 vazio sem o aviso, 3/3 resposta honesta com ele.
+_AVISO_FIM_DAS_RODADAS = (
+    "Acabaram as rodadas de ferramenta deste turno: NÃO há mais tools. Responda "
+    "agora em texto, com o que já tem: o que ficou pronto, o que faltou e onde "
+    "parou. Não chame ferramenta."
+)
+_AVISO_FIM_POR_REPETICAO = (
+    "Você mandou a MESMA chamada de ferramenta {vezes} rodadas seguidas e o "
+    "resultado não muda. Acabaram as rodadas de ferramenta deste turno: NÃO há "
+    "mais tools. Responda agora em texto, com o que já tem: o que ficou pronto, o "
+    "que faltou e onde parou. Não chame ferramenta."
+)
+
+
+def _aviso_de_repeticao(
+    nome: str, argumentos: Any, resultado_anterior: str, trecho_max: int
+) -> str:
+    """O que o modelo lê quando repete uma chamada idêntica no mesmo turno.
+
+    O histórico do loop é texto: o assistente aparece vazio e o resultado chega
+    como "Tool: X / Result: …", então o modelo não vê os argumentos que mandou.
+    Responder só "já consultado" deixava ele sem saber QUAL chamada repetiu: na
+    session-3229310a foram 12 rodadas mandando o mesmo `neo_bash`. Aqui vai a
+    chamada (começo e fim) e o começo do resultado que ela já deu
+    (`trecho_max` caracteres; a chamada leva a metade).
+    """
+    try:
+        args = json.dumps(argumentos, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args = str(argumentos)
+    args_max = max(2, trecho_max // 2)
+    if len(args) > args_max:
+        # Começo E fim: os scripts de um turno costumam abrir com o mesmo
+        # helper, e o começo sozinho era igual em todas as chamadas
+        # (session-607c5313). O que repetiu está no fim, onde o script muda.
+        cabeca = args_max // 4
+        args = args[:cabeca] + " … " + args[-(args_max - cabeca):]
+    anterior = (resultado_anterior or "").strip()
+    if len(anterior) > trecho_max:
+        anterior = anterior[:trecho_max] + "…"
+    return (
+        f"Tool: {nome}\n"
+        "Result: NÃO RODOU — chamada REPETIDA: você já mandou exatamente esta "
+        "chamada (mesmos argumentos) neste turno, e rodar de novo dá o mesmo "
+        "resultado. Mude os argumentos (corrija o comando) ou responda com o que já tem.\n"
+        f"Chamada repetida: {args}\n"
+        f"Resultado que ela já deu: {anterior or '(vazio)'}"
+    )
+
 # O outro lado da mesma moeda do teto de tokens: em vez de content vazio, a API
 # devolve uma tool_call com o JSON dos argumentos CORTADO no meio (típico ao
 # escrever um HTML inteiro num `neo_write_file`). `get_tool_calls()` levanta
@@ -967,7 +1167,7 @@ _MAX_TRUNCATED_TOOL_ROUNDS = 2
 #: produzem chega minutos depois, por fora do turno — ver `_summarize_tool_call`.
 _ASYNC_JOB_TOOLS = frozenset({
     "browser_task", "browser_local_task", "agent_job", "deep_research", "deep_read",
-    "neo_bash_background",
+    "neo_bash_background", "claude_task", "claude_enviar",
 })
 
 _WM_HEAVY_TOOLS = frozenset({
@@ -1273,6 +1473,15 @@ def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[
             "tool": name, "ok": True,
             "name": result.get("name"), "file_id": result.get("file_id"),
             "size_bytes": result.get("size_bytes"), "path": arguments.get("path"),
+            "versao_de": arguments.get("versao_de"),
+        }
+    if name == "claude_reply" and isinstance(result, dict) and result.get("job_id"):
+        # O `job_id` em campo próprio: com a tarefa parada, a continuação nasce com
+        # id NOVO, e é por ele que o balão desta resposta acha o processo
+        # (core/claude_code/balao.py). O resto fica igual ao caso genérico.
+        return {
+            "tool": name, "ok": True, "job_id": result.get("job_id"),
+            "summary": str(result)[:200], "note_detail": _note_detail(result),
         }
     return {
         "tool": name, "ok": True, "summary": str(result)[:200],
@@ -1480,8 +1689,89 @@ _TOOL_PROGRESS_LABEL: dict[str, str] = {
     "browser_task": "abrindo o navegador do servidor",
     "deep_research": "abrindo a pesquisa profunda",
     "deep_read": "delegando a leitura dos documentos",
+    "claude_task": "passando a tarefa para o Claude Code",
+    "claude_reply": "falando com o Claude Code",
+    "claude_sessoes": "olhando as sessões do Claude no Mac",
+    "claude_enviar": "mandando o pedido para a sessão do Claude",
     "service_request": "chamando o serviço externo",
 }
+
+#: Até quando uma tarefa do Claude parada desvia a resposta do Daniel para o cérebro.
+_CLAUDE_ESPERA_MAX = timedelta(hours=12)
+#: Até quando a última tarefa do Claude desta conversa é "a do Claude" para um
+#: pedido que CITA o Claude — ele volta para ela (`claude_reply`, mesma sessão).
+_CLAUDE_RECENTE_MAX = timedelta(days=7)
+_CLAUDE_CITADO_RE = re.compile(r"\bclaude\b", re.IGNORECASE)
+_ESTADO_CLAUDE_PT = {
+    "queued": "na fila", "running": "rodando", "waiting": "esperando o Daniel",
+    "completed": "concluída", "failed": "falhou", "timeout": "passou do tempo",
+    "cancelled": "cancelada", "continued": "seguiu em outra rodada",
+}
+
+
+def _nota_claude_recente(job: Any) -> str:
+    """O aviso ao cérebro quando o Daniel cita o Claude e já houve tarefa dele aqui.
+
+    Sem isto, "pede pro Claude pôr um placar" virava um `claude_task` novo: sessão
+    nova (o Claude sem lembrar do que fez) e pasta nova (sem os arquivos). Só vai
+    quando a mensagem CITA o Claude — ajuste sem citar ele o Neo resolve sozinho,
+    escolha do Daniel (07/11): não gasta a cota do Claude sem ele pedir.
+    """
+    if job is None:
+        return ""
+    claude = (job.extra_metadata or {}).get("claude") or {}
+    pasta = claude.get("cwd") or ((job.spec_json or {}).get("claude") or {}).get("cwd") or ""
+    estado = _ESTADO_CLAUDE_PT.get(job.status, job.status)
+    return "\n\n".join([
+        "## Tarefa do Claude Code nesta conversa",
+        f'job_id: {job.id} — "{job.title}" — {estado}' + (f", na pasta {pasta}" if pasta else ""),
+        "Se o Daniel pede ao Claude um AJUSTE ou a CONTINUAÇÃO desse trabalho ('pede pro Claude "
+        "ajustar…', 'manda o Claude pôr um placar'), chame `claude_reply(job_id=\"" + str(job.id)
+        + "\", mensagem=<o pedido dele, completo>)`: o Claude retoma a MESMA sessão, na mesma "
+        "pasta, lembrando do que fez. `claude_task` é só para trabalho NOVO, sem relação com esse.",
+        "Se ele fala de uma sessão DELE (a que está usando no VSCode ou num terminal: 'o Claude "
+        "que eu estava usando', 'lá no VSCode'), não é este job: `claude_sessoes` e `claude_enviar`.",
+    ])
+
+
+def _nota_claude_esperando(job: Any) -> str:
+    """O aviso ao cérebro: a pergunta do Claude, o que ele pediu e como responder.
+
+    O `claude_reply` está no toolset, a pausa está no histórico e no caderno — e
+    mesmo assim a resposta "pode rodar" virou outra coisa. Isto põe a tarefa
+    pendente na frente do modelo, no turno em que ela importa.
+    """
+    if job is None:
+        return ""
+    claude = (job.extra_metadata or {}).get("claude") or {}
+    from core.claude_code import Recusa, regra_de_permissao
+
+    acoes = []
+    for r in claude.get("recusas") or []:
+        recusa = Recusa(str(r.get("ferramenta") or ""), dict(r.get("entrada") or {}))
+        acoes.append(
+            f"- {recusa.descricao()}"
+            + ("" if regra_de_permissao(recusa) else " (não dá para liberar por aqui)")
+        )
+    partes = [
+        "## Tarefa do Claude Code esperando o Daniel",
+        f'job_id: {job.id} — "{job.title}"',
+    ]
+    if claude.get("pergunta"):
+        partes.append(f"O Claude perguntou: {claude['pergunta']}")
+    if acoes:
+        partes.append("Ações que ele pediu e a permissão negou:\n" + "\n".join(acoes))
+    partes.append(
+        "Se a mensagem do Daniel responde a isso ('pode', 'pode rodar', 'libera', 'não, faz "
+        "assim…'), chame `claude_reply(job_id=\"" + str(job.id) + "\", mensagem=<as palavras "
+        "dele>, liberar=true)` quando ele AUTORIZAR as ações acima, ou `liberar=false` quando não "
+        "autorizar ou mandar outra orientação. NÃO execute você mesmo o que o Claude pediu "
+        "(nem por `run_command`, nem no sandbox): o trabalho é dele, na pasta dele, e a tarefa "
+        "ficaria parada para sempre. Se a mensagem for de outro assunto, atenda normalmente e "
+        "deixe a tarefa esperando."
+    )
+    return "\n\n".join(partes)
+
 
 #: Eventos do stream que carregam pedaço de tool call (o resto é texto/controle).
 _TOOL_CALL_EVENTS = (
@@ -1710,10 +2000,28 @@ _WORKBENCH_INSTRUCTION = (
     "(`lang=\"por\"`) + `pdf2image`/`pymupdf`; Office com `python-docx`, "
     "`python-pptx`, `openpyxl`, `xlrd`, `odfpy`; HTML com `html2text`/"
     "`trafilatura`; dados com pandas, `duckdb` (SQL direto em CSV/Parquet) e "
-    "`pyarrow`; mídia com `ffmpeg`/`ffprobe`; `7z`/`unzip`. Faltou alguma lib? "
+    "`pyarrow`; mídia com `ffmpeg`/`ffprobe`; `7z`/`unzip`; Word/planilha para PDF "
+    "com `soffice --headless --convert-to pdf` (LibreOffice) e PDF para imagem com "
+    "`pdftoppm` — e a tool `file_olhar` enxerga a imagem por você (editar .docx: "
+    "skill `docx`). Faltou alguma lib? "
     "`pip install --user <x>` funciona na hora — mas ela some no próximo restart "
     "do sandbox, então não conte com ela depois. NUNCA responda que não consegue "
     "ler um PDF/planilha/documento: você consegue, é só rodar.\n\n"
+    "**Compactar em PARTES** (\"zip em 2 partes\", \"divide em pedaços de 50 MB\"): "
+    "`7z a -tzip -mx=0 -v<N>m saida.zip <arquivo>` gera `saida.zip.001`, `.002`…; "
+    "confira com `7z t saida.zip.001` e publique TODAS as partes com `file_save`. "
+    "NÃO use `zip -s` (as partes juntadas saem corrompidas — testado aqui e no Mac) "
+    "nem `split` + um zip por pedaço (cada zip vira um pedaço cru que ninguém "
+    "remonta). Diga ao usuário como abrir: no Mac, na pasta onde baixou, "
+    "`cat saida.zip.0* > saida.zip` no Terminal e dois cliques no `saida.zip` (o "
+    "Utilitário de Arquivo não abre as partes soltas; Keka, The Unarchiver e 7-Zip "
+    "abrem o `.001` direto). Se ele quiser que CADA parte abra sozinha, divida o "
+    "CONTEÚDO em vez do arquivo (vídeo por tempo com ffmpeg, arquivos em grupos).\n\n"
+    "**O /workspace tem faxina automática:** arquivo grande parado e anexos antigos "
+    "são apagados sozinhos depois de um tempo. O que precisa durar, publique com "
+    "`file_save` (o catálogo guarda); intermediário que você não vai mais usar "
+    "(o zip depois de extraído, o original depois de convertido), apague você "
+    "mesmo no fim da tarefa.\n\n"
     "**NUNCA** tente `neo_bash cp`/`mv`/escrever um arquivo pra fora de "
     "/workspace (ex.: caminhos tipo `/Users/...`, `/home/...`, `~/Desktop`) — "
     "essa máquina não enxerga o disco do usuário de jeito nenhum, sempre falha "
@@ -2015,6 +2323,11 @@ async def _media_context_completo(
 # contrato de música só sabia checar se FALTAVA handoff, nunca se o turno já tinha
 # atuado por outro canal.
 _USER_BROWSER_TOOL = "browser_local_task"
+#: Tools cujo resultado é CONTEÚDO de um arquivo (ou o arquivo materializado para
+#: ler) — é nelas que o aviso de documento de outra conversa entra.
+_TOOLS_QUE_LEEM_CONTEUDO = frozenset({
+    "file_read", "file_stage", "neo_read_file", "neo_bash", "neo_bash_background",
+})
 
 # Sessão 455646dd: "olha no meu navegador local". O classificador acertou, e mesmo
 # assim o cérebro leu no caderno que o último job tinha falhado, repetiu o resultado
@@ -2049,6 +2362,33 @@ def _aviso_navegador_pedido(decision: Any, tools: list[Any], autoridade: Any) ->
     if not any(getattr(t, "name", "") == _USER_BROWSER_TOOL for t in tools):
         return None
     return _AVISO_NAVEGADOR_DO_USUARIO
+
+
+#: Onde a tarefa roda é a decisão que o classificador mais acerta e o cérebro mais
+#: erra, porque a decisão ficava só na explicação dele, que não entra no prompt.
+#: Session-a20f4722: o classificador escreveu "web_search + sandbox; nada depende da
+#: máquina do usuário", e o cérebro rodou `find` no Mac e perguntou o link.
+_AVISO_ROTA_SANDBOX = (
+    "## Onde esta tarefa roda\n"
+    "No SEU ambiente, não na máquina do Daniel: o que ela precisa vem da internet ou é "
+    "gerado por você. Use `web_search`/`web_fetch` para achar o que vem de fora, "
+    "`neo_bash` para baixar, calcular e processar no sandbox, e `file_save` para entregar "
+    "arquivo. Não procure no computador dele (`run_command`) e não peça o link antes de "
+    "buscar."
+)
+
+#: `onde` que é TAREFA (tem ferramenta a usar). Só a conversa (`nenhum`) e o
+#: "não sei" (None) ficam com a temperatura da persona na 1ª rodada.
+_ONDE_TAREFA = frozenset({"sandbox", "maquina", "navegador"})
+
+
+def _aviso_rota(decision: Any) -> str | None:
+    """O aviso deste turno quando o classificador decidiu que a tarefa é do sandbox."""
+    if getattr(decision, "onde", None) != "sandbox":
+        return None
+    if getattr(decision, "intent", None) != IntentType.DIRECT_RESPONSE:
+        return None
+    return _AVISO_ROTA_SANDBOX
 
 
 def _drop_music_handoff_after_browser(
@@ -2626,6 +2966,24 @@ def _actuation_stop_text(motivo: str, steps: list[dict[str, Any]] | None) -> str
         linhas.insert(0, f"(os {corte} primeiros passos ficaram de fora desta lista)")
     feito = "\n".join(linhas) if linhas else "(nada rodou ainda)"
     return f"{motivo}\n\nO que já rodou neste pedido:\n{feito}\n\nMe diga como seguir a partir daqui."
+
+def _limites_do_comando() -> dict[str, int]:
+    """Prazos de um comando no computador, do `[comando_no_computador]` do neo.toml.
+
+    Vão nos argumentos do `execute_command`/`run_command`; o desktop
+    (services/local_jobs.rs) adota como tarefa o que passa de `background_after_s`
+    ainda trabalhando. Desktop antigo ignora as chaves.
+    """
+    try:
+        cfg = ajustes().comando_no_computador
+        return {
+            "background_after_s": int(cfg.segundo_plano_apos_s),
+            "max_runtime_s": int(cfg.teto_min) * 60,
+        }
+    except Exception as exc:  # noqa: BLE001 — sem ajustes, o desktop usa os padrões dele
+        logger.warning("[comando-local] prazos do neo.toml ilegíveis: %s", exc)
+        return {}
+
 
 #: Evidência de disco guardada por sessão (quantas saídas, e quanto de cada).
 _DISK_EVIDENCE_KEPT, _DISK_EVIDENCE_CHARS = 12, 20000
@@ -3381,6 +3739,7 @@ class AIService:
         metadata: dict[str, Any] | None,
         *,
         session_id: Any = None,
+        user_id: Any = None,
     ) -> str | None:
         """Manifesto compacto dos anexos (docs/file-store-plan.md §5).
 
@@ -3398,6 +3757,7 @@ class AIService:
         sid = str(session_id) if session_id else None
         if sid and fresh_ids:
             self._remember_session_attachments(sid, fresh_ids)
+            await self._record_attachments(fresh_ids, user_id=user_id, session_id=sid)
         carry_ids = [
             file_id
             for file_id in (self._session_attachments.get(sid, []) if sid else [])
@@ -3413,13 +3773,23 @@ class AIService:
 
         blocks: list[str] = []
         if fresh_lines:
-            blocks.append("## ARQUIVOS ANEXADOS NESTA MENSAGEM\n" + "\n".join(fresh_lines))
+            blocks.append(
+                "## ARQUIVOS ANEXADOS NESTA MENSAGEM\n" + "\n".join(fresh_lines)
+                # session-20cb02b6: "coloca meu R.A. no cabeçalho DESSE arquivo" com
+                # um anexo na mão, e o classificador ainda chutou um TXT de outra
+                # conversa como "o arquivo". O dêitico desta mensagem é o anexo dela.
+                + "\n\"esse/este/desse arquivo\" nesta mensagem = o anexo acima: é ele o "
+                "alvo do pedido, não um arquivo de outra conversa."
+            )
         if carry_lines:
             blocks.append(
                 ("## OUTROS ARQUIVOS DESTA CONVERSA (anexados antes)\n" if fresh_lines
                  else "## ARQUIVOS DESTA CONVERSA (anexados antes, seguem valendo)\n")
                 + "\n".join(carry_lines)
             )
+        dica_skill = self._dica_de_skill_para_anexos([*fresh_lines, *carry_lines])
+        if dica_skill:
+            blocks.append(dica_skill)
         logger.info(
             "[files] manifesto injetado: %d anexo(s) neste turno, %d da conversa",
             len(fresh_lines), len(carry_lines),
@@ -3438,6 +3808,90 @@ class AIService:
             "o arquivo inteiro de uma vez."
         )
         return "\n\n".join(blocks)
+
+    async def _valores_ausentes_no_arquivo(
+        self, resposta: str, files_out: list[dict[str, Any]]
+    ) -> tuple[list[str], str] | None:
+        """``(valores, nome)`` destacados na resposta que o arquivo publicado não tem.
+
+        Confere o ÚLTIMO arquivo publicado no turno — é dele que a resposta final
+        fala. Formato que não dá para ler aqui (PDF, imagem) não acusa nada:
+        ausência de evidência não é prova do contrário. Nunca levanta.
+        """
+        from core.files.conferencia import ausentes, texto_do_arquivo, valores_afirmados
+
+        valores = valores_afirmados(resposta)
+        store = getattr(self, "file_store", None)
+        if not valores or store is None or not files_out:
+            return None
+        try:
+            ultimo = files_out[-1]
+            entrada = await store.get(str(ultimo.get("file_id")))
+            if entrada is None or not getattr(entrada, "sha256", None):
+                return None
+            nome = str(ultimo.get("name") or getattr(entrada, "name", "") or "")
+            texto = await asyncio.to_thread(texto_do_arquivo, store.blob_path(entrada.sha256), nome)
+            if texto is None:
+                return None
+            faltando = ausentes(valores, texto)
+            return (faltando, nome) if faltando else None
+        except Exception as exc:  # noqa: BLE001 — conferência é extra, nunca custa o turno
+            logger.warning("[Cognitive] conferência de valor afirmado falhou: %s", exc)
+            return None
+
+    def _dica_de_skill_para_anexos(self, linhas: list[str]) -> str | None:
+        """Anexo .docx → aponta a skill docx, quando ela está no catálogo.
+
+        A palavra-chave do pedido ("cabeçalho", "template") nem sempre aparece, e a
+        skill só ajuda se for lida ANTES do primeiro script avulso: na
+        session-20cb02b6 o Neo gastou 8 chamadas mapeando a tabela à mão e apagou o
+        logo escrevendo com `p.text`.
+        """
+        biblioteca = getattr(self, "skill_library", None)
+        if biblioteca is None or not any(
+            ".docx" in linha.lower() or "wordprocessingml" in linha for linha in linhas
+        ):
+            return None
+        try:
+            entrada = biblioteca.get("docx")
+            if entrada is None or not biblioteca.is_available(entrada):
+                return None
+        except Exception:  # noqa: BLE001 — dica é extra
+            return None
+        return (
+            "Anexo Word (.docx): antes de abrir ou editar, leia `skill_read(name=\"docx\")` — "
+            "é o procedimento que preenche campos sem apagar logo nem texto do template, e "
+            "confere antes de entregar."
+        )
+
+    async def _record_attachments(self, file_ids: list[str], *, user_id: Any, session_id: Any) -> None:
+        """Anexo vira documento DESTA conversa no registro, com origem "veio dele".
+
+        Antes ele só aparecia quando o Neo o materializava, e como "gerado por você
+        no sandbox, file_id=None" — sem dono, sem origem, e sem ligação com a versão
+        preenchida que saía dele. Uma linha por anexo por conversa; nunca levanta.
+        """
+        ledger = self._file_ledger
+        if ledger is None or not session_id or not file_ids:
+            return
+        try:
+            eventos = await ledger.events(session_id, user_id=user_id)
+            ja = {
+                str(getattr(e, "file_id", None) if not isinstance(e, dict) else e.get("file_id"))
+                for e in eventos
+                if (getattr(e, "action", None) if not isinstance(e, dict) else e.get("action")) == "attached"
+            }
+            for fid in file_ids:
+                if str(fid) in ja:
+                    continue
+                entrada = await self.file_store.get(str(fid)) if self.file_store is not None else None
+                await ledger.record(
+                    user_id=user_id, session_id=session_id, action="attached",
+                    name=getattr(entrada, "name", "") or "", file_id=str(fid),
+                    sha256=getattr(entrada, "sha256", None), size_bytes=getattr(entrada, "size_bytes", None),
+                )
+        except Exception as exc:  # noqa: BLE001 — registro é best-effort
+            logger.warning("[FileLedger] registro do anexo falhou: %s", exc)
 
     def _spawn_bg(self, coro, *, name: str) -> None:
         """Schedule a tracked fire-and-forget task (post-response work only)."""
@@ -4127,7 +4581,7 @@ class AIService:
         # (que recebe o mesmo sys_context), por isso os anexos da sessão inteira
         # entram: é o que impede o roteamento de tratar o anexo como arquivo local.
         attachments_manifest = await self._build_attachments_manifest(
-            metadata, session_id=sid
+            metadata, session_id=sid, user_id=user_id
         )
         if attachments_manifest:
             sys_context = "\n\n".join(part for part in (sys_context, attachments_manifest) if part)
@@ -4142,9 +4596,28 @@ class AIService:
             sys_context = "\n\n".join(part for part in (sys_context, artifacts_block) if part)
         # Onde está cada cópia dos arquivos desta conversa (docs/file-links-plan.md) —
         # no sys_context pelo mesmo motivo: o classificador também escolhe file_id.
-        file_links = await self._file_links_block(sid, user_id)
+        # A mensagem do turno vai junto: documento de OUTRA conversa só entra no
+        # bloco quando ela o cita (ver core/files/ledger.py, "Dois anéis").
+        from core.files.ledger import texto_de_ancora
+
+        file_links = await self._file_links_block(
+            sid, user_id, anchor_text=texto_de_ancora(user_message, history)
+        )
         if file_links:
             sys_context = "\n\n".join(part for part in (sys_context, file_links) if part)
+        # A tarefa que está RODANDO no navegador desta conversa
+        # (docs/browser-conversa-plan.md §4.5). No sys_context porque o
+        # classificador também lê: com ela viva, "abre outro site" não vira um
+        # segundo job, vira recado (`job_falar`).
+        try:
+            from core.browser_local.conversa import bloco_para_o_cerebro
+
+            tarefa_viva = bloco_para_o_cerebro(sid)
+        except Exception as e:  # noqa: BLE001 — sem o bloco, o turno segue normal
+            logger.debug("[browser-local] bloco da tarefa viva indisponível: %s", e)
+            tarefa_viva = ""
+        if tarefa_viva:
+            sys_context = "\n\n".join(part for part in (sys_context, tarefa_viva) if part)
 
         if continuity.get("action") == "inject" and continuity.get("history"):
             continuity_history = continuity["history"]
@@ -4267,6 +4740,7 @@ class AIService:
         _force_intent = (metadata or {}).get("force_intent", "").upper()
         t0 = time.monotonic()
         active_whatsapp_mission = await self.db.find_active_whatsapp_mission_by_session(sid, user_id)
+        claude_esperando = await self._claude_esperando(sid, user_id)
         if forced_clarification:
             decision = RoutingDecision(
                 intent=IntentType.DIRECT_RESPONSE,
@@ -4293,6 +4767,26 @@ class AIService:
                 "[INTENT-OVERRIDE] active whatsapp mission follow-up mission=%s",
                 active_whatsapp_mission.id,
             )
+        elif claude_esperando is not None:
+            # A tarefa do Claude parou perguntando ao Daniel: a próxima mensagem
+            # dele é, muito provavelmente, a resposta — e só o cérebro tem o
+            # `claude_reply`. Sem isto, "pode rodar" virou `run_command` e o Neo
+            # rodou o script do Claude no terminal dele, deixando a tarefa parada
+            # para sempre (job decc8224, 07/11). Assunto diferente o cérebro
+            # atende normalmente; o aviso (`_nota_claude_esperando`) diz quando
+            # responder ao Claude.
+            decision = RoutingDecision(
+                intent=IntentType.DIRECT_RESPONSE,
+                confidence=1.0,
+                needs_memory=True,
+                needs_plan=False,
+                requires_approval=False,
+                explanation=(
+                    f"Tarefa do Claude {str(claude_esperando.id)[:8]} esperando o Daniel: a "
+                    "resposta vai ao cérebro (claude_reply), não ao terminal."
+                ),
+            )
+            logger.info("[INTENT-OVERRIDE] tarefa do Claude esperando → DIRECT_RESPONSE job=%s", claude_esperando.id)
         elif _force_intent in ("CLIENT_TOOL", "DIRECT_RESPONSE", "COGNITIVE", "SERVER_TOOL"):
             from shared.types import RoutingDecision as _RD
             _intent_map = {
@@ -5496,6 +5990,14 @@ class AIService:
         if _resume_note:
             messages.append(Message(role=MessageRole.SYSTEM, content=_resume_note))
 
+        # Tarefa do Claude parada esperando o Daniel. Vai no fim pelo mesmo
+        # motivo: só existe enquanto a tarefa espera.
+        _nota_claude = _nota_claude_esperando(await self._claude_esperando(session_id, user_id))
+        if not _nota_claude and _CLAUDE_CITADO_RE.search(user_message or ""):
+            _nota_claude = _nota_claude_recente(await self._claude_recente(session_id, user_id))
+        if _nota_claude:
+            messages.append(Message(role=MessageRole.SYSTEM, content=_nota_claude))
+
         # Autocorreção do ciclo: a ordem repetia um passo que já rodou, ou o ciclo
         # acabou e este passo escreve o fecho. Vai por ÚLTIMO, depois da ordem —
         # é a instrução mais volátil do turno e a que precisa ser lida por cima de
@@ -5637,6 +6139,16 @@ class AIService:
                         "Navegador pedido",
                         "O classificador escolheu `browser_local_task`: aviso no turno.",
                     )
+                # Por último, depois da mensagem do usuário: é a posição que o modelo
+                # lê (medido em 31/10, 8 de 8 contra 3 de 8 no prompt de sistema).
+                _aviso_onde = _aviso_rota(decision)
+                if _aviso_onde:
+                    messages.append(Message(role=MessageRole.SYSTEM, content=_aviso_onde))
+                    if slog:
+                        slog.log_event(
+                            "Rota do classificador",
+                            "onde=sandbox: aviso no fim do prompt (internet + sandbox, não a máquina dele).",
+                        )
                 _skill_tool_names = {t.name for t in _autoloaded_tools}
                 _used_tools: set[str] = set()
                 # Progresso ao vivo: o loop empurra linhas numa fila e o drenador
@@ -5657,12 +6169,14 @@ class AIService:
                     slog=slog,
                     trace=trace,
                     force_tool_first=bool(_autoloaded_tools) or recall_forced,
+                    tarefa=getattr(decision, "onde", None) in _ONDE_TAREFA,
                     skill_tool_names=_skill_tool_names,
                     used_tools=_used_tools,
                     produced_files=produced_files,
                     tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
+                    annotate_result=self._origin_annotator(user_id, session_id),
                 ):
                     yield _bolha
                 full_response = _run.text
@@ -5723,7 +6237,7 @@ class AIService:
                         duration_ms=round(llm_ms, 2), temperature=0.9, stage="cognitive",
                     )
 
-            if not full_response:
+            if not full_response.strip():
                 full_response = "Desculpe, não consegui gerar uma resposta."
 
             # Rede de segurança pós-loop: mesmo com as guardas DENTRO do loop, a
@@ -5777,10 +6291,11 @@ class AIService:
                     produced_files=produced_files, tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
+                    annotate_result=self._origin_annotator(user_id, session_id),
                 ):
                     yield _bolha
                 full_response = _run2.text
-                if not full_response:
+                if not full_response.strip():
                     full_response = "Desculpe, não consegui gerar uma resposta."
 
         except ClientActuationRequested as car:
@@ -5856,6 +6371,18 @@ class AIService:
                 metadata={"needs_clarification": True, "round": clarification_round},
             )
             return
+
+        # Imagem gerada no sandbox: o marcador com `/workspace/…` vira `file:<id>`
+        # do que foi publicado neste turno (ver _imagens_do_sandbox_para_catalogo).
+        full_response, _imagens_trocadas = _imagens_do_sandbox_para_catalogo(
+            full_response, produced_files
+        )
+        if _imagens_trocadas and slog:
+            slog.log_event(
+                "Imagem do sandbox → catálogo",
+                "Marcador com caminho do sandbox trocado pelo do catálogo: "
+                + ", ".join(_imagens_trocadas[:5]),
+            )
 
         # Safety: never leak a raw sentinel to the user (e.g. the model emitted it
         # on the final round, where clarification is disabled).
@@ -6066,6 +6593,11 @@ class AIService:
             _resp_metadata["persist_reply"] = True
         if produced_files:
             _resp_metadata["files"] = produced_files
+        # A tarefa do Claude que esta resposta abriu vai junto, para o desktop
+        # pôr o botão do processo no balão (o histórico tira do tool_trace salvo).
+        _jobs_do_balao = tarefas_do_balao(tool_trace)
+        if _jobs_do_balao:
+            _resp_metadata["jobs"] = _jobs_do_balao
         yield AIServiceResponse(
             intent=IntentType.DIRECT_RESPONSE,
             session_id=session_id,
@@ -6309,11 +6841,20 @@ class AIService:
                     # oferecer a tool com a flag desligada seria pura tentação —
                     # o portão rebaixaria toda chamada para o servidor.
                     if not getattr(self.settings, "browser_local_enabled", False):
-                        job_tools = [t for t in job_tools if t.name != "browser_local_task"]
+                        job_tools = [
+                            t for t in job_tools
+                            if t.name not in ("browser_local_task", "job_falar")
+                        ]
                     # deep_read sem runner (flag off, sandbox fora) enfileiraria um
                     # job que ninguém roda — "Tipo de job não suportado" minutos depois.
                     if not self._deep_read_available():
                         job_tools = [t for t in job_tools if t.name != "deep_read"]
+                    # Claude Code sem runner seria a mesma promessa vazia
+                    # (docs/claude-code-delegation-plan.md).
+                    if not self._claude_code_available():
+                        from core.claude_code import chave
+
+                        job_tools = [t for t in job_tools if t.name not in chave.TOOLS]
                     tools += job_tools
             except Exception:  # noqa: BLE001
                 pass
@@ -6402,6 +6943,45 @@ class AIService:
             getattr(self.settings, "deep_read_enabled", False)
             and getattr(self.job_manager, "_deep_read_runner", None) is not None
         )
+
+    async def _claude_esperando(self, session_id: UUID | None, user_id: UUID | None) -> Any:
+        """A tarefa do Claude desta sessão parada esperando o Daniel (até 12 h), ou None."""
+        if session_id is None or not self._claude_code_available():
+            return None
+        try:
+            parados = await self.db.list_agent_jobs(user_id, statuses=["waiting"], limit=10)
+        except Exception as e:  # noqa: BLE001 — sem a lista, o turno segue normal
+            logger.warning("[claude] não consegui ver tarefas esperando: %s", e)
+            return None
+        limite = datetime.utcnow() - _CLAUDE_ESPERA_MAX
+        for job in parados or []:
+            quando = job.finished_at or job.created_at
+            if job.kind == "claude_code" and job.session_id == session_id and quando and quando >= limite:
+                return job
+        return None
+
+    async def _claude_recente(self, session_id: UUID | None, user_id: UUID | None) -> Any:
+        """A tarefa do Claude mais nova desta sessão (até 7 dias), em qualquer estado."""
+        if session_id is None or not self._claude_code_available():
+            return None
+        try:
+            recentes = await self.db.list_agent_jobs(user_id, limit=50)
+        except Exception as e:  # noqa: BLE001 — sem a lista, o turno segue normal
+            logger.warning("[claude] não consegui ver as tarefas recentes: %s", e)
+            return None
+        limite = datetime.utcnow() - _CLAUDE_RECENTE_MAX
+        daqui = [
+            j for j in recentes or []
+            if j.kind == "claude_code" and j.session_id == session_id
+            and j.created_at is not None and j.created_at >= limite
+        ]
+        return max(daqui, key=lambda j: j.created_at, default=None)
+
+    def _claude_code_available(self) -> bool:
+        """O Claude Code delegado roda de verdade? (flag + runner no JobManager)."""
+        from core.claude_code import chave
+
+        return bool(chave.ligado() and getattr(self.job_manager, "_claude_runner", None) is not None)
 
     async def _active_skill(self, session_id: UUID | None) -> str | None:
         """Skill que continua ATIVA nesta sessão (grudenta por alguns turnos).
@@ -6741,11 +7321,15 @@ class AIService:
         from core.router.intent_router import server_tool_can_run
         from modules.release.tools import RELEASE_TOOLS
 
+        from core.claude_code import chave
+
         visiveis = [
             t
             for t in self.agent.tool_registry.get_all()
             if server_tool_can_run(t.name, execution=getattr(t, "execution", None))
             and (t.name != "pks_reveal" or escolhida == "pks_reveal")
+            # Chave do Claude desligada no painel: as tools dele somem daqui também.
+            and (t.name not in chave.TOOLS or self._claude_code_available())
         ]
         nomes = {t.name for t in visiveis}
         return visiveis + [t for t in RELEASE_TOOLS if t.name not in nomes]
@@ -7001,6 +7585,7 @@ class AIService:
         max_tokens: int,
         extra: dict[str, Any],
         progress: "asyncio.Queue[str] | None",
+        temperature: float = 0.9,
     ) -> tuple[Any, float]:
         """Um round do loop cognitivo, streamado quando dá — sempre com a rede.
 
@@ -7030,7 +7615,7 @@ class AIService:
         pode_streamar = bool(self.settings.cognitive_stream_enabled) and not forca_tool
         comum: dict[str, Any] = {
             "model": req_model or None,
-            "temperature": 0.9,
+            "temperature": temperature,
             "max_tokens": max_tokens,
             # O raciocínio do OpenRouter vem ligado sozinho, é gerado ANTES do
             # primeiro token de texto e ignora o max_tokens. Ver a flag.
@@ -7112,6 +7697,7 @@ class AIService:
         slog: "SessionFileLogger | None",
         trace: "MessageTrace | None",
         force_tool_first: bool = False,
+        tarefa: bool = False,
         skill_tool_names: set[str] | None = None,
         used_tools: set[str] | None = None,
         produced_files: list[dict[str, Any]] | None = None,
@@ -7119,6 +7705,7 @@ class AIService:
         browser_actuation: list[str] | None = None,
         progress: "asyncio.Queue[str] | None" = None,
         on_step: Any = None,
+        annotate_result: Any = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -7148,6 +7735,11 @@ class AIService:
         (``jobs.executor._gate_browser``) reescreve local ⇄ servidor por baixo; o
         ``tool_trace`` guarda o nome pré-portão e o resultado já stringificado.
 
+        ``annotate_result``: ``async (nome, argumentos, resultado) -> str | None``.
+        O texto devolvido vai colado ao resultado da tool que o modelo lê — é por
+        onde chega o aviso de que o arquivo lido é de OUTRA conversa
+        (``FileLedger.nota_de_origem``). Falhar aqui nunca derruba o round.
+
         ``tool_trace`` (in/out): se passado, recebe um resumo compacto (via
         ``_summarize_tool_call``) de CADA tool call bem-sucedida deste turno — não
         só ``file_save``. É salvo em ``extra_metadata`` da mensagem e reinjetado no
@@ -7155,7 +7747,14 @@ class AIService:
         ("cade os arquivos?") refaça do zero um trabalho que já foi feito.
         """
         max_rounds = self.settings.cognitive_max_tool_rounds
-        seen: set[tuple[str, str]] = set()
+        # Chamada já feita neste turno → o texto do resultado que ela deu, para o
+        # aviso de repetição mostrar ao modelo O QUE ele repetiu.
+        seen: dict[tuple[str, str], str] = {}
+        # Rodadas seguidas em que TODA chamada era repetida. No limite
+        # (`[cerebro] repeticoes_seguidas_max`) a próxima rodada vai sem tools.
+        rodadas_repetidas = 0
+        encerrar_por_repeticao = False
+        aviso_final_dado = False
         final_text = ""
         files_out: list[dict[str, Any]] = produced_files if produced_files is not None else []
         # Cópia mutável: skill_read pode DESTRAVAR tools de uma skill tool_backed
@@ -7174,12 +7773,46 @@ class AIService:
         browser_promise_retried = False
         download_claim_retried = False
         artifact_claim_retried = False
+        value_claim_retried = False
         handoff_tool_retried = False
         truncated_rounds = 0
 
         for round_idx in range(max_rounds + 1):
-            round_tools = tools if (tools and round_idx < max_rounds) else None
+            round_tools = (
+                tools
+                if (tools and round_idx < max_rounds and not encerrar_por_repeticao)
+                else None
+            )
             extra: dict[str, Any] = {}
+            # Depois da primeira tool do turno o round é oficina (código, comando,
+            # argumento): temperatura de oficina. Ver [cerebro] no neo.toml.
+            _cerebro = ajustes().cerebro
+            if tools and round_tools is None and not aviso_final_dado:
+                # Rodada final: avisar que as tools acabaram, senão o modelo tenta
+                # chamar uma e o texto chega vazio (ver _AVISO_FIM_DAS_RODADAS).
+                aviso_final_dado = True
+                aviso_final = (
+                    _AVISO_FIM_POR_REPETICAO.format(vezes=rodadas_repetidas)
+                    if encerrar_por_repeticao
+                    else _AVISO_FIM_DAS_RODADAS
+                )
+                messages.append(Message(role=MessageRole.SYSTEM, content=aviso_final))
+                if slog:
+                    slog.log_event(
+                        "Última rodada sem tools",
+                        (
+                            f"{rodadas_repetidas} rodadas seguidas só com chamada repetida"
+                            if encerrar_por_repeticao
+                            else f"teto de {max_rounds} rodadas"
+                        )
+                        + " — aviso no fim do prompt para responder em texto.",
+                    )
+            # Também desde a 1ª rodada quando o classificador disse que é TAREFA
+            # (`onde` ≠ conversa): a 1ª rodada é a que escolhe a tool, e a 0.9 a
+            # session-a20f4722 escolheu `find` no Mac para um pedido da internet.
+            temperatura = (
+                _cerebro.temperatura_com_ferramentas if (used or tarefa) else _cerebro.temperatura
+            )
             if round_tools and ((force_tool_first and round_idx == 0) or force_next):
                 extra["tool_choice"] = "required"
             force_next = False
@@ -7192,7 +7825,7 @@ class AIService:
                     messages,
                     model=model_name,
                     provider=provider_name,
-                    temperature=0.9,
+                    temperature=temperatura,
                     tools=round_tools,
                     tool_choice=extra.get("tool_choice"),
                 )
@@ -7204,6 +7837,7 @@ class AIService:
                 max_tokens=self.settings.default_max_tokens,
                 extra=extra,
                 progress=progress,
+                temperature=temperatura,
             )
             content = resp.get_content() or ""
             try:
@@ -7259,17 +7893,24 @@ class AIService:
                     self.settings.default_max_tokens * 2,
                     _EMPTY_RETRY_MAX_TOKENS_CEILING,
                 )
+                # finish=length é o teto comido pelo raciocínio; finish=stop com
+                # texto vazio é o provedor engolindo o que o modelo gerou (na
+                # session-3229310a, tool call numa rodada sem tools).
+                _leitor_finish = getattr(resp, "finish_reason", None)
+                try:
+                    _finish = _leitor_finish() if callable(_leitor_finish) else None
+                except Exception:  # noqa: BLE001 — só vai para o log
+                    _finish = None
                 logger.warning(
-                    "[Cognitive] round %d resposta vazia (orçamento consumido no "
-                    "raciocínio) — retentando com max_tokens=%d",
-                    round_idx, bigger,
+                    "[Cognitive] round %d resposta vazia (finish=%s) — retentando "
+                    "com max_tokens=%d",
+                    round_idx, _finish, bigger,
                 )
                 if slog:
                     slog.log_event(
                         "Retry resposta vazia",
                         f"round {round_idx}: content vazio + zero tool_calls "
-                        f"(raciocínio consumiu o teto) — retentando com "
-                        f"max_tokens={bigger}.",
+                        f"(finish={_finish}) — retentando com max_tokens={bigger}.",
                     )
                 resp, retry_ms = await self._cognitive_round(
                     provider=provider,
@@ -7305,7 +7946,7 @@ class AIService:
                 trace.add_llm_call(
                     provider=provider_name, model=model_name, messages_sent=payload,
                     response_text=(content or '')[:1000], duration_ms=round(llm_ms, 2),
-                    temperature=0.9, stage="cognitive",
+                    temperature=temperatura, stage="cognitive",
                 )
 
             if not tool_calls:
@@ -7567,9 +8208,43 @@ class AIService:
                     )
                     continue
 
-                final_text = content
+                # Guarda de valor-afirmado (session-20cb02b6, turno 4): a resposta
+                # destaca um valor ("R.A. **12345678-9**") que o arquivo publicado
+                # NESTE turno não contém. Determinística como a de cima: lê o blob
+                # do catálogo, sem LLM. Uma vez por turno.
+                if files_out and not value_claim_retried and round_tools:
+                    faltando = await self._valores_ausentes_no_arquivo(content, files_out)
+                    if faltando:
+                        value_claim_retried = True
+                        force_next = True
+                        valores, arquivo = faltando
+                        if slog:
+                            slog.log_event(
+                                "Conferência de valor afirmado",
+                                f"A resposta destaca {valores} e «{arquivo}», publicado neste "
+                                f"turno, não contém — round extra para conferir.\n\n> {content[:200]}",
+                            )
+                        messages.append(Message(role=MessageRole.ASSISTANT, content=content))
+                        messages.append(
+                            Message(
+                                role=MessageRole.USER,
+                                content=(
+                                    f"PARE: sua resposta diz que «{arquivo}» tem "
+                                    + ", ".join(f"«{v}»" for v in valores)
+                                    + ", mas o arquivo que você publicou neste turno NÃO contém "
+                                    "isso (conferi o texto dele). Abra o arquivo, veja o que "
+                                    "está lá e corrija antes de responder — ou diga a ele o que "
+                                    "realmente ficou no arquivo."
+                                ),
+                            )
+                        )
+                        continue
+
+                # Só espaço ("\n\n" da session-3229310a) é resposta vazia: o
+                # chamador aplica o fallback em vez de mandar uma bolha em branco.
+                final_text = content if content.strip() else ""
                 if slog:
-                    slog.log_llm_response("COGNITIVE", final_text, duration_ms=llm_ms, model=model_name)
+                    slog.log_llm_response("COGNITIVE", content, duration_ms=llm_ms, model=model_name)
                 break
 
             # Feed tool results back as a user message (text-based, like AgentExecutor).
@@ -7578,133 +8253,181 @@ class AIService:
             # Blocos de conversa recuperada deste round — entram como SYSTEM,
             # separados do histórico e do slot de resultado de tool (ver abaixo).
             recall_blocks: list[str] = []
-            for tc in tool_calls:
-                # Tool client-actuating (request_user_file/save_generated_file): o
-                # disco/picker do usuário só existe no cliente — não dá para rodar
-                # in-process. Quebra o loop AGORA (antes de qualquer bookkeeping) e
-                # deixa _handle_direct_response emitir o tool_request; o turno retoma
-                # em process_tool_result quando o desktop devolver o resultado.
-                if tc.name in _ALL_ACTUATION_TOOLS:
-                    if slog:
-                        slog.log_event("Cognitive Tool (client-actuating)", f"→ `{tc.name}` {tc.arguments}")
-                    raise ClientActuationRequested(tc.name, dict(tc.arguments or {}), tc.id)
-                key = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False))
-                if key in seen:
-                    result_lines.append(f"Tool: {tc.name}\nResult: (já consultado neste turno — não repita; use o resultado anterior)")
-                    continue
-                seen.add(key)
-                used.add(tc.name)
-                if slog:
-                    slog.log_event("Cognitive Tool", f"→ `{tc.name}` {tc.arguments}")
-                # Agora com o argumento em mãos a bolha pode dizer em QUE ele
-                # está mexendo — e cobre a espera da tool, que num `neo_bash`
-                # pesado é o pedaço do turno que o stream não alcança.
-                await self._emit_progress(progress, _progress_label(tc.name, tc.arguments))
-                tr = await tool_executor.execute_tool_call(tc)
-                if tr.error:
-                    result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
-                elif tc.name == "conversation_recall" and isinstance(tr.result, dict):
-                    # Conversa antiga NÃO pode entrar pelo mesmo canal do resto:
-                    # os resultados de tool viram um Message(USER) e o modelo lê
-                    # isso como "foi dito agora", emendando a resposta a partir
-                    # dali. O corpo vai como SYSTEM (bloco delimitado, com data e
-                    # autor em cada linha, ver render_recall_block) e aqui fica só
-                    # o resumo de uma linha, para o texto não aparecer duas vezes.
-                    result_lines.append(
-                        f"Tool: {tc.name}\nResult: {tr.result.get('resumo', '')}"
-                    )
-                    bloco = str(tr.result.get("bloco") or "").strip()
-                    if bloco:
-                        recall_blocks.append(bloco)
-                else:
-                    result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
-                if tool_trace is not None:
-                    tool_trace.append(_summarize_tool_call(tc.name, tc.arguments, tr))
-                    if on_step is not None:
-                        # Caderno passo a passo: o piso do fim do turno não roda em
-                        # turno cancelado (ver `_note_trace_step`).
-                        await on_step(tool_trace[-1])
-                if (
-                    tc.name == "neo_bash"
-                    and not tr.error
-                    and isinstance(tr.result, dict)
-                    and tr.result.get("backgrounded")
-                ):
-                    # Virou job: "te aviso quando terminar" passa a ser a resposta
-                    # CERTA, e a guarda anti-promessa precisa enxergar isso.
-                    used.add("neo_bash_background")
-                # Atuou no navegador DO USUÁRIO? Só aqui dá pra saber: `tr.name` é o
-                # nome PÓS-portão (o gate rebaixa local→servidor quando o usuário não
-                # pediu a tela dele) e o `ok` do payload distingue a ordem aceita da
-                # que voltou com erro. Ver `_drop_music_handoff_after_browser`.
-                if (
-                    browser_actuation is not None
-                    and not tr.error
-                    and (getattr(tr, "name", None) or tc.name) == _USER_BROWSER_TOOL
-                    and isinstance(tr.result, dict)
-                    and tr.result.get("ok")
-                ):
-                    browser_actuation.append(_USER_BROWSER_TOOL)
-                if tc.name in ("file_save", "file_offer") and not tr.error and isinstance(tr.result, dict):
-                    fid = tr.result.get("file_id")
-                    if fid:
-                        files_out.append({
-                            "file_id": str(fid),
-                            "name": tr.result.get("name"),
-                            "size_bytes": tr.result.get("size_bytes"),
-                        })
-                # Tool gating: ler uma skill tool_backed destrava as tools dela
-                # para os próximos rounds deste turno (e só deste turno).
-                if tc.name == "skill_read" and not tr.error and skill_library is not None:
-                    try:
-                        unlocked = skill_library.tools_for(str(tc.arguments.get("name", "")))
-                    except Exception as e:  # noqa: BLE001 — gating nunca derruba o turno
-                        logger.warning("[SkillLibrary] tools_for falhou: %s", e)
-                        unlocked = []
-                    have = {t.name for t in tools}
-                    fresh = [t for t in unlocked if t.name not in have]
-                    if fresh:
-                        tools.extend(fresh)
+            novas_no_round = 0
+            repetidas_no_round = 0
+            # O lote inteiro foi decidido antes de qualquer resultado dele: a
+            # contaminação que chega aqui dentro só vale para a próxima rodada.
+            with lote_de_chamadas():
+                for tc in tool_calls:
+                    # Tool client-actuating (request_user_file/save_generated_file): o
+                    # disco/picker do usuário só existe no cliente — não dá para rodar
+                    # in-process. Quebra o loop AGORA (antes de qualquer bookkeeping) e
+                    # deixa _handle_direct_response emitir o tool_request; o turno retoma
+                    # em process_tool_result quando o desktop devolver o resultado.
+                    if tc.name in _ALL_ACTUATION_TOOLS:
+                        if slog:
+                            slog.log_event("Cognitive Tool (client-actuating)", f"→ `{tc.name}` {tc.arguments}")
+                        raise ClientActuationRequested(tc.name, dict(tc.arguments or {}), tc.id)
+                    key = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False))
+                    if key in seen:
+                        repetidas_no_round += 1
+                        result_lines.append(
+                            _aviso_de_repeticao(
+                                tc.name, tc.arguments, seen[key], _cerebro.repeticao_trecho_max
+                            )
+                        )
                         if slog:
                             slog.log_event(
-                                "Skill tools destravadas",
-                                ", ".join(f"`{t.name}`" for t in fresh),
+                                "Cognitive Tool repetida",
+                                f"→ `{tc.name}` com os mesmos argumentos — não rodou.",
                             )
-                if slog:
-                    if not tr.error and tc.name == "conversation_recall" and isinstance(tr.result, dict):
-                        # O `bloco` inteiro (~900 tokens de conversa antiga) não
-                        # cabe aqui: o que importa depurar é O QUE a busca achou
-                        # e por qual trilho.
-                        slog.log_event(
-                            "Recall de conversas",
-                            f"termos={tr.result.get('termos')} "
-                            f"trilho={tr.result.get('trilho')} "
-                            f"conversas={tr.result.get('total_conversas')} "
-                            f"mensagens={tr.result.get('total_mensagens')} "
-                            f"tem_mais={tr.result.get('tem_mais')} "
-                            f"proxima_before={tr.result.get('proxima_busca_before')}\n\n"
-                            + str(tr.result.get("bloco") or "")[:1500],
+                        continue
+                    seen[key] = ""
+                    novas_no_round += 1
+                    used.add(tc.name)
+                    if slog:
+                        slog.log_event("Cognitive Tool", f"→ `{tc.name}` {tc.arguments}")
+                    # Agora com o argumento em mãos a bolha pode dizer em QUE ele
+                    # está mexendo — e cobre a espera da tool, que num `neo_bash`
+                    # pesado é o pedaço do turno que o stream não alcança.
+                    await self._emit_progress(progress, _progress_label(tc.name, tc.arguments))
+                    urls_de_memoria = _urls_de_memoria(tc.name, tc.arguments)
+                    tr = await tool_executor.execute_tool_call(tc)
+                    nota_extra: str | None = None
+                    if annotate_result is not None and not tr.error:
+                        try:
+                            nota_extra = await annotate_result(tc.name, dict(tc.arguments or {}), tr.result)
+                        except Exception as exc:  # noqa: BLE001 — anotação é extra, nunca custa o round
+                            logger.warning("[Cognitive] anotação do resultado de %s falhou: %s", tc.name, exc)
+                    if tr.error:
+                        result_lines.append(f"Tool: {tc.name}\nError: {tr.error}")
+                    elif tc.name == "conversation_recall" and isinstance(tr.result, dict):
+                        # Conversa antiga NÃO pode entrar pelo mesmo canal do resto:
+                        # os resultados de tool viram um Message(USER) e o modelo lê
+                        # isso como "foi dito agora", emendando a resposta a partir
+                        # dali. O corpo vai como SYSTEM (bloco delimitado, com data e
+                        # autor em cada linha, ver render_recall_block) e aqui fica só
+                        # o resumo de uma linha, para o texto não aparecer duas vezes.
+                        result_lines.append(
+                            f"Tool: {tc.name}\nResult: {tr.result.get('resumo', '')}"
                         )
+                        bloco = str(tr.result.get("bloco") or "").strip()
+                        if bloco:
+                            recall_blocks.append(bloco)
                     else:
-                        # O nome EFETIVO, não o que o modelo pediu: o portão do
-                        # navegador rebaixa/promove entre `browser_local_task` e
-                        # `browser_task`, e o log mostrando só a escolha do modelo
-                        # afirmava "mexeu no navegador dele" quando o que rodou foi
-                        # o headless do servidor (sessão 0939a295 — foi o que
-                        # escondeu a dupla atuação da música por um turno inteiro).
-                        _eff = getattr(tr, "name", None) or tc.name
-                        _rotulo = (
-                            f"`{tc.name}`"
-                            if _eff == tc.name
-                            else f"`{tc.name}` → portão: `{_eff}`"
-                        )
-                        slog.log_event(
-                            "Cognitive Tool Result",
-                            f"{_rotulo} → " + (f"ERRO: {tr.error}" if tr.error else str(tr.result)[:600]),
-                        )
+                        result_lines.append(f"Tool: {tc.name}\nResult: {tr.result}")
+                    # Guarda o "Result: …"/"Error: …" para o aviso de repetição.
+                    seen[key] = result_lines[-1].split("\n", 1)[-1]
+                    if nota_extra:
+                        result_lines.append(nota_extra)
+                        if slog:
+                            slog.log_event("Aviso de origem", f"`{tc.name}` → {nota_extra}")
+                    if urls_de_memoria and not tr.error and _download_falhou(tr.result):
+                        result_lines.append(_AVISO_URL_DE_MEMORIA)
+                        if slog:
+                            slog.log_event(
+                                "Aviso de URL de memória",
+                                "Download com URL sem procedência falhou — aviso para buscar "
+                                "com `web_search`: " + ", ".join(u[:120] for u in urls_de_memoria[:3]),
+                            )
+                    if tool_trace is not None:
+                        tool_trace.append(_summarize_tool_call(tc.name, tc.arguments, tr))
+                        if on_step is not None:
+                            # Caderno passo a passo: o piso do fim do turno não roda em
+                            # turno cancelado (ver `_note_trace_step`).
+                            await on_step(tool_trace[-1])
+                    if (
+                        tc.name == "neo_bash"
+                        and not tr.error
+                        and isinstance(tr.result, dict)
+                        and tr.result.get("backgrounded")
+                    ):
+                        # Virou job: "te aviso quando terminar" passa a ser a resposta
+                        # CERTA, e a guarda anti-promessa precisa enxergar isso.
+                        used.add("neo_bash_background")
+                    # Atuou no navegador DO USUÁRIO? Só aqui dá pra saber: `tr.name` é o
+                    # nome PÓS-portão (o gate rebaixa local→servidor quando o usuário não
+                    # pediu a tela dele) e o `ok` do payload distingue a ordem aceita da
+                    # que voltou com erro. Ver `_drop_music_handoff_after_browser`.
+                    if (
+                        browser_actuation is not None
+                        and not tr.error
+                        and (getattr(tr, "name", None) or tc.name) == _USER_BROWSER_TOOL
+                        and isinstance(tr.result, dict)
+                        and tr.result.get("ok")
+                    ):
+                        browser_actuation.append(_USER_BROWSER_TOOL)
+                    if tc.name in ("file_save", "file_offer") and not tr.error and isinstance(tr.result, dict):
+                        fid = tr.result.get("file_id")
+                        if fid:
+                            files_out.append({
+                                "file_id": str(fid),
+                                "name": tr.result.get("name"),
+                                "size_bytes": tr.result.get("size_bytes"),
+                                # O caminho no sandbox: é por ele que um
+                                # `[[IMAGE:/workspace/…]]` vira `file:<id>`.
+                                "path": str((tc.arguments or {}).get("path") or ""),
+                            })
+                    # Tool gating: ler uma skill tool_backed destrava as tools dela
+                    # para os próximos rounds deste turno (e só deste turno).
+                    if tc.name == "skill_read" and not tr.error and skill_library is not None:
+                        try:
+                            unlocked = skill_library.tools_for(str(tc.arguments.get("name", "")))
+                        except Exception as e:  # noqa: BLE001 — gating nunca derruba o turno
+                            logger.warning("[SkillLibrary] tools_for falhou: %s", e)
+                            unlocked = []
+                        have = {t.name for t in tools}
+                        fresh = [t for t in unlocked if t.name not in have]
+                        if fresh:
+                            tools.extend(fresh)
+                            if slog:
+                                slog.log_event(
+                                    "Skill tools destravadas",
+                                    ", ".join(f"`{t.name}`" for t in fresh),
+                                )
+                    if slog:
+                        if not tr.error and tc.name == "conversation_recall" and isinstance(tr.result, dict):
+                            # O `bloco` inteiro (~900 tokens de conversa antiga) não
+                            # cabe aqui: o que importa depurar é O QUE a busca achou
+                            # e por qual trilho.
+                            slog.log_event(
+                                "Recall de conversas",
+                                f"termos={tr.result.get('termos')} "
+                                f"trilho={tr.result.get('trilho')} "
+                                f"conversas={tr.result.get('total_conversas')} "
+                                f"mensagens={tr.result.get('total_mensagens')} "
+                                f"tem_mais={tr.result.get('tem_mais')} "
+                                f"proxima_before={tr.result.get('proxima_busca_before')}\n\n"
+                                + str(tr.result.get("bloco") or "")[:1500],
+                            )
+                        else:
+                            # O nome EFETIVO, não o que o modelo pediu: o portão do
+                            # navegador rebaixa/promove entre `browser_local_task` e
+                            # `browser_task`, e o log mostrando só a escolha do modelo
+                            # afirmava "mexeu no navegador dele" quando o que rodou foi
+                            # o headless do servidor (sessão 0939a295 — foi o que
+                            # escondeu a dupla atuação da música por um turno inteiro).
+                            _eff = getattr(tr, "name", None) or tc.name
+                            _rotulo = (
+                                f"`{tc.name}`"
+                                if _eff == tc.name
+                                else f"`{tc.name}` → portão: `{_eff}`"
+                            )
+                            slog.log_event(
+                                "Cognitive Tool Result",
+                                f"{_rotulo} → " + (f"ERRO: {tr.error}" if tr.error else str(tr.result)[:600]),
+                            )
             messages.append(Message(role=MessageRole.USER, content="\n\n".join(result_lines)))
             for bloco in recall_blocks:
                 messages.append(Message(role=MessageRole.SYSTEM, content=bloco))
+            # Rodada em que nada rodou de novo: o modelo está travado na mesma
+            # chamada. No limite, a próxima rodada vai sem tools e com o aviso.
+            if repetidas_no_round and not novas_no_round:
+                rodadas_repetidas += 1
+                if rodadas_repetidas >= _cerebro.repeticoes_seguidas_max:
+                    encerrar_por_repeticao = True
+            else:
+                rodadas_repetidas = 0
 
         return final_text
 
@@ -9327,7 +10050,11 @@ class AIService:
                 tool_request={
                     "tool_call_id": tool_call_id,
                     "tool_name": step.tool_name,
-                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                    "arguments": json.dumps(
+                        {**_limites_do_comando(), **arguments}
+                        if step.tool_name == "run_command" else arguments,
+                        ensure_ascii=False,
+                    ),
                     "requires_approval": False,
                 },
                 is_final=False,
@@ -9767,7 +10494,11 @@ class AIService:
                 tool_request={
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
-                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                    "arguments": json.dumps(
+                        {**_limites_do_comando(), **arguments}
+                        if tool_name == "run_command" else arguments,
+                        ensure_ascii=False,
+                    ),
                     "requires_approval": decision.requires_approval,
                 },
                 is_final=False,
@@ -10064,12 +10795,35 @@ class AIService:
             self._file_ledger_obj = ledger
         return ledger
 
-    async def _file_links_block(self, session_id: Any, user_id: Any = None) -> str | None:
+    def _origin_annotator(self, user_id: Any, session_id: Any) -> Any:
+        """Callback do laço: avisa quando uma tool LEU documento de outra conversa.
+
+        Só as tools que leem conteúdo — listar a pasta não é usar o arquivo, e um
+        aviso a cada ``ls`` viraria ruído que o modelo aprende a ignorar.
+        """
+        ledger = self._file_ledger
+        if ledger is None or not session_id:
+            return None
+
+        async def anotar(nome: str, argumentos: dict[str, Any], resultado: Any) -> str | None:
+            if nome not in _TOOLS_QUE_LEEM_CONTEUDO:
+                return None
+            ids = [argumentos.get("file_id")]
+            if isinstance(resultado, dict):
+                ids.append(resultado.get("file_id"))
+            textos = [argumentos.get("path"), argumentos.get("command")]
+            return await ledger.nota_de_origem(session_id, user_id, file_ids=ids, textos=textos)
+
+        return anotar
+
+    async def _file_links_block(
+        self, session_id: Any, user_id: Any = None, anchor_text: str | None = None
+    ) -> str | None:
         ledger = self._file_ledger
         if ledger is None or not (session_id or user_id):
             return None
         try:
-            return await ledger.block(session_id, user_id) or None
+            return await ledger.block(session_id, user_id, anchor_text=anchor_text) or None
         except Exception as exc:  # noqa: BLE001 — contexto extra é best-effort
             logger.warning("[FileLedger] bloco indisponível: %s", exc)
             return None
@@ -10107,6 +10861,7 @@ class AIService:
                     name=entry.get("name") or getattr(entrada, "name", ""),
                     sandbox_path=entry.get("path"), file_id=entry["file_id"],
                     sha256=getattr(entrada, "sha256", None), size_bytes=entry.get("size_bytes"),
+                    versao_de=entry.get("versao_de"),
                 )
             elif tool == "file_stage" and entry.get("file_id"):
                 entrada = await catalogo(entry["file_id"])
@@ -10451,15 +11206,19 @@ class AIService:
 
             curto = " ".join(command.split())[:90]
             if _repeated_actuation(steps, command):
-                # Igual letra por letra: a saída seria idêntica. Isso é beco, não
-                # tropeço — parar é a resposta certa.
+                # Igual letra por letra: a saída seria idêntica e JÁ está no transcript.
+                # Não despacha; responde com ela, sem tool nenhuma. Parar com "me diga
+                # como seguir" obrigava o usuário a pedir de novo o que o turno já
+                # tinha (session-1bbdd7c5, duas vezes).
                 logger.warning("[brain-shell] comando repetido no mesmo pedido: %s", command)
-                final_text = _actuation_stop_text(
-                    f"Parei antes de repetir `{curto}` — esse comando já apareceu neste "
-                    "pedido e devolveria a mesma coisa.",
-                    steps,
-                )
-                async for resp in self._final_text_reply(session_id, final_text):
+                async for resp in self._answer_from_steps(
+                    session_id, user_message, steps,
+                    motivo=(
+                        f"Parei antes de repetir `{curto}` — esse comando já apareceu neste "
+                        "pedido e devolveria a mesma coisa."
+                    ),
+                    slog=slog,
+                ):
                     yield resp
                 return
 
@@ -10475,13 +11234,15 @@ class AIService:
                 if empurroes >= _MAX_REPEAT_NUDGES:
                     logger.warning("[brain-shell] %sº quase-repetido no mesmo pedido: %s",
                                    empurroes + 1, command)
-                    final_text = _actuation_stop_text(
-                        f"Parei: `{curto}` pede de novo o que os passos "
-                        f"{', '.join(str(i) for i in cobertos)} já responderam, e essa "
-                        "já é a terceira volta no mesmo ponto.",
-                        steps,
-                    )
-                    async for resp in self._final_text_reply(session_id, final_text):
+                    async for resp in self._answer_from_steps(
+                        session_id, user_message, steps,
+                        motivo=(
+                            f"Parei: `{curto}` pede de novo o que os passos "
+                            f"{', '.join(str(i) for i in cobertos)} já responderam, e essa "
+                            "já é a terceira volta no mesmo ponto."
+                        ),
+                        slog=slog,
+                    ):
                         yield resp
                     return
                 logger.info("[brain-shell] quase-repetido (passos %s), devolvendo ao cérebro: %s",
@@ -10890,6 +11651,12 @@ class AIService:
             needs_memory=True,
             needs_plan=False,
             explanation="retomada após ação de arquivo no cliente",
+            # A retomada é, por definição, o meio de uma tarefa que JÁ agiu na máquina
+            # do usuário. Sem `onde`, o laço não sabia disso: a rodada que lê a saída
+            # e escolhe o próximo comando ia a 0.9, a temperatura de conversa, e não à
+            # `temperatura_com_ferramentas` (session-1bbdd7c5: as duas repetições
+            # literais saíram dessas rodadas). Ver [cerebro] no neo.toml.
+            onde="maquina",
         )
         depth = int((pend or {}).get("depth", 0)) + 1
         # enable_handoff=False: a retomada existe pra LER/ENTREGAR o arquivo e
@@ -11341,6 +12108,186 @@ class AIService:
     # Continue flow after tool result from desktop
     # ---------------------------------------------------------------
 
+    async def _handle_local_task(
+        self,
+        session_id: UUID,
+        tarefa: dict[str, Any],
+        *,
+        user_message: str,
+        has_plan: bool,
+        device_id: str | None,
+        user_id: UUID | None,
+        slog: "SessionFileLogger | None",
+        trace: "MessageTrace | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """O comando virou tarefa no computador: abre o job que acompanha e avisa.
+
+        O aviso é escrito por CÓDIGO, não pelo modelo. Os fatos são fixos (o comando,
+        há quanto tempo roda, onde parar) e um modelo no meio só abria espaço para
+        "pronto, zipado" sobre um zip pela metade. O fim chega pelo dispatcher, quando
+        o job termina (core/jobs/runner_comando_local.py).
+        """
+        from core.jobs.runner_comando_local import duracao
+
+        sid = str(session_id)
+        # Nos três caminhos o turno acaba aqui: a retomada do cérebro não tem mais o
+        # que retomar, e deixá-la pendurada sequestraria o próximo ToolResult.
+        pend = self._pending_actuations.pop(sid, None) or {}
+        device = str(device_id or (pend.get("metadata") or {}).get("device_id") or "").strip()
+        uid = user_id
+        if uid is None and pend.get("user_id"):
+            try:
+                uid = UUID(str(pend["user_id"]))
+            except (TypeError, ValueError):
+                uid = None
+        if uid is None:
+            try:
+                sessao = await self.sessions.get_or_create_session(
+                    session_id=session_id, service="neo-desktop"
+                )
+                uid = sessao.user_id
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[comando-local] dono da sessão %s indisponível: %s", sid, exc)
+
+        comando = " ".join(str(tarefa.get("command") or "o comando").split())
+        curto = comando if len(comando) <= 120 else comando[:117] + "…"
+        job = None
+        sem_acompanhar = ""
+        if self.job_manager is None:
+            sem_acompanhar = "o acompanhamento de tarefas está desligado neste servidor"
+        elif not device:
+            sem_acompanhar = "não sei de qual computador o comando veio"
+        else:
+            try:
+                job = await self.job_manager.adopt_local_command(
+                    user_id=uid, session_id=session_id, device_id=device, tarefa=tarefa,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[comando-local] job da tarefa %s não abriu", tarefa.get("id"))
+                sem_acompanhar = f"não consegui abrir o acompanhamento ({exc})"
+
+        # Plano: o passo que virou tarefa conta como despachado, e os seguintes não
+        # podem rodar antes de ele terminar (o "manda o zip" antes de o zip existir).
+        pulados: list[str] = []
+        plano = self.planner.get_active_plan(sid) if has_plan else None
+        if plano is not None:
+            plano.advance(
+                step_result=f"rodando em segundo plano no computador (tarefa {tarefa.get('id')})"
+            )
+            for passo in plano.steps:
+                if passo.status in ("pending", "running"):
+                    passo.status = "skipped"
+                    pulados.append(passo.description)
+            plano.status = "completed"
+            yield self._plan_final_update(plano, session_id)
+            self.planner.clear_plans(sid)
+
+        decorrido = duracao(tarefa.get("elapsed_s"))
+        teto = duracao(tarefa.get("max_runtime_s"))
+        if job is not None:
+            texto = (
+                f"⏳ `{curto}` passou de {decorrido} e continua rodando no seu computador, em "
+                "segundo plano. Te aviso aqui quando terminar. Dá para acompanhar ou parar em "
+                f"Configurações → Tarefas em background (teto de {teto})."
+            )
+        else:
+            texto = (
+                f"⏳ `{curto}` passou de {decorrido} e continua rodando no seu computador, em "
+                f"segundo plano (teto de {teto}). Não vou conseguir te avisar quando terminar: "
+                f"{sem_acompanhar}."
+            )
+        if pulados:
+            texto += (
+                "\n\nOs próximos passos dependem dele e ficaram para depois: "
+                + "; ".join(pulados)
+                + ". Quando ele terminar, me peça para seguir."
+            )
+
+        await self._note_client_step(
+            pend, session_id,
+            {
+                "tool": "run_command", "ok": True, "command": comando,
+                "note_detail": f"virou tarefa em segundo plano (job {job.id if job else '—'})",
+            },
+            slog,
+        )
+        await self.sessions.add_message(
+            session_id=session_id, role="assistant", content=texto, generate_embedding=False,
+        )
+        if slog:
+            slog.log_event(
+                "Comando virou tarefa no computador",
+                f"`{comando}` — tarefa {tarefa.get('id')}, job {job.id if job else '—'}, "
+                f"device {device or '?'}, {decorrido} em primeiro plano, teto {teto}"
+                + (f"\n**Sem acompanhamento:** {sem_acompanhar}" if sem_acompanhar else "")
+                + (f"\n**Passos pulados:** {'; '.join(pulados)}" if pulados else ""),
+            )
+            slog.log_final_response(texto, "CLIENT_TOOL", iterations=1)
+        if trace is not None:
+            get_obs().finish_trace(trace, response=texto)
+        yield AIServiceResponse(
+            intent=IntentType.CLIENT_TOOL, session_id=session_id,
+            message=texto, is_final=True, iterations=1,
+        )
+
+    async def _answer_from_steps(
+        self,
+        session_id: UUID,
+        user_message: str,
+        steps: list[dict[str, Any]] | None,
+        *,
+        motivo: str,
+        slog: "SessionFileLogger | None",
+    ) -> AsyncIterator[AIServiceResponse]:
+        """Responde o pedido com as saídas que o turno JÁ tem, sem tool nenhuma.
+
+        É a saída da guarda de repetição. Ela encerrava com "Parei antes de repetir…
+        Me diga como seguir", jogando fora uma resposta que já estava no transcript:
+        na session-1bbdd7c5 o Daniel mandou "rola ele de novo" e "tenta de novo", e
+        nas duas vezes a resposta certa saiu da MESMA saída que o turno já tinha. Sem
+        saída aproveitável, a parada antiga continua sendo a resposta.
+        """
+        feitos = [
+            p for p in (steps or [])
+            if (p or {}).get("ok") and str((p or {}).get("output") or "").strip()
+        ][-_ACTUATION_STEPS_KEPT:]
+        texto = ""
+        if feitos:
+            blocos = [
+                f"$ {p.get('command')}\n"
+                + self._truncate_output(str(p.get("output") or ""), max_lines=200, max_chars=8000)
+                for p in feitos
+            ]
+            comandos = " ; ".join(str(p.get("command") or "") for p in feitos)
+            try:
+                historico = await self.sessions.get_history(
+                    session_id, limit=_FORMAT_HISTORY_MSGS, max_tokens_budget=1500
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[brain-shell] histórico indisponível para a resposta: %s", exc)
+                historico = None
+            try:
+                texto = await self._format_tool_result(
+                    user_message, comandos, "\n\n".join(blocos),
+                    live=str(session_id) in self._live_sessions,
+                    register=self._session_registers.get(str(session_id)),
+                    can_show_images=str(session_id) in self._image_capable_sessions,
+                    history=historico,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[brain-shell] resposta com as saídas do turno falhou: %s", exc)
+                texto = ""
+        if slog:
+            slog.log_event(
+                "Resposta com o que o turno já tinha (sem tools)",
+                f"{motivo}\n→ "
+                + (f"respondido com {len(feitos)} saída(s)" if texto.strip() else "sem saída aproveitável: parada"),
+            )
+        if not texto.strip():
+            texto = _actuation_stop_text(motivo, steps)
+        async for resp in self._final_text_reply(session_id, texto):
+            yield resp
+
     async def process_tool_result(
         self,
         session_id: UUID,
@@ -11357,6 +12304,8 @@ class AIService:
         _followup_count: int = 0,
         _has_plan: bool = False,
         _escalated: bool = False,
+        device_id: str | None = None,
+        user_id: UUID | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Process tool execution result from desktop and format response.
 
@@ -11415,6 +12364,24 @@ class AIService:
         # aqui. save_generated_file: intercepta quando é o formato NOVO (JSON com
         # "status": saved/conflict) OU a flag de atuação está on; senão cai no fluxo
         # genérico antigo (rollout conservador: desktop velho devolve string simples).
+        # ── COMANDO QUE VIROU TAREFA NO COMPUTADOR ──
+        # Passou do orçamento de primeiro plano ainda trabalhando e o desktop o manteve
+        # vivo (services/local_jobs.rs). Vem ANTES dos três caminhos (cérebro,
+        # classificador, plano) porque o desfecho é o mesmo nos três: abrir o job que
+        # acompanha, avisar e encerrar o turno. Session-1bbdd7c5: o `zip` de 5,6 GB
+        # morria aos 120 s e derrubava o turno.
+        if tool_name in ("execute_command", "run_command") and success:
+            from core.jobs.runner_comando_local import tarefa_do_resultado
+
+            tarefa = tarefa_do_resultado(result)
+            if tarefa is not None:
+                async for resp in self._handle_local_task(
+                    session_id, tarefa, user_message=user_message, has_plan=_has_plan,
+                    device_id=device_id, user_id=user_id, slog=slog, trace=trace,
+                ):
+                    yield resp
+                return
+
         # ── SHELL PEDIDO PELO CÉREBRO (neo_brain_shell_enabled) ──
         # Chega como `execute_command` (passou pela aprovação) ou `run_command`. O que
         # distingue do CLIENT_TOOL do classificador não é o nome e sim o estado deixado
@@ -11875,7 +12842,11 @@ class AIService:
                                 "tool_call_id": new_tool_call_id,
                                 "tool_name": "run_command",
                                 "arguments": json.dumps(
-                                    {"command": followup_cmd, "working_dir": (tool_arguments or {}).get("working_dir", "")},
+                                    {
+                                        **_limites_do_comando(),
+                                        "command": followup_cmd,
+                                        "working_dir": (tool_arguments or {}).get("working_dir", ""),
+                                    },
                                     ensure_ascii=False,
                                 ),
                                 "requires_approval": False,
@@ -12303,7 +13274,7 @@ class AIService:
                 "tool_call_id": tool_call_id,
                 "tool_name": "execute_command",
                 "arguments": json.dumps(
-                    {"command": command, "is_background": False},
+                    {"command": command, "is_background": False, **_limites_do_comando()},
                     ensure_ascii=False,
                 ),
                 "requires_approval": False,
@@ -13020,6 +13991,15 @@ class AIService:
                 if can_show_images
                 else ""
             ),
+            "- Comando demorado (zip, cópia grande, build) roda NORMAL, em primeiro plano: "
+            "se passar de ~1,5 min ainda trabalhando, ele vira tarefa em segundo plano "
+            "sozinho e o usuário é avisado no fim. Não use `&`, `nohup` nem `timeout` para "
+            "isso. E não liste arquivo por arquivo: `zip -rq` (não `zip -r`), sem `-v` no "
+            "`cp`/`tar`/`rsync` — a saída gigante não ajuda ninguém.",
+            "- Para compactar uma pasta, entre na pasta-mãe e use o nome RELATIVO: "
+            "`cd /pasta/mae && zip -rq /destino/nome.zip pasta`. Com o caminho absoluto da "
+            "pasta, o zip/tar guarda a árvore inteira (`Users/fulano/...`) e quem descompacta "
+            "recebe essas pastas todas. Destino que o usuário citou vai exatamente onde ele disse.",
         ]
         if platform == "darwin":
             rules.append(

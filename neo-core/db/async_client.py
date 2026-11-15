@@ -19,7 +19,7 @@ from db.models.mission import Mission
 from db.models.whatsapp_contact import WhatsAppContact
 from db.models.user_notification import UserNotification
 from db.models.connected_device import ConnectedDevice
-from db.models.agent_job import AgentJob
+from db.models.agent_job import REATTACHABLE_JOB_KINDS, AgentJob
 from db.models.auth_refresh_token import AuthRefreshToken
 from shared.config import get_settings
 
@@ -2097,8 +2097,19 @@ class AsyncPostgresClient:
 
         async with self.get_session() as db:
             stmt = select(AgentJob).where(AgentJob.status == "running")
-            orphans = list((await db.execute(stmt)).scalars().all())
+            running = list((await db.execute(stmt)).scalars().all())
             now = datetime.utcnow()
+            # O Claude Code roda FORA do core (no Mac ou num container) e o estado
+            # da rodada está no spec: o job volta para a fila e o runner reata o
+            # stream em vez de perder uma tarefa de meia hora a cada `.py` salvo
+            # (docs/claude-code-delegation-plan.md §6).
+            orphans = []
+            for job in running:
+                if job.kind in REATTACHABLE_JOB_KINDS:
+                    job.status = "queued"
+                    db.add(job)
+                else:
+                    orphans.append(job)
             for job in orphans:
                 job.status = "failed"
                 job.finished_at = now

@@ -221,6 +221,11 @@ class OpenAICompletionResponse(CompletionResponse):
         """Retorna o finish_reason."""
         return self._response.choices[0].finish_reason
 
+    def reasoning_tokens(self) -> int | None:
+        detalhes = getattr(getattr(self._response, "usage", None), "completion_tokens_details", None)
+        tokens = getattr(detalhes, "reasoning_tokens", None)
+        return tokens if isinstance(tokens, int) else None
+
 
 class OpenAIProvider(LLMProvider):
     """Provider para OpenAI (GPT-4, GPT-3.5, etc)."""
@@ -276,6 +281,9 @@ class OpenAIProvider(LLMProvider):
             # DeepSeekProvider); para os demais é ruído e precisa sumir — indo
             # junto no corpo, a API responde 400 e derruba o turno.
             kwargs.pop("disable_thinking", None)
+            # Idem: o teto de raciocínio é traduzido pelo OpenRouterProvider; aqui
+            # chega só de quem não sabe traduzi-lo, e iria como campo inválido.
+            kwargs.pop("teto_raciocinio", None)
 
             # Idem: intenção do chamador, não parâmetro da API. `True` = "não gaste
             # a escada de backoff com 429, levanta na primeira e me deixa consertar
@@ -429,6 +437,7 @@ class OpenAIProvider(LLMProvider):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Streaming completion with OpenAI — yields StreamChunk events."""
+        kwargs.pop("teto_raciocinio", None)
         try:
             openai_messages = [
                 {"role": msg.role.value, "content": _content_for(msg)} for msg in messages

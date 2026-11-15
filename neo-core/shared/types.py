@@ -270,6 +270,14 @@ class RoutingDecision(BaseModel):
     # --- complexity assessment (avoids separate should_create_plan LLM call) ---
     needs_plan: bool = False  # True when 2+ steps with dependencies are needed
     tipo_tarefa: str = "simples"  # simples | multi_etapas | analitica | criacao
+    # ONDE a tarefa roda, pela "regra mestra" do classificador: sandbox (o cérebro
+    # faz no /workspace, inclusive baixar da internet) | maquina (disco/sistema/app
+    # do usuário) | navegador (o navegador logado dele) | nenhum (só conversa).
+    # None = o classificador não disse (fallback, bypass determinístico). Quem lê:
+    # o cérebro (aviso de rota + temperatura da 1ª rodada). Session-a20f4722: o
+    # classificador escreveu "nada depende da máquina do usuário" só na explicação,
+    # que não chega ao cérebro, e o cérebro foi procurar com `find` no Mac.
+    onde: str | None = None
 
     # --- Phase 4: declared cascade (Modo B) ---
     # When the message has 2+ INDEPENDENT actions, the classifier fills this with
