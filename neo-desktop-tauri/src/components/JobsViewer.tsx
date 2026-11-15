@@ -11,6 +11,7 @@
 // é cancelar — a mesma regra da tool `job_cancel` no core.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import type { JobDetail, JobLogs, JobSummary } from '../lib/tauriApi';
 import { humanizeTime } from '../hooks/useSessionManagement';
 import { CopyButton } from './CodeBlock';
@@ -48,6 +49,8 @@ const KIND_LABEL: Record<string, string> = {
   sandbox_task: 'sandbox',
   browser: 'navegador',
   browser_local: 'seu navegador',
+  claude_code: 'Claude Code',
+  comando_local: 'seu computador',
   research: 'pesquisa',
   download_watch: 'download',
   scheduled_prompt: 'turno agendado',
@@ -97,7 +100,10 @@ export default function JobsViewer({ onClose }: JobsViewerProps) {
   const [listError, setListError] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
 
-  const [selected, setSelected] = useState<string | null>(null);
+  // Aberta pela faixa do Claude no chat: já entra na tarefa pedida.
+  const [selected, setSelected] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get('job'),
+  );
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [logs, setLogs] = useState<JobLogs | null>(null);
   const [detailState, setDetailState] = useState<LoadState>('loading');
@@ -186,6 +192,23 @@ export default function JobsViewer({ onClose }: JobsViewerProps) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
+
+  // Janela já aberta e a faixa do chat pediu outra tarefa (`open_jobs_window`).
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let gone = false;
+    listen<string>('jobs-focus', (event) => {
+      followLog.current = true;
+      setSelected(event.payload);
+    }).then((unlisten) => {
+      if (gone) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  }, []);
 
   const selectJob = (id: string) => {
     if (id === selected) return;
@@ -403,7 +426,10 @@ export default function JobsViewer({ onClose }: JobsViewerProps) {
 
                 <section className="jobs-block jobs-log-block">
                   <div className="jobs-block-head">
-                    <span>Log{logs?.truncated ? ' (fim)' : ''}</span>
+                    <span>
+                      {detail.kind === 'claude_code' ? 'Atividade do Claude' : 'Log'}
+                      {logs?.truncated ? ' (fim)' : ''}
+                    </span>
                     {isActive && <span className="jobs-live">atualizando</span>}
                     <CopyButton getText={getLogText} className="wm-copy" />
                   </div>

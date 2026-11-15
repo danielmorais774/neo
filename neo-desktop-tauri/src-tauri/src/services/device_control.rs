@@ -36,6 +36,13 @@ pub fn capabilities() -> Value {
         // só de ter um Chromium instalado —, então é o degrau que continua
         // disponível quando o `browser_local` não está.
         "browser_headless": crate::services::headless::available(),
+        // Claude Code (neo-core/docs/claude-code-delegation-plan.md): instalado.
+        // Logado ou não, quem diz é o `claude.health` a cada tarefa.
+        "claude_code": crate::services::claude_cli::available(),
+        // Retrato do trabalho e sessões do Claude do Daniel
+        // (neo-core/docs/ambiente-de-trabalho-plan.md): só lê arquivos do VSCode e
+        // do Claude Code, e o `procStart` é conferido com o `ps` do macOS.
+        "trabalho": cfg!(target_os = "macos"),
     })
 }
 

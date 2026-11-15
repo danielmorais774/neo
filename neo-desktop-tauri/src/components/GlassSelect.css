@@ -101,7 +101,12 @@
   right: auto;
   bottom: auto;
   z-index: 9999;
-  max-width: 320px;
+  /* Largura e altura máximas vêm do componente (medidas contra a janela);
+     aqui só garante que a lista longa role por dentro em vez de vazar. */
+  max-width: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .glass-select-option {

@@ -2371,22 +2371,44 @@ const JOBS_WINDOW: &str = "jobs";
 /// Mesmo desenho da janela do caderno: criada sob demanda, decoração nativa, uma
 /// só por vez. Um comando longo agora vira job sozinho e roda longe da conversa;
 /// sem um lugar para olhar, "está trabalhando" e "travou" são indistinguíveis.
+///
+/// `job_id` abre a janela JÁ naquela tarefa (a faixa do Claude no chat): na URL
+/// quando a janela nasce, num evento `jobs-focus` quando ela já está aberta.
+/// O botão "terminal" do processo do Claude (faixa e balão): abre o Terminal do
+/// Mac já em `claude --resume` na sessão da tarefa. Tudo é conferido no
+/// `claude_cli::abrir_no_terminal` — a pasta e a sessão vêm do core.
 #[tauri::command]
-pub async fn open_jobs_window(app: AppHandle) -> Result<(), String> {
+pub async fn open_claude_terminal(cwd: String, session_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::services::claude_cli::abrir_no_terminal(&cwd, &session_id)
+    })
+    .await
+    .map_err(|e| format!("falha interna: {}", e))?
+}
+
+#[tauri::command]
+pub async fn open_jobs_window(app: AppHandle, job_id: Option<String>) -> Result<(), String> {
+    // Só um uuid: o valor vai parar numa URL e num evento.
+    let job_id = job_id.filter(|id| {
+        !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    });
     if let Some(window) = app.get_webview_window(JOBS_WINDOW) {
         let _ = window.unminimize();
         let _ = window.show();
         window
             .set_focus()
             .map_err(|e| format!("Não consegui focar a janela de tarefas: {}", e))?;
+        if let Some(id) = &job_id {
+            let _ = app.emit_to(JOBS_WINDOW, "jobs-focus", id);
+        }
         return Ok(());
     }
 
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        JOBS_WINDOW,
-        tauri::WebviewUrl::App("index.html?mode=jobs".into()),
-    )
+    let url = match &job_id {
+        Some(id) => format!("index.html?mode=jobs&job={}", id),
+        None => "index.html?mode=jobs".to_string(),
+    };
+    tauri::WebviewWindowBuilder::new(&app, JOBS_WINDOW, tauri::WebviewUrl::App(url.into()))
     .title("Tarefas do Neo")
     .inner_size(1080.0, 720.0)
     .min_inner_size(720.0, 440.0)

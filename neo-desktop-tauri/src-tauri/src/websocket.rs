@@ -323,7 +323,10 @@ impl DeviceWsManager {
         let action = command.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let args = command.get("args").cloned().unwrap_or(serde_json::Value::Null);
 
-        info!("[DeviceWS] Control command: {} (id={})", action, id);
+        // `claude.read` e `tarefa.status` chegam a cada poucos segundos: fora do info.
+        if action != "claude.read" && action != "tarefa.status" {
+            info!("[DeviceWS] Control command: {} (id={})", action, id);
+        }
 
         // Energia pede confirmação NESTA máquina — quem está na frente dela é
         // quem decide. Recusar mantém o canal aberto, e o core lê "continua
@@ -343,6 +346,51 @@ impl DeviceWsManager {
         // neo-core/docs/browser-local-plan.md §3.2.
         if action.starts_with("browser.") {
             let reply = match crate::services::browser_local::execute(&action, &args).await {
+                Ok(result) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+                Err(e) => {
+                    warn!("[DeviceWS] {} falhou: {}", action, e);
+                    serde_json::json!({ "id": id, "ok": false, "error": e })
+                }
+            };
+            return Some(reply.to_string());
+        }
+
+        // Claude Code nesta máquina: o core orquestra, aqui só se lança, lê e
+        // para. Ver services/claude_cli.rs e neo-core/docs/claude-code-delegation-plan.md §4.
+        if action.starts_with("claude.") {
+            let reply = match crate::services::claude_cli::execute(app_handle, &action, &args).await {
+                Ok(result) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+                Err(e) => {
+                    warn!("[DeviceWS] {} falhou: {}", action, e);
+                    serde_json::json!({ "id": id, "ok": false, "error": e })
+                }
+            };
+            return Some(reply.to_string());
+        }
+
+        // Tarefas em segundo plano deste Mac (services/local_jobs.rs): o core só LÊ
+        // o estado e PARA. Iniciar não existe por aqui — só vira tarefa o comando que
+        // já passou pela política ou pelo card dentro de um turno.
+        if action.starts_with("tarefa.") {
+            let act = action.clone();
+            let a = args.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                crate::services::local_jobs::execute(&act, &a)
+            })
+            .await;
+            let reply = match outcome {
+                Ok(Ok(result)) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+                Ok(Err(e)) => serde_json::json!({ "id": id, "ok": false, "error": e }),
+                Err(e) => serde_json::json!({ "id": id, "ok": false, "error": format!("falha: {}", e) }),
+            };
+            return Some(reply.to_string());
+        }
+
+        // Retrato do trabalho (janelas do VSCode, sessões do Claude): só leitura,
+        // pedido pelo core em turno de trabalho. Ver services/trabalho.rs e
+        // neo-core/docs/ambiente-de-trabalho-plan.md §6.
+        if action.starts_with("trabalho.") {
+            let reply = match crate::services::trabalho::execute(&action, &args).await {
                 Ok(result) => serde_json::json!({ "id": id, "ok": true, "result": result }),
                 Err(e) => {
                     warn!("[DeviceWS] {} falhou: {}", action, e);

@@ -59,3 +59,15 @@ export function readStoredChatMode(): ChatMode {
 export function storeChatMode(mode: ChatMode): void {
   write(MODE_KEY, mode);
 }
+
+// Faixa do Claude (ClaudeBar.tsx): a caixa do diário aberta ou fechada fica
+// como a pessoa deixou, entre uma tarefa e outra.
+const CLAUDE_BOX_KEY = 'neo.chat.claudeBox';
+
+export function readClaudeBoxOpen(): boolean {
+  return read(CLAUDE_BOX_KEY) === 'open';
+}
+
+export function storeClaudeBoxOpen(open: boolean): void {
+  write(CLAUDE_BOX_KEY, open ? 'open' : 'closed');
+}

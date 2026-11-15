@@ -5,6 +5,7 @@ import type { ModelCatalog, ModelType, ProviderType } from '../lib/models';
 import { modelOptions, providerOptions } from '../lib/models';
 import MessageList from './MessageList';
 import GlassSelect from './GlassSelect';
+import ClaudeBar from './ClaudeBar';
 import './Chat.css';
 
 interface ChatProps {
@@ -36,6 +37,8 @@ interface ChatProps {
   /** Lista do seletor, do neo-core (null = nunca carregou e não há cache). */
   modelCatalog: ModelCatalog | null;
   windowMode: 'tooltip' | 'agent';
+  /** A conversa aberta — a faixa do Claude só mostra a tarefa dela. */
+  sessionId: string;
   initialInput?: string;
   // Modo Live (voz)
   isLive?: boolean;
@@ -90,6 +93,7 @@ function Chat({
   selectedProvider,
   modelCatalog,
   windowMode,
+  sessionId,
   initialInput,
   isLive = false,
   liveState = 'idle',
@@ -292,6 +296,8 @@ function Chat({
       )}
 
       <form className="input-container" onSubmit={handleSubmit}>
+        {/* O turno é o `isExecuting`: o `isLoading` nunca liga (useAgentState). */}
+        <ClaudeBar ocupado={isLoading || isExecuting} sessaoId={sessionId} />
         {isLive && (
           <div className={`live-bar live-${liveState}`} role="status">
             <span className="live-dot" />

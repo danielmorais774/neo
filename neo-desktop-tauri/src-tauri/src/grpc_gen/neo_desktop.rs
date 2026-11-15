@@ -200,6 +200,20 @@ pub struct AgentResponse {
     /// rodou neste turno.
     #[prost(message, repeated, tag = "6")]
     pub files: ::prost::alloc::vec::Vec<FileRef>,
+    /// Tarefas em segundo plano que ESTA resposta abriu (hoje: o Claude Code, por
+    /// claude_task/claude_reply). O desktop ancora o processo no balão: a faixa
+    /// some quando a tarefa acaba ou a conversa troca, e o botão no balão a acha de
+    /// novo. O histórico (/desktop/session/{id}/history) traz o mesmo `jobs`.
+    #[prost(message, repeated, tag = "7")]
+    pub jobs: ::prost::alloc::vec::Vec<JobRef>,
+}
+/// Uma tarefa (agent_job) presa a uma resposta. `kind` é o do job (claude_code).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobRef {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
 }
 /// Referência a um arquivo gerado/catalogado (file_save), pronto pra download
 /// via GET /api/v1/files/{id}/download no neo-core.

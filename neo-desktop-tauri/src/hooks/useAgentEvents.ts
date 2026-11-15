@@ -7,13 +7,16 @@ interface UseAgentEventsProps {
   setIsExecuting: (value: boolean) => void;
   setCurrentIteration: (value: number) => void;
   setMaxIterations: (value: number) => void;
+  /** O core rotacionou a sessão: quem mostra algo da conversa precisa saber. */
+  setSessionId: (sessionId: string) => void;
 }
 
 export const useAgentEvents = ({
   setMessages,
   setIsExecuting,
   setCurrentIteration,
-  setMaxIterations
+  setMaxIterations,
+  setSessionId
 }: UseAgentEventsProps) => {
   useEffect(() => {
     const handleAgentEvent = (event: AgentEvent) => {
@@ -23,6 +26,7 @@ export const useAgentEvents = ({
         case 'session_changed':
           if (event.data.sessionId) {
             void window.electronAPI?.resetAgent(event.data.sessionId);
+            setSessionId(event.data.sessionId);
           }
           break;
 
@@ -54,6 +58,7 @@ export const useAgentEvents = ({
               messageType: 'text',
               timestamp: new Date(),
               files: event.data.files,
+              jobs: event.data.jobs ?? undefined,
             }];
           });
           break;
@@ -288,6 +293,8 @@ export const useAgentEvents = ({
                 timestamp: new Date(),
                 details,
                 files: event.data.files,
+                // O Rust manda `null` quando a resposta não abriu tarefa.
+                jobs: event.data.jobs ?? undefined,
                 ...(parsedMission ? { mission: parsedMission } : {}),
               }];
             }
@@ -325,5 +332,5 @@ export const useAgentEvents = ({
       unlistenAgent?.();
       unlistenCommand?.();
     };
-  }, [setMessages, setIsExecuting, setCurrentIteration, setMaxIterations]);
+  }, [setMessages, setIsExecuting, setCurrentIteration, setMaxIterations, setSessionId]);
 };

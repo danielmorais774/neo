@@ -381,8 +381,10 @@ export interface ElectronAPI {
   getJob: (jobId: string) => Promise<JobDetail>;
   getJobLogs: (jobId: string, tail?: number) => Promise<JobLogs>;
   cancelJob: (jobId: string) => Promise<JobCancelResult>;
-  /** Abre (ou foca, se já aberta) a janela de tarefas. */
-  openJobsWindow: () => Promise<void>;
+  /** Abre (ou foca, se já aberta) a janela de tarefas — já na `jobId`, se vier. */
+  openJobsWindow: (jobId?: string) => Promise<void>;
+  /** Abre o Terminal do Mac em `claude --resume` na sessão de uma tarefa do Claude. */
+  openClaudeTerminal: (cwd: string, sessionId: string) => Promise<void>;
 }
 
 export interface SessionInfo {
@@ -442,6 +444,9 @@ export interface JobSummary {
   has_then: boolean;
   continuation_of: string | null;
   has_log: boolean;
+  /** Tarefa do Claude Code com sessão já começada: onde retomá-la no Terminal.
+   *  `rodando` = ainda com o Neo; duas cópias na mesma sessão se atropelam. */
+  claude?: { session_id: string; cwd: string; rodando: boolean };
 }
 
 export interface JobDetail extends JobSummary {
@@ -961,5 +966,7 @@ export const electronAPI: ElectronAPI = {
   getJob: (jobId: string) => invoke<JobDetail>('get_job', { jobId }),
   getJobLogs: (jobId: string, tail?: number) => invoke<JobLogs>('get_job_logs', { jobId, tail }),
   cancelJob: (jobId: string) => invoke<JobCancelResult>('cancel_job', { jobId }),
-  openJobsWindow: () => invoke<void>('open_jobs_window'),
+  openJobsWindow: (jobId?: string) => invoke<void>('open_jobs_window', { jobId }),
+  openClaudeTerminal: (cwd: string, sessionId: string) =>
+    invoke<void>('open_claude_terminal', { cwd, sessionId }),
 };

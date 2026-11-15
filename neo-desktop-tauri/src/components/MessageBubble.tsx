@@ -9,6 +9,7 @@ import InlineImages from './InlineImages';
 import CodeBlock, { CopyButton } from './CodeBlock';
 import { extractInlineImages } from '../lib/inlineImages';
 import FileChangeCard from './FileChangeCard';
+import ClaudeNoBalao from './ClaudeNoBalao';
 import './MessageBubble.css';
 
 interface MessageBubbleProps {
@@ -396,6 +397,11 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
           <InlineImages images={inlineImages} />
 
           {renderFiles()}
+
+          {/* O processo do Claude que esta resposta pediu ou entregou. */}
+          {message.jobs
+            ?.filter((j) => j.kind === 'claude_code')
+            .map((j) => <ClaudeNoBalao key={j.id} jobId={j.id} />)}
 
           {message.fileChange && <FileChangeCard change={message.fileChange} />}
 

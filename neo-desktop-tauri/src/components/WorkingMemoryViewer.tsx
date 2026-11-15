@@ -148,10 +148,59 @@ export default function WorkingMemoryViewer({ onClose, standalone = false }: Wor
   }, [selected, reloadTick]);
 
   // Volta ao topo ao trocar de nota: sem isto, abrir uma nota curta depois de
-  // rolar uma longa mostra o painel em branco no meio do scroll herdado.
+  // rolar uma longa mostra o painel em branco no meio do scroll herdado. Só na
+  // TROCA: com o acompanhamento ao vivo abaixo, o corpo da mesma nota muda a
+  // cada questão, e voltar ao topo a cada mudança tiraria o leitor do fim, que
+  // é onde o progresso está.
+  const scrolledFor = useRef<string | null>(null);
   useEffect(() => {
+    if (!detail || scrolledFor.current === detail.slug) return;
+    scrolledFor.current = detail.slug;
     bodyRef.current?.scrollTo({ top: 0 });
-  }, [selected, detail]);
+  }, [detail]);
+
+  // Acompanhamento ao vivo. Enquanto um job do navegador roda, o core reescreve
+  // o progresso dele no caderno a cada questão (nota com resumo "[em
+  // andamento] …", ver neo-core/core/browser_local/progresso.py). A tela se
+  // atualiza sozinha, em silêncio: sem o "Abrindo a nota…" do recarregar, que
+  // piscaria a cada volta. Sem job ao vivo, a volta é longa — é ela que percebe
+  // o job que começou com a tela já aberta.
+  const aoVivo = useMemo(
+    () => notes.some((note) => note.summary.startsWith('[em andamento]')),
+    [notes]
+  );
+  useEffect(() => {
+    // Resposta que chega depois de trocar de nota é da nota velha: descartada.
+    let cancelled = false;
+    const timer = window.setInterval(
+      () => {
+        if (document.hidden) return;
+        void (async () => {
+          try {
+            const page = await window.electronAPI?.listWorkingNotes();
+            if (cancelled) return;
+            if (page) {
+              setNotes(page.notes ?? []);
+              setCounts(page.counts ?? {});
+            }
+            if (selected) {
+              const note = await window.electronAPI?.readWorkingNote(selected);
+              if (cancelled) return;
+              if (note) setDetail((current) => (current?.body === note.body ? current : note));
+            }
+          } catch (err) {
+            // A próxima volta tenta de novo; o botão de recarregar mostra o erro.
+            console.debug('[Neo] Atualização ao vivo do caderno falhou:', err);
+          }
+        })();
+      },
+      aoVivo ? 3000 : 10000
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [aoVivo, selected]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {

@@ -86,6 +86,14 @@ export interface FileChangeInfo {
   diff?: string;
 }
 
+// Tarefa em segundo plano presa a este balão: a que a resposta abriu (claude_task)
+// ou cujo resultado ela entrega. Vem do core (AgentResponse.jobs, histórico e a
+// notificação da entrega); o balão mostra o botão do processo (ClaudeNoBalao).
+export interface JobRef {
+  id: string;
+  kind: string;
+}
+
 export type MessageType = 'text' | 'thinking' | 'plan' | 'plan_update' | 'step' | 'command' | 'mission' | 'result' | 'error' | 'iteration' | 'file_change';
 
 export interface Message {
@@ -102,5 +110,6 @@ export interface Message {
   mission?: MissionInfo;
   details?: MessageDetails;
   files?: GeneratedFile[];
+  jobs?: JobRef[];
   fileChange?: FileChangeInfo;
 }

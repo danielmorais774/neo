@@ -50,6 +50,19 @@ export const ChatPage = () => {
     setStartupNotification
   } = useAgentState();
 
+  // A conversa aberta, espelho do `session_id` do Rust: muda nos três lugares
+  // que chamam `resetAgent` (novo chat, sessão antiga, rotação do core). Hoje só
+  // a faixa do Claude usa — a tarefa aparece na conversa onde nasceu.
+  const [sessionId, setSessionId] = useState('');
+  useEffect(() => {
+    window.electronAPI
+      ?.getSessionId()
+      .then((id) => setSessionId((atual) => atual || id))
+      .catch(() => {
+        /* sem id, a faixa só não aparece */
+      });
+  }, []);
+
   // Hook para carregar histórico e configurar startup
   const loadHistory = useCallback(async () => {
     const history = await HistoryService.loadHistory();
@@ -77,6 +90,7 @@ export const ChatPage = () => {
 
       try {
         await window.electronAPI?.resetAgent(sessionId);
+        setSessionId(sessionId);
         const history = await HistoryService.loadHistory();
         // Troca o conteúdo mesmo se vier vazio: manter as mensagens da conversa
         // anterior na tela faria parecer que a sessão escolhida é outra.
@@ -270,6 +284,10 @@ export const ChatPage = () => {
           name: String(f.name || 'arquivo'),
           sizeBytes: Number(f.sizeBytes ?? f.size_bytes ?? 0),
         }));
+      // A entrega de uma tarefa do Claude leva ao processo dela, como no histórico.
+      const jobs = jobId && payload.kind_detail === 'claude_code'
+        ? [{ id: jobId, kind: 'claude_code' }]
+        : undefined;
 
       setMessages(prev => {
         if (prev.some(msg => msg.details?.notificationId === notificationId)) {
@@ -287,6 +305,7 @@ export const ChatPage = () => {
             jobId,
           },
           ...(files.length ? { files } : {}),
+          ...(jobs ? { jobs } : {}),
         };
         return [...prev, jobMessage];
       });
@@ -321,7 +340,8 @@ export const ChatPage = () => {
     setMessages,
     setIsExecuting,
     setCurrentIteration,
-    setMaxIterations
+    setMaxIterations,
+    setSessionId
   });
 
   // Handlers
@@ -475,6 +495,7 @@ export const ChatPage = () => {
     // é de lá que a lista de sessões é lida.
     const newSessionId = crypto.randomUUID();
     await window.electronAPI?.resetAgent(newSessionId);
+    setSessionId(newSessionId);
     await HistoryService.clearHistory();
     clearMessages();
     setCurrentIteration(0);
@@ -526,6 +547,7 @@ export const ChatPage = () => {
         selectedProvider={selectedProvider}
         modelCatalog={modelCatalog}
         windowMode={windowMode}
+        sessionId={sessionId}
         // initialInput={`manda uma mensagem para minha irmã avisando que vou chegar mais tarde`}
         initialInput={``}
         isLive={isLive}

@@ -1,6 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import './GlassSelect.css';
+
+const MENU_GAP = 8; // distância entre o gatilho e o menu
+const VIEWPORT_MARGIN = 8; // folga mínima até a borda da janela
+const MIN_MENU_HEIGHT = 120;
+const MIN_MENU_WIDTH = 210;
+const MAX_MENU_WIDTH = 360;
 
 export type GlassSelectOption<T extends string> = {
   value: T;
@@ -30,6 +36,11 @@ function GlassSelect<T extends string>({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties | null>(null);
 
+  const close = () => {
+    setOpen(false);
+    setMenuStyle(null);
+  };
+
   const selected = useMemo(() => {
     return options.find(o => o.value === value) ?? options[0];
   }, [options, value]);
@@ -46,11 +57,11 @@ function GlassSelect<T extends string>({
       if (target && (rootEl.contains(target) || (menuEl && menuEl.contains(target)))) {
         return;
       }
-      setOpen(false);
+      close();
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') close();
     };
 
     window.addEventListener('mousedown', onMouseDown);
@@ -61,45 +72,92 @@ function GlassSelect<T extends string>({
     };
   }, [open]);
 
-  // Reposition portal menu on open / resize / scroll
-  useEffect(() => {
-    if (!open) {
-      setMenuStyle(null);
-      return;
-    }
+  // Posiciona o menu (portal) MEDINDO o DOM — antes estimava 44px/opção com
+  // teto de 400px e não tinha max-height: com a lista de modelos crescendo, o
+  // menu real ficava maior que a estimativa e vazava pela borda da janela
+  // (opções ocultas, sem scroll). Agora: abre para o lado com mais espaço,
+  // ancora pela borda do gatilho (bottom quando abre para cima), limita a
+  // altura ao espaço disponível e rola por dentro.
+  useLayoutEffect(() => {
+    if (!open) return;
 
     const updatePosition = () => {
       const rootEl = rootRef.current;
-      if (!rootEl) return;
+      const menuEl = menuRef.current;
+      if (!rootEl || !menuEl) return;
       const rect = rootEl.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
 
-      // Estimate menu height and width
-      const estItemH = 44; // estimate per option
-      const estHeight = Math.min(400, options.length * estItemH + 12);
-      const menuWidth = Math.min(320, Math.max(210, rect.width));
+      // scrollHeight é a altura do conteúdo inteiro, mesmo com max-height.
+      const naturalH = menuEl.scrollHeight;
+      const spaceBelow = vh - rect.bottom - MENU_GAP - VIEWPORT_MARGIN;
+      const spaceAbove = rect.top - MENU_GAP - VIEWPORT_MARGIN;
+      const showBelow = naturalH <= spaceBelow || spaceBelow >= spaceAbove;
+      const maxHeight = Math.max(MIN_MENU_HEIGHT, showBelow ? spaceBelow : spaceAbove);
 
-      const spaceBelow = window.innerHeight - rect.bottom;
-      const spaceAbove = rect.top;
-      const showBelow = spaceBelow >= estHeight || spaceBelow >= spaceAbove;
+      const maxWidth = Math.max(160, Math.min(MAX_MENU_WIDTH, vw - VIEWPORT_MARGIN * 2));
+      const minWidth = Math.min(maxWidth, Math.max(MIN_MENU_WIDTH, rect.width));
+      // Aplica os limites ANTES de medir a largura: com max-height a barra de
+      // rolagem aparece e alarga o menu — medido sem ela, o menu encostado na
+      // borda direita vazava a largura da barra para fora da janela.
+      menuEl.style.maxHeight = `${maxHeight}px`;
+      menuEl.style.maxWidth = `${maxWidth}px`;
+      menuEl.style.minWidth = `${minWidth}px`;
+      const width = menuEl.offsetWidth;
+      const left = Math.max(
+        VIEWPORT_MARGIN,
+        Math.min(rect.left, vw - VIEWPORT_MARGIN - width)
+      );
 
-      const left = Math.max(8, rect.left);
-      const top = showBelow ? rect.bottom + 8 : Math.max(8, rect.top - estHeight - 8);
+      setMenuStyle({
+        position: 'fixed',
+        left: `${left}px`,
+        ...(showBelow
+          ? { top: `${rect.bottom + MENU_GAP}px` }
+          : { bottom: `${vh - rect.top + MENU_GAP}px` }),
+        minWidth: `${minWidth}px`,
+        maxWidth: `${maxWidth}px`,
+        maxHeight: `${maxHeight}px`,
+        zIndex: 9999
+      });
+    };
 
-      setMenuStyle({ position: 'fixed', left: `${left}px`, top: `${top}px`, width: `${menuWidth}px`, zIndex: 9999 });
+    const onScroll = (e: Event) => {
+      // Rolar a própria lista não move o gatilho: não recalcula.
+      const menuEl = menuRef.current;
+      if (menuEl && e.target instanceof Node && menuEl.contains(e.target)) return;
+      updatePosition();
     };
 
     updatePosition();
     window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
+    window.addEventListener('scroll', onScroll, true);
     return () => {
       window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
+      window.removeEventListener('scroll', onScroll, true);
     };
-  }, [open, options.length]);
+  }, [open, options]);
+
+  // Ao abrir, centraliza a opção selecionada na área visível da lista
+  // (uma vez por abertura, depois que a altura máxima já foi aplicada).
+  const scrolledForOpenRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!open) {
+      scrolledForOpenRef.current = false;
+      return;
+    }
+    const menuEl = menuRef.current;
+    if (!menuStyle || !menuEl || scrolledForOpenRef.current) return;
+    scrolledForOpenRef.current = true;
+    const sel = menuEl.querySelector<HTMLElement>('.glass-select-option.selected');
+    if (!sel || menuEl.scrollHeight <= menuEl.clientHeight) return;
+    menuEl.scrollTop = sel.offsetTop - (menuEl.clientHeight - sel.offsetHeight) / 2;
+  }, [open, menuStyle]);
 
   const handleSelect = (next: T) => {
     onChange(next);
-    setOpen(false);
+    close();
   };
 
   const menu = (
@@ -108,7 +166,7 @@ function GlassSelect<T extends string>({
       className="glass-select-menu portal"
       role="listbox"
       aria-label={ariaLabel}
-      style={menuStyle || undefined}
+      style={menuStyle ?? { position: 'fixed', left: 0, top: 0, visibility: 'hidden' }}
     >
       {options.map((opt) => (
         <button
@@ -117,6 +175,7 @@ function GlassSelect<T extends string>({
           role="option"
           aria-selected={opt.value === value}
           className={`glass-select-option ${opt.value === value ? 'selected' : ''}`}
+          title={opt.description ? `${opt.label} — ${opt.description}` : opt.label}
           onClick={() => handleSelect(opt.value)}
         >
           <span className="glass-select-option-main">{opt.label}</span>
@@ -144,7 +203,7 @@ function GlassSelect<T extends string>({
         aria-haspopup="listbox"
         aria-expanded={open}
         disabled={disabled}
-        onClick={() => setOpen(v => !v)}
+        onClick={() => (open ? close() : setOpen(true))}
       >
         <span className="glass-select-text">
           <span className="glass-select-label">{selected?.label}</span>

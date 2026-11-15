@@ -64,6 +64,100 @@ pub(crate) struct JanelaPedida {
     pub gesto: bool,
 }
 
+/// O que o Daniel escreveu no PAINEL da aba (notificação `neo.msg` da extensão),
+/// esperando o core ler. O `browser.snapshot` e o `browser.inbox` esvaziam a
+/// fila (neo-core/docs/browser-conversa-plan.md §4.3).
+///
+/// Vem pelo canal da extensão e NUNCA pelo DOM, ao contrário do PARE: um
+/// atributo na página pode ser escrito pela própria página, e a mensagem tem a
+/// autoridade do Daniel. O pior caso de um PARE forjado é parar; de uma
+/// mensagem forjada, obedecer.
+static MENSAGENS: OnceLock<std::sync::Mutex<Vec<Value>>> = OnceLock::new();
+/// Teto da fila e de cada mensagem. O core lê a cada passo: acumular mais que
+/// isto é a tarefa parada, e aí o que importa é o mais recente.
+const MENSAGENS_MAX: usize = 20;
+const MENSAGEM_CHARS: usize = 2000;
+
+fn mensagens() -> &'static std::sync::Mutex<Vec<Value>> {
+    MENSAGENS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Guarda uma `neo.msg`: `{tabId, texto, opcao?}`. Texto vazio é ignorado.
+pub(crate) fn guardar_mensagem(params: &Value) {
+    let texto = params.get("texto").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if texto.is_empty() {
+        return;
+    }
+    let texto: String = texto.chars().take(MENSAGEM_CHARS).collect();
+    let mut item = json!({ "texto": texto });
+    if let Some(tab) = params.get("tabId").and_then(|v| v.as_i64()) {
+        item["tab"] = json!(tab);
+    }
+    // `opcao` só chega quando a extensão conferiu que o botão é da pergunta que o
+    // Neo fez (canal privilegiado) — ver `NEO_MSG` no background.js.
+    if let Some(opcao) = params.get("opcao").and_then(|v| v.as_u64()) {
+        item["opcao"] = json!(opcao);
+    }
+    if let Ok(mut fila) = mensagens().lock() {
+        if fila.len() >= MENSAGENS_MAX {
+            fila.remove(0);
+        }
+        fila.push(item);
+    }
+}
+
+/// Esvazia a fila: o core leu.
+pub(crate) fn tomar_mensagens() -> Vec<Value> {
+    mensagens()
+        .lock()
+        .map(|mut fila| std::mem::take(&mut *fila))
+        .unwrap_or_default()
+}
+
+/// Por que o navegador soltou o debugger de cada aba (`neo.detach`):
+/// `target_closed` é a aba fechada; `canceled_by_user`, a faixa amarela
+/// cancelada. Sem isto, "Debugger unattached" não dizia qual dos dois (sessão
+/// 2bd028fb: três jobs morreram assim logo depois de digitar um e-mail).
+static DESLIGADAS: OnceLock<std::sync::Mutex<HashMap<i64, String>>> = OnceLock::new();
+
+fn desligadas() -> &'static std::sync::Mutex<HashMap<i64, String>> {
+    DESLIGADAS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn anotar_desligamento(tab: i64, motivo: &str) {
+    if let Ok(mut mapa) = desligadas().lock() {
+        if mapa.len() > 64 {
+            mapa.clear();
+        }
+        mapa.insert(tab, motivo.to_string());
+    }
+}
+
+/// O erro do navegador, com o motivo do desligamento quando ele é conhecido.
+pub(crate) fn com_motivo_do_desligamento(tab: i64, erro: String) -> String {
+    if !erro.contains("Debugger unattached") {
+        return erro;
+    }
+    match desligadas().lock().ok().and_then(|m| m.get(&tab).cloned()) {
+        Some(motivo) if motivo == "target_closed" => {
+            format!("{erro} (a aba foi fechada)")
+        }
+        Some(motivo) if motivo == "canceled_by_user" => {
+            format!("{erro} (alguém cancelou a depuração na faixa do navegador)")
+        }
+        Some(motivo) if !motivo.is_empty() => format!("{erro} (motivo: {motivo})"),
+        _ => erro,
+    }
+}
+
+/// Abas com pergunta aberta no painel (`neoPergunta`). A próxima faixa que não
+/// for pergunta fecha a caixa de resposta de lá.
+static PERGUNTAS: OnceLock<std::sync::Mutex<std::collections::HashSet<i64>>> = OnceLock::new();
+
+fn perguntas() -> &'static std::sync::Mutex<std::collections::HashSet<i64>> {
+    PERGUNTAS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 static JANELAS: OnceLock<std::sync::Mutex<HashMap<i64, Vec<JanelaPedida>>>> = OnceLock::new();
 
 fn janelas() -> &'static std::sync::Mutex<HashMap<i64, Vec<JanelaPedida>>> {
@@ -272,6 +366,25 @@ impl Conn {
                         info!("[BrowserLocal] PARE recebido da faixa da página");
                         STOP_REQUESTED.store(true, Ordering::SeqCst);
                     }
+                    // O Daniel escreveu no painel da aba. Não loga o texto: é dele.
+                    Some("neo.msg") => {
+                        let p = frame.get("params").cloned().unwrap_or(Value::Null);
+                        let tamanho = p
+                            .get("texto")
+                            .and_then(|v| v.as_str())
+                            .map(|t| t.chars().count())
+                            .unwrap_or(0);
+                        info!("[BrowserLocal] mensagem do painel da aba ({} caracteres)", tamanho);
+                        guardar_mensagem(&p);
+                    }
+                    Some("neo.detach") => {
+                        let p = frame.get("params").cloned().unwrap_or(Value::Null);
+                        if let Some(tab) = p.get("tabId").and_then(|v| v.as_i64()) {
+                            let motivo = p.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                            warn!("[BrowserLocal] o navegador soltou a aba {}: {}", tab, motivo);
+                            anotar_desligamento(tab, motivo);
+                        }
+                    }
                     Some("onCDPEvent") => {
                         let p = frame.get("params").cloned().unwrap_or(Value::Null);
                         if p.get("method").and_then(|v| v.as_str()) == Some("Page.windowOpen") {
@@ -365,6 +478,7 @@ async fn cdp(tab_id: i64, method: &str, params: Value) -> Result<Value, String> 
         }),
     )
     .await
+    .map_err(|erro| com_motivo_do_desligamento(tab_id, erro))
 }
 
 /// `Runtime.evaluate` com `returnByValue`, devolvendo já o valor JS.
@@ -478,6 +592,78 @@ const JS_HELPERS: &str = r#"
     const raw = String(el.getAttribute('aria-label') || el.innerText || el.textContent || '');
     const first = raw.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
     return first.replace(/\s+/g, ' ').slice(0, 60);
+  };
+  // A ESTRUTURA de um rádio de grade (vai em `item.grade`), para o core montar linhas × colunas em
+  // qualquer site (core/browser_local/grade.py). Antes o core só lia o Google
+  // Forms em português: dependia de o `radiogroup` entrar no inventário por
+  // acaso (o Google põe `jsaction` nele) e do rótulo "X, resposta para Y". Uma
+  // matriz em <table> de rádios comuns (SurveyMonkey, Moodle) dava zero
+  // perguntas, e o Google em inglês embaralhava as colunas.
+  //   grupo    — quem é a "linha": o radiogroup ARIA ou o `name` do rádio HTML
+  //   linha    — o nome dela: o do radiogroup, ou o cabeçalho da linha na tabela
+  //   coluna   — o cabeçalho da coluna, quando o rádio está numa tabela
+  //   pergunta — o enunciado: legend, caption ou o título do item da lista
+  NEO.grade = (el) => {
+    const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+    const ctl = el.tagName === 'LABEL' && el.control ? el.control : el;
+    const nativo = ctl.tagName === 'INPUT' && String(ctl.type || '').toLowerCase() === 'radio';
+    const aria = ctl.getAttribute('role') === 'radio';
+    if (!nativo && !aria) return null;
+    const nomeAria = (n) => {
+      let out = clean(n.getAttribute('aria-label'));
+      const ids = n.getAttribute('aria-labelledby');
+      if (!out && ids) {
+        out = clean(ids.split(/\s+/).map((id) => {
+          const x = document.getElementById(id);
+          return x ? x.innerText || x.textContent || '' : '';
+        }).join(' '));
+      }
+      return out.slice(0, 200);
+    };
+    const out = {};
+    const grupo = ctl.closest('[role=radiogroup]');
+    if (grupo) {
+      NEO._grupos = NEO._grupos || new WeakMap();
+      if (!NEO._grupos.has(grupo)) NEO._grupos.set(grupo, (NEO._nGrupos = (NEO._nGrupos || 0) + 1));
+      out.grupo = 'g' + NEO._grupos.get(grupo);
+      // Sem nome ARIA, o texto do grupo serve só se for UMA linha ("Clareza"):
+      // o de uma escolha simples traz as opções, uma por linha.
+      const texto = String(grupo.innerText || '').trim();
+      const nome = nomeAria(grupo) || (texto && !texto.includes('\n') ? clean(texto).slice(0, 200) : '');
+      if (nome) out.linha = nome;
+    } else if (nativo && ctl.name) {
+      out.grupo = 'n:' + ctl.name;
+    } else return null;
+    const celula = ctl.closest('td,th,[role=gridcell],[role=cell]');
+    const tr = celula && celula.closest('tr,[role=row]');
+    const tabela = tr && tr.closest('table,[role=grid],[role=table]');
+    if (celula && tr && tabela) {
+      const cells = Array.from(tr.children);
+      const i = cells.indexOf(celula);
+      const topo = tabela.querySelector('thead tr') || tabela.querySelector('tr,[role=row]');
+      if (topo && topo !== tr && i >= 0 && topo.children[i]) {
+        const cab = clean(topo.children[i].innerText).slice(0, 80);
+        if (cab) out.coluna = cab;
+      }
+      if (!out.linha) {
+        const rotulo = cells.find((c) => c !== celula && !c.querySelector('input,[role=radio]') && clean(c.innerText));
+        if (rotulo) out.linha = clean(rotulo.innerText).slice(0, 200);
+      }
+      const cap = tabela.querySelector('caption');
+      if (cap && clean(cap.innerText)) out.pergunta = clean(cap.innerText).slice(0, 300);
+      else if (nomeAria(tabela)) out.pergunta = nomeAria(tabela);
+    }
+    if (!out.pergunta) {
+      const legenda = ctl.closest('fieldset') && ctl.closest('fieldset').querySelector('legend');
+      if (legenda && clean(legenda.innerText)) out.pergunta = clean(legenda.innerText).slice(0, 300);
+    }
+    if (!out.pergunta) {
+      // Google Forms (e outros): a pergunta é um item de lista com um título.
+      const item = ctl.closest('[role=listitem]');
+      const titulo = item && item.querySelector('[role=heading]');
+      if (titulo && clean(titulo.innerText)) out.pergunta = clean(titulo.innerText).slice(0, 300);
+    }
+    return out;
   };
   NEO.el = (ref) => {
     const el = NEO.refs[ref];
@@ -1035,6 +1221,32 @@ const JS_HELPERS: &str = r#"
       if (el.click) el.click(); else el.dispatchEvent(new Mouse('click', { ...opts, detail: 1 }));
     }
   };
+  // O estado de seleção do controle clicado: true/false, ou undefined se não é
+  // controle marcável.
+  NEO.estadoMarcado = (c) => {
+    const ctl = NEO.controleDe(c.el) || NEO.controleDe(c.alvo) ||
+      (c.el.querySelector ? c.el.querySelector('input[type=radio],input[type=checkbox]') : null);
+    const tipo = ctl && ctl.getAttribute('type');
+    if (tipo === 'radio' || tipo === 'checkbox') return !!ctl.checked;
+    const aria = c.el.getAttribute('aria-checked') || c.el.getAttribute('aria-selected');
+    if (aria === 'true' || aria === 'false') return aria === 'true';
+    return undefined;
+  };
+  // O fim do clique, esperando a página ASSENTAR o estado. O Google Forms vira o
+  // `aria-checked` da grade pelo JS dele, um instante depois do clique: lido na
+  // hora, saía "NÃO ficou selecionado" para célula que tinha ficado (sessão
+  // 74408e70, ~15 vezes num job), e o agente gastava passo re-clicando e
+  // pedindo `look`. Só relê quando o primeiro veredito é "não".
+  NEO.fimDoCliqueAssentado = async (c, via) => {
+    const out = NEO.fimDoClique(c, via);
+    if (out.checked !== false || out.saiu) return out;
+    for (const ms of [120, 300]) {
+      await new Promise((ok) => setTimeout(ok, ms));
+      if (!c.el.isConnected) { out.saiu = true; delete out.checked; return out; }
+      if (NEO.estadoMarcado(c) === true) { out.checked = true; out.assentou_ms = ms; return out; }
+    }
+    return out;
+  };
   NEO.fimDoClique = (c, via) => {
     const recebeu = c.recebeu;
     NEO.soltar(c);
@@ -1059,14 +1271,8 @@ const JS_HELPERS: &str = r#"
     if (!c.el.isConnected) {
       out.saiu = true;
     } else {
-      const ctl = NEO.controleDe(c.el) || NEO.controleDe(c.alvo) ||
-        (c.el.querySelector ? c.el.querySelector('input[type=radio],input[type=checkbox]') : null);
-      const tipo = ctl && ctl.getAttribute('type');
-      if (tipo === 'radio' || tipo === 'checkbox') out.checked = !!ctl.checked;
-      else {
-        const aria = c.el.getAttribute('aria-checked') || c.el.getAttribute('aria-selected');
-        if (aria === 'true' || aria === 'false') out.checked = aria === 'true';
-      }
+      const estado = NEO.estadoMarcado(c);
+      if (estado !== undefined) out.checked = estado;
     }
     // O número, quando existe: o modelo volta a poder usar `click`/`extract` nele.
     if (NEO.refs) {
@@ -1943,6 +2149,10 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
       if (href.length > 2000) item.href_cortado = true;
     }}
     if (el.tagName === 'IMG') item.src = NEO.srcDe(el).slice(0, 300);
+    // Aninhado: `grupo` solto já quer dizer "caixa com N itens" (o driver não
+    // deixa clicar nela), e um rádio de grade não pode virar caixa.
+    const grade = NEO.grade(el);
+    if (grade) item.grade = grade;
     elements.push(item);
   }}
   // Texto da PÁGINA INTEIRA, sempre. Tentei recortar isto para "a área da
@@ -2444,20 +2654,20 @@ fn js_find(texto: &str, limite: usize) -> String {
 /// O evento chegou na página? Não recebe os helpers de propósito: depois de uma
 /// navegação `window.__neo` não existe mais, e é assim que se sabe que o clique
 /// foi tão bem-sucedido que levou a página embora.
-const JS_CLIQUE_CONFIRMA: &str = r#"(() => {
+const JS_CLIQUE_CONFIRMA: &str = r#"(async () => {
   const NEO = window.__neo;
   const c = NEO && NEO.clique;
   if (!c) return { ok: true, entregue: null };
   if (!c.recebeu) return { ok: true, entregue: false };
-  return { ...NEO.fimDoClique(c, 'pixel'), entregue: true };
+  return { ...(await NEO.fimDoCliqueAssentado(c, 'pixel')), entregue: true };
 })()"#;
 
-const JS_CLIQUE_DESPACHA: &str = r#"(() => {
+const JS_CLIQUE_DESPACHA: &str = r#"(async () => {
   const NEO = window.__neo;
   const c = NEO && NEO.clique;
   if (!c) return { ok: false, error: 'stale' };
   NEO.despachar(c);
-  return NEO.fimDoClique(c, 'js');
+  return await NEO.fimDoCliqueAssentado(c, 'js');
 })()"#;
 
 /// O mouse de verdade, pelo CDP. O navegador faz o teste de acerto, o site recebe
@@ -3099,7 +3309,19 @@ fn js_fill(reference: i64, value: &str) -> String {
   const el = NEO.controleDe(rosto) || rosto;
   const value = {value};
   rosto.scrollIntoView({{ block: 'nearest' }});
-  el.focus();
+  // Campo de LOGIN (e-mail, usuário, senha) não recebe foco. O gerenciador de
+  // senhas do navegador abre o menu dele num iframe `chrome-extension://` quando
+  // o campo é focado — e o Chrome solta o debugger de aba com página de outra
+  // extensão, e recusa religar ("Cannot access a chrome-extension:// URL of
+  // different extension"). Foi o "Debugger unattached" do cadastro do AppDemo, 5 de
+  // 5 vezes logo depois de digitar o e-mail. O valor entra igual pelo setter
+  // nativo + `input`/`change`, que é o que React e Vue escutam.
+  const credencial = el.tagName === 'INPUT' && (
+    /^(email|password)$/i.test(el.type || '') ||
+    /(user|email|password)/i.test(el.getAttribute('autocomplete') || '') ||
+    /(e-?mail|senha|password|passwd|login|usu[aá]rio|username)/i.test((el.name || '') + ' ' + (el.id || ''))
+  );
+  if (!credencial) el.focus();
   if (el.isContentEditable) {{
     el.textContent = value;
     NEO.fire(el, 'input');
@@ -3455,17 +3677,62 @@ fn js_banner(text: &str, active: bool, stopped: bool, kind: &str, detail: &str) 
 /// conteúdo é que é `closed`), o mundo principal consegue apagá-lo pelo id —
 /// síncrono, sem round-trip de mensagem e sem reflow (`visibility`, não
 /// `display`).
+///
+/// `opacity` e não `visibility`: esconder com `visibility:hidden` um campo
+/// FOCADO tira o foco dele (o navegador corrige o foco de quem deixa de ser
+/// focável), e a cada print o Daniel perdia o cursor no meio da frase que
+/// escrevia no painel. Com opacidade zero o painel some da foto igual e o foco
+/// fica onde estava.
 const JS_PAINEL_OCULTAR: &str = r#"(() => {
   const h = document.getElementById('neo-browser-local-overlay');
-  if (h) h.style.visibility = 'hidden';
+  if (h) h.style.opacity = '0';
   return { ok: true };
 })()"#;
 
 const JS_PAINEL_MOSTRAR: &str = r#"(() => {
   const h = document.getElementById('neo-browser-local-overlay');
-  if (h) h.style.visibility = '';
+  if (h) h.style.opacity = '';
   return { ok: true };
 })()"#;
+
+/// O Daniel está ESCREVENDO no painel da aba? O content script carimba
+/// `data-neo-digitando` (epoch ms da página) a cada tecla e, com o campo
+/// focado e rascunho, a cada segundo (até 30 s parado). Agir agora roubaria o
+/// foco do campo dele — e uma tecla do agente cairia no rascunho.
+const DIGITANDO_FRESCO_MS: f64 = 2500.0;
+/// Quanto UMA ação espera aqui. O passo tem 15 s de prazo do lado do core;
+/// passou disto, devolve `DIGITANDO:` e quem espera mais é o core.
+const DIGITANDO_ESPERA: Duration = Duration::from_secs(8);
+
+const JS_IDADE_DIGITANDO: &str = r#"(() => {
+  const t = Number(document.documentElement.getAttribute('data-neo-digitando') || 0);
+  return t ? Date.now() - t : 1e12;
+})()"#;
+
+/// Carimbo de "o agente vai agir agora": o painel tira o foco do campo do
+/// Daniel (sem apagar o rascunho), e tecla que chegar logo depois não é dele.
+const JS_AGINDO: &str =
+    "document.documentElement.setAttribute('data-neo-agindo', String(Date.now()))";
+
+async fn esperar_quem_digita(id: i64) -> Result<(), String> {
+    if is_headless(id) {
+        return Ok(());
+    }
+    let inicio = Instant::now();
+    loop {
+        let fresco = matches!(
+            eval(id, JS_IDADE_DIGITANDO).await,
+            Ok(Value::Number(ref n)) if n.as_f64().map(|v| v < DIGITANDO_FRESCO_MS).unwrap_or(false)
+        );
+        if !fresco {
+            return Ok(());
+        }
+        if inicio.elapsed() >= DIGITANDO_ESPERA {
+            return Err("DIGITANDO: o Daniel está escrevendo no painel da aba".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
 
 // ─── vocabulário ────────────────────────────────────────────────────────────
 
@@ -3502,8 +3769,17 @@ pub fn available() -> bool {
 
 /// Executa uma ação `browser.*` do canal de controle.
 pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
-    if ATUA.contains(&action) && parado(tab_id(args)?).await {
-        return Err("PARE: o usuário mandou parar".to_string());
+    if ATUA.contains(&action) {
+        let id = tab_id(args)?;
+        if parado(id).await {
+            return Err("PARE: o usuário mandou parar".to_string());
+        }
+        // Ele está escrevendo no painel: espera ele terminar antes de mexer na
+        // página (neo-core/docs/browser-conversa-plan.md §9.3).
+        esperar_quem_digita(id).await?;
+        if !is_headless(id) {
+            let _ = eval(id, JS_AGINDO).await;
+        }
     }
     match action {
         // ── saúde / abas ──
@@ -3628,7 +3904,29 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                     object.insert("stop".to_string(), Value::Bool(true));
                 }
             }
+            // O que o Daniel escreveu no painel desde o último passo. Headless não
+            // tem painel: não mexe na fila (ela é de uma aba que ele vê).
+            if !is_headless(id) {
+                let fila = tomar_mensagens();
+                if !fila.is_empty() {
+                    if let Some(object) = snapshot.as_object_mut() {
+                        object.insert("mensagens".to_string(), Value::Array(fila));
+                    }
+                }
+            }
             Ok(snapshot)
+        }
+
+        // A espera de uma pergunta (`perguntar` no core): não há snapshot, então o
+        // core pergunta aqui o que chegou do painel. O `eval` do PARE é também o
+        // que bombeia as notificações paradas no socket.
+        "browser.inbox" => {
+            let id = tab_id(args)?;
+            if is_headless(id) {
+                return Ok(json!({ "mensagens": [], "parado": false }));
+            }
+            let parado = parado(id).await;
+            Ok(json!({ "mensagens": tomar_mensagens(), "parado": parado }))
         }
 
         "browser.extract" => {
@@ -3734,6 +4032,31 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("passo");
             let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
             let _ = eval(id, &js_banner(text, active, false, kind, detail)).await?;
+            // A PERGUNTA vai também pelo canal privilegiado da extensão: o
+            // `postMessage` acima a própria página consegue imitar, e uma pergunta
+            // falsa com botão "Sim" ao lado da verdadeira ("posso excluir a
+            // conta?") seria uma autorização forjada. Só o que vem por aqui ganha
+            // botões e a caixa "respondendo a…". Extensão antiga: segue sem.
+            if kind == "pergunta" {
+                let opcoes: Vec<&str> = detail
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let aberta = call(
+                    "neoPergunta",
+                    json!({ "tabId": id, "texto": text, "opcoes": opcoes }),
+                )
+                .await
+                .is_ok();
+                if aberta {
+                    if let Ok(mut abertas) = perguntas().lock() {
+                        abertas.insert(id);
+                    }
+                }
+            } else if perguntas().lock().map(|mut a| a.remove(&id)).unwrap_or(false) {
+                let _ = call("neoPergunta", json!({ "tabId": id, "texto": "" })).await;
+            }
             Ok(json!({ "ok": true }))
         }
         "browser.screenshot" => {
@@ -4167,6 +4490,70 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A fila do painel (neo-core/docs/browser-conversa-plan.md §4.3): guarda só
+    /// texto, corta no teto, passa a opção do botão e esvazia quando o core lê.
+    /// Um teste só, porque a fila é global e os testes rodam em paralelo.
+    #[test]
+    fn fila_do_painel_guarda_corta_e_esvazia() {
+        let _ = tomar_mensagens();
+        guardar_mensagem(&json!({ "tabId": 7, "texto": "   " }));
+        guardar_mensagem(&json!({ "tabId": 7, "texto": " avalie pelos critérios " }));
+        guardar_mensagem(&json!({ "tabId": 7, "texto": "Pode enviar", "opcao": 0 }));
+        guardar_mensagem(&json!({ "tabId": 7, "texto": "x".repeat(5000) }));
+        let lidas = tomar_mensagens();
+        assert_eq!(lidas.len(), 3, "texto vazio não entra: {lidas:?}");
+        assert_eq!(lidas[0]["texto"], "avalie pelos critérios");
+        assert_eq!(lidas[0]["tab"], 7);
+        assert!(lidas[0].get("opcao").is_none());
+        assert_eq!(lidas[1]["opcao"], 0);
+        assert_eq!(lidas[2]["texto"].as_str().unwrap().chars().count(), MENSAGEM_CHARS);
+        assert!(tomar_mensagens().is_empty(), "lida uma vez, some");
+
+        for i in 0..(MENSAGENS_MAX + 5) {
+            guardar_mensagem(&json!({ "texto": format!("m{i}") }));
+        }
+        let lidas = tomar_mensagens();
+        assert_eq!(lidas.len(), MENSAGENS_MAX);
+        assert_eq!(lidas[0]["texto"], "m5", "o teto descarta as mais antigas");
+    }
+
+    /// O `fill` não foca campo de login: o gerenciador de senhas abriria o menu
+    /// dele (iframe de outra extensão) e o navegador soltaria a aba. O JS gerado
+    /// também precisa ser JS válido — confere com o node quando ele existe.
+    #[test]
+    fn fill_nao_foca_campo_de_login_e_gera_js_valido() {
+        let js = js_fill(8, "teste@exemplo.com");
+        assert!(js.contains("const credencial"), "{js}");
+        assert!(js.contains("if (!credencial) el.focus();"));
+        let caminho = std::env::temp_dir().join(format!("neo-fill-{}.js", std::process::id()));
+        std::fs::write(&caminho, &js).unwrap();
+        if let Ok(saida) = std::process::Command::new("node").arg("--check").arg(&caminho).output() {
+            assert!(
+                saida.status.success(),
+                "js_fill não é JS válido: {}",
+                String::from_utf8_lossy(&saida.stderr)
+            );
+        }
+        std::fs::remove_file(&caminho).ok();
+    }
+
+    #[test]
+    fn debugger_solto_diz_o_motivo_quando_sabe() {
+        anotar_desligamento(9101, "target_closed");
+        assert_eq!(
+            com_motivo_do_desligamento(9101, "Debugger unattached".to_string()),
+            "Debugger unattached (a aba foi fechada)"
+        );
+        anotar_desligamento(9102, "canceled_by_user");
+        assert!(com_motivo_do_desligamento(9102, "Debugger unattached".to_string())
+            .contains("cancelou"));
+        assert_eq!(
+            com_motivo_do_desligamento(9103, "Debugger unattached".to_string()),
+            "Debugger unattached"
+        );
+        assert_eq!(com_motivo_do_desligamento(9101, "outro erro".to_string()), "outro erro");
+    }
+
     #[test]
     fn base64_ida_e_volta() {
         for original in [&b""[..], b"a", b"ab", b"abc", b"\x00\xff\x10dados"] {
@@ -4562,6 +4949,125 @@ mod tests_headless {
     /// O caminho inteiro em Rust: mira, mouse real pelo CDP, sonda. A conta tem de
     /// subir de 1 em 1: 0 é o clique morto do job 8bc25dd1, 2 é a reserva
     /// disparando em cima do mouse real (item em dobro no carrinho).
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn radio_que_assenta_depois_do_clique_conta_como_selecionado() {
+        // O rádio da grade do Google Forms: div role=radio que só vira
+        // aria-checked=true pelo JS da página, um instante depois do clique. Lido
+        // na hora dava "NÃO ficou selecionado" (sessão 74408e70).
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+        let pagina = "data:text/html;charset=utf-8,<div role=radiogroup aria-label=Clareza>\
+            <div id=r role=radio aria-checked=false aria-label='Conforme, resposta para Clareza' \
+            style='width:40px;height:40px;background:%23ccc' \
+            onclick=\"setTimeout(()=>this.setAttribute('aria-checked','true'),80)\"></div></div>";
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": pagina }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+        let snap = execute("browser.snapshot", &json!({ "tab_ref": tab })).await.expect("snapshot");
+        let radio = snap["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .find(|e| e["text"] == "Conforme, resposta para Clareza")
+            .unwrap_or_else(|| panic!("o rádio não entrou no inventário: {snap}"))
+            .clone();
+        let r = execute("browser.click", &json!({ "tab_ref": tab, "ref": radio["ref"] }))
+            .await
+            .expect("click");
+        assert_eq!(r["checked"], true, "o estado assentou depois do clique: {r}");
+        assert!(r["assentou_ms"].as_u64().is_some(), "{r}");
+        super::super::headless::shutdown().await;
+    }
+
+    /// A estrutura de grade vai em cada rádio, em qualquer site (core/browser_local/grade.py).
+    #[tokio::test]
+    #[ignore = "sobe um Chromium de verdade"]
+    async fn o_radio_de_grade_traz_grupo_linha_coluna_e_pergunta() {
+        if super::super::headless::available() == false {
+            eprintln!("sem navegador nesta máquina — pulando");
+            return;
+        }
+        super::super::headless::shutdown().await;
+        let radio = |rotulo: &str, extra: &str| {
+            format!("<div role=radio aria-checked={extra} aria-label='{rotulo}' style='display:inline-block;width:20px;height:20px;background:#ccc;margin:2px'></div>")
+        };
+        let mut html = String::from("<div role=list>");
+        // 1. grade ARIA como a do Google, em inglês
+        html += "<div role=listitem><div role=heading>RF-01: O sistema deve permitir sair. *</div>";
+        for linha in ["Clareza", "Completude"] {
+            html += &format!("<div role=radiogroup aria-label={linha}>");
+            for coluna in ["Conforme", "Parcialmente"] {
+                let marcado = if linha == "Completude" && coluna == "Parcialmente" { "true" } else { "false" };
+                html += &radio(&format!("{coluna}, response for {linha}"), marcado);
+            }
+            html += "</div>";
+        }
+        html += "</div>";
+        // 2. escolha simples ARIA: o grupo é a própria pergunta
+        html += "<div role=listitem><div role=heading id=t2>Qual a sua escolaridade? *</div>\
+                 <div role=radiogroup aria-labelledby=t2>";
+        html += &radio("Superior", "false");
+        html += &radio("Mestrado", "false");
+        html += "</div></div></div>";
+        // 3. matriz em tabela de rádios comuns
+        html += "<table><caption>RF-02: O sistema deve exibir o perfil.</caption>\
+                 <thead><tr><th></th><th>Conforme</th><th>Parcialmente</th></tr></thead><tbody>";
+        for (i, linha) in ["Clareza", "Completude"].iter().enumerate() {
+            html += &format!("<tr><td>{linha}</td><td><input type=radio name=rf02_{i} value=1></td>\
+                              <td><input type=radio name=rf02_{i} value=2{}></td></tr>",
+                             if i == 0 { " checked" } else { "" });
+        }
+        html += "</tbody></table>";
+        // 4. escolha simples em fieldset
+        html += "<fieldset><legend>Cor favorita</legend><label><input type=radio name=cor> Azul</label>\
+                 <label><input type=radio name=cor> Verde</label></fieldset>";
+        let pagina = format!(
+            "data:text/html;charset=utf-8,{}",
+            html.replace('%', "%25").replace('#', "%23")
+        );
+        let claim = execute("browser.claim", &json!({ "mode": "headless", "url": pagina }))
+            .await
+            .expect("claim headless");
+        let tab = claim["tab_ref"].as_i64().expect("tab_ref");
+        let snap = execute("browser.snapshot", &json!({ "tab_ref": tab })).await.expect("snapshot");
+        if let Ok(caminho) = std::env::var("NEO_GRADE_SNAPSHOT_OUT") {
+            std::fs::write(caminho, snap.to_string()).expect("gravar o snapshot");
+        }
+        let els = snap["elements"].as_array().expect("elements").clone();
+        let ache = |texto: &str| {
+            els.iter()
+                .find(|e| e["text"] == texto)
+                .unwrap_or_else(|| panic!("«{texto}» não entrou no inventário: {snap}"))
+                .clone()
+        };
+        let a = ache("Conforme, response for Clareza");
+        assert_eq!(a["grade"]["linha"], "Clareza", "{a}");
+        assert_eq!(a["grade"]["pergunta"], "RF-01: O sistema deve permitir sair. *", "{a}");
+        assert!(a["grade"]["grupo"].as_str().unwrap_or("").starts_with('g'), "{a}");
+        let b = ache("Parcialmente, response for Completude");
+        assert_ne!(a["grade"]["grupo"], b["grade"]["grupo"], "cada linha é um grupo");
+        assert_eq!(b["checked"], true, "{b}");
+        assert!(a.get("grupo").is_none(), "rádio de grade não é caixa: {a}");
+        let s = ache("Superior");
+        assert_eq!(s["grade"]["linha"], s["grade"]["pergunta"], "escolha simples: o grupo é a pergunta — {s}");
+        let nativos: Vec<_> = els.iter().filter(|e| e["grade"]["grupo"] == "n:rf02_0").cloned().collect();
+        assert_eq!(nativos.len(), 2, "{snap}");
+        assert_eq!(nativos[0]["grade"]["linha"], "Clareza", "{}", nativos[0]);
+        assert_eq!(nativos[0]["grade"]["coluna"], "Conforme", "{}", nativos[0]);
+        assert_eq!(nativos[1]["grade"]["coluna"], "Parcialmente", "{}", nativos[1]);
+        assert_eq!(nativos[1]["checked"], true, "{}", nativos[1]);
+        assert_eq!(nativos[0]["grade"]["pergunta"], "RF-02: O sistema deve exibir o perfil.", "{}", nativos[0]);
+        let cor: Vec<_> = els.iter().filter(|e| e["grade"]["grupo"] == "n:cor").cloned().collect();
+        assert!(!cor.is_empty(), "{snap}");
+        assert!(cor.iter().all(|e| e["grade"]["pergunta"] == "Cor favorita" && e["grade"].get("linha").is_none()), "{cor:?}");
+        super::super::headless::shutdown().await;
+    }
+
     #[tokio::test]
     #[ignore = "sobe um Chromium de verdade"]
     async fn o_clique_chega_no_controle_transparente_uma_vez_so() {

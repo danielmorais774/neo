@@ -1,10 +1,14 @@
 pub mod ai_agent;
 pub mod audio_route;
 pub mod browser_local;
+pub mod claude_cli;
+pub mod claude_sessoes;
 pub mod command_policy;
 pub mod device_control;
 pub mod file_ops;
 pub mod headless;
+pub mod local_jobs;
 pub mod shell;
 pub mod system_info;
+pub mod trabalho;
 pub mod wake;

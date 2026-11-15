@@ -3,8 +3,8 @@
 use crate::grpc_gen::neo_desktop::neo_desktop_service_client::NeoDesktopServiceClient;
 use crate::ext_bridge::ExtBridge;
 use crate::grpc_gen::neo_desktop::{
-    core_message, desktop_message, CommandApproval, CoreMessage, DesktopMessage, ToolResult,
-    UserInput, VoiceSettings,
+    core_message, desktop_message, CommandApproval, CoreMessage, DesktopMessage, JobRef,
+    ToolResult, UserInput, VoiceSettings,
 };
 use crate::services::command_policy;
 use log::{error, info, warn};
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -28,6 +29,18 @@ const STREAM_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_s
 
 /// Last-resort cap for one run, progressing or not.
 const STREAM_MAX_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(60 * 60);
+
+/// Teto de um ToolResult na volta ao neo-core (`result` + `error`).
+///
+/// O servidor recusa mensagem maior que o limite dele e derruba o stream INTEIRO
+/// (`ResourceExhausted`): o turno morre e o Neo nunca sabe o que aconteceu (sessão
+/// 1bbdd7c5, a saída de um `zip -r`). Aqui é a última porta antes da rede, então vale
+/// para toda tool: texto de comando é encurtado; JSON (arquivo, mídia) não pode ser
+/// cortado no meio, e vira falha explicada.
+const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+
+/// O que o cliente aceita receber do neo-core (o padrão do tonic é 4 MiB).
+const MAX_DECODING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Shared handle to the active bidi stream's input sender. Lets UI-driven actions
 /// (command approval/rejection via `respond_to_command`) inject a message into the
@@ -133,7 +146,8 @@ impl GrpcClient {
             .connect()
             .await
             .map_err(|e| format!("Failed to connect: {}", e))?;
-        let mut client = NeoDesktopServiceClient::new(channel);
+        let mut client =
+            NeoDesktopServiceClient::new(channel).max_decoding_message_size(MAX_DECODING_BYTES);
 
         // `tx` fica vivo no escopo do chamador até ser explicitamente dropado no
         // fim do loop — é isso que fecha o nosso lado do stream.
@@ -160,7 +174,11 @@ impl GrpcClient {
         // mensagem: o `metadata` do user_input alimenta o contexto do prompt
         // (`_build_current_device_context` no core), e credencial não pode
         // chegar perto disso.
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        // Todo ToolResult passa por `bound_tool_result` antes da rede: é o único ponto
+        // por onde as ~10 tools deste cliente devolvem resultado.
+        let mut request = tonic::Request::new(
+            ReceiverStream::new(rx).map(bound_tool_result as fn(DesktopMessage) -> DesktopMessage),
+        );
         if let Some(token) = crate::device_token() {
             match token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>() {
                 Ok(value) => {
@@ -356,6 +374,8 @@ impl GrpcClient {
         // Arquivos gerados/catalogados na resposta final (ex: um .zip via file_save) —
         // {id, name, sizeBytes}, mesma forma que o neo-panel usa (AttachmentRef).
         let mut last_files_json: Option<serde_json::Value> = None;
+        // Tarefas que a resposta abriu (claude_task): o botão do processo no balão.
+        let mut last_jobs_json: Option<serde_json::Value> = None;
         let mut active_session_id = self.session_id.clone();
 
         loop {
@@ -838,6 +858,9 @@ impl GrpcClient {
                                                 .collect(),
                                         ));
                                     }
+                                    if !r.jobs.is_empty() {
+                                        last_jobs_json = Some(jobs_json(&r.jobs));
+                                    }
                                     if !r.files.is_empty() {
                                         last_files_json = Some(serde_json::Value::Array(
                                             r.files
@@ -921,6 +944,7 @@ impl GrpcClient {
                     "voice": last_voice_json,
                     "segments": last_segments_json,
                     "files": last_files_json,
+                    "jobs": last_jobs_json,
                 }),
                 timestamp: chrono::Utc::now().to_rfc3339(),
             };
@@ -1012,6 +1036,7 @@ impl GrpcClient {
                             "isFinal": true,
                             "totalIterations": r.total_iterations,
                             "files": files,
+                            "jobs": jobs_json(&r.jobs),
                         }),
                         timestamp,
                     }
@@ -1026,6 +1051,7 @@ impl GrpcClient {
                             "sessionId": msg.session_id,
                             "content": r.message,
                             "files": files,
+                            "jobs": jobs_json(&r.jobs),
                         }),
                         timestamp,
                     }
@@ -1081,6 +1107,16 @@ impl GrpcClient {
 
 /// Tools opened directly via the OS handler (default browser/app). `media_command`
 /// is NOT here — it goes through the extension bridge (`run_media_command`).
+/// `JobRef` do proto → `[{id, kind}]`, a forma que `Message.jobs` tem no
+/// TypeScript e no histórico (`/desktop/session/{id}/history`).
+fn jobs_json(jobs: &[JobRef]) -> serde_json::Value {
+    serde_json::Value::Array(
+        jobs.iter()
+            .map(|j| serde_json::json!({ "id": j.id, "kind": j.kind }))
+            .collect(),
+    )
+}
+
 fn is_media_tool(name: &str) -> bool {
     matches!(name, "open_url" | "launch_uri")
 }
@@ -1189,6 +1225,12 @@ fn user_dir(resolved: Option<std::path::PathBuf>, home: &str, fallback: &str) ->
 /// the user via the CommandRequest flow) or from a `run_command` plan step. Returns
 /// ``(success, result, error)`` for the ToolResult sent back to neo-core. Blocking —
 /// call inside `spawn_blocking`.
+///
+/// Comando que passa de `background_after_s` ainda trabalhando vira tarefa em segundo
+/// plano (services/local_jobs.rs): volta `success=true` com o JSON
+/// `{"neo_tarefa_local": …}` no `result`, e o neo-core passa a acompanhá-la. Os
+/// números vêm do neo-core (`config/neo.toml`); app antigo ou core antigo usam os
+/// padrões daqui.
 fn run_command_blocking(arguments: &str) -> (bool, String, String) {
     let args: serde_json::Value =
         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
@@ -1198,19 +1240,93 @@ fn run_command_blocking(arguments: &str) -> (bool, String, String) {
     }
     // Os passos de plano carregam `working_dir`; o fluxo aprovado não manda nenhum.
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
-
+    let limits = command_limits(&args);
     // Shell da plataforma (ver services::shell): era `/bin/bash` fixo, que no Windows
     // não existe e derrubava o comando antes de rodar.
-    // O schema do run_command sempre anunciou `timeout` e o executor ignorava.
-    let timeout = args
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(crate::services::shell::DEFAULT_TIMEOUT);
-    match crate::services::shell::run_with(command, working_dir, timeout) {
-        Ok(output) => crate::services::shell::split_output(output),
+    match crate::services::shell::run_limited(command, working_dir, limits) {
+        Ok(crate::services::shell::Ran::Done(output)) => {
+            crate::services::shell::split_output(output)
+        }
+        Ok(crate::services::shell::Ran::Background(tarefa)) => (true, tarefa.marker(), String::new()),
         Err(e) => (false, String::new(), e),
     }
+}
+
+/// Prazos de um comando a partir dos argumentos da tool.
+///
+/// - `timeout` (do modelo, no schema do `run_command`) continua sendo o limite TOTAL
+///   que ele pediu; menor que o orçamento de primeiro plano, o comando nunca vira
+///   tarefa e morre nele, como sempre.
+/// - `background_after_s` / `max_runtime_s` vêm do neo-core; `0` desliga a adoção.
+fn command_limits(args: &serde_json::Value) -> crate::services::shell::Limits {
+    use crate::services::local_jobs::{DEFAULT_BACKGROUND_AFTER, DEFAULT_MAX_RUNTIME, MAX_RUNTIME};
+    use crate::services::shell::{Limits, DEFAULT_TIMEOUT};
+    use std::time::Duration;
+    let secs = |k: &str| args.get(k).and_then(|v| v.as_u64());
+    let explicit_timeout = secs("timeout").filter(|t| *t > 0).map(Duration::from_secs);
+    let background_after = match secs("background_after_s") {
+        Some(0) => None,
+        Some(n) => Some(Duration::from_secs(n)),
+        None => Some(DEFAULT_BACKGROUND_AFTER),
+    };
+    let max_runtime = explicit_timeout
+        .or_else(|| secs("max_runtime_s").filter(|t| *t > 0).map(Duration::from_secs))
+        .unwrap_or(DEFAULT_MAX_RUNTIME)
+        .min(MAX_RUNTIME);
+    Limits {
+        timeout: explicit_timeout.unwrap_or(DEFAULT_TIMEOUT),
+        background_after,
+        max_runtime,
+    }
+}
+
+/// Aplica [`MAX_TOOL_RESULT_BYTES`] a um ToolResult; o resto passa intacto.
+fn bound_tool_result(mut msg: DesktopMessage) -> DesktopMessage {
+    if let Some(desktop_message::Content::ToolResult(tr)) = msg.content.as_mut() {
+        let total = tr.result.len() + tr.error.len();
+        if total > MAX_TOOL_RESULT_BYTES {
+            warn!(
+                "[GrpcClient] resultado de {} com {} bytes passou do teto de {} — encurtado",
+                tr.tool_name, total, MAX_TOOL_RESULT_BYTES
+            );
+            if tr.tool_name == "execute_command" || tr.tool_name == "run_command" {
+                tr.result = shrink_text(&tr.result, MAX_TOOL_RESULT_BYTES / 2);
+                tr.error = shrink_text(&tr.error, MAX_TOOL_RESULT_BYTES / 2);
+            } else {
+                tr.success = false;
+                tr.result = String::new();
+                tr.error = format!(
+                    "o resultado de `{}` tinha {}, acima do teto de {} para voltar ao Neo, \
+                     e não foi enviado",
+                    tr.tool_name,
+                    crate::services::shell::human_bytes(total as u64),
+                    crate::services::shell::human_bytes(MAX_TOOL_RESULT_BYTES as u64),
+                );
+            }
+        }
+    }
+    msg
+}
+
+/// Começo + aviso + fim, cortando só em fronteira de caractere.
+fn shrink_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut a = max / 4;
+    while a > 0 && !s.is_char_boundary(a) {
+        a -= 1;
+    }
+    let mut b = s.len() - (max - max / 4).saturating_sub(96);
+    while b < s.len() && !s.is_char_boundary(b) {
+        b += 1;
+    }
+    format!(
+        "{}\n[neo] … {} omitidos …\n{}",
+        &s[..a],
+        crate::services::shell::human_bytes((b - a) as u64),
+        &s[b..]
+    )
 }
 
 /// Open a URL or app URI with the OS default handler (non-blocking).
@@ -1308,6 +1424,84 @@ fn stream_deadline(
 mod stream_deadline_tests {
     use super::*;
     use tokio::time::{Duration, Instant};
+
+    fn tool_result(tool: &str, result: String) -> DesktopMessage {
+        DesktopMessage {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            content: Some(desktop_message::Content::ToolResult(ToolResult {
+                tool_call_id: "t".into(),
+                tool_name: tool.into(),
+                success: true,
+                result,
+                error: String::new(),
+            })),
+        }
+    }
+
+    fn unwrap_result(msg: DesktopMessage) -> ToolResult {
+        match msg.content {
+            Some(desktop_message::Content::ToolResult(tr)) => tr,
+            _ => panic!("não é ToolResult"),
+        }
+    }
+
+    /// Sessão 1bbdd7c5: 4194528 bytes contra o limite de 4194304 derrubaram o turno.
+    #[test]
+    fn resultado_de_comando_grande_e_encurtado_antes_da_rede() {
+        let grande = format!("comeco\n{}\nfim", "x".repeat(5 * 1024 * 1024));
+        let tr = unwrap_result(bound_tool_result(tool_result("execute_command", grande)));
+        assert!(tr.success);
+        assert!(tr.result.len() <= MAX_TOOL_RESULT_BYTES, "{}", tr.result.len());
+        assert!(tr.result.starts_with("comeco") && tr.result.ends_with("fim"));
+        assert!(tr.result.contains("omitidos"));
+    }
+
+    #[test]
+    fn json_grande_vira_falha_explicada_em_vez_de_cortado() {
+        let grande = format!("{{\"content\":\"{}\"}}", "é".repeat(700 * 1024));
+        let tr = unwrap_result(bound_tool_result(tool_result("read_user_file", grande)));
+        assert!(!tr.success);
+        assert!(tr.result.is_empty());
+        assert!(tr.error.contains("teto"), "{}", tr.error);
+    }
+
+    #[test]
+    fn resultado_pequeno_passa_intacto() {
+        let tr = unwrap_result(bound_tool_result(tool_result("run_command", "ok".into())));
+        assert_eq!(tr.result, "ok");
+    }
+
+    #[test]
+    fn shrink_respeita_fronteira_de_caractere() {
+        let s = "ação ".repeat(10_000);
+        let curto = shrink_text(&s, 1000);
+        assert!(curto.len() <= 1000 + 64, "{}", curto.len());
+        assert!(curto.contains("omitidos"));
+    }
+
+    #[test]
+    fn prazos_do_comando() {
+        use std::time::Duration;
+        let l = command_limits(&serde_json::json!({"command": "x"}));
+        assert_eq!(l.timeout, crate::services::shell::DEFAULT_TIMEOUT);
+        assert_eq!(l.background_after, Some(crate::services::local_jobs::DEFAULT_BACKGROUND_AFTER));
+        let l = command_limits(&serde_json::json!({
+            "command": "x", "background_after_s": 30, "max_runtime_s": 600
+        }));
+        assert_eq!(l.background_after, Some(Duration::from_secs(30)));
+        assert_eq!(l.max_runtime, Duration::from_secs(600));
+        // O `timeout` do modelo vira o teto total.
+        let l = command_limits(&serde_json::json!({"command": "x", "timeout": 900}));
+        assert_eq!(l.timeout, Duration::from_secs(900));
+        assert_eq!(l.max_runtime, Duration::from_secs(900));
+        // 0 desliga a adoção; teto acima do máximo é cortado.
+        let l = command_limits(&serde_json::json!({
+            "command": "x", "background_after_s": 0, "max_runtime_s": 999_999
+        }));
+        assert_eq!(l.background_after, None);
+        assert_eq!(l.max_runtime, crate::services::local_jobs::MAX_RUNTIME);
+    }
 
     #[test]
     fn idle_deadline_follows_the_last_message() {

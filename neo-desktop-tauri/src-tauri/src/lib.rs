@@ -327,8 +327,12 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default()
         .plugin(
+            // O padrão do plugin é UM arquivo de 40 KB: a falha do job 40852ae7
+            // (02:31) já tinha sido descartada às 13:10 do mesmo dia.
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
+                .max_file_size(5 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                 .build(),
         )
         .plugin(tauri_plugin_shell::init())
@@ -415,6 +419,7 @@ pub fn run() {
             commands::read_working_note,
             commands::open_working_memory_window,
             commands::open_jobs_window,
+            commands::open_claude_terminal,
             commands::list_jobs,
             commands::get_job,
             commands::get_job_logs,
@@ -620,6 +625,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app, event| {
+            // Nenhuma tarefa em segundo plano sobrevive ao app: sem o Neo aberto,
+            // ninguém acompanha nem para (services/local_jobs.rs).
+            if let RunEvent::Exit = event {
+                services::local_jobs::kill_all();
+            }
             #[cfg(target_os = "macos")]
             if let RunEvent::Exit = event {
                 notifications::shutdown();
