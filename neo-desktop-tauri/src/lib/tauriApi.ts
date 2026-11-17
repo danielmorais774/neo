@@ -208,6 +208,15 @@ export interface ChatImage {
   path?: string | null;
 }
 
+// Arquivo no disco do usuário citado por `[[FILE:…]]` (já baixado na máquina
+// dele). Ver src-tauri: stat_local_file.
+export interface LocalFileInfo {
+  name: string;
+  sizeBytes: number;
+  /** Caminho absoluto real (resolvido, sem `~`). */
+  path: string;
+}
+
 /** Turno que veio do microfone (STT do neo-voice), não do teclado.
  *  Vira `input_source`/`asr_raw`/`asr_engine` no metadata do gRPC — é o que faz o
  *  neo-core tolerar erro de transcrição (docs/voice-input-normalization-plan.md). */
@@ -248,6 +257,10 @@ export interface ElectronAPI {
   loadChatImage: (source: string) => Promise<ChatImage>;
   // Abre o arquivo no app padrão do sistema (ver a imagem em tamanho real).
   revealLocalFile: (path: string) => Promise<void>;
+  // `[[FILE:…]]`: confere que o arquivo existe (nome/tamanho) e o mostra na
+  // pasta dele (Finder/Explorer), sem abrir nem executar.
+  statLocalFile: (path: string) => Promise<LocalFileInfo>;
+  revealInFolder: (path: string) => Promise<void>;
   respondFileChange: (changeId: string, approved: boolean) => Promise<void>;
   undoFileChange: (changeId: string) => Promise<void>;
   stopExecution: () => void;
@@ -564,6 +577,10 @@ export const electronAPI: ElectronAPI = {
   loadChatImage: (source: string) => invoke<ChatImage>('load_chat_image', { source }),
 
   revealLocalFile: (path: string) => invoke<void>('reveal_local_file', { path }),
+
+  statLocalFile: (path: string) => invoke<LocalFileInfo>('stat_local_file', { path }),
+
+  revealInFolder: (path: string) => invoke<void>('reveal_in_folder', { path }),
 
   // Card de arquivo (services/file_ops.rs): aprovar/rejeitar fora das pastas
   // liberadas, e Desfazer uma alteração já gravada.

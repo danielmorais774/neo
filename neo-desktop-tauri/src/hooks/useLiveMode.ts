@@ -14,6 +14,7 @@ import { LiveVoiceSession } from '../lib/liveVoiceService';
 import type { SttFinalMeta } from '../lib/liveVoiceService';
 import { AgentService } from '../lib';
 import { stripInlineImageMarkers } from '../lib/inlineImages';
+import { stripLocalFileMarkers } from '../lib/localFiles';
 import type { VoiceOverride, SpeechSegmentOverride } from '../lib/tauriApi';
 
 export type LiveState = 'idle' | 'listening' | 'thinking' | 'speaking';
@@ -61,7 +62,8 @@ interface UseLiveModeResult {
 function cleanForSpeech(raw: string): string {
   // `[[IMAGE:/caminho…]]` é instrução de RENDER pra bolha do chat; falado viraria
   // o caminho do arquivo lido letra por letra.
-  return stripInlineImageMarkers(raw || '')
+  // `[[FILE:/caminho…]]` idem: o cartão é visual, o caminho não é falado.
+  return stripLocalFileMarkers(stripInlineImageMarkers(raw || ''))
     .replace(/\[MISSION:\{.*\}\]/gs, '')
     .replace(/```[\s\S]*?```/g, ' ') // blocos de código não são falados
     .replace(/[*_`#>]/g, '')

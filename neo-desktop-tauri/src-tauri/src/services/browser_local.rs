@@ -186,6 +186,36 @@ fn esquecer_janelas(tab: i64) {
     }
 }
 
+/// `Page.fileChooserOpened` por aba: a página tentou abrir a janela de
+/// arquivos e o navegador (com a interceptação ligada no claim) segurou. Guarda
+/// o `backendNodeId` do input — é por ele que o `upload` chega a um campo que
+/// só nasce no clique.
+static SELETORES: OnceLock<std::sync::Mutex<HashMap<i64, (i64, Instant)>>> = OnceLock::new();
+
+fn seletores() -> &'static std::sync::Mutex<HashMap<i64, (i64, Instant)>> {
+    SELETORES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Guarda um `Page.fileChooserOpened` da aba `tab` (negativo = headless).
+pub(crate) fn anotar_seletor(tab: i64, params: &Value) {
+    if let Some(node) = params.get("backendNodeId").and_then(|v| v.as_i64()) {
+        info!("[BrowserLocal] a aba {} pediu a janela de arquivos (segurada)", tab);
+        if let Ok(mut mapa) = seletores().lock() {
+            mapa.insert(tab, (node, Instant::now()));
+        }
+    }
+}
+
+/// O input do último pedido de janela de arquivos da aba, se veio depois de `desde`.
+fn seletor_desde(tab: i64, desde: Instant) -> Option<i64> {
+    seletores()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&tab).copied())
+        .filter(|(_, quando)| *quando >= desde)
+        .map(|(node, _)| node)
+}
+
 static CONN: OnceLock<Mutex<Option<Conn>>> = OnceLock::new();
 
 fn conn_slot() -> &'static Mutex<Option<Conn>> {
@@ -387,6 +417,11 @@ impl Conn {
                     }
                     Some("onCDPEvent") => {
                         let p = frame.get("params").cloned().unwrap_or(Value::Null);
+                        if p.get("method").and_then(|v| v.as_str()) == Some("Page.fileChooserOpened") {
+                            if let Some(tab) = p.pointer("/source/tabId").and_then(|v| v.as_i64()) {
+                                anotar_seletor(tab, p.get("params").unwrap_or(&Value::Null));
+                            }
+                        }
                         if p.get("method").and_then(|v| v.as_str()) == Some("Page.windowOpen") {
                             if let Some(tab) = p.pointer("/source/tabId").and_then(|v| v.as_i64()) {
                                 let ev = p.get("params").cloned().unwrap_or(Value::Null);
@@ -670,6 +705,57 @@ const JS_HELPERS: &str = r#"
     if (!el || !el.isConnected) return null;
     return el;
   };
+  // CAMPO DE ARQUIVO. Clicar nele (ou no label dele) abre a janela de arquivos
+  // do SISTEMA, que nenhuma ação alcança: a tarefa ficava presa ali. O caminho é
+  // o `browser.upload`, que põe o arquivo direto no input. Estes helpers acham o
+  // input a partir do que o modelo enxerga: o próprio campo, o label, o
+  // procurador (`NEO.controles`) ou a caixa que o embrulha.
+  NEO.ARQ = 'input[type=file]';
+  NEO.arquivoDe = (el) => {
+    if (!el || !el.matches) return null;
+    if (el.matches(NEO.ARQ)) return el;
+    const ctl = NEO.controles && NEO.controles.get(el);
+    if (ctl && ctl.matches && ctl.matches(NEO.ARQ)) return ctl;
+    if (el.tagName === 'LABEL' && el.control && el.control.matches(NEO.ARQ)) return el.control;
+    const dentro = el.querySelector && el.querySelector(NEO.ARQ);
+    return dentro || null;
+  };
+  // O único campo de arquivo das caixas em volta (até 4 níveis): o botão
+  // "Alterar foto" ao lado de um input escondido.
+  NEO.arquivoPerto = (el) => {
+    let p = el && el.parentElement;
+    for (let i = 0; p && i < 4; i++, p = p.parentElement) {
+      const todos = p.querySelectorAll(NEO.ARQ);
+      if (todos.length === 1) return todos[0];
+      if (todos.length > 1) return null;
+    }
+    return null;
+  };
+  // Botão que abre o campo por código (`input.click()` no handler): logo depois
+  // de um clique NOSSO, a janela não abre — o input fica guardado para o
+  // `upload`. Só nessa janela de tempo: o clique do Daniel na mesma página
+  // continua abrindo a janela normalmente.
+  if (!NEO.arquivoTravado) {
+    NEO.arquivoTravado = true;
+    const proto = HTMLInputElement.prototype;
+    const clicarOriginal = proto.click;
+    const seletorOriginal = proto.showPicker;
+    const segurar = (inp) => {
+      if (inp.type !== 'file' || !(Date.now() < (NEO.travaArquivoAte || 0))) return false;
+      NEO.arquivoPedido = inp;
+      return true;
+    };
+    proto.click = function () {
+      if (segurar(this)) return undefined;
+      return clicarOriginal.apply(this, arguments);
+    };
+    if (seletorOriginal) {
+      proto.showPicker = function () {
+        if (segurar(this)) return undefined;
+        return seletorOriginal.apply(this, arguments);
+      };
+    }
+  }
   // MOLDURA do site, em UM lugar. Era uma string literal dentro do
   // `js_snapshot` e o `js_extract` não tinha acesso a ela — então o extract
   // devolvia 1500 caracteres de menu sem nenhum sinal de que era menu, e
@@ -1151,6 +1237,14 @@ const JS_HELPERS: &str = r#"
       if (denovo.pixel) m = denovo;
     }
     const tipo = opcoes.tipo || 'esquerdo';
+    // Campo de arquivo: o clique abriria a janela do sistema. Recusa com o
+    // caminho certo (o core lê o prefixo).
+    if (NEO.arquivoDe(el) || NEO.arquivoDe(m.alvo)) {
+      return { ok: false, error: 'ARQUIVO: este elemento abre a janela de arquivos do ' +
+        'sistema, que não dá para controlar. Use `upload` com este ref e o caminho do arquivo' };
+    }
+    NEO.arquivoPedido = null;
+    NEO.travaArquivoAte = Date.now() + 2500;
     const ehControle = m.alvo !== el && m.alvo.matches(NEO.CONTROLE);
     // O rótulo é lido ANTES de clicar: num INTERRUPTOR ele vira no próprio clique,
     // e o histórico registrava o estado NOVO como se fosse o que foi clicado —
@@ -1170,6 +1264,10 @@ const JS_HELPERS: &str = r#"
       el, alvo: m.alvo, x: m.x, y: m.y, tipo, rotulo, recebeu: null,
       desc: NEO.descrever(m.alvo), achados: opcoes.achados,
     };
+    // O estado ANTES do clique: sem ele, desmarcar uma caixa que estava marcada
+    // (o que se pediu) saía como "NÃO ficou selecionado" — e o agente marcava
+    // de novo para "consertar" (sessão 74d069b7, "Trabalho aqui atualmente").
+    c.antes = NEO.estadoMarcado(c);
     c.ouvir = (e) => { if (!c.recebeu) c.recebeu = (e.composedPath && e.composedPath()[0]) || e.target; };
     const janela = m.alvo.ownerDocument.defaultView || window;
     for (const t of ['pointerdown', 'mousedown', 'click']) janela.addEventListener(t, c.ouvir, true);
@@ -1239,7 +1337,9 @@ const JS_HELPERS: &str = r#"
   // pedindo `look`. Só relê quando o primeiro veredito é "não".
   NEO.fimDoCliqueAssentado = async (c, via) => {
     const out = NEO.fimDoClique(c, via);
-    if (out.checked !== false || out.saiu) return out;
+    // Estava marcado e ficou desmarcado: o clique PEGOU (desmarcou). Esperar
+    // virar `true` aqui seria esperar o contrário do que aconteceu.
+    if (out.checked !== false || out.saiu || out.antes === true) return out;
     for (const ms of [120, 300]) {
       await new Promise((ok) => setTimeout(ok, ms));
       if (!c.el.isConnected) { out.saiu = true; delete out.checked; return out; }
@@ -1273,6 +1373,7 @@ const JS_HELPERS: &str = r#"
     } else {
       const estado = NEO.estadoMarcado(c);
       if (estado !== undefined) out.checked = estado;
+      if (estado !== undefined && c.antes !== undefined) out.antes = c.antes;
     }
     // O número, quando existe: o modelo volta a poder usar `click`/`extract` nele.
     if (NEO.refs) {
@@ -2105,6 +2206,13 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
       }}
     }}
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') item.disabled = true;
+    // Campo de arquivo, ou o botão de envio ao lado de um input escondido: o
+    // core diz ao modelo para usar `upload` em vez de clicar.
+    if (NEO.arquivoDe(el) || (el.matches('button,[role=button],a,label,img') &&
+        /foto|imagem|arquivo|anex|upload|carreg|alterar|escolh|selecion|troc|photo|image|file|attach|choose|browse|avatar|curr[ií]culo|\bcv\b|pdf/i
+          .test(item.text || '') && NEO.arquivoPerto(el))) {{
+      item.arquivo = true;
+    }}
     // ESTADO sai do controle, nunca do rótulo — e quando o elemento é um
     // procurador (o label visível de um rádio escondido), o controle é o input
     // lá atrás. Sem isto, "marcar a alternativa" não tem como ser verificado:
@@ -2123,7 +2231,14 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
       else if (controle.tagName === 'SELECT') {{
         item.options = Array.from(controle.options).slice(0, 30).map((o) => o.text.trim().slice(0, 60));
         item.value = controle.value;
-      }} else item.value = String(controle.value || '').slice(0, 80);
+      }} else {{
+        const v = String(controle.value || '');
+        item.value = v.slice(0, 80);
+        // Texto longo (descrição, apresentação): a linha mostra só o começo, e o
+        // modelo precisa saber que há mais — `extract` no ref lê o valor inteiro
+        // (sessão c4316486: "Referência técnica do time" estava depois do corte).
+        if (v.length > 80) item.valor_total = v.length;
+      }}
     }}
     // Estado ARIA: o mesmo conceito para quem implementou o controle na mão.
     for (const a of ['aria-checked', 'aria-selected', 'aria-pressed', 'aria-expanded']) {{
@@ -2517,9 +2632,10 @@ fn js_snapshot(max_elements: usize, text_chars: usize) -> String {
 }
 
 /// Ações que mudam alguma coisa. Passam pelo portão do PARE.
-const ATUA: [&str; 8] = [
+const ATUA: [&str; 9] = [
     "browser.navigate", "browser.click", "browser.click_text", "browser.dblclick",
     "browser.right_click", "browser.fill", "browser.select", "browser.press",
+    "browser.upload",
 ];
 
 /// O PARE chegou enquanto o modelo decidia? O snapshot só lê no começo da rodada,
@@ -2659,7 +2775,8 @@ const JS_CLIQUE_CONFIRMA: &str = r#"(async () => {
   const c = NEO && NEO.clique;
   if (!c) return { ok: true, entregue: null };
   if (!c.recebeu) return { ok: true, entregue: false };
-  return { ...(await NEO.fimDoCliqueAssentado(c, 'pixel')), entregue: true };
+  const fim = await NEO.fimDoCliqueAssentado(c, 'pixel');
+  return { ...fim, entregue: true, arquivo_pedido: !!NEO.arquivoPedido };
 })()"#;
 
 const JS_CLIQUE_DESPACHA: &str = r#"(async () => {
@@ -2667,7 +2784,8 @@ const JS_CLIQUE_DESPACHA: &str = r#"(async () => {
   const c = NEO && NEO.clique;
   if (!c) return { ok: false, error: 'stale' };
   NEO.despachar(c);
-  return await NEO.fimDoCliqueAssentado(c, 'js');
+  const fim = await NEO.fimDoCliqueAssentado(c, 'js');
+  return { ...fim, arquivo_pedido: !!NEO.arquivoPedido };
 })()"#;
 
 /// O mouse de verdade, pelo CDP. O navegador faz o teste de acerto, o site recebe
@@ -2693,6 +2811,20 @@ async fn mouse_real(id: i64, x: f64, y: f64, vezes: u32) -> Result<(), String> {
 /// sem essa prova, a reserva viraria clique dobrado, e clique dobrado num
 /// "Adicionar ao carrinho" é item em dobro.
 async fn clicar(id: i64, mira: String, vezes: u32) -> Result<Value, String> {
+    let antes = Instant::now();
+    let mut r = clicar_bruto(id, mira, vezes).await?;
+    // A página quis abrir a janela de arquivos (por código, segurado pela trava
+    // do `NEO`, ou nativo, segurado pela interceptação): o clique "deu certo" e
+    // não serve para nada. O core troca isso por "use `upload`".
+    let pediu = r.get("arquivo_pedido").and_then(|v| v.as_bool()) == Some(true)
+        || seletor_desde(id, antes).is_some();
+    if let Some(obj) = r.as_object_mut() {
+        obj.insert("arquivo_pedido".to_string(), Value::Bool(pediu));
+    }
+    Ok(r)
+}
+
+async fn clicar_bruto(id: i64, mira: String, vezes: u32) -> Result<Value, String> {
     let alvo = unwrap_ok(eval(id, &mira).await?)?;
     if alvo.get("real").and_then(|v| v.as_bool()) == Some(true) {
         let x = alvo.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -2857,6 +2989,459 @@ async fn abas_da_sessao(id: i64) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "tabs": abas }))
+}
+
+// ─── upload: arquivo do disco do usuário para um campo da página ────────────
+//
+// Sessão be8d195e (16/11): "atualize a foto do perfil com esta imagem". Clicar
+// em "Alterar foto" abre a janela de arquivos do SISTEMA, fora do alcance de
+// qualquer ação — a tarefa ficaria parada ali. Aqui o arquivo vai direto para o
+// `<input type=file>`, sem janela nenhuma, por um de dois caminhos:
+//
+// 1. `DOM.setFileInputFiles` (o caminho do Chrome: eventos nativos). Pela
+//    extensão, o Chrome só deixa com "Permitir acesso a URLs de arquivo" ligado
+//    nos detalhes dela; sem isso devolve "Not allowed". No headless sempre vale.
+// 2. A reserva: este processo lê o arquivo, entrega em pedaços à página e ela
+//    monta um `File` num `DataTransfer` e o põe no input, com `input`/`change`.
+//    Os pedaços existem porque a mensagem do host nativo para a extensão tem
+//    teto de 1 MB.
+//
+// Quem decide QUAL arquivo pode sair é o core (só o que o Daniel citou); aqui
+// fica a segunda trava, no disco: dentro da home, fora de pasta oculta e da
+// Library, arquivo comum, até o teto.
+
+/// Teto quando o core não manda o dele (`[navegador.tarefa] arquivo_max_mb`).
+const UPLOAD_MAX_PADRAO: u64 = 25 * 1024 * 1024;
+/// Caracteres de base64 por `Runtime.evaluate` na reserva (abaixo de 1 MB).
+const UPLOAD_PEDACO: usize = 512 * 1024;
+/// Quanto esperar a página pedir a janela de arquivos depois do clique.
+const UPLOAD_ESPERA_CAMPO: Duration = Duration::from_millis(1500);
+/// Quanto esperar o campo ficar com o arquivo.
+const UPLOAD_ESPERA_CONFIRMA: Duration = Duration::from_millis(1200);
+
+fn arquivo_para_enviar(caminho: &str, max_bytes: u64) -> Result<(PathBuf, u64), String> {
+    let home = dirs::home_dir().ok_or_else(|| "não achei a pasta do usuário".to_string())?;
+    arquivo_para_enviar_em(caminho, max_bytes, &home)
+}
+
+fn arquivo_para_enviar_em(
+    caminho: &str,
+    max_bytes: u64,
+    home: &std::path::Path,
+) -> Result<(PathBuf, u64), String> {
+    let bruto = caminho.trim();
+    let expandido = match bruto.strip_prefix("~/") {
+        Some(resto) => home.join(resto),
+        None => PathBuf::from(bruto),
+    };
+    if !expandido.is_absolute() {
+        return Err(format!("caminho relativo não serve: «{}»", bruto));
+    }
+    let real = std::fs::canonicalize(&expandido)
+        .map_err(|_| format!("não achei o arquivo «{}» no disco", bruto))?;
+    let home_real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let dentro = real.strip_prefix(&home_real).map_err(|_| {
+        format!("só envio arquivo de dentro da pasta do usuário, e «{}» está fora dela", bruto)
+    })?;
+    for parte in dentro.components() {
+        if parte.as_os_str().to_string_lossy().starts_with('.') {
+            return Err("arquivo de pasta oculta (como .ssh) nunca sai do disco".to_string());
+        }
+    }
+    if dentro.components().next().map(|c| c.as_os_str() == "Library").unwrap_or(false) {
+        return Err("arquivo da Library do sistema não sai do disco".to_string());
+    }
+    let meta = std::fs::metadata(&real).map_err(|e| format!("não consegui ler «{}»: {}", bruto, e))?;
+    if !meta.is_file() {
+        return Err(format!("«{}» não é um arquivo", bruto));
+    }
+    let tamanho = meta.len();
+    if tamanho == 0 {
+        return Err(format!("«{}» está vazio", bruto));
+    }
+    if tamanho > max_bytes {
+        return Err(format!(
+            "«{}» tem {:.1} MB, acima do teto de {:.1} MB",
+            bruto,
+            tamanho as f64 / 1_048_576.0,
+            max_bytes as f64 / 1_048_576.0
+        ));
+    }
+    Ok((real, tamanho))
+}
+
+fn tipo_do_arquivo(caminho: &std::path::Path) -> &'static str {
+    let ext = caminho
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
+/// O `accept` do campo aceita este arquivo? Vazio aceita tudo.
+fn campo_aceita(accept: &str, nome: &str, mime: &str) -> bool {
+    let tokens: Vec<String> = accept
+        .split(',')
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    let nome = nome.to_lowercase();
+    tokens.iter().any(|t| {
+        if t.starts_with('.') {
+            nome.ends_with(t.as_str())
+        } else if let Some(familia) = t.strip_suffix("/*") {
+            mime.starts_with(&format!("{}/", familia))
+        } else {
+            t == mime || t == "*/*"
+        }
+    })
+}
+
+/// Acha o `<input type=file>` a partir do `ref` (o campo, o label, o botão de
+/// envio) ou, sem `ref`, o único da página. Sem input à vista, CLICA por código
+/// no `ref` com a trava ligada: o site que cria o campo no clique cai na trava
+/// (`NEO.arquivoPedido`) em vez de abrir a janela.
+fn js_alvo_upload(reference: i64) -> String {
+    format!(
+        r#"{helpers};
+(() => {{
+  const NEO = window.__neo;
+  const ref = {reference};
+  const el = ref >= 0 ? NEO.el(ref) : null;
+  if (ref >= 0 && !el) return {{ ok: false, error: 'stale' }};
+  NEO.alvoUpload = null;
+  let inp = el ? (NEO.arquivoDe(el) || NEO.arquivoPerto(el)) : null;
+  if (!inp) {{
+    const todos = Array.from(document.querySelectorAll(NEO.ARQ));
+    if (todos.length === 1) inp = todos[0];
+    else if (!el && todos.length > 1) {{
+      return {{ ok: false, error: 'esta página tem ' + todos.length + ' campos de arquivo: ' +
+        'diga qual com o `ref` do botão de envio dele' }};
+    }}
+  }}
+  let clicou = false;
+  if (!inp && el) {{
+    NEO.arquivoPedido = null;
+    NEO.travaArquivoAte = Date.now() + 3000;
+    el.click();
+    clicou = true;
+    inp = NEO.arquivoPedido || null;
+  }}
+  const campo = String((el && NEO.nomeDe(el)) || (inp && (NEO.nomeDe(inp) || inp.name)) || '').slice(0, 120);
+  if (!inp) return {{ ok: true, achou: false, clicou, campo }};
+  NEO.alvoUpload = inp;
+  return {{ ok: true, achou: true, clicou, campo, accept: inp.accept || '', multiplo: !!inp.multiple }};
+}})()"#,
+        helpers = JS_HELPERS,
+        reference = reference
+    )
+}
+
+/// O input que a página pediu DEPOIS do clique (trava do `NEO` ou evento nativo).
+async fn alvo_tardio(id: i64, antes: Instant) -> Result<bool, String> {
+    let fim = Instant::now() + UPLOAD_ESPERA_CAMPO;
+    loop {
+        let achou = eval(
+            id,
+            "(() => { const N = window.__neo; if (N && N.arquivoPedido) { N.alvoUpload = N.arquivoPedido; return true; } return false; })()",
+        )
+        .await?;
+        if achou == Value::Bool(true) {
+            return Ok(true);
+        }
+        if let Some(node) = seletor_desde(id, antes) {
+            let r = cdp(id, "DOM.resolveNode", json!({ "backendNodeId": node })).await?;
+            if let Some(obj) = r.pointer("/object/objectId").and_then(|v| v.as_str()) {
+                cdp(
+                    id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj,
+                        "functionDeclaration": "function () { (window.__neo = window.__neo || {}).alvoUpload = this; }",
+                    }),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+        if Instant::now() >= fim {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+const JS_UPLOAD_VIGIA: &str = r#"(() => {
+  const N = window.__neo;
+  const i = N && N.alvoUpload;
+  if (!i) return false;
+  N.upMudou = 0;
+  i.addEventListener('change', () => { N.upMudou = (i.files && i.files.length) || 1; },
+    { once: true, capture: true });
+  return true;
+})()"#;
+
+const JS_UPLOAD_ESTADO: &str = r#"(() => {
+  const N = window.__neo;
+  const i = N && N.alvoUpload;
+  const n = i && i.files ? i.files.length : 0;
+  return { n, mudou: (N && N.upMudou) || 0, nome: n ? i.files[0].name : '' };
+})()"#;
+
+/// O campo ficou com o arquivo? Lê até o prazo. O site que zera o input no
+/// `change` (para deixar escolher o mesmo arquivo de novo) conta pelo evento.
+async fn upload_confirmado(id: i64) -> bool {
+    let fim = Instant::now() + UPLOAD_ESPERA_CONFIRMA;
+    loop {
+        match eval(id, JS_UPLOAD_ESTADO).await {
+            Ok(v) => {
+                let n = v.get("n").and_then(|x| x.as_i64()).unwrap_or(0);
+                let mudou = v.get("mudou").and_then(|x| x.as_i64()).unwrap_or(0);
+                if n > 0 || mudou > 0 {
+                    return true;
+                }
+            }
+            // A página trocou depois do `change` (site que envia na hora).
+            Err(_) => return true,
+        }
+        if Instant::now() >= fim {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// A reserva: o arquivo em pedaços para a página, que monta o `File` sozinha.
+async fn upload_pela_pagina(id: i64, bytes: &[u8], nome: &str, mime: &str) -> Result<(), String> {
+    let b64 = b64_encode(bytes);
+    unwrap_ok(eval(id, "(() => { window.__neo.upPartes = []; return { ok: true }; })()").await?)?;
+    for pedaco in b64.as_bytes().chunks(UPLOAD_PEDACO) {
+        // base64 só tem A-Z a-z 0-9 + / = : cabe entre aspas sem escapar nada.
+        let texto = std::str::from_utf8(pedaco).map_err(|e| e.to_string())?;
+        let js = format!(
+            "(() => {{ window.__neo.upPartes.push(\"{}\"); return {{ ok: true }}; }})()",
+            texto
+        );
+        unwrap_ok(eval(id, &js).await?)?;
+    }
+    let js = format!(
+        r#"(() => {{
+  const N = window.__neo;
+  const inp = N.alvoUpload;
+  if (!inp) return {{ ok: false, error: 'o campo de arquivo sumiu da página' }};
+  const bin = atob(N.upPartes.join(''));
+  N.upPartes = null;
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const dt = new DataTransfer();
+  dt.items.add(new File([u8], {nome}, {{ type: {mime}, lastModified: Date.now() }}));
+  inp.files = dt.files;
+  inp.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+  inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  return {{ ok: true }};
+}})()"#,
+        nome = serde_json::to_string(nome).unwrap_or_else(|_| "\"arquivo\"".to_string()),
+        mime = serde_json::to_string(mime).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    unwrap_ok(eval(id, &js).await?)?;
+    Ok(())
+}
+
+/// De onde vem o arquivo do `upload`.
+enum FonteUpload {
+    /// Do disco dele: o caminho que ele citou, conferido pela trava de disco.
+    Disco { caminho: String, max_bytes: u64 },
+    /// Do catálogo do Neo (o Neo gerou no sandbox, ou ele anexou no chat): o core
+    /// manda o CONTEÚDO, porque esse arquivo não existe no disco dele.
+    Conteudo { nome: String, bytes: Vec<u8> },
+}
+
+/// Nome que o site vai ver, sem pasta e sem caractere de controle.
+fn nome_seguro(nome: &str) -> String {
+    let base = nome.rsplit(['/', '\\']).next().unwrap_or("");
+    let limpo: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .take(120)
+        .collect();
+    if limpo.is_empty() {
+        "arquivo".to_string()
+    } else {
+        limpo
+    }
+}
+
+/// Grava o conteúdo vindo do core numa pasta temporária, com o nome que o site
+/// vai ver: o `DOM.setFileInputFiles` só aceita caminho. Fica lá até a próxima
+/// faxina (1 h): o site pode ler o arquivo bem depois do `change`.
+fn gravar_temporario_em(base: &std::path::Path, nome: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    if let Ok(entradas) = std::fs::read_dir(base) {
+        for e in entradas.flatten() {
+            let velho = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d > Duration::from_secs(3600))
+                .unwrap_or(false);
+            if velho {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let pasta = base.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&pasta).map_err(|e| format!("não consegui preparar o arquivo: {}", e))?;
+    let caminho = pasta.join(nome_seguro(nome));
+    std::fs::write(&caminho, bytes).map_err(|e| format!("não consegui preparar o arquivo: {}", e))?;
+    Ok(caminho)
+}
+
+/// A `FonteUpload` que o core pediu, a partir dos argumentos da ação.
+fn fonte_do_upload(args: &Value, max_bytes: u64) -> Result<FonteUpload, String> {
+    match args.get("conteudo_b64").and_then(|v| v.as_str()) {
+        Some(b64) => {
+            let bytes = b64_decode(b64).unwrap_or_default();
+            if bytes.is_empty() {
+                return Err("o arquivo do catálogo chegou vazio".to_string());
+            }
+            if bytes.len() as u64 > max_bytes {
+                return Err(format!(
+                    "o arquivo tem {:.1} MB, acima do teto de {:.1} MB",
+                    bytes.len() as f64 / 1_048_576.0,
+                    max_bytes as f64 / 1_048_576.0
+                ));
+            }
+            let nome = args.get("nome").and_then(|v| v.as_str()).unwrap_or("arquivo").to_string();
+            Ok(FonteUpload::Conteudo { nome, bytes })
+        }
+        None => Ok(FonteUpload::Disco { caminho: arg_str(args, "arquivo")?, max_bytes }),
+    }
+}
+
+async fn upload(id: i64, fonte: FonteUpload, reference: Option<i64>) -> Result<Value, String> {
+    let (real, tamanho, mut conteudo) = match fonte {
+        FonteUpload::Disco { caminho, max_bytes } => {
+            let (real, tamanho) = arquivo_para_enviar(&caminho, max_bytes)?;
+            (real, tamanho, None)
+        }
+        FonteUpload::Conteudo { nome, bytes } => {
+            let base = std::env::temp_dir().join("neo-upload");
+            let real = gravar_temporario_em(&base, &nome, &bytes)?;
+            (real, bytes.len() as u64, Some(bytes))
+        }
+    };
+    let nome = real
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "arquivo".to_string());
+    let mime = tipo_do_arquivo(&real);
+
+    let antes = Instant::now();
+    let alvo = unwrap_ok(eval(id, &js_alvo_upload(reference.unwrap_or(-1))).await?)?;
+    let campo = alvo.get("campo").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut achou = alvo.get("achou").and_then(|v| v.as_bool()) == Some(true);
+    if !achou && alvo.get("clicou").and_then(|v| v.as_bool()) == Some(true) {
+        achou = alvo_tardio(id, antes).await?;
+    }
+    if !achou {
+        return Err(if reference.is_some() {
+            "não achei campo de arquivo ligado a esse elemento, e clicar nele não pediu \
+             arquivo nenhum. Procure o botão/área de envio (\"Alterar foto\", \"Anexar\") \
+             e passe o `ref` dele"
+                .to_string()
+        } else {
+            "esta página não tem campo de arquivo à vista: abra antes a parte do site que \
+             recebe o arquivo (ex.: editar a foto) e passe o `ref` do botão de envio"
+                .to_string()
+        });
+    }
+    let accept = alvo.get("accept").and_then(|v| v.as_str()).unwrap_or("");
+    if !campo_aceita(accept, &nome, mime) {
+        return Err(format!("o campo só aceita «{}», e «{}» é {}", accept, nome, mime));
+    }
+
+    let _ = eval(id, JS_UPLOAD_VIGIA).await;
+    let mut via = "cdp";
+    let objeto = cdp(
+        id,
+        "Runtime.evaluate",
+        json!({ "expression": "window.__neo && window.__neo.alvoUpload", "returnByValue": false }),
+    )
+    .await?;
+    let pelo_cdp = match objeto.pointer("/result/objectId").and_then(|v| v.as_str()) {
+        Some(obj) => cdp(
+            id,
+            "DOM.setFileInputFiles",
+            json!({ "files": [real.to_string_lossy()], "objectId": obj }),
+        )
+        .await
+        .map(|_| ()),
+        None => Err("sem handle do campo".to_string()),
+    };
+    let mut ok = pelo_cdp.is_ok() && upload_confirmado(id).await;
+    if !ok {
+        if let Err(e) = &pelo_cdp {
+            info!("[BrowserLocal] upload pelo CDP recusado ({}); montando o arquivo na página", e);
+        }
+        let bytes = match conteudo.take() {
+            Some(b) => b,
+            None => std::fs::read(&real).map_err(|e| format!("não consegui ler o arquivo: {}", e))?,
+        };
+        upload_pela_pagina(id, &bytes, &nome, mime).await?;
+        via = "pagina";
+        ok = upload_confirmado(id).await;
+    }
+    let _ = eval(id, "(() => { if (window.__neo) window.__neo.alvoUpload = null; return true; })()").await;
+    if !ok {
+        return Err("pus o arquivo no campo e a página não reagiu (nenhum `change`)".to_string());
+    }
+    info!("[BrowserLocal] upload de {} ({} bytes) via {}", nome, tamanho, via);
+    Ok(json!({
+        "ok": true,
+        "nome": nome,
+        "bytes": tamanho,
+        "mime": mime,
+        "via": via,
+        "campo": campo,
+    }))
+}
+
+/// Liga a interceptação da janela de arquivos na aba: o clique que a abriria
+/// vira o evento `Page.fileChooserOpened` (ver `anotar_seletor`), e a tela do
+/// Daniel não ganha um diálogo do sistema que nenhuma ação fecha. Melhor
+/// esforço: navegador que recusa segue sem ela (a trava do `NEO` ainda segura
+/// o `input.click()` por código).
+async fn interceptar_seletor(id: i64) {
+    if let Err(e) = cdp(id, "Page.setInterceptFileChooserDialog", json!({ "enabled": true })).await {
+        info!("[BrowserLocal] interceptação da janela de arquivos indisponível na aba {}: {}", id, e);
+    }
 }
 
 // ─── downloads ──────────────────────────────────────────────────────────────
@@ -3031,178 +3616,30 @@ async fn downloads_merged(seconds: u64, ids: Value) -> Result<Value, String> {
 
 // ─── marcações desenhadas na imagem ─────────────────────────────────────────
 
-/// Dígitos 3x5. Um "font" de 10 linhas evita puxar renderização de texto de
-/// verdade só para escrever números de dois dígitos numa etiqueta.
-const GLYPHS: [[u8; 5]; 10] = [
-    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
-    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
-    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
-    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
-    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
-    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
-    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
-    [0b111, 0b001, 0b001, 0b001, 0b001], // 7
-    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
-    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
-];
-
-const MARK: [u8; 3] = [255, 45, 149];
-const INK: [u8; 3] = [255, 255, 255];
-
-fn put(img: &mut image::RgbImage, x: i64, y: i64, color: [u8; 3]) {
-    if x < 0 || y < 0 || x >= img.width() as i64 || y >= img.height() as i64 {
-        return;
-    }
-    img.put_pixel(x as u32, y as u32, image::Rgb(color));
-}
-
-fn fill(img: &mut image::RgbImage, x: i64, y: i64, w: i64, h: i64, color: [u8; 3]) {
-    for dy in 0..h {
-        for dx in 0..w {
-            put(img, x + dx, y + dy, color);
-        }
-    }
-}
-
-/// Contorno de 2px — não preenche, senão esconde o que o modelo precisa ler.
-fn outline(img: &mut image::RgbImage, x: i64, y: i64, w: i64, h: i64, color: [u8; 3]) {
-    for t in 0..2 {
-        fill(img, x + t, y + t, w - 2 * t, 1, color);
-        fill(img, x + t, y + h - 1 - t, w - 2 * t, 1, color);
-        fill(img, x + t, y + t, 1, h - 2 * t, color);
-        fill(img, x + w - 1 - t, y + t, 1, h - 2 * t, color);
-    }
-}
-
-fn digits(img: &mut image::RgbImage, x: i64, y: i64, scale: i64, value: i64) {
-    let text = value.to_string();
-    let mut cursor = x;
-    for ch in text.chars() {
-        let glyph = GLYPHS[ch.to_digit(10).unwrap_or(0) as usize];
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..3 {
-                if bits & (1 << (2 - col)) != 0 {
-                    fill(
-                        img,
-                        cursor + col * scale,
-                        y + row as i64 * scale,
-                        scale,
-                        scale,
-                        INK,
-                    );
-                }
-            }
-        }
-        cursor += 4 * scale;
-    }
-}
-
-/// Escreve os números dos `ref` em cima do print. Devolve `None` em qualquer
-/// tropeço (jpeg estranho, viewport zerada): print sem marcação ainda é útil,
-/// print nenhum não é.
+/// As marcações vêm de `neo-imagem` (crate compilada otimizada mesmo no
+/// `tauri dev`: ver o cabeçalho dela). Aqui só se traduz o JSON do snapshot.
 fn draw_marks(jpeg: &[u8], rects: &[Value], css_width: f64, scale: f64) -> Option<Vec<u8>> {
-    if (rects.is_empty() || css_width <= 0.0) && scale >= 0.999 {
-        return None;
-    }
-    let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
-    let mut img = decoded.to_rgb8();
-
-    // Reduzir AQUI e não no `clip` do CDP: pedir clip faz o Chrome relayoutar a
-    // página para a captura, e o usuário vê a tela piscar e os elementos
-    // mudarem de tamanho a cada passo (25 vezes por tarefa). Redimensionar o
-    // JPEG depois não toca no navegador dele.
-    if scale < 0.999 {
-        let (w, h) = (
-            ((img.width() as f64 * scale).round() as u32).max(1),
-            ((img.height() as f64 * scale).round() as u32).max(1),
-        );
-        img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
-    }
-    if rects.is_empty() || css_width <= 0.0 {
-        let mut out = Vec::with_capacity(jpeg.len());
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 70)
-            .encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8)
-            .ok()?;
-        return Some(out);
-    }
-    // A imagem pode vir em DPR 2 (retina) ou reduzida pelo `clip.scale` — o
-    // fator sai da largura real contra a largura em px de CSS.
-    let ratio = img.width() as f64 / css_width;
-    let scale = ((ratio * 2.0).round() as i64).clamp(2, 6);
-    let glyph_h = 5 * scale;
-
+    let mut marcas = Vec::with_capacity(rects.len());
     for rect in rects {
         let values = rect.as_array()?;
         if values.len() < 5 {
             continue;
         }
-        let number = values[0].as_i64().unwrap_or(-1);
-        if number < 0 {
-            continue;
-        }
-        let at = |i: usize| (values[i].as_f64().unwrap_or(0.0) * ratio).round() as i64;
-        let (x, y, w, h) = (at(1), at(2), at(3), at(4));
-        outline(&mut img, x, y, w, h, MARK);
-
-        // Etiqueta acima do elemento; se não couber, por dentro dele.
-        let label_w = (number.to_string().len() as i64) * 4 * scale + scale;
-        let label_h = glyph_h + 2 * scale;
-        let label_y = if y - label_h >= 0 { y - label_h } else { y };
-        fill(&mut img, x, label_y, label_w, label_h, MARK);
-        digits(&mut img, x + scale, label_y + scale, scale, number);
+        let num = |i: usize| values[i].as_f64().unwrap_or(0.0);
+        marcas.push(neo_imagem::Marca {
+            numero: values[0].as_i64().unwrap_or(-1),
+            x: num(1),
+            y: num(2),
+            w: num(3),
+            h: num(4),
+        });
     }
-
-    let mut out = Vec::with_capacity(jpeg.len());
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 70)
-        .encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8)
-        .ok()?;
-    Some(out)
+    neo_imagem::draw_marks(jpeg, &marcas, css_width, scale)
 }
 
-/// Recorta o print num retângulo em px de CSS. Devolve `None` em qualquer
-/// tropeço — print inteiro ainda serve, print nenhum não.
-///
-/// Existe para a TRIAGEM DE PAINEL: quando um modal aparece, a pergunta é "o que
-/// está escrito aqui dentro?", e a tela inteira é o pior insumo possível para
-/// isso. O print normal sai a `scale: 0.75, quality: 60` de uma tela de 2954px —
-/// um modal de 600px vira texto ilegível. Aqui não há redução nem marcação: o
-/// recorte sai na resolução nativa e com qualidade alta, porque o trabalho dele
-/// é ser LIDO.
-///
-/// O recorte é feito no JPEG já capturado, nunca pelo `clip` do CDP — pedir clip
-/// ao Chrome faz a página relayoutar e o usuário vê a tela piscar (é o mesmo
-/// motivo documentado em `draw_marks`).
+/// Recorte do print em px de CSS — ver `neo_imagem::crop_jpeg`.
 fn crop_jpeg(jpeg: &[u8], css_width: f64, rect: &[f64; 4]) -> Option<Vec<u8>> {
-    if css_width <= 0.0 {
-        return None;
-    }
-    let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
-    let img = decoded.to_rgb8();
-    let ratio = img.width() as f64 / css_width;
-    // Uma folga em volta: sem ela o X de fechar, que costuma morar em cima da
-    // borda, sai cortado pela metade — e é justamente ele que a triagem precisa
-    // descrever quando o veredito é "intruso".
-    let pad = 12.0 * ratio;
-    let x = ((rect[0] * ratio) - pad).max(0.0).round() as u32;
-    let y = ((rect[1] * ratio) - pad).max(0.0).round() as u32;
-    let w = ((rect[2] * ratio) + 2.0 * pad).round() as u32;
-    let h = ((rect[3] * ratio) + 2.0 * pad).round() as u32;
-    let w = w.min(img.width().saturating_sub(x));
-    let h = h.min(img.height().saturating_sub(y));
-    if w < 16 || h < 16 {
-        return None;
-    }
-    let cortado = image::imageops::crop_imm(&img, x, y, w, h).to_image();
-    let mut out = Vec::with_capacity(jpeg.len());
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 82)
-        .encode(
-            cortado.as_raw(),
-            cortado.width(),
-            cortado.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .ok()?;
-    Some(out)
+    neo_imagem::crop_jpeg(jpeg, css_width, rect)
 }
 
 /// Base64 padrão, nos dois sentidos. São ~30 linhas em vez de uma dependência
@@ -3521,6 +3958,25 @@ fn js_extract(reference: i64, chars: usize) -> String {
 (() => {{
   const el = window.__neo.el({reference});
   if (!el) return {{ ok: false, error: 'stale' }};
+  // CAMPO de formulário: o texto dele é o VALOR, não o innerText (que é vazio).
+  // Sem isto, "ler a descrição" num textarea devolvia "não tem texto nenhum"
+  // (sessão c4316486, seis tentativas).
+  const ctl = window.__neo.controleDe ? window.__neo.controleDe(el) : null;
+  if (ctl) {{
+    const tipo = String(ctl.getAttribute('type') || '').toLowerCase();
+    // O nome do CAMPO ("Descrição"), não o começo do que está escrito nele.
+    const rot = ((ctl.labels && ctl.labels[0] && ctl.labels[0].innerText) || ctl.getAttribute('aria-label') ||
+      ctl.getAttribute('placeholder') || (window.__neo.shortLabel ? window.__neo.shortLabel(el) : '')).trim().slice(0, 80);
+    if (tipo === 'password') return {{ ok: true, campo: true, senha: true, label: rot, text: '' }};
+    if (ctl.tagName === 'SELECT') {{
+      const op = ctl.options[ctl.selectedIndex];
+      return {{ ok: true, campo: true, label: rot, total: 0, text: op ? op.text.trim() : '' }};
+    }}
+    if (!/^(checkbox|radio|file|hidden|submit|button|image|reset)$/.test(tipo)) {{
+      const v = String(ctl.value || '');
+      return {{ ok: true, campo: true, label: rot, total: v.length, cortado: v.length > {chars}, text: v.slice(0, {chars}) }};
+    }}
+  }}
   // De ONDE veio o texto. Sem isto, leitura errada e leitura certa chegam
   // idênticas ao modelo — foi o que deixou ele repetir a mesma leitura inútil
   // sem ter como perceber.
@@ -3545,6 +4001,44 @@ fn js_extract(reference: i64, chars: usize) -> String {
         helpers = JS_HELPERS,
         reference = reference,
         chars = chars
+    )
+}
+
+/// O retângulo do print de CONFIRMAÇÃO de um campo, medido na página agora: o
+/// campo, o rótulo dele (acima) e `abaixo` px de CSS embaixo, onde o site
+/// escreve "campo obrigatório". Campo fora da tela é trazido para a vista
+/// (`rolou`) — é o que acabou de ser editado.
+fn js_alvo_do_print(reference: i64, abaixo: f64) -> String {
+    format!(
+        r#"(() => {{
+  const NEO = window.__neo;
+  const el = NEO && NEO.el ? NEO.el({reference}) : null;
+  if (!el) return {{ ok: false }};
+  let r = el.getBoundingClientRect();
+  let rolou = false;
+  if (r.width === 0 || r.height === 0) return {{ ok: false }};
+  if (r.bottom < 0 || r.top > innerHeight) {{
+    el.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+    r = el.getBoundingClientRect();
+    rolou = true;
+  }}
+  const ctl = NEO.controleDe ? (NEO.controleDe(el) || el) : el;
+  const lab = ctl.labels && ctl.labels[0] ? ctl.labels[0].getBoundingClientRect() : null;
+  let topo = r.top - 40, esq = r.left - 24, dir = r.right + 24;
+  if (lab && lab.height > 0 && Math.abs(lab.top - r.top) < 200) {{
+    topo = Math.min(topo, lab.top - 8);
+    esq = Math.min(esq, lab.left - 8);
+    dir = Math.max(dir, lab.right + 8);
+  }}
+  topo = Math.max(0, topo);
+  esq = Math.max(0, esq);
+  const baixo = Math.min(innerHeight, r.bottom + {abaixo});
+  dir = Math.min(innerWidth, dir);
+  if (baixo - topo < 8 || dir - esq < 8) return {{ ok: false }};
+  return {{ ok: true, rolou, rect: [esq, topo, dir - esq, baixo - topo] }};
+}})()"#,
+        reference = reference,
+        abaixo = abaixo
     )
 }
 
@@ -3621,6 +4115,26 @@ fn js_buscar(termo: &str, chars: usize) -> String {
     }}
     trechos.push(pedaco.join('\n'));
   }});
+  // Os VALORES dos campos de formulário também: o que está escrito numa
+  // descrição em edição não está no texto da página (sessão c4316486).
+  let campos = 0;
+  for (const c of NEO.todos('input,textarea')) {{
+    if (campos >= 6) break;
+    const tipo = String(c.getAttribute('type') || 'text').toLowerCase();
+    if (/^(password|hidden|checkbox|radio|file|submit|button|image|reset)$/.test(tipo)) continue;
+    const v = String(c.value || '');
+    const pos = v ? NEO.normaliza(v).indexOf(alvo) : -1;
+    if (pos < 0) continue;
+    campos++;
+    achados++;
+    const ref = Array.isArray(NEO.refs) ? NEO.refs.indexOf(c) : -1;
+    const rot = ((c.labels && c.labels[0] && c.labels[0].innerText) || c.getAttribute('aria-label') ||
+      c.getAttribute('placeholder') || (NEO.shortLabel ? NEO.shortLabel(c) : '')).trim();
+    const ini = Math.max(0, pos - 100);
+    trechos.push('campo ' + (ref >= 0 ? '[' + ref + '] ' : '') + '«' + rot.slice(0, 60) + '» (' + v.length +
+      ' caracteres): ' + (ini > 0 ? '…' : '') + v.slice(ini, pos + alvo.length + 100) +
+      (pos + alvo.length + 100 < v.length ? '…' : ''));
+  }}
   let enderecos = 0;
   for (const el of NEO.todos('img,a[href]')) {{
     if (enderecos >= 6) break;
@@ -3837,6 +4351,7 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                 let id = super::headless::open_tab(alvo).await?;
                 let tab_ref = -id; // negativo = headless (ver `is_headless`)
                 let _ = cdp(tab_ref, "Page.enable", json!({})).await;
+                interceptar_seletor(tab_ref).await;
                 info!("[BrowserLocal] aba headless {} aberta (url={})", tab_ref, alvo);
                 return Ok(json!({ "tab_ref": tab_ref, "mode": "headless" }));
             }
@@ -3858,6 +4373,7 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
 
             call("attach", json!({ "tabId": id })).await?;
             let _ = cdp(id, "Page.enable", json!({})).await;
+            interceptar_seletor(id).await;
             // O upstream cria a aba com `active: false` (agente trabalhando
             // escondido). Aqui é o contrário: a razão de existir deste modo é o
             // usuário VER. Page.bringToFront traz a aba para a frente sem
@@ -3990,6 +4506,16 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
             unwrap_ok(eval(id, &js_fill(reference, value)).await?)
         }
+        "browser.upload" => {
+            let id = tab_id(args)?;
+            let reference = args.get("ref").and_then(|v| v.as_i64());
+            let max_bytes = args
+                .get("max_bytes")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(UPLOAD_MAX_PADRAO);
+            upload(id, fonte_do_upload(args, max_bytes)?, reference).await
+        }
         "browser.select" => {
             let id = tab_id(args)?;
             let reference = arg_i64(args, "ref")?;
@@ -4077,7 +4603,34 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             // CSS. Quando vem, este print tem um trabalho só — ser LIDO — então
             // ele sai sem marcação e sem redução, e o caminho normal abaixo é
             // pulado inteiro.
-            let clip: Option<[f64; 4]> = args.get("clip").and_then(|v| {
+            // ALVO pela referência: o campo é medido na página AGORA, pelo mesmo
+            // número que o agente usou no `fill` (o `NEO.refs` do snapshot de antes
+            // da ação ainda vale). Recortar pela caixa do snapshot errava quando a
+            // página rolava ou renumerava (sessão 69020f7a).
+            let mut alvo_rolou = false;
+            let alvo_clip: Option<[f64; 4]> = match args.get("alvo_ref").and_then(|v| v.as_i64()) {
+                Some(referencia) => {
+                    let abaixo = args.get("margem_abaixo").and_then(|v| v.as_f64()).unwrap_or(120.0);
+                    match eval(id, &js_alvo_do_print(referencia, abaixo)).await {
+                        Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+                            alvo_rolou = v.get("rolou").and_then(|b| b.as_bool()).unwrap_or(false);
+                            v.get("rect").and_then(|r| r.as_array()).and_then(|a| {
+                                if a.len() < 4 {
+                                    return None;
+                                }
+                                let mut r = [0.0f64; 4];
+                                for (i, slot) in r.iter_mut().enumerate() {
+                                    *slot = a[i].as_f64()?;
+                                }
+                                (r[2] > 0.0 && r[3] > 0.0).then_some(r)
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            let clip: Option<[f64; 4]> = alvo_clip.or_else(|| args.get("clip").and_then(|v| {
                 let a = v.as_array()?;
                 if a.len() < 4 {
                     return None;
@@ -4087,12 +4640,17 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                     *slot = a[i].as_f64()?;
                 }
                 (r[2] > 0.0 && r[3] > 0.0).then_some(r)
-            });
+            }));
 
             // Captura CRUA do viewport: sem `clip`, sem `captureBeyondViewport`,
             // sem nada que faça o Chrome relayoutar a página. A redução de
             // tamanho acontece depois, em cima do JPEG (draw_marks).
             let params = json!({ "format": "jpeg", "quality": quality });
+
+            // Quanto leva cada etapa, para o diário do core separar o que é do
+            // device do que é rede (docs/browser-visao-confirmacao-plan.md §7).
+            let inicio = Instant::now();
+            let ms = |t: Instant| t.elapsed().as_millis() as u64;
 
             // Os retângulos são LIDOS antes da foto; nada é escrito na página.
             // O recorte também precisa da largura em px de CSS para converter o
@@ -4102,18 +4660,25 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             } else {
                 None
             };
+            let rects_ms = ms(inicio);
 
             // Esconde o painel do Neo só durante o clique do obturador. O
             // `let shot` separado do `?` é de propósito: captura que falha
             // ainda precisa devolver o painel para a tela.
             let esconder = !is_headless(id);
+            let t = Instant::now();
             if esconder {
                 let _ = eval(id, JS_PAINEL_OCULTAR).await;
             }
+            let esconder_ms = ms(t);
+            let t = Instant::now();
             let shot = cdp(id, "Page.captureScreenshot", params).await;
+            let captura_ms = ms(t);
+            let t = Instant::now();
             if esconder {
                 let _ = eval(id, JS_PAINEL_MOSTRAR).await;
             }
+            let mostrar_ms = ms(t);
             let shot = shot?;
             let mut data = shot
                 .get("data")
@@ -4123,6 +4688,20 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
             if data.is_empty() {
                 return Err("o navegador não devolveu a imagem".to_string());
             }
+            let bytes_captura = data.len() as u64 * 3 / 4;
+            let t_imagem = Instant::now();
+            let tempos = |saida: usize| {
+                json!({
+                    "rects_ms": rects_ms,
+                    "esconder_ms": esconder_ms,
+                    "captura_ms": captura_ms,
+                    "mostrar_ms": mostrar_ms,
+                    "imagem_ms": ms(t_imagem),
+                    "total_ms": ms(inicio),
+                    "bytes_captura": bytes_captura,
+                    "bytes_saida": saida as u64 * 3 / 4,
+                })
+            };
 
             if let Some(rect) = clip {
                 let css_width = boxes
@@ -4132,13 +4711,33 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                     .unwrap_or(0.0);
                 if let Some(bytes) = b64_decode(&data) {
                     if let Some(cortado) = crop_jpeg(&bytes, css_width, &rect) {
+                        let data = b64_encode(&cortado);
                         return Ok(json!({
-                            "ok": true, "format": "jpeg", "data": b64_encode(&cortado),
-                            "marks": false, "marks_refs": [], "clipped": true
+                            "ok": true, "format": "jpeg", "tempos": tempos(data.len()), "data": data,
+                            "marks": false, "marks_refs": [], "clipped": true,
+                            "alvo": alvo_clip.is_some(), "rolou": alvo_rolou
                         }));
                     }
                 }
                 // Recorte que não deu certo cai no print inteiro: cego é pior.
+            }
+
+            // Print de CONFIRMAÇÃO: sem números, só reduzido até a largura pedida
+            // (a visão lê igual e a rede leva 1/3 dos bytes).
+            // (Também é para onde cai o recorte que não deu: com `max_width` e sem
+            // `marks`, o print inteiro sai reduzido e SEM números — antes caía no
+            // `draw_marks` e desenhava as marcações que ninguém pediu.)
+            let largura_max = args.get("max_width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if largura_max > 0 && !marks {
+                if let Some(bytes) = b64_decode(&data) {
+                    if let Some(menor) = neo_imagem::reduzir(&bytes, largura_max, quality as u8) {
+                        data = b64_encode(&menor);
+                    }
+                }
+                return Ok(json!({
+                    "ok": true, "format": "jpeg", "tempos": tempos(data.len()), "data": data,
+                    "marks": false, "marks_refs": []
+                }));
             }
 
             let mut marked = false;
@@ -4155,7 +4754,7 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                     }
                 }
             }
-            if let Some(boxes) = boxes {
+            if let Some(boxes) = boxes.filter(|_| marks) {
                 let css_width = boxes.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let rects = boxes.get("rects").and_then(|v| v.as_array());
                 if let (Some(rects), Some(bytes)) = (rects, b64_decode(&data)) {
@@ -4171,7 +4770,7 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
                 }
             }
             Ok(json!({
-                "ok": true, "format": "jpeg", "data": data,
+                "ok": true, "format": "jpeg", "tempos": tempos(data.len()), "data": data,
                 "marks": marked, "marks_refs": painted_refs
             }))
         }
@@ -4250,11 +4849,35 @@ pub async fn execute(action: &str, args: &Value) -> Result<Value, String> {
         "browser.focus_tab" => {
             let id = tab_id(args)?;
             if !is_headless(id) {
-                call("attach", json!({ "tabId": id })).await?;
+                if let Err(e) = call("attach", json!({ "tabId": id })).await {
+                    // Menu de OUTRA extensão (gerenciador de senhas) dentro da aba:
+                    // o navegador recusa o debugger até ele fechar. A extensão tira
+                    // o foco do campo pelo `chrome.scripting` e tenta de novo.
+                    // Extensão antiga (sem o método): o erro original segue.
+                    if !e.contains("chrome-extension") {
+                        return Err(e);
+                    }
+                    let soltou = call("neoSoltarMenu", json!({ "tabId": id })).await;
+                    info!("[BrowserLocal] menu de outra extensão na aba {}: {:?}", id, soltou);
+                    if soltou.is_err() {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    call("attach", json!({ "tabId": id })).await?;
+                }
                 let _ = cdp(id, "Page.enable", json!({})).await;
             }
             cdp(id, "Page.bringToFront", json!({})).await?;
             Ok(json!({ "ok": true }))
+        }
+        // Fecha o menu de outra extensão (gerenciador de senhas) que tomou a aba:
+        // blur + Esc pelo `chrome.scripting` da extensão, sem debugger.
+        "browser.soltar_menu" => {
+            let id = tab_id(args)?;
+            if is_headless(id) {
+                return Ok(json!({ "ok": true, "skipped": "headless" }));
+            }
+            call("neoSoltarMenu", json!({ "tabId": id })).await
         }
         // Aba que trabalha ESCONDIDA (subagente do `paralelo`). Sem isto o Chromium
         // para o `requestAnimationFrame`, roda timer a 1/s e não dispara o
@@ -5161,5 +5784,135 @@ mod tests_headless {
             .expect("health headless");
         assert_eq!(h["ok"], true);
         assert_eq!(h["backend"], "headless");
+    }
+}
+
+#[cfg(test)]
+mod tests_upload {
+    use super::*;
+
+    /// Uma "home" falsa em pasta temporária, com os casos que importam.
+    fn casa() -> PathBuf {
+        // Uma pasta POR CHAMADA: os testes rodam em paralelo, e com a pasta do
+        // processo um apagava a "home" do outro no meio (teste instável).
+        let base = std::env::temp_dir().join(format!("neo-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("Downloads")).unwrap();
+        std::fs::create_dir_all(base.join(".ssh")).unwrap();
+        std::fs::create_dir_all(base.join("Library/Prefs")).unwrap();
+        std::fs::write(base.join("Downloads/Retrato Masculino em Estúdio Cinza.png"), b"png!").unwrap();
+        std::fs::write(base.join("Downloads/vazio.txt"), b"").unwrap();
+        std::fs::write(base.join(".ssh/id_ed25519"), b"segredo").unwrap();
+        std::fs::write(base.join("Library/Prefs/x.plist"), b"x").unwrap();
+        base
+    }
+
+    #[test]
+    fn arquivo_da_home_sai_com_espaco_e_acento_no_nome() {
+        let home = casa();
+        let cheio = home.join("Downloads/Retrato Masculino em Estúdio Cinza.png");
+        let (real, n) = arquivo_para_enviar_em(cheio.to_str().unwrap(), 1024, &home).unwrap();
+        assert_eq!(n, 4);
+        assert!(real.ends_with("Retrato Masculino em Estúdio Cinza.png"));
+        // `~/` vale como a home.
+        let (_, n) =
+            arquivo_para_enviar_em("~/Downloads/Retrato Masculino em Estúdio Cinza.png", 1024, &home).unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn pasta_oculta_library_fora_da_home_vazio_e_grande_nao_saem() {
+        let home = casa();
+        let ssh = home.join(".ssh/id_ed25519");
+        assert!(arquivo_para_enviar_em(ssh.to_str().unwrap(), 1024, &home).unwrap_err().contains("oculta"));
+        // `..` não escapa: o caminho é canonizado antes da conferência.
+        let volta = home.join("Downloads/../.ssh/id_ed25519");
+        assert!(arquivo_para_enviar_em(volta.to_str().unwrap(), 1024, &home).is_err());
+        let lib = home.join("Library/Prefs/x.plist");
+        assert!(arquivo_para_enviar_em(lib.to_str().unwrap(), 1024, &home).unwrap_err().contains("Library"));
+        assert!(arquivo_para_enviar_em("/etc/hosts", 1 << 20, &home).unwrap_err().contains("fora"));
+        let vazio = home.join("Downloads/vazio.txt");
+        assert!(arquivo_para_enviar_em(vazio.to_str().unwrap(), 1024, &home).unwrap_err().contains("vazio"));
+        let foto = home.join("Downloads/Retrato Masculino em Estúdio Cinza.png");
+        assert!(arquivo_para_enviar_em(foto.to_str().unwrap(), 2, &home).unwrap_err().contains("teto"));
+        assert!(arquivo_para_enviar_em("Downloads/x.png", 1024, &home).unwrap_err().contains("relativo"));
+        assert!(arquivo_para_enviar_em("/nao/existe.png", 1024, &home).unwrap_err().contains("não achei"));
+        assert!(arquivo_para_enviar_em(home.join("Downloads").to_str().unwrap(), 1024, &home).is_err());
+    }
+
+    #[test]
+    fn accept_do_campo() {
+        assert!(campo_aceita("", "a.pdf", "application/pdf"));
+        assert!(campo_aceita("image/*", "a.png", "image/png"));
+        assert!(!campo_aceita("image/*", "a.pdf", "application/pdf"));
+        assert!(campo_aceita(".jpg, .png", "Foto.PNG", "image/png"));
+        assert!(campo_aceita("image/png,image/jpeg", "a.jpeg", "image/jpeg"));
+        assert!(!campo_aceita(".pdf", "a.docx", "application/octet-stream"));
+    }
+
+    #[test]
+    fn tipo_pela_extensao() {
+        assert_eq!(tipo_do_arquivo(std::path::Path::new("/x/A.JPG")), "image/jpeg");
+        assert_eq!(tipo_do_arquivo(std::path::Path::new("/x/cv.pdf")), "application/pdf");
+        assert_eq!(tipo_do_arquivo(std::path::Path::new("/x/sem")), "application/octet-stream");
+    }
+
+    #[test]
+    fn js_do_alvo_traz_os_helpers_e_o_ref() {
+        let js = js_alvo_upload(15);
+        assert!(js.contains("NEO.arquivoDe"));
+        assert!(js.contains("const ref = 15;"));
+        assert!(js_alvo_upload(-1).contains("const ref = -1;"));
+    }
+
+    #[test]
+    fn evento_do_seletor_fica_guardado_por_aba() {
+        let antes = Instant::now();
+        anotar_seletor(987_654, &json!({ "backendNodeId": 42, "mode": "selectSingle" }));
+        assert_eq!(seletor_desde(987_654, antes), Some(42));
+        assert_eq!(seletor_desde(987_655, antes), None);
+        assert_eq!(seletor_desde(987_654, Instant::now() + Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn conteudo_do_catalogo_vira_arquivo_temporario_com_o_nome_dele() {
+        let base = std::env::temp_dir().join(format!("neo-upload-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let p = gravar_temporario_em(&base, "../../retrato_quadrado.png", b"png!").unwrap();
+        assert!(p.starts_with(&base));
+        assert_eq!(p.file_name().unwrap(), "retrato_quadrado.png");
+        assert_eq!(std::fs::read(&p).unwrap(), b"png!");
+        assert_eq!(nome_seguro(".bashrc"), "bashrc");
+        assert_eq!(nome_seguro("a\nb.png"), "ab.png");
+        assert_eq!(nome_seguro("   "), "arquivo");
+    }
+
+    #[test]
+    fn fonte_do_upload_disco_ou_conteudo() {
+        let disco = fonte_do_upload(&json!({ "arquivo": "~/a.png" }), 10).unwrap();
+        assert!(matches!(disco, FonteUpload::Disco { ref caminho, max_bytes: 10 } if caminho == "~/a.png"));
+        let b64 = b64_encode(b"png!");
+        let cont = fonte_do_upload(&json!({ "conteudo_b64": b64, "nome": "q.png" }), 10).unwrap();
+        assert!(matches!(cont, FonteUpload::Conteudo { ref nome, ref bytes } if nome == "q.png" && bytes == b"png!"));
+        let grande = fonte_do_upload(&json!({ "conteudo_b64": b64, "nome": "q.png" }), 2);
+        assert!(grande.err().unwrap().contains("teto"));
+        assert!(fonte_do_upload(&json!({ "conteudo_b64": "" }), 10).is_err());
+        assert!(fonte_do_upload(&json!({}), 10).is_err());
+    }
+
+    #[test]
+    fn extract_e_busca_leem_o_valor_dos_campos_sem_senha() {
+        // Sessão c4316486: o texto do textarea preenchido pelo JS do site não
+        // aparecia nem no `extract` nem na busca. O lab em Edge headless
+        // (scratchpad/scripts/lab_descricao.py) mediu o comportamento; aqui fica
+        // a garantia de que o JS continua pedindo o valor e pulando a senha.
+        let ext = js_extract(13, 4000);
+        assert!(ext.contains("controleDe") && ext.contains("ctl.value") && ext.contains("tipo === 'password'"));
+        let busca = js_buscar("Referência técnica", 4000);
+        assert!(busca.contains("NEO.todos('input,textarea')") && busca.contains("password|hidden"));
+    }
+
+    #[test]
+    fn upload_e_acao_que_atua() {
+        assert!(ATUA.contains(&"browser.upload"));
     }
 }

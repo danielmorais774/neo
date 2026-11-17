@@ -2590,6 +2590,7 @@ dependencies = [
  "libc",
  "log",
  "mime_guess",
+ "neo-imagem",
  "prost",
  "reqwest 0.12.28",
  "serde",
@@ -2613,6 +2614,13 @@ dependencies = [
  "tungstenite 0.24.0",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "neo-imagem"
+version = "0.1.0"
+dependencies = [
+ "image",
 ]
 
 [[package]]

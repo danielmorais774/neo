@@ -53,3 +53,20 @@ libc = "0.2"
 # pesadas; aqui o navegador dele nunca é tocado. A versão já vinha na árvore
 # pelo tauri — o que entra de novo é só o decoder de jpeg.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+neo-imagem = { path = "crates/neo-imagem" }
+
+# O print do navegador local: as funções de imagem são genéricas e, sem isto,
+# rodam sem otimização no `tauri dev` (~5 s por print de tela Retina; com isto,
+# ~0,14 s). Só estas crates: o resto continua compilando rápido. Ver
+# crates/neo-imagem/src/lib.rs.
+[profile.dev.package.neo-imagem]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3

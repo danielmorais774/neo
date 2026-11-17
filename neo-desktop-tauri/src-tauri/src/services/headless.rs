@@ -527,6 +527,16 @@ impl Headless {
             if valor.get("id").and_then(|v| v.as_u64()) != Some(id) {
                 // O único evento que interessa: a aba pediu outra janela. É o
                 // gatilho de "este clique abriu uma aba" (ver browser_local.rs).
+                // O campo de arquivo pediu a janela (segurada): é o input do `upload`.
+                if valor.get("method").and_then(|v| v.as_str()) == Some("Page.fileChooserOpened") {
+                    let sessao = valor.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(tab) = self.tabs.iter().find(|t| t.session_id == sessao) {
+                        super::browser_local::anotar_seletor(
+                            -tab.id,
+                            valor.get("params").unwrap_or(&Value::Null),
+                        );
+                    }
+                }
                 if valor.get("method").and_then(|v| v.as_str()) == Some("Page.windowOpen") {
                     let sessao = valor.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                     if let Some(tab) = self.tabs.iter().find(|t| t.session_id == sessao) {

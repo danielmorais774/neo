@@ -370,6 +370,8 @@ pub fn run() {
             commands::download_generated_file,
             commands::load_chat_image,
             commands::reveal_local_file,
+            commands::stat_local_file,
+            commands::reveal_in_folder,
             commands::stop_execution,
             commands::respond_to_command,
             commands::respond_file_change,

@@ -6,8 +6,10 @@ import { memo, useCallback, useMemo, useState } from 'react';
 import type { Message, PlanStep } from '../types';
 import PlanTracker from './PlanTracker';
 import InlineImages from './InlineImages';
+import LocalFiles from './LocalFiles';
 import CodeBlock, { CopyButton } from './CodeBlock';
 import { extractInlineImages } from '../lib/inlineImages';
+import { extractLocalFiles } from '../lib/localFiles';
 import FileChangeCard from './FileChangeCard';
 import ClaudeNoBalao from './ClaudeNoBalao';
 import './MessageBubble.css';
@@ -33,10 +35,13 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
   // vira imagem de verdade abaixo dele (bytes lidos do disco pelo Rust, nunca
   // pelo prompt — ver lib/inlineImages.ts). Como o marcador fica salvo no
   // conteúdo da mensagem, reabrir uma sessão antiga redesenha as imagens.
-  const { text: displayText, images: inlineImages } = useMemo(
-    () => extractInlineImages(message.content || ''),
-    [message.content]
-  );
+  // `[[FILE:…]]` é o arquivo que já está no disco dele (cartão com "Mostrar no
+  // Finder", ver lib/localFiles.ts) — sai do texto do mesmo jeito.
+  const { displayText, inlineImages, localFiles } = useMemo(() => {
+    const imgs = extractInlineImages(message.content || '');
+    const locais = extractLocalFiles(imgs.text);
+    return { displayText: locais.text, inlineImages: imgs.images, localFiles: locais.files };
+  }, [message.content]);
 
   // Lido no clique (o comando pode chegar depois, junto do evento de permissão).
   const getCommandText = useCallback(() => message.command?.cmd ?? '', [message.command?.cmd]);
@@ -395,6 +400,8 @@ function MessageBubble({ message, onPermissionResponse, onMissionResponse }: Mes
           </div>
 
           <InlineImages images={inlineImages} />
+
+          <LocalFiles files={localFiles} />
 
           {renderFiles()}
 

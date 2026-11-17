@@ -1,0 +1,98 @@
+/* Cartão de arquivo no disco do usuário (marcador [[FILE:…]]).
+   Tokens de tema, como o InlineImages.css, para acompanhar os 4 temas. */
+
+.local-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.local-file-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  max-width: 520px;
+  border: 1px solid var(--surface-border, rgba(59, 130, 246, 0.15));
+  border-radius: var(--app-radius, 8px);
+  background: var(--surface-1, rgba(15, 20, 35, 0.7));
+}
+
+.local-file-icon {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.local-file-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.local-file-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #e2e8f0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-file-detail {
+  font-size: 11px;
+  color: var(--text-secondary, #94a3b8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-file-dir {
+  opacity: 0.8;
+}
+
+.local-file-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-secondary, #94a3b8);
+  word-break: break-all;
+}
+
+.local-file-reveal {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-primary, #e2e8f0);
+  background: var(--control-bg, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--surface-border, rgba(255, 255, 255, 0.14));
+  border-radius: var(--app-radius, 6px);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.local-file-reveal:hover:not(:disabled) {
+  background: var(--control-bg-hover, rgba(255, 255, 255, 0.15));
+}
+
+.local-file-reveal:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.local-file-error {
+  align-items: flex-start;
+  border-color: var(--error-border, rgba(239, 68, 68, 0.35));
+}
+
+.local-file-error .local-file-icon {
+  color: var(--error, #ef4444);
+  font-size: 14px;
+}
+
+.local-file-reveal-error {
+  color: var(--error, #ef4444);
+  white-space: normal;
+}

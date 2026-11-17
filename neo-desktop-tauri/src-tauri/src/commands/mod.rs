@@ -680,7 +680,7 @@ pub struct ChatImage {
     pub path: Option<String>,
 }
 
-/// Remove os marcadores `[[IMAGE:…]]` de um texto que vai ser FALADO (notch/TTS)
+/// Remove os marcadores `[[IMAGE:…]]` e `[[FILE:…]]` de um texto que vai ser FALADO (notch/TTS)
 /// ou mostrado onde não há renderização. Sem isto o TTS lê o caminho inteiro em
 /// voz alta. O front tem o equivalente em src/lib/inlineImages.ts (que também
 /// devolve as imagens); aqui só interessa o texto limpo.
@@ -730,12 +730,17 @@ fn find_image_marker(haystack: &str) -> Option<usize> {
             continue;
         }
         let word = skip_ws(i + 2);
-        if bytes.len() < word + 5 || !bytes[word..word + 5].eq_ignore_ascii_case(b"image") {
-            continue;
-        }
-        let colon = skip_ws(word + 5);
-        if colon < bytes.len() && bytes[colon] == b':' {
-            return Some(i);
+        // `[[IMAGE:` e `[[FILE:` (arquivo no disco dele, cartão "Mostrar no
+        // Finder"): os dois são de RENDER, e nenhum caminho pode ser falado.
+        for marker in [&b"image"[..], &b"file"[..]] {
+            let end = word + marker.len();
+            if bytes.len() < end || !bytes[word..end].eq_ignore_ascii_case(marker) {
+                continue;
+            }
+            let colon = skip_ws(end);
+            if colon < bytes.len() && bytes[colon] == b':' {
+                return Some(i);
+            }
         }
     }
     None
@@ -1088,6 +1093,63 @@ pub async fn reveal_local_file(path: String) -> Result<(), String> {
     result
         .map(|_| ())
         .map_err(|e| format!("Não consegui abrir o arquivo: {}", e))
+}
+
+/// Arquivo no disco do usuário citado por `[[FILE:…]]` (`LocalFileInfo` em
+/// src/lib/tauriApi.ts).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    /// Caminho absoluto real (canônico, sem `~`).
+    pub path: String,
+}
+
+/// Confere que o arquivo do `[[FILE:…]]` existe e devolve nome e tamanho.
+///
+/// O caminho é escrito pelo MODELO: inventado, a resposta é um erro com o
+/// caminho, que o cartão mostra (falha visível, como no `[[IMAGE:…]]`). Não lê
+/// o conteúdo, só os metadados.
+#[tauri::command]
+pub async fn stat_local_file(path: String) -> Result<LocalFileInfo, String> {
+    let resolved = resolve_local_image_path(&path)?;
+    let size_bytes = std::fs::metadata(&resolved)
+        .map_err(|e| format!("Não consegui ler o arquivo: {}", e))?
+        .len();
+    let name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| resolved.display().to_string());
+    Ok(LocalFileInfo {
+        name,
+        size_bytes,
+        path: resolved.display().to_string(),
+    })
+}
+
+/// Mostra o arquivo selecionado na pasta dele (Finder/Explorer), sem abrir.
+///
+/// De propósito não usa o `reveal_local_file` (que ABRE com o app padrão): o
+/// caminho vem do modelo, e abrir um `.command`/`.sh` executaria o script. Selecionar
+/// na pasta não executa nada.
+#[tauri::command]
+pub async fn reveal_in_folder(path: String) -> Result<(), String> {
+    let resolved = resolve_local_image_path(&path)?;
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(&resolved).spawn()
+    } else if cfg!(target_os = "windows") {
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(resolved.as_os_str());
+        std::process::Command::new("explorer").arg(select).spawn()
+    } else {
+        // Linux não tem "selecionar" padrão: abre a pasta que contém o arquivo.
+        let pasta = resolved.parent().unwrap_or(&resolved);
+        std::process::Command::new("xdg-open").arg(pasta).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| format!("Não consegui mostrar o arquivo na pasta: {}", e))
 }
 
 /// O token da ponte da extensão de música, para colar no popup dela.
@@ -2526,6 +2588,45 @@ mod inline_image_tests {
         // Resposta cortada no meio do marcador: o caminho não pode ser falado.
         let out = strip_image_markers("Olha só: [[IMAGE:/Users/d/Downloads/WhatsApp Ima");
         assert_eq!(out, "Olha só:");
+    }
+
+    #[test]
+    fn strips_local_file_marker_too() {
+        let out = strip_image_markers(
+            "Baixei:\n[[FILE:/Users/d/Downloads/taca-lê pau [nRuiacgrY0w].mp4|o vídeo]] pronto",
+        );
+        // O `[id]` que o yt-dlp põe no nome não fecha o marcador: só o `]]` fecha.
+        assert!(!out.contains("/Users/d") && !out.contains("nRuiacgrY0w"), "{out}");
+        assert!(out.starts_with("Baixei:") && out.ends_with("pronto"), "{out}");
+        assert_eq!(strip_image_markers("ok [[ file : ~/a.mp4]] fim"), "ok  fim");
+        assert_eq!(strip_image_markers("cortado [[FILE:/Users/d/Down"), "cortado");
+    }
+
+    #[test]
+    fn file_word_inside_other_marker_is_not_a_marker() {
+        let text = "[[FILEX:/a]] e [[filename]] ficam";
+        assert_eq!(strip_image_markers(text), text);
+    }
+
+    #[test]
+    fn stat_local_file_reports_name_and_size_or_the_missing_path() {
+        let dir = std::env::temp_dir().join(format!("neo-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("vídeo com espaço.mp4");
+        std::fs::write(&file, b"12345").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let info = rt
+            .block_on(stat_local_file(file.display().to_string()))
+            .unwrap();
+        assert_eq!(info.name, "vídeo com espaço.mp4");
+        assert_eq!(info.size_bytes, 5);
+        let err = rt
+            .block_on(stat_local_file(dir.join("inventado.mp4").display().to_string()))
+            .unwrap_err();
+        assert!(err.contains("inventado.mp4"), "{err}");
+        let pasta = rt.block_on(stat_local_file(dir.display().to_string())).unwrap_err();
+        assert!(pasta.contains("não é um arquivo"), "{pasta}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
