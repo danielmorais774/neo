@@ -64,3 +64,6 @@ models/
 
 # Gabarito do ranking do PKS: 50 trechos de conversas REAIS. Fica só no disco (scripts/pks_ranking_bench.py).
 /neo-core/tests/pks_ranking/golden.yaml
+
+# Notas de trabalho da organização do repositório (fica só no disco).
+/neo-core/docs/plano-monorepo-e-readme.md
