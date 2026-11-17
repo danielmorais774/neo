@@ -204,7 +204,7 @@ def test_wikimedia_mantem_o_ua_identificado():
 def test_resto_da_web_recebe_perfil_de_navegador():
     from modules.web_search.fetch import headers_for
 
-    h = headers_for("dadosabertos.exemplo.gov.br")
+    h = headers_for("dados.exemplo.gov.br")
     assert h["User-Agent"].startswith("Mozilla/5.0")
     # O que destrava não é o UA sozinho: é o conjunto coerente. Testado header a
     # header contra o CDN do portal de dados, nenhum isolado passa.

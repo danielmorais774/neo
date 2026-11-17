@@ -24,7 +24,7 @@ from db.models.agent_job import AgentJob
 DIAGNOSTICO = (
     "Chegou ao passo 22 antes de ser interrompido.\n"
     "O que o agente já tinha tentado: Tentativas falhas: 1) cdn.exemplo.gov.br → 403. "
-    "2) dadosabertos.exemplo.gov.br → Access Denied (EdgeSuite). 3) DuckDuckGo → CAPTCHA. "
+    "2) dados.exemplo.gov.br → Access Denied (EdgeSuite). 3) DuckDuckGo → CAPTCHA. "
     "4) Google → CAPTCHA. 5) www.exemplo.gov.br → Access Denied."
 )
 

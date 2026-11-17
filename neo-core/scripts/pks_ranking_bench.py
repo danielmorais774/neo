@@ -128,6 +128,9 @@ async def main() -> None:
     from db.async_client import AsyncPostgresClient
 
     settings = get_settings()
+    if not GOLDEN.exists():
+        # O gabarito é feito de conversas reais e não vai para o repositório.
+        sys.exit(f"gabarito não encontrado em {GOLDEN} (fica só na máquina do dono: conversas reais)")
     cases = yaml.safe_load(GOLDEN.read_text())["cases"]
     db = AsyncPostgresClient()
     svc = PKSService(db, LLMRouter())

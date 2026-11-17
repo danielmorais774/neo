@@ -402,7 +402,7 @@ def _urls_nao_fundamentadas(command: str, haystack_lower: str) -> list[str]:
     """URLs do comando que não aparecem LITERALMENTE na conversa.
 
     A fundamentação é pela URL inteira, não pelo host: "pega no site do portal de dados" não
-    torna `https://www.exemplo.gov.br/arquivos/plano_2026.pdf` real — o host é
+    torna `https://www.exemplo.gov.br/arquivos/relatorio_2026.pdf` real — o host é
     plausível e o caminho continua sendo chute, que é justamente o que falha
     (404, ou pior, um HTML de erro salvo como .pdf). Só a busca produz deep link.
     """

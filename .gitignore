@@ -61,3 +61,6 @@ models/
 /neo-whatsapp/auth/
 /neo-voice/**/state/
 /neo-voice/**/cache/
+
+# Gabarito do ranking do PKS: 50 trechos de conversas REAIS. Fica só no disco (scripts/pks_ranking_bench.py).
+/neo-core/tests/pks_ranking/golden.yaml

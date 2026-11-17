@@ -31,8 +31,8 @@ from core.jobs.browser_blocked import (
 DIAGNOSTICO_REAL = (
     "Chegou ao passo 22 antes de ser interrompido.\n"
     "O que o agente já tinha tentado: Tentativas falhas: 1) "
-    "cdn.exemplo.gov.br/estatistica/sead/odsele/proposta_governo/"
-    "relatorios_2026_BR.zip → 403. 2) dadosabertos.exemplo.gov.br/dataset/"
+    "cdn.exemplo.gov.br/dados/relatorios/"
+    "relatorios_2026_BR.zip → 403. 2) dados.exemplo.gov.br/dataset/"
     "candidatos-2026 → Access Denied (EdgeSuite). 3) DuckDuckGo → CAPTCHA. "
     "4) Google → CAPTCHA. 5) Bing → resultados irrelevantes (localização fora "
     "do Brasil). 6) www.exemplo.gov.br → Access Denied."
