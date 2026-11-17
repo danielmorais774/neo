@@ -1,0 +1,6 @@
+*.svg -diff
+uv.lock -diff linguist-generated
+package-lock.json -diff linguist-generated
+Cargo.lock -diff linguist-generated
+*.pb2.py linguist-generated
+*_pb2_grpc.py linguist-generated
