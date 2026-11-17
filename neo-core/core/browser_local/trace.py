@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -128,17 +129,28 @@ class RunTrace:
         marked: bool | None,
         recorte: bool = False,
         final: bool = False,
+        tempos: dict | None = None,
+        gatilho: str = "",
     ) -> str | None:
         """Salva o JPEG do passo e devolve o nome do arquivo."""
         if not self.ok or not data:
             return None
         # O print do fim ganha nome próprio: é o que vai para o chat, e no
         # diário ele precisa ser achável sem contar passos.
+        # Print de confirmação: o nome diz o gatilho ("07-G2.jpg"), e dois no
+        # mesmo passo (o depois do campo anterior + o antes deste) não se apagam.
+        codigo = re.sub(r"[^A-Za-z0-9+]", "", gatilho.split(" ", 1)[0]).replace("+", "-") if gatilho else ""
         name = self.prefixo + (
             f"{number:02d}-final.jpg" if final
+            else f"{number:02d}-{codigo}.jpg" if codigo
             else f"{number:02d}-painel.jpg" if recorte
             else f"{number:02d}-tela.jpg"
         )
+        if codigo and (self.dir / name).exists():
+            extra = 2
+            while (self.dir / name.replace(".jpg", f"-{extra}.jpg")).exists():
+                extra += 1
+            name = name.replace(".jpg", f"-{extra}.jpg")
         try:
             import base64
 
@@ -150,14 +162,48 @@ class RunTrace:
         # `marked is None` = o device não respondeu o campo, ou seja é uma versão
         # anterior ao desenho das marcações. É o sintoma de desktop desatualizado.
         estado = (
-            "a tela do FIM, sem marcações — é este que vai para o chat" if final
+            f"confirmação {gatilho}" + (" (recortado)" if recorte else "") if gatilho
+            else "a tela do FIM, sem marcações — é este que vai para o chat" if final
             else "recorte do painel, sem marcações (é para LER, não para clicar)" if recorte
             else "com marcações" if marked
             else ("SEM marcações (desktop antigo? o campo `marks` nem voltou)" if marked is None
                   else "SEM marcações (o device não conseguiu desenhar)")
         )
         self._write(f"\n- print: `{name}` — {len(raw) // 1024} KB, {estado}\n")
+        linha = self._tempos_do_print(tempos)
+        if linha:
+            self._write(f"  - tempo: {linha}\n")
         return name
+
+    @staticmethod
+    def _tempos_do_print(tempos: dict | None) -> str:
+        """Onde foi o tempo do print: o device (por etapa) e o transporte (o resto).
+
+        Desktop antigo não manda as etapas: sai só a ida e volta.
+        """
+        if not tempos:
+            return ""
+        total = tempos.get("ida_e_volta_ms")
+        device = tempos.get("total_ms")
+        if not isinstance(total, (int, float)):
+            return ""
+        if not isinstance(device, (int, float)):
+            return f"{total:.0f} ms de ida e volta (o desktop não mandou as etapas)"
+        etapas = " · ".join(
+            f"{nome} {tempos[chave]:.0f}"
+            for chave, nome in (
+                ("captura_ms", "captura"), ("esconder_ms", "esconder painel"),
+                ("mostrar_ms", "mostrar painel"), ("rects_ms", "retângulos"), ("imagem_ms", "imagem"),
+            )
+            if isinstance(tempos.get(chave), (int, float))
+        )
+        tamanhos = ""
+        if isinstance(tempos.get("bytes_captura"), (int, float)) and isinstance(tempos.get("bytes_saida"), (int, float)):
+            tamanhos = f" · {tempos['bytes_captura'] // 1024} KB capturado → {tempos['bytes_saida'] // 1024} KB enviado"
+        return (
+            f"{total:.0f} ms de ida e volta = device {device:.0f} ms ({etapas}) "
+            f"+ transporte {max(0, total - device):.0f} ms{tamanhos}"
+        )
 
     def no_shot(self, reason: str) -> None:
         self._write(f"\n- print: **não tirado** — {reason}\n")

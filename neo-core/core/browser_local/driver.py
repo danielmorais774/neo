@@ -43,6 +43,7 @@ Ver docs/browser-local-plan.md §3.4 e §6.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -137,6 +138,13 @@ ACTIONS = {
     "right_click": ("ref",),
     "fill": ("ref", "value"),
     "select": ("ref", "option"),
+    # ARQUIVO do disco do Daniel para um campo de envio (foto de perfil, PDF).
+    # Clicar no "Escolher arquivo" abre a janela de arquivos do SISTEMA, que
+    # nenhuma ação alcança — a tarefa ficava presa ali. O desktop põe o arquivo
+    # direto no `<input type=file>`, sem janela. Só vale arquivo que ELE citou
+    # (`arquivos_do_daniel`, core/browser_local/pedido.py). `ref` é opcional: o
+    # campo, ou o botão/área de envio perto dele.
+    "upload": ("arquivo",),
     "press": ("key",),
     "scroll": ("delta",),  # `ref` opcional: qual painel rolar
     # A SAÍDA para o que se lê e não se consegue endereçar. Todo inventário de
@@ -480,6 +488,17 @@ _ANOTAR_POR_PASSO = 12
 #: tentar extract 'AC_'"). O caderno é o que vai para o usuário, e cada nota nova
 #: devolve um passo ao orçamento: no job aa4c89f8 foram 35 notas para 5 produtos, o
 #: orçamento subiu de 35 para 66 e o freio de improdutividade nunca disparou.
+#: Nota que AFIRMA arquivo no disco dele ("baixado… destino /Users/…/x.mp4"). No
+#: job 1c55ba10 (17/11) essa nota entrou no passo 8, antes de qualquer arquivo
+#: aparecer; dali em diante o modelo leu o próprio caderno como prova ("o caderno
+#: já diz que baixei") e gastou 12 passos conferindo uma pasta vazia. Só passa
+#: depois que o `downloads` viu arquivo novo nesta tarefa.
+_NOTA_DIZ_BAIXADO = re.compile(
+    r"\b(?:baixad[oa]s?|salv[oa]s?|download(?:s)?\s+(?:feito|conclu[ií]do|completo))\b",
+    re.IGNORECASE,
+)
+_NOTA_CITA_DISCO = re.compile(r"/Users/|/home/|~/|\b[A-Za-z]:\\|\bDownloads/")
+
 _NOTA_DE_BASTIDOR = re.compile(
     r"\b(tentar|tentando|tentei|extract|snapshot|wait_for|click_text)\b", re.IGNORECASE
 )
@@ -950,6 +969,9 @@ def _acao_em_palavras(action: str, args: dict, alvo: str = "") -> str:
         return f"preenchendo {quem or 'o campo'}"
     if action == "select":
         return f"escolhendo uma opção em {quem or 'a lista'}"
+    if action == "upload":
+        nome = str(args.get("arquivo") or "").rsplit("/", 1)[-1]
+        return f"enviando o arquivo «{nome[:60]}»" + (f" em {quem}" if quem else "")
     if action == "press":
         return f"tecla {str(args.get('key') or '')[:20]}"
     if action == "scroll":
@@ -1055,7 +1077,12 @@ _EXTENSOES = frozenset(
     py js ts jsx tsx rb sh bash bat ps1 sql db bak tmp cfg conf ini env lock""".split()
 )
 
-_HOST_NO_TEXTO = re.compile(r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:/\S*)?")
+#: O TLD não pode emendar em letra/número: sem a trava, `taca-le-pau-marco-veio.mp4`
+#: virava o host `taca-le-pau-marco-veio.mp` (o `[a-z]{2,}` parava antes do `4`, e o
+#: filtro de extensão via `mp`, não `mp4`) — job 1c55ba10, 17/11.
+_HOST_NO_TEXTO = re.compile(
+    r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?![a-z0-9-])(?:/\S*)?"
+)
 
 
 def _hosts_citados(text: str) -> set[str]:
@@ -1398,6 +1425,18 @@ Ações e argumentos:
                                           no COFRE), nunca um inventado nem de
                                           caixa pública (mailinator e afins).
 - select    {"ref": 4, "option": "São Paulo"}
+- upload    {"ref": 15, "arquivo": "/Users/daniel/Downloads/foto.png"}
+                                          ENVIA um arquivo do disco do Daniel ao
+                                          campo de arquivo (foto, currículo,
+                                          anexo). `ref` = o campo ⟪ARQUIVO⟫ ou o
+                                          botão/área de envio ("Alterar foto",
+                                          "Anexar"). NUNCA clique nesses botões:
+                                          eles abrem a janela de arquivos do
+                                          sistema, que você não controla. Só
+                                          arquivo da lista ARQUIVOS DO DANIEL;
+                                          sem lista, `perguntar` qual arquivo.
+                                          Depois confira a tela (prévia, recorte,
+                                          botão de salvar a foto)
 - press     {"key": "Enter"}              Enter|Tab|Escape|Backspace|ArrowDown|
                                           ArrowUp|PageDown|PageUp|Home|End
 - scroll    {"delta": 600, "ref": 12}     positivo desce, negativo sobe; o `ref`
@@ -1768,6 +1807,10 @@ class BrowserLocalDriver:
         filho: bool = False,
         conversa: Any = None,
         falas: str = "",
+        arquivos: list[str] | None = None,
+        arquivo_max_bytes: int = 0,
+        catalogo: list[dict] | None = None,
+        ler_catalogo: Callable[[str], Awaitable[dict]] | None = None,
         on_avisar: Callable[[str], Awaitable[None]] | None = None,
         on_perguntar: Callable[[str, list[str]], Awaitable[None]] | None = None,
         on_mensagem: Callable[[Any], Awaitable[None]] | None = None,
@@ -1798,6 +1841,17 @@ class BrowserLocalDriver:
         #: O que o Daniel disse sobre o trabalho, nas palavras DELE. A TAREFA é o
         #: Neo resumindo; isto é a fonte (sessão c469e4c7).
         self._falas = str(falas or "").strip()
+        #: Os arquivos do disco DELE que ele citou na conversa: os únicos que o
+        #: `upload` envia (a página e o modelo não escolhem arquivo).
+        self._arquivos = [str(a) for a in (arquivos or []) if str(a or "").strip()]
+        self._arquivo_max_bytes = int(arquivo_max_bytes or 0)
+        #: Os do CATÁLOGO desta conversa (o Neo gerou no sandbox, ou ele anexou no
+        #: chat): não estão no disco dele, então o conteúdo vai junto da ação
+        #: (sessão d7ad32a0). Sem leitor, não há como mandar: a lista fica vazia.
+        self._catalogo = [
+            dict(c) for c in (catalogo or []) if isinstance(c, dict) and c.get("file_id")
+        ] if ler_catalogo is not None else []
+        self._ler_catalogo = ler_catalogo
         self.on_avisar = on_avisar
         self.on_perguntar = on_perguntar
         #: Mensagem que chegou PELO PAINEL: o runner a guarda no histórico da
@@ -1970,6 +2024,9 @@ class BrowserLocalDriver:
         # várias vezes na mesma tarefa e o registro não pode ganhar uma linha
         # por conferência.
         self._announced: set[str] = set()
+        # O `downloads` já viu arquivo NOVO nesta tarefa? Até lá, nota que diz
+        # "baixado em /Users/…" é promessa, não dado (`_NOTA_DIZ_BAIXADO`).
+        self._viu_download = False
         self._tab_ref: int | None = None
         self._allowed_hosts: set[str] = set()
         # Alguma página já carregou? Enquanto for False o escopo não tranca (ver
@@ -2099,6 +2156,23 @@ class BrowserLocalDriver:
         #: Recusas de LEITURA (`look`/`extract`) por tela. As duas recusas
         #: apontavam uma para a outra — ver `_recusa_de_leitura`.
         self._leituras_barradas: dict[str, int] = {}
+        #: O que cada clique FEZ, por (tela de antes, ação): a tela de depois e o
+        #: começo do que apareceu. É o freio do ciclo de dois passos que o de
+        #: "a tela não mudou" não vê, porque ela muda toda vez — job 136453ab:
+        #: `edit` [8] → modal do nome → CANCELAR → `edit` [8], onze voltas.
+        self._desfechos: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        self._resumo_atual = ""
+        #: Prints de CONFIRMAÇÃO (`core/browser_local/visao.py`): o que já foi
+        #: fotografado e os prints guardados para a análise (fase seguinte).
+        from core.browser_local.visao import EstadoDaVisao
+
+        self._visao = EstadoDaVisao()
+        self.prints_de_confirmacao: list[dict] = []
+        #: As conferências prontas, na ordem em que chegaram (o prompt mostra as últimas).
+        self.conferencias: list[dict] = []
+        self._analises = 0
+        self._tarefas_visao: set[asyncio.Task] = set()
+        self._sem_visao: asyncio.Semaphore | None = None
 
         # ── painéis abertos (ver _note_panels / _triage_panel) ───────────
         # Painéis abertos no ÚLTIMO snapshot visto, por identidade estável. O
@@ -2354,7 +2428,11 @@ class BrowserLocalDriver:
             "perguntei ao Daniel",
             pergunta + (f"\nopções: {' / '.join(opcoes)}" if opcoes else ""),
         )
-        await self._banner(pergunta[:600], kind="pergunta", detail="\n".join(opcoes))
+        # A conferência é a pergunta mais longa (um campo por linha, com o valor):
+        # o teto é o do neo.toml, não os 600 de antes.
+        await self._banner(
+            pergunta[: int(cfg.pergunta_painel_max)], kind="pergunta", detail="\n".join(opcoes)
+        )
         if self.on_perguntar is not None:
             try:
                 await self.on_perguntar(pergunta, list(opcoes))
@@ -2514,17 +2592,34 @@ class BrowserLocalDriver:
             return None
         self._religadas += 1
         try:
-            await self._call("browser.focus_tab", {"tab_ref": self._tab_ref})
-            snapshot = await self._snapshot({})
+            snapshot = await self._religar_uma_vez()
         except StopRequested:
             raise
-        except Exception as exc2:  # noqa: BLE001 — aí não deu mesmo
-            self._log("note", "não deu para religar", str(exc2))
-            return "outra_extensao" if "chrome-extension" in str(exc2) else None
+        except Exception as exc2:  # noqa: BLE001
+            if "chrome-extension" not in str(exc2):
+                self._log("note", "não deu para religar", str(exc2))
+                return None
+            # Menu de outra extensão (gerenciador de senhas) na aba: a extensão
+            # do Neo tira o foco do campo e fecha o menu, sem debugger. Só se
+            # ainda assim não voltar é que o Daniel é chamado (98c8bac7).
+            try:
+                soltou = await self._call("browser.soltar_menu", {"tab_ref": self._tab_ref})
+                self._log("note", "fechei o menu de outra extensão", json.dumps(soltou)[:200])
+                await asyncio.sleep(0.4)
+                snapshot = await self._religar_uma_vez()
+            except StopRequested:
+                raise
+            except Exception as exc3:  # noqa: BLE001 — aí não deu mesmo
+                self._log("note", "não deu para religar", f"{exc2} · depois de fechar o menu: {exc3}")
+                return "outra_extensao" if "chrome-extension" in str(exc3) else None
         self._log("note", "religuei a aba", f"{motivo} → o debugger voltou")
         logger.info("[BrowserLocal] aba %s religada (%s)", self._tab_ref, motivo)
         await self._banner("o navegador me soltou da aba — religuei e sigo", kind="ok")
         return snapshot
+
+    async def _religar_uma_vez(self) -> dict:
+        await self._call("browser.focus_tab", {"tab_ref": self._tab_ref})
+        return await self._snapshot({})
 
     @staticmethod
     def _quer_parar(respostas: list[Any]) -> bool:
@@ -3967,7 +4062,11 @@ class BrowserLocalDriver:
             if not (p["rotulo"] == rotulo[:120] and p.get("aba", "") == self._ativa)
         ]
         self._preenchidos.append(
-            {"rotulo": rotulo[:120], "valor": valor[:300], "origem": origem, "chave": chave,
+            # O valor INTEIRO (até 4000): a conferência corta na hora de mostrar,
+            # avisando. Cortado aqui em 300, a apresentação de ~700 caracteres
+            # chegou ao Daniel terminando em "postos de combustíve" e ele
+            # respondeu "Não envie" (sessão 98c8bac7).
+            {"rotulo": rotulo[:120], "valor": valor[:4000], "origem": origem, "chave": chave,
              # A ABA do campo: a conferência mostra só o formulário que vai ser
              # enviado (sessão 58b84b87 misturou o Google Forms no cadastro do AppDemo).
              "aba": self._ativa}
@@ -4033,13 +4132,27 @@ class BrowserLocalDriver:
             if self._consulta_aba.get(k, self._ativa) == self._ativa
         }
 
+    @staticmethod
+    def _valor_na_conferencia(valor: str, maximo: int) -> str:
+        """O valor como o Daniel confere: inteiro, ou começo e fim com o total.
+
+        Texto cortado sem aviso parece texto quebrado no campo — e o "Não envie"
+        dele é a resposta certa para isso.
+        """
+        from core.browser_local.pedido import cortar_meio
+
+        if len(valor) <= maximo:
+            return valor
+        return f"{cortar_meio(valor, maximo)}\n  (texto de {len(valor)} caracteres: o meio não aparece aqui, mas está no campo)"
+
     def _linhas_de_revisao(self) -> list[str]:
         """Uma linha por campo DESTA ABA: o que vai, e de onde veio."""
         linhas: list[str] = []
         usadas: set[str] = set()
         respostas = self._respostas_da_aba()
+        maximo = int(_conversa_ajustes().conferencia_valor_max)
         for p in self._preenchidos_da_aba():
-            inicio = f"«{p['rotulo']}» → {p['valor']}"
+            inicio = f"«{p['rotulo']}» → {self._valor_na_conferencia(str(p['valor']), maximo)}"
             if p["origem"] == "marcador":
                 linhas.append(f"{inicio} — o seu dado, só com a sua liberação")
             elif p["origem"] == "cofre":
@@ -4117,6 +4230,11 @@ class BrowserLocalDriver:
         extra = ""
         if item.get("value"):
             extra += f' = "{item["value"]}"'
+            if int(item.get("valor_total") or 0) > len(str(item["value"])):
+                extra += (
+                    f' (só o começo: o valor tem {int(item["valor_total"])} caracteres — '
+                    f'`extract {{"ref": {item.get("ref")}}}` lê inteiro)'
+                )
         if item.get("checked") is not None:
             extra += " [marcado]" if item["checked"] else " [desmarcado]"
         # O elemento é o ROSTO de um controle escondido por CSS (o caso do rádio
@@ -4126,6 +4244,10 @@ class BrowserLocalDriver:
             extra += f' [seleciona {item["controla"]}]'
         if item.get("disabled"):
             extra += " [desabilitado]"
+        # Campo de arquivo, ou o botão que o abre: clicar abre a janela do
+        # SISTEMA (fora do alcance de qualquer ação). O caminho é o `upload`.
+        if item.get("arquivo"):
+            extra += " ⟪ARQUIVO: envie com `upload`, não clique⟫"
         if item.get("options"):
             extra += f" opções: {', '.join(item['options'][:8])}"
         # O que salva o "Mais ações" nº 33 de ser igual ao nº 34: o nome da
@@ -5247,6 +5369,48 @@ class BrowserLocalDriver:
             + self._saidas_da_tela(snapshot)
         )
 
+    @staticmethod
+    def _resumo_da_tela(snapshot: dict) -> str:
+        """O começo do que está na tela, numa linha: é o "o que esse clique abre"."""
+        linhas = [l.strip() for l in str(snapshot.get("tela") or "").splitlines() if l.strip()]
+        return " · ".join(linhas[:4])[:140]
+
+    def _recusa_de_clique_que_ja_se_sabe(self, args: dict, snapshot: dict) -> ValueError | None:
+        """Mesmo clique, na mesma tela, que já deu DUAS vezes o mesmo resultado.
+
+        O freio de "a tela não mudou" não pega o ciclo de dois passos: o clique
+        abre um modal (a tela muda), o modelo fecha (muda de novo) e volta ao
+        começo achando que o clique faz outra coisa. Job 136453ab: o `edit` ao
+        lado do nome abre "Foto · Nome completo", e o agente o clicou onze vezes
+        para editar a headline. Na terceira, a ação é recusada com o que ela abre.
+        """
+        tela = self._last_fingerprint
+        if not tela:
+            return None
+        # Caixa e rádio ALTERNAM: o mesmo clique dá resultados opostos, e o
+        # estado está no snapshot ([marcado]/[desmarcado]). Não é ciclo.
+        for item in snapshot.get("elements") or []:
+            if item.get("ref") == args.get("ref") and item.get("checked") is not None:
+                return None
+        vistos = self._desfechos.get((tela, self._signature("click", args)), [])
+        if len(vistos) < 2 or len({fp for fp, _ in vistos[-2:]}) != 1:
+            return None
+        resumo = vistos[-1][1] or "a mesma tela"
+        rotulo = ""
+        for item in snapshot.get("elements") or []:
+            if item.get("ref") == args.get("ref"):
+                rotulo = str(item.get("text") or "")[:40]
+                break
+        alvo = f'[{args.get("ref")}] «{rotulo}»' if rotulo else "esse elemento"
+        return ValueError(
+            f"você já clicou em {alvo} nesta mesma tela {len(vistos)} vezes, e TODA vez "
+            f"ele abriu a mesma coisa: «{resumo}». Clicar de novo dá o mesmo — o que você "
+            "procura não é por aí. Se o que quer mudar não tem edição nesse lugar, ela "
+            "fica em outro bloco da página (procure pelo rótulo) ou não existe: siga com "
+            "o resto da tarefa e diga no fim o que ficou sem dar. "
+            + self._saidas_da_tela(snapshot)
+        )
+
     def _note_change(self, snapshot: dict) -> None:
         """A tela mudou depois do último passo de atuação?
 
@@ -5289,8 +5453,21 @@ class BrowserLocalDriver:
                 self._looked_on_screen.add(fingerprint)
             self._url_do_olhar = url
 
+        resumo_antes, self._resumo_atual = self._resumo_atual, self._resumo_da_tela(snapshot)
         if signature is None:  # o passo anterior não era de atuação
             return
+        # Só o clique que ABRIU outra coisa (o texto à vista mudou): marcar e
+        # desmarcar a mesma alternativa é giro também, mas quem o pega é a régua
+        # de "sem ganho", que diz o porquê.
+        if (
+            previous is not None
+            and signature.startswith("click:")
+            and self._resumo_atual
+            and self._resumo_atual != resumo_antes
+        ):
+            vistos = self._desfechos.setdefault((previous, signature), [])
+            vistos.append((fingerprint, self._resumo_atual))
+            del vistos[:-5]
         if previous is None or fingerprint != previous:
             self._stuck = 0
             self._stuck_signature = None
@@ -5400,6 +5577,82 @@ class BrowserLocalDriver:
         # Leitura única: alguma resposta chegou nos últimos 3s.
         return bool(fim and agora and (agora - fim) < 3000)
 
+    # ── upload: arquivo do disco dele para um campo da página ─────────────
+
+    def _validar_upload(self, args: dict) -> dict:
+        """Só sai arquivo que o DANIEL citou, ou um do catálogo desta conversa; o
+        `ref`, se veio, tem que ser número."""
+        from core.browser_local.pedido import caminho_autorizado, catalogo_autorizado
+
+        pedido = str(args.get("arquivo") or "").strip()
+        if not self._arquivos and not self._catalogo:
+            raise ValueError(
+                "o Daniel não citou nenhum arquivo do disco dele nesta conversa, e o Neo "
+                "não tem arquivo desta conversa no catálogo; eu só envio esses. Pergunte "
+                "(`perguntar`) qual arquivo e o caminho dele — ou siga sem e diga no fim "
+                "que faltou"
+            )
+        limpo: dict = {}
+        caminho = caminho_autorizado(pedido, self._arquivos) if self._arquivos else None
+        if caminho is not None:
+            limpo["arquivo"] = caminho
+        else:
+            do_neo = catalogo_autorizado(pedido, self._catalogo)
+            if do_neo is None:
+                opcoes = [f"«{a}»" for a in self._arquivos[:6]] + [
+                    f"«{c['nome']}» (do Neo)" for c in self._catalogo[:6]
+                ]
+                raise ValueError(
+                    f"«{pedido[:120]}» não é um arquivo que eu possa enviar. Os que posso: "
+                    + "; ".join(opcoes)
+                )
+            limpo["arquivo"] = str(do_neo["nome"])
+            limpo["file_id"] = str(do_neo["file_id"])
+        ref = args.get("ref")
+        if ref not in (None, ""):
+            try:
+                limpo["ref"] = int(ref)
+            except (TypeError, ValueError):
+                raise ValueError("`ref` do upload é o NÚMERO do campo ou do botão de envio") from None
+        return limpo
+
+    async def _acao_upload(self, args: dict) -> str:
+        """O desktop põe o arquivo no `<input type=file>` — nenhuma janela abre.
+
+        Arquivo do disco dele vai pelo caminho; do catálogo, o conteúdo vai junto
+        (em base64) e o desktop o grava numa pasta temporária com o nome dele.
+        """
+        payload = {k: v for k, v in args.items() if k != "file_id"}
+        if self._arquivo_max_bytes:
+            payload["max_bytes"] = self._arquivo_max_bytes
+        if args.get("file_id"):
+            if self._ler_catalogo is None:
+                raise RuntimeError("não consigo ler o catálogo agora")
+            lido = await self._ler_catalogo(str(args["file_id"]))
+            dados = bytes(lido.get("bytes") or b"")
+            if not dados:
+                raise RuntimeError("o arquivo do catálogo está vazio")
+            payload.pop("arquivo", None)
+            payload["nome"] = str(lido.get("nome") or args.get("arquivo") or "arquivo")
+            payload["conteudo_b64"] = base64.b64encode(dados).decode("ascii")
+            payload["max_bytes"] = max(int(payload.get("max_bytes") or 0), len(dados))
+        result = await self._agir_no_device("upload", payload)
+        nome = str(result.get("nome") or str(args["arquivo"]).rsplit("/", 1)[-1])
+        tamanho = int(result.get("bytes") or 0)
+        campo = str(result.get("campo") or "").strip()
+        via = str(result.get("via") or "")
+        self._log("note", f"upload: {nome}", f"{tamanho} bytes via {via or '?'}")
+        await self._banner(f"enviei «{nome[:60]}»", kind="ok", detail=campo[:120])
+        partes = [f"arquivo «{nome}» ({max(1, tamanho // 1024)} KB) está no campo"]
+        if campo:
+            partes.append(f"«{campo[:80]}»")
+        return (
+            " ".join(partes)
+            + ". O site ainda pode pedir um passo: recortar a foto, confirmar, ou "
+            "SALVAR — confira a tela e conclua. Não envie o mesmo arquivo de novo "
+            "se a prévia já apareceu"
+        )
+
     async def _conferir_downloads(self, args: dict) -> str:
         """Confere o que aconteceu com o download. É o que destrava o reclique.
 
@@ -5465,6 +5718,8 @@ class BrowserLocalDriver:
             await asyncio.sleep(2.0)
 
         novos = [f for f in files if f.get("name") not in antes]
+        if novos:
+            self._viu_download = True
         # O arquivo já está no disco DELE neste ponto, mesmo que ainda esteja
         # enchendo. Registrar agora é o que sobrevive a um job que morre no
         # meio — o fim da tarefa só confirma tamanho.
@@ -5575,7 +5830,8 @@ class BrowserLocalDriver:
         return self._absorb_listing(listing)
 
     async def _shot(
-        self, clip: list | None = None, *, para_usuario: bool = False
+        self, clip: list | None = None, *, para_usuario: bool = False, confirmacao: str = "",
+        alvo_ref: int | None = None,
     ) -> str | None:
         """Print da tela com os números dos elementos desenhados em cima.
 
@@ -5597,7 +5853,9 @@ class BrowserLocalDriver:
         `look`, e sobrescrevê-lo aqui faria a próxima olhada achar que a tela
         não tem número nenhum desenhado.
         """
-        if para_usuario:
+        if para_usuario or confirmacao:
+            # Print de confirmação não depende da visão estar ligada: nesta fase
+            # ele vai para o diário (e, depois, para a análise).
             if self._shot_broken:
                 return None
         elif not self.vision_model:
@@ -5609,12 +5867,41 @@ class BrowserLocalDriver:
             if isinstance(clip, list) and len(clip) == 4
             else None
         )
-        if recorte and recorte[2] > 0 and recorte[3] > 0:
+        if confirmacao and alvo_ref is not None:
+            # O desktop mede o elemento na página AGORA (e o traz para a vista);
+            # sem achar, sai a tela inteira reduzida.
+            recorte = None
+            try:
+                cfg = self._visao_ajustes()
+                margem, largura = float(cfg.recorte_margem_px), int(cfg.largura_max_px)
+            except Exception:  # noqa: BLE001
+                margem, largura = 120.0, 1280
+            pedido = {"marks": False, "quality": 80, "alvo_ref": int(alvo_ref),
+                      "margem_abaixo": margem, "max_width": largura}
+        elif recorte and recorte[2] > 0 and recorte[3] > 0:
             pedido = {"marks": False, "quality": 80, "clip": recorte}
+            if confirmacao:
+                # Recorte fora da tela cai no print inteiro: que caia reduzido e
+                # sem números (sessão 69020f7a: 367 KB, com marcações).
+                try:
+                    pedido["max_width"] = int(self._visao_ajustes().largura_max_px)
+                except Exception:  # noqa: BLE001
+                    pedido["max_width"] = 1280
         else:
             recorte = None
             if para_usuario:
                 pedido = {"marks": False, "quality": 80}
+            elif confirmacao:
+                # Sem números: a confirmação confere VALOR, não aponta elemento.
+                # Largura máxima em vez de escala: a visão lê igual a 1280 px e a
+                # rede leva 1/3 dos bytes (plano §9). Desktop antigo ignora e
+                # manda a captura crua.
+                try:
+                    largura = int(self._visao_ajustes().largura_max_px)
+                except Exception:  # noqa: BLE001
+                    largura = 1280
+                pedido = {"marks": False, "quality": 70, "max_width": largura}
+        inicio_print = time.monotonic()
         try:
             shot = await self._call("browser.screenshot", pedido)
         except Exception as exc:  # noqa: BLE001
@@ -5627,12 +5914,19 @@ class BrowserLocalDriver:
             self._shot_broken = True
             return None
         data = (shot.get("data") or "").strip() or None
-        if recorte or para_usuario:
+        # Quanto o print custou, e onde: o device diz as etapas dele; o resto da
+        # ida e volta é transporte (extensão → desktop → websocket → aqui).
+        tempos = dict(shot.get("tempos") or {}) if isinstance(shot.get("tempos"), dict) else {}
+        tempos["ida_e_volta_ms"] = round((time.monotonic() - inicio_print) * 1000)
+        if recorte or para_usuario or confirmacao:
+            if shot.get("rolou"):
+                self._log("note", "print do campo", "o campo estava fora da tela: rolei até ele para fotografar")
             # Device antigo ignora `clip` e devolve a tela inteira. Não é erro —
             # é print pior, e print pior ainda vale mais que nenhum.
             if data:
                 self._log("shot", len(self.steps) + 1, data, shot.get("marks"),
-                          recorte=bool(shot.get("clipped")), final=para_usuario)
+                          recorte=bool(shot.get("clipped")), final=para_usuario, tempos=tempos,
+                          gatilho=confirmacao)
             else:
                 self._log("no_shot", "o device devolveu imagem vazia")
             return data
@@ -5644,10 +5938,224 @@ class BrowserLocalDriver:
         if data:
             # `marks` só existe no device novo: a ausência do campo é o sintoma
             # de desktop desatualizado, e é isso que o diário precisa mostrar.
-            self._log("shot", len(self.steps) + 1, data, shot.get("marks"))
+            self._log("shot", len(self.steps) + 1, data, shot.get("marks"), tempos=tempos)
         else:
             self._log("no_shot", "o device devolveu imagem vazia")
         return data
+
+    # ── prints de confirmação (docs/browser-visao-confirmacao-plan.md) ────
+
+    @staticmethod
+    def _visao_ajustes() -> Any:
+        from shared.ajustes import ajustes
+
+        return ajustes().navegador.visao
+
+    def _visao_ligada(self) -> bool:
+        """O booleano do Daniel. Ilegível = desligado (o caminho de sempre)."""
+        try:
+            return bool(self._visao_ajustes().confirmacao_visual)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _visao_antes(self, action: str, args: dict, snapshot: dict) -> None:
+        """G1/G1b/G3: os prints de ANTES da ação. Nunca derruba o passo."""
+        if not self._visao_ligada():
+            return
+        try:
+            from core.browser_local.visao import antes_da_acao, juntar
+
+            fp = self._last_fingerprint or ""
+            disparos = antes_da_acao(
+                self._visao, action, args, snapshot,
+                fingerprint=fp, painel=",".join(sorted(self._panels_now)) or None, envio=_ENVIO,
+            )
+            await self._tirar_prints(juntar(disparos, fingerprint=fp, estado=self._visao), fp)
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[BrowserLocal] print de confirmação (antes) falhou: %s", exc)
+
+    async def _visao_logo_depois(self, detalhe: str) -> None:
+        """G2 logo depois da ação, guiado pelo número do campo (antes de rolar)."""
+        if not self._visao_ligada():
+            return
+        try:
+            from core.browser_local.visao import logo_depois
+
+            disparo = logo_depois(self._visao, detalhe)
+            if disparo is not None:
+                await self._tirar_prints([disparo], self._last_fingerprint or "")
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[BrowserLocal] print de confirmação (logo depois) falhou: %s", exc)
+
+    async def _visao_depois(self, snapshot: dict) -> None:
+        """G2/G4/G5/G7/G8: os prints de DEPOIS, no snapshot seguinte à ação."""
+        if not self._visao_ligada():
+            self._visao.pendente = None
+            return
+        try:
+            from core.browser_local.visao import depois_da_acao, juntar
+
+            fp = self._last_fingerprint or ""
+            painel = self._panels_now.get(self._panel_new) if self._panel_new else None
+            disparos = depois_da_acao(
+                self._visao, snapshot, painel_novo=painel,
+                margem=float(self._visao_ajustes().recorte_margem_px),
+            )
+            if any(d.gatilho == "G4" for d in disparos):
+                self._conferir_envio_pela_dom(snapshot)
+            await self._tirar_prints(juntar(disparos, fingerprint=fp, estado=self._visao), fp)
+        except StopRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[BrowserLocal] print de confirmação (depois) falhou: %s", exc)
+
+    def _campos_para_conferir(self) -> list[dict]:
+        """Os campos desta aba como a conferência os vê: dado pessoal e senha vão
+        sem valor (a visão só confere que estão preenchidos)."""
+        return [
+            {"rotulo": p["rotulo"], "valor": None if p["origem"] in ("marcador", "cofre") else p["valor"]}
+            for p in self._preenchidos_da_aba()
+        ]
+
+    def _conferir_envio_pela_dom(self, snapshot: dict) -> None:
+        """Depois de enviar: os valores digitados aparecem na página? Pela DOM,
+        porque o print pode não pegar o item salvo — a página rola (job cb0374f1)."""
+        from core.browser_local.conferencia import Conferencia, valores_salvos_na_pagina
+
+        campos = [c for c in self._campos_para_conferir() if c.get("valor")]
+        if not campos:
+            return
+        achados = valores_salvos_na_pagina(snapshot, campos)
+        if achados:
+            conf = Conferencia("DOM", True, f"✓ depois de enviar, a página mostra o valor de {', '.join(f'«{a}»' for a in achados[:4])}")
+        else:
+            conf = Conferencia("DOM", None, "? depois de enviar, nenhum valor digitado aparece no texto da página")
+        self.conferencias.append({"gatilho": "DOM", "passo": len(self.steps) + 1,
+                                  "fingerprint": self._last_fingerprint, "conferencia": conf})
+        self._log("note", "conferência pela DOM depois de enviar", conf.linha)
+
+    async def _tirar_prints(self, disparos: list, fingerprint: str) -> None:
+        if not disparos:
+            return
+        teto = int(self._visao_ajustes().prints_max)
+        # O passo que CAUSOU o "depois" (é nele que a divergência aparece).
+        causador = self.steps[-1] if self.steps else None
+        for d in disparos:
+            if self._visao.prints >= teto:
+                if not self._visao.avisou_teto:
+                    self._visao.avisou_teto = True
+                    self._log("no_shot", f"teto de {teto} prints de confirmação atingido")
+                return
+            data = await self._shot(d.recorte, confirmacao=f"{d.gatilho} — {d.motivo}", alvo_ref=d.alvo_ref)
+            if not data:
+                continue
+            self._visao.prints += 1
+            if d.recorte is None and d.alvo_ref is None:
+                self._visao.ultimo_inteiro = fingerprint
+            registro = {
+                "gatilho": d.gatilho, "motivo": d.motivo, "passo": len(self.steps) + 1,
+                "fingerprint": fingerprint, "recorte": d.recorte is not None or d.alvo_ref is not None, "data": data,
+            }
+            self.prints_de_confirmacao.append(registro)
+            del self.prints_de_confirmacao[:-20]
+            # Na timeline da aba: o Daniel vê QUANDO o Neo fotografou e por quê.
+            await self._banner(f"📷 print {d.gatilho}", kind="print", detail=d.motivo)
+            contexto = dict(d.contexto)
+            if "G3" in d.gatilho.split("+"):
+                contexto["campos"] = self._campos_para_conferir()
+            # O do "depois" pertence ao passo anterior; o do "antes", ao que vem.
+            dono = causador if d.gatilho.split("+")[0] in ("G2", "G4", "G5", "G7", "G8") else None
+            self._analisar_em_paralelo(registro, contexto, dono)
+
+    def _analisar_em_paralelo(self, registro: dict, contexto: dict, passo: Any) -> None:
+        """A visão confere o print enquanto o agente segue (plano §3.1)."""
+        if not self.vision_model:
+            return
+        try:
+            cfg = self._visao_ajustes()
+            if self._analises >= int(cfg.analises_max):
+                return
+            if self._sem_visao is None:
+                self._sem_visao = asyncio.Semaphore(int(cfg.paralelas_max))
+        except Exception:  # noqa: BLE001
+            return
+        self._analises += 1
+        tarefa = asyncio.create_task(self._analisar(registro, contexto, passo))
+        self._tarefas_visao.add(tarefa)
+        tarefa.add_done_callback(self._tarefas_visao.discard)
+
+    async def _analisar(self, registro: dict, contexto: dict, passo: Any) -> None:
+        from core.browser_local import conferencia
+        from shared.types import Message, MessageRole
+
+        gatilho = registro["gatilho"]
+        pergunta = conferencia.pergunta(gatilho, contexto)
+        try:
+            assert self._sem_visao is not None
+            async with self._sem_visao:
+                modelo = self.vision_model
+                if not modelo:
+                    return
+                inicio = time.monotonic()
+                provider = self.llm.get_provider_for_model(modelo)
+                resposta = await provider.complete(
+                    messages=[
+                        Message(role=MessageRole.SYSTEM, content=conferencia.SISTEMA),
+                        Message(role=MessageRole.USER, content=pergunta, images=[registro["data"]]),
+                    ],
+                    model=modelo,
+                    temperature=0.1,
+                    max_tokens=700,
+                    disable_thinking=True,
+                    teto_raciocinio=int(self._visao_ajustes().teto_raciocinio),
+                )
+                texto = (resposta.get_content() or "").strip()
+                self._log("vision", modelo, (time.monotonic() - inicio) * 1000, f"[conferência {gatilho}] {pergunta}", texto)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — conferência que falha não derruba nada
+            self._log("note", f"conferência {gatilho} não veio", str(exc)[:200])
+            return
+        conf = conferencia.interpretar(gatilho, contexto, texto)
+        registro["conferencia"] = conf
+        self.conferencias.append(registro)
+        await self._banner(
+            f"👁 {conf.linha[:110]}", kind="erro" if conf.ok is False else "visto", detail=registro["motivo"]
+        )
+        if conf.ok is False and passo is not None and conf.divergencia:
+            passo.detail = f"{passo.detail} · ⚠ conferência visual: {conf.divergencia}"
+
+    def _bloco_conferencia(self) -> str:
+        """As últimas conferências para o prompt do passo."""
+        if not self.conferencias:
+            return ""
+        linhas = []
+        for reg in self.conferencias[-6:]:
+            conf = reg.get("conferencia")
+            if conf is None:
+                continue
+            velha = " (tela anterior)" if reg.get("fingerprint") != self._last_fingerprint else ""
+            linhas.append(f"- passo {reg.get('passo')} {reg.get('gatilho')}{velha}: {conf.linha}")
+        if not linhas:
+            return ""
+        return (
+            "CONFERÊNCIA VISUAL (prints que o Neo tirou sozinho e a visão conferiu; para "
+            "marcado/valor do campo vale a DOM — aqui vale o que a DOM não vê: erro na "
+            "tela, campo coberto, resultado do envio):\n" + "\n".join(linhas)
+        )
+
+    async def _encerrar_conferencias(self, espera_s: float = 3.0) -> None:
+        """No fim da tarefa: dá um instante às conferências em voo e cancela o resto."""
+        pendentes = [t for t in self._tarefas_visao if not t.done()]
+        if not pendentes:
+            return
+        _, ainda = await asyncio.wait(pendentes, timeout=espera_s)
+        for t in ainda:
+            t.cancel()
 
     def _guardar_print(self, data: str | None) -> None:
         """Guarda um print candidato à entrega, mantendo os ÚLTIMOS.
@@ -5676,6 +6184,7 @@ class BrowserLocalDriver:
         entrega do que já está na mão, e é justamente no fim ruim (deu pau,
         acabaram os passos) que a foto de onde parou vale mais.
         """
+        await self._encerrar_conferencias()
         try:
             self.shot_final = await asyncio.wait_for(
                 self._shot(para_usuario=True), timeout=_TIMEOUT_PRINT_FINAL
@@ -5908,10 +6417,30 @@ class BrowserLocalDriver:
                 ),
                 f"TAREFA: {task}",
                 f"CONTEXTO: {context}" if context else "",
+                (
+                    "ARQUIVOS DO DANIEL (do disco dele, que ele citou — envie com `upload`):\n"
+                    + "\n".join(f"- {a}" for a in self._arquivos)
+                    if self._arquivos
+                    else ""
+                ),
+                (
+                    "ARQUIVOS DO NEO (desta conversa, no catálogo do Neo — o Neo gerou ou o "
+                    "Daniel anexou; NÃO estão no disco dele, e mesmo assim o `upload` envia: "
+                    "passe o NOME em `arquivo`):\n"
+                    + "\n".join(
+                        f"- {c['nome']}"
+                        + (f" ({max(1, int(c.get('bytes') or 0) // 1024)} KB)" if c.get("bytes") else "")
+                        + (" — ele anexou no chat" if c.get("origem") == "anexo" else " — feito pelo Neo")
+                        for c in self._catalogo
+                    )
+                    if self._catalogo
+                    else ""
+                ),
                 # Logo abaixo da tarefa, porque é o que a CORRIGE: o Daniel
                 # escrevendo no painel ou no chat durante a execução.
                 self._bloco_mensagens(),
                 f"PASSOS JÁ DADOS:\n{history}" if history else "PASSOS JÁ DADOS: nenhum ainda.",
+                self._bloco_conferencia(),
                 stuck,
                 (
                     "SEU CADERNO ({}):\n{}".format(
@@ -6271,6 +6800,9 @@ class BrowserLocalDriver:
             recusa = self._celula_julgada_trocada(snapshot, args.get("ref"))
             if recusa:
                 raise ValueError(recusa)
+
+        if action == "upload":
+            args = self._validar_upload(args)
 
         if action in ("julgar", "marcar_grade"):
             from core.browser_local.grade import achar, ler_grades
@@ -6731,6 +7263,11 @@ class BrowserLocalDriver:
                 "`extract`; se for o que fazer, escolha uma ação e olhe DEPOIS dela",
                 snapshot,
             )
+
+        if action == "click":
+            recusa = self._recusa_de_clique_que_ja_se_sabe(args, snapshot)
+            if recusa is not None:
+                raise recusa
 
         if self._stuck and self._stuck_signature == self._signature(action, args):
             # Recusar sem dizer o que fazer só empurra o modelo para a mesma
@@ -7284,7 +7821,7 @@ class BrowserLocalDriver:
         return pedido
 
     def _guardar_nota(self, texto: str) -> str:
-        """Põe no caderno, se for dado novo. Devolve `nova`, `atualizada` ou `recusada`.
+        """Põe no caderno, se for dado novo. Devolve `nova`, `atualizada`, `recusada` ou `sem_prova`.
 
         Só `nova` faz o caderno crescer, e é o crescimento que conta como produção
         (`_contabilizar_producao`). Reescrever o que já se tem não é progresso; a
@@ -7299,6 +7836,13 @@ class BrowserLocalDriver:
         if numero_da_nota(texto) is None and _NOTA_DE_NARRACAO.search(texto):
             self._log("note", "não anotei", f"narração, não é dado: {texto[:120]}")
             return "recusada"
+        if (
+            not self._viu_download
+            and _NOTA_DIZ_BAIXADO.search(texto)
+            and _NOTA_CITA_DISCO.search(texto)
+        ):
+            self._log("note", "não anotei", f"diz que baixou, sem arquivo novo: {texto[:120]}")
+            return "sem_prova"
         for i, antiga in enumerate(self.notes):
             if _mesma_nota(antiga, texto):
                 if len(texto) > len(antiga):
@@ -7358,6 +7902,12 @@ class BrowserLocalDriver:
         if action == "note":
             texto = _nota_cortada(str(args.get("texto") or ""))
             estado = self._guardar_nota(texto)
+            if estado == "sem_prova":
+                return (
+                    "não anotei: a nota diz que o arquivo foi baixado/salvo, mas o "
+                    "`downloads` não viu arquivo novo nesta tarefa. Anote só depois que "
+                    "`downloads` mostrar o arquivo, com o nome que ele devolveu"
+                )
             if estado == "recusada":
                 return (
                     "não anotei: o caderno é só para o DADO que a tarefa pediu, e é o que "
@@ -7387,6 +7937,9 @@ class BrowserLocalDriver:
 
         if action == "downloads":
             return await self._conferir_downloads(args)
+
+        if action == "upload":
+            return await self._acao_upload(args)
 
         if action == "consultar":
             return await self._consultar(list(args.get("perguntas") or []))
@@ -7460,6 +8013,18 @@ class BrowserLocalDriver:
                 await self._cofre.anotar_usuario(self._host_of(url), login)
         if action in _PODE_ABRIR_ABA and isinstance(result, dict):
             self._aviso_aba = await self._adotar_abas(result)
+        if (
+            action in ("click", "click_text", "dblclick")
+            and isinstance(result, dict)
+            and result.get("arquivo_pedido")
+        ):
+            # O botão abre a janela de arquivos por código: o desktop segurou a
+            # janela, e o clique em si não adiantou nada.
+            return (
+                "a página tentou abrir a JANELA DE ARQUIVOS do sistema e eu segurei (você "
+                "não a controla). Para mandar o arquivo, use `upload` com o `ref` deste "
+                "botão e um caminho da lista ARQUIVOS DO DANIEL"
+            )
         if action == "find":
             self._reads_on_screen.add(self._signature(action, args))
             return self._texto_dos_candidatos(str(args["texto"]), result)
@@ -7483,12 +8048,24 @@ class BrowserLocalDriver:
                     # convite: 26 buscas e 15 termos atrás da mesma foto (aa4c89f8).
                     return (
                         f"NÃO achei «{termo}» nesta página: nem no texto "
-                        f"({int(result.get('total') or 0)} caracteres), nem nos endereços de "
-                        "links e imagens. Se a tarefa pede esse campo, registre \"não "
-                        "informado\" e siga"
+                        f"({int(result.get('total') or 0)} caracteres), nem no que está "
+                        "escrito nos campos do formulário, nem nos endereços de links e "
+                        "imagens. Se a tarefa pede esse campo, registre \"não informado\" e siga"
                     )
                 self._buscas_vazias[pagina] = 0
                 return f"achei «{termo}» {achados} {'vez' if achados == 1 else 'vezes'}:\n{texto}"
+            if result.get("campo"):
+                # O VALOR de um campo de formulário (sessão c4316486): é o que dá
+                # para editar um trecho de um texto longo sem chutar o resto.
+                rotulo = str(result.get("label") or "").strip()
+                nome = f"«{rotulo}»" if rotulo else "o campo"
+                if result.get("senha"):
+                    return f"{nome} é campo de SENHA: o valor não é lido"
+                if not texto.strip():
+                    return f"{nome} está VAZIO"
+                total = int(result.get("total") or len(texto))
+                cortado = "\n… (o campo continua além deste trecho)" if result.get("cortado") else ""
+                return f"valor de {nome} ({total} caracteres), inteiro:\n{texto}{cortado}"
             if result.get("imagem"):
                 alt = str(result.get("alt") or "").strip()
                 return f"imagem: {result['imagem']}" + (f"\n{alt}" if alt else "")
@@ -7584,10 +8161,27 @@ class BrowserLocalDriver:
                     " → e o elemento SAIU da tela logo depois: a página reagiu ao clique "
                     "(avançou ou trocou de etapa). Leia NA TELA AGORA antes de agir de novo"
                 )
-            elif marcado is True:
+            # O estado de ANTES separa "desmarquei" de "não pegou". Sem ele, a
+            # caixa desmarcada de propósito saía como falha e o agente a marcava
+            # de novo para consertar — sessão 74d069b7, seis voltas em "Trabalho
+            # aqui atualmente". Device antigo não manda `antes`: segue como era.
+            antes = result.get("antes")
+            desmarcou = marcado is False and antes is True
+            if not result.get("saiu") and desmarcou:
+                sufixo = (
+                    " → DESMARCADO (estava marcado; o clique pegou). Se era para ficar "
+                    "desmarcado, está feito — não clique de novo"
+                )
+            elif not result.get("saiu") and marcado is True and antes is True:
+                sufixo = (
+                    " → continua MARCADO (já estava antes do clique). Se a ideia era "
+                    "desmarcar, o clique não mudou nada: confira o [marcado] no snapshot"
+                )
+                self._marcou = True
+            elif marcado is True and not result.get("saiu"):
                 sufixo = " → SELECIONADO"
                 self._marcou = True
-            elif marcado is False:
+            elif marcado is False and not result.get("saiu"):
                 sufixo = (
                     " → mas NÃO ficou selecionado (o clique não pegou nesse elemento; "
                     "tente `click_text` com o texto da opção)"
@@ -7862,6 +8456,7 @@ class BrowserLocalDriver:
                 self._last_seen_url = last_url or self._last_seen_url
                 self._log("step_open", step_number + 1, self._teto_de_passos())
                 self._note_change(snapshot)
+                await self._visao_depois(snapshot)
                 self._contabilizar_producao(snapshot)
                 self.progresso.ver(snapshot)
                 await self._publicar_progresso()
@@ -8044,6 +8639,7 @@ class BrowserLocalDriver:
                     faixa = f"{self.progresso.resumo()} · {faixa}"
                 await self._progress(faixa)
 
+                await self._visao_antes(action, args, snapshot)
                 started = time.monotonic()
                 try:
                     try:
@@ -8064,6 +8660,7 @@ class BrowserLocalDriver:
                         detail = await self._retry_stale(action, args, alvo)
                     self.steps.append(Step(action, args, True, detail))
                     self._log("acted", action, args, True, detail, (time.monotonic() - started) * 1000)
+                    await self._visao_logo_depois(detail)
                     self._interagiu = action in _INTERAGE
                     assento = self._pedido_de_assento(action, args, snapshot)
                     # O RETORNO no painel. É a metade que a faixa de uma linha

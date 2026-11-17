@@ -386,6 +386,23 @@ def local_browser_requested(user_message: str) -> bool:
     return False
 
 
+def machine_only_request(user_message: str) -> bool:
+    """O portão só casou porque a mensagem nomeia a MÁQUINA dele ("pela minha máquina").
+
+    Sem palavra de navegador, extensão nem frase explícita, "na minha máquina"
+    diz ONDE, não COMO: o terminal dele também é a máquina dele. Quem decide
+    entre terminal e navegador aí é o classificador (`onde`), não o portão.
+    """
+    text = _normalize(user_message)
+    if not text or not (_MACHINE_OF_USER.search(text) and not _MACHINE_OTHER_SENSE.search(text)):
+        return False
+    if any(phrase in text for phrase in _EXPLICIT):
+        return False
+    if _EXTENSION.search(text) and not _EXTENSION_FILE_SENSE.search(text):
+        return False
+    return not _has_browser_word(text)
+
+
 def headless_requested(user_message: str) -> bool:
     """O usuário pediu, com todas as letras, para NÃO abrir janela (headless)?
 

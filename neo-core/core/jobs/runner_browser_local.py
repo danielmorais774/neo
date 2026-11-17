@@ -14,6 +14,7 @@ estado terminal do job — com os prints indo para o File Store pelo mesmo
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -123,6 +124,50 @@ async def _resolver_juiz(db: Any) -> tuple[str, str]:
 # Depois disso o usuário quase certamente usou o navegador para outra coisa, e
 # começar numa aba nova é mais previsível do que herdar um estado desconhecido.
 _ABA_VALIDA_POR = timedelta(minutes=15)
+
+
+
+def _arquivo_max_bytes() -> int:
+    """Maior arquivo que o `upload` envia (`[navegador.tarefa] arquivo_max_mb`)."""
+    from shared.ajustes import ajustes
+
+    return int(ajustes().navegador.tarefa.arquivo_max_mb * 1024 * 1024)
+
+def _catalogo_max_bytes() -> int:
+    """Maior arquivo do catálogo que o `upload` envia (`[navegador.tarefa] catalogo_max_mb`)."""
+    from shared.ajustes import ajustes
+
+    return int(ajustes().navegador.tarefa.catalogo_max_mb * 1024 * 1024)
+
+
+def _leitor_do_catalogo(
+    get_file_store: Callable[[], Any] | None, user_id: Any
+) -> Callable[[str], Awaitable[dict]] | None:
+    """Lê do catálogo o arquivo que o `upload` vai mandar ao site.
+
+    Só arquivo DESTE usuário e disponível; o driver já conferiu que é um dos da
+    conversa (``arquivos_do_neo`` do spec).
+    """
+    store = _resolve_store(get_file_store)
+    if store is None:
+        return None
+
+    async def ler(file_id: str) -> dict:
+        entry = await store.get(file_id)
+        if entry is None or entry.status != "available":
+            raise RuntimeError("esse arquivo não está mais no catálogo")
+        if user_id is not None and entry.user_id is not None and str(entry.user_id) != str(user_id):
+            raise RuntimeError("esse arquivo não é desta conta")
+        maximo = _catalogo_max_bytes()
+        if int(entry.size_bytes or 0) > maximo:
+            raise RuntimeError(
+                f"«{entry.name}» tem {entry.size_bytes / 1048576:.1f} MB, acima do teto de "
+                f"{maximo / 1048576:.1f} MB para arquivo do catálogo"
+            )
+        dados = await asyncio.to_thread(store.blob_path(entry.sha256).read_bytes)
+        return {"nome": str(entry.name or "arquivo"), "mime": str(entry.mime or ""), "bytes": dados}
+
+    return ler
 
 
 def chave_do_navegador(superficie: Any, device_id: str) -> str:
@@ -999,6 +1044,12 @@ def build_browser_local_runner(
             abas_previas=list(spec.get("abas") or []),
             pedido=str(spec.get("pedido") or ""),
             falas=str(spec.get("falas") or ""),
+            # `upload`: só os arquivos que ELE citou, até o teto do neo.toml.
+            arquivos=list(spec.get("arquivos_do_daniel") or []),
+            arquivo_max_bytes=_arquivo_max_bytes(),
+            # E os do catálogo desta conversa (o Neo gerou, ou ele anexou).
+            catalogo=list(spec.get("arquivos_do_neo") or []),
+            ler_catalogo=_leitor_do_catalogo(get_file_store, job.user_id),
             conversa=caixa,
             on_avisar=on_avisar,
             on_perguntar=on_perguntar,

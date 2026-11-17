@@ -2739,3 +2739,222 @@ questão com as mesmas alternativas) abrem a questão seguinte. Contador na pág
 precedência. Sem contador e sem total no pedido, não há bloco. Testes: 7 novos (23 no arquivo).
 Os 13 diários da VPS têm todos contador, então o replay não muda; **o modo sem contador não foi
 exercitado em site real.** neo-core 4014.
+
+### 2026-11-16 — Uma tarefa só, e arquivo do disco dele (sessão be8d195e)
+
+**O caso.** Pedido colado (1732 caracteres): atualizar o perfil do GeekHunter pelo currículo
+anexado e trocar a foto por `/Users/daniel/Downloads/Retrato Masculino em Estúdio Cinza.png`.
+O cérebro rodou `ls` da foto (aprovação → turno estacionado → retomada), leu o PDF e abriu o job
+`de35c22b` com a tarefa "NÃO altere nada ainda: apenas mapeie e reporte", sem `then`, prometendo
+"te aviso com a lista do que pretendo mudar e você aprova". O job mapeou bem em 26 s. Ninguém
+voltou.
+
+**Quatro defeitos, quatro consertos.**
+
+1. *A tarefa encolhida.* Ele mandou alterar; o cérebro mandou só ler. `core/browser_local/pedido.py`
+   (`tarefa_encolhida`) recusa a tool quando a TAREFA tem restrição de só-leitura e as FALAS dele
+   têm ordem de alterar (forma verbal, não negada), salvo se ele pediu para ver antes. Medido nos
+   219 jobs `browser_local` de produção: 20 tarefas com restrição de só-leitura, dispara em 3, os 3
+   com esse padrão (GeekHunter e duas vezes "preenche esse formulário" → "LER sem preencher"),
+   0 falso positivo depois de apertar o verbo ("alternativas" e "completo" casavam na v1). A
+   recusa diz o caminho: tarefa inteira, dúvida o agente pergunta ao vivo, material no `context`.
+2. *O agente nunca viu as palavras dele.* `_falas_do_daniel` descartava a fala que passasse de
+   1500 caracteres — a única fala, no caso. Agora a mais recente nunca some: perde o MEIO
+   (`cortar_falas`), teto `[navegador.tarefa] falas_max = 4000`. O `context` subiu de 2000 fixo
+   para `contexto_max = 8000` (um currículo de uma página tem ~4000), com aviso ao cérebro se cortar.
+3. *A retomada sem verificador de promessa.* `_reenter_cognitive` chama o cérebro com
+   `enable_handoff=False`, e o bloco que pendura a promessa no job aberto só rodava com handoff.
+   `_pendurar_promessa_da_retomada` roda a mesma regra (job sem `then` + promessa além do aviso)
+   no turno retomado. Observação honesta: a frase real de be8d195e ("Primeiro eu mapeio… e só
+   depois mexo") nem passa no pré-filtro de promessa — quem fecha o caso é o item 1.
+4. *Arquivo do disco.* Ação `upload {"ref", "arquivo"}` no driver, `browser.upload` no desktop.
+   - Só sai arquivo que ELE citou (`caminhos_citados` nas falas → `spec["arquivos_do_daniel"]`;
+     `caminho_autorizado` no `_validate`). A página e o modelo não escolhem arquivo.
+   - Segunda trava no desktop: dentro da home, fora de pasta oculta e da `Library`, caminho
+     canonizado (`..` não escapa), arquivo comum, não vazio, até `arquivo_max_mb = 25`.
+   - Acha o `<input type=file>` pelo `ref` (o campo, o label, o procurador, a caixa) ou pelo
+     vizinho; sem input, clica por código com a TRAVA ligada: `HTMLInputElement.prototype.click`
+     e `showPicker` seguram o campo de arquivo por 2,5 s depois de um clique nosso (o do Daniel
+     fora dessa janela abre normal).
+   - Põe o arquivo por `DOM.setFileInputFiles`; pela extensão o Chrome só deixa com "Permitir
+     acesso a URLs de arquivo" ligado (senão `Not allowed`). Reserva: o desktop lê o arquivo e
+     manda em pedaços de 512 KB (a mensagem host→extensão tem teto de 1 MB), a página monta
+     `File` + `DataTransfer` e dispara `input`/`change`.
+   - Confirma por `files.length` OU pelo `change` (site que zera o input depois de ler).
+   - No claim, `Page.setInterceptFileChooserDialog`: clique nativo num campo de arquivo não abre
+     janela na tela dele; vira `Page.fileChooserOpened` com o `backendNodeId`, que o `upload` usa.
+   - Clique direto no campo ou no label dele é recusado (`ARQUIVO:`); clique num botão que abre o
+     campo por código volta com `arquivo_pedido` e o driver responde "use `upload`".
+   - Snapshot marca `item.arquivo` (⟪ARQUIVO: envie com `upload`, não clique⟫).
+
+**Ensaio num Edge headless real** (`scratchpad/scripts/lab_upload.py`, os MESMOS JS extraídos do
+`browser_local.rs`): botão + input escondido com `accept=image/*` → CDP, a página recebeu o
+arquivo e gerou a prévia mesmo zerando o input; campo criado só no clique, depois de um tick →
+trava + reserva em 4 pedaços (1,5 MB íntegros); clique de mouse real no campo com a
+interceptação → `fileChooserOpened` + envio pelo `backendNodeId`; trava fora da janela não
+segura nada; guarda recusou label e campo. **Não exercitado:** a reserva pela EXTENSÃO real (o
+teto de 1 MB do host nativo foi respeitado por construção, não medido), e site real com recorte
+de foto.
+
+Testes: `tests/browser_local/test_pedido_upload.py` (20), `tests/test_continuacao_pendurada.py`
+(+2), Rust `tests_upload` (7). neo-core 4580, Rust 132.
+
+### 2026-11-17 — `upload` de arquivo do catálogo (sessão d7ad32a0)
+
+Primeiro E2E real do `upload` (job 3443e6d1, GeekHunter): o arquivo entrou no
+campo pelo desktop em 389 ms, sem janela do sistema, e o site salvou a foto.
+O defeito foi de **fonte**: o Neo tinha recortado o retrato no sandbox
+(catálogo `245d3f7d…`), e esse arquivo não existe no disco dele. O cérebro
+inventou `/Users/daniel/Downloads/retrato_quadrado.png`, o driver recusou (não
+era caminho citado por ele), o agente perguntou e subiu o **original vertical**.
+
+Conserto:
+- `pedido.arquivos_do_catalogo(views)`: os documentos DESTA conversa no registro
+  de arquivos (`core/files/ledger.py`) com versão no catálogo; fica fora o de
+  outra conversa e o que tem versão nova só no sandbox (subiria o velho). Vai no
+  spec como `arquivos_do_neo` e na nota do `browser_local_task` ao cérebro.
+- `pedido.catalogo_autorizado`: o agente cita pelo nome, pelo file_id, ou por um
+  caminho inventado que termina no nome (o caso d7ad32a0).
+- Driver: bloco "ARQUIVOS DO NEO" no prompt; o `upload` de um deles lê o blob
+  (`_leitor_do_catalogo` no runner: só do mesmo usuário, `available`, até
+  `[navegador.tarefa] catalogo_max_mb` = 10) e manda `conteudo_b64` + `nome`
+  em vez de `arquivo`.
+- Desktop (`FonteUpload::Conteudo`): grava em `$TMPDIR/neo-upload/<uuid>/<nome>`
+  (faxina de 1 h, o site pode ler depois do `change`) e segue o mesmo caminho —
+  CDP pelo arquivo temporário, reserva pela página com os bytes. A trava de
+  disco (home, sem oculta/Library) continua valendo só para o arquivo DELE.
+- Teto de 10 MB: o conteúdo vai em base64 (+33%) pelo websocket do desktop, cujo
+  quadro máximo é 16 MiB (tokio-tungstenite).
+
+### 2026-11-17 — Conferência cortada, catálogo adotado, menu do gerenciador (sessão 98c8bac7)
+
+Job b2f541b5 ("atualizar o perfil GeekHunter pelo currículo"): uma tarefa só,
+como o conserto de 16/11 pedia — e nada foi salvo. Três causas:
+- **Conferência cortada em 300.** O valor de cada campo era guardado com `[:300]`;
+  a apresentação nova (~700 caracteres) chegou ao Daniel terminando em "postos de
+  combustíve", parecendo quebrada, e ele respondeu "Não envie". Agora o valor é
+  guardado inteiro (até 4000) e a conferência mostra até
+  `[navegador.conversa] conferencia_valor_max` (1500) — maior, começo e fim com
+  o total. O painel subiu de 600 para `pergunta_painel_max` (4000), e a caixa de
+  pergunta da extensão (`neoPergunta`) de 1500 para 8000.
+- **Catálogo com arquivo adotado.** A lista do `upload` (16/11) trazia
+  documentos que a conversa só ADOTOU (o nome bateu com "imagem", "foto",
+  "perfil" do pedido): na 98c8 a foto de outra pessoa e uma planilha; na d7ad o
+  `recorte_operador_yasmin.jpg`. `DocView.worked_in_session` (evento que não é
+  `adopted` nesta conversa) passa a ser exigido em `arquivos_do_catalogo`. O
+  bloco do prompt não muda.
+- **Menu do gerenciador de senhas.** O `fill` na rede social abriu o menu de outra
+  extensão na aba; o navegador soltou o debugger e recusou religar ("Cannot
+  access a chrome-extension:// URL of different extension"; 2 dos 20 diários
+  recentes). Antes de perguntar ao Daniel, o desktop agora chama
+  `neoSoltarMenu` na extensão (`chrome.scripting`, sem debugger: blur no campo,
+  Esc, remove iframe de outra extensão) e religa — no `browser.focus_tab` e,
+  pelo driver, com `browser.soltar_menu`. Só se não voltar é que pergunta.
+  Não medido em navegador real (não há gerenciador de senhas no lab).
+
+Fora do código: o pedido dizia "a imagem indicada" sem indicar nenhuma; o
+cérebro pôs na tarefa um caminho de outra conversa (`Retrato Masculino…`), que o
+`upload` recusaria (não citado nesta).
+
+### 2026-11-17 — Ciclo de dois passos no `edit` do nome (sessão 089e9131)
+
+Job 136453ab: a apresentação foi salva (a conferência inteira funcionou), e
+depois o agente girou ONZE vezes em `edit` [8] → modal "Foto · Nome completo" →
+CANCELAR, achando que aquele `edit` editava a headline "Node.js React" (que no
+GeekHunter são as habilidades principais, editadas na Área de atuação). Nenhum
+freio pegou: o de "a tela não mudou" não vê o ciclo (a tela muda a cada passo),
+e o de "mesma tela 3x" só vale sem notas — e o agente anotava a cada volta.
+
+Conserto (`_desfechos` / `_recusa_de_clique_que_ja_se_sabe`): o driver guarda o
+que cada clique abriu, por (tela de antes, ação). O mesmo clique, na mesma
+tela, que já levou DUAS vezes à mesma tela é recusado antes de tocar na
+página, dizendo o que ele abre e as saídas da tela. Só conta o clique que mudou
+o texto à vista: marcar/desmarcar alternativa segue com a régua de "sem ganho".
+
+### 2026-11-17 — Desmarcar não é "o clique não pegou" (sessão 74d069b7)
+
+Job 509c4f7a (experiência Acme): o agente precisava DESMARCAR "Trabalho
+aqui atualmente" e alternou a caixa seis vezes. Não foi contexto (o passo tinha
+~5 KB e 16 elementos) nem DOM ruim: o snapshot mostrava `[marcado]` /
+`[desmarcado]` certo em todo passo. Quem mentia era o veredito do clique: o
+device lia só o estado DEPOIS (`checked:false`) e o driver traduzia como "NÃO
+ficou selecionado (o clique não pegou; tente `click_text`)". O agente confiava
+no veredito, usava `click_text`, a caixa voltava a marcar ("SELECIONADO"), e
+assim por diante. A trava de clique repetido de 089e9131 ainda disparou em
+cima ("abriu a mesma coisa"), o que não ajudou.
+
+Conserto: `NEO.preparar` guarda `c.antes = NEO.estadoMarcado(c)`; o fim do
+clique devolve `antes`; `fimDoCliqueAssentado` não espera virar `true` quando
+estava marcado. O driver diz "DESMARCADO (estava marcado; o clique pegou)" e
+"continua MARCADO (já estava)". A trava de clique repetido ignora controle
+marcável (alternar é o comportamento dele). Ensaio em Edge headless com o JS
+do Rust: produção devolve `{checked:false}` sem `antes`; o novo,
+`{checked:false, antes:true}`.
+
+Prints: não são por passo, por desenho. O agente lê o DOM; print sai no `look`
+(visão), na olhada automática quando trava e no fim. Neste job: 26-tela (look)
+e 49-final; no anterior (ccfee96e), dez.
+
+### 2026-11-17 — O texto de um campo é o VALOR dele (sessão c4316486)
+
+Pedido: trocar "Referência técnica do time" por "… de produto" na descrição da
+Acme. Dois jobs falharam (1f82153a, e39fd79d) sem editar nada: a descrição é
+um textarea preenchido pelo JS do site, e (1) a linha do elemento mostrava o
+valor cortado em 80 caracteres, sem dizer que havia mais; (2) `extract` no ref
+lia `innerText` — vazio num textarea preenchido por JS ("não tem texto
+nenhum"); (3) a busca do `extract` só olhava o texto da página. O trecho estava
+depois do corte, e o agente ficou entre as travas de leitura repetida.
+
+Conserto: o snapshot manda `valor_total` quando o valor passa de 80 e a linha
+diz "só o começo: o valor tem N caracteres — `extract {"ref": N}` lê inteiro";
+`js_extract` lê o VALOR do controle (`controleDe`: o próprio campo ou o
+`label`), com o nome do campo pelo `<label>`; senha nunca é lida; `js_buscar`
+procura também nos valores de `input`/`textarea` (sem senha/hidden) e devolve
+"campo [13] «Descrição» (412 caracteres): …trecho…". Lab em Edge headless com o
+JS do Rust (`scratchpad/scripts/lab_descricao.py`): produção devolve vazio no
+textarea preenchido por JS e 0 achados na busca; o novo lê e acha.
+
+### 2026-11-17 — Caderno que afirma "baixado" sem arquivo (job 1c55ba10, sessão 3ed86282)
+
+Pedido: baixar um vídeo do YouTube. O yt-dlp do sandbox tomou bot-check (IP de
+datacenter), e o cérebro mandou um job headless usar o SaveFrom. O link do
+googlevideo saiu preso ao IP do SaveFrom (`ip=76.36.255.163`, itag 398 = AV1
+sem áudio) e abriu como player preto, sem download. No passo 8 o modelo anotou
+"baixado via SaveFrom… destino /Users/daniel/Downloads/…mp4" antes de existir
+arquivo. Daí em diante leu o próprio caderno como prova ("o caderno já diz que
+baixei") e conferiu a pasta vazia 12 vezes até a trava de improdutividade.
+
+Conserto:
+- `_guardar_nota` devolve `sem_prova` para nota que afirma baixado/salvo
+  (`_NOTA_DIZ_BAIXADO`) e cita caminho do disco (`_NOTA_CITA_DISCO`) enquanto o
+  `downloads` não viu arquivo novo na tarefa (`_viu_download`). A ação `note`
+  responde dizendo por quê.
+- Medido nas 264 notas dos diários da VPS: casa 1, que é justamente essa, e não
+  há nenhum falso positivo.
+- `_HOST_NO_TEXTO` ganhou `(?![a-z0-9-])` depois do TLD. Sem isso,
+  `taca-le-pau-marco-veio.mp4` virava o host `taca-le-pau-marco-veio.mp`.
+
+A rota certa para o vídeo é outra (aviso do `neo_bash` → yt-dlp no Mac →
+`[[FILE:…]]`), ver o mapa técnico §11.
+
+### 2026-11-17 — "Pela minha máquina" não é "pelo meu navegador" (reteste da 3ed86282)
+
+Turno 4: "faz para mim pela minha maquina". O classificador escolheu
+`run_command yt-dlp` no Mac, com `onde=maquina`. O `_bias_local_browser` desfez
+isso porque `_MACHINE_OF_USER` vale sozinho no portão, e o cérebro mandou o Edge
+para o SaveFrom de novo (job c1a738d6, falhou em 22 passos). No corpus de 2869
+mensagens, 36 das 233 marcações do portão são só pela máquina, e quase todas são
+de terminal ("quantas chaves ssh tenho no meu pc", "abre o editor de texto da
+minha máquina").
+
+Conserto: `machine_only_request` (gate.py). Quando a única pista é a máquina e o
+classificador disse `onde=maquina` ou escolheu `run_command`/`execute_command`,
+o viés não mexe na decisão nem liga `navegador_do_usuario`. O trilho do servidor
+continua sendo promovido ("toca um rock no meu macbook" não é headless), e frase
+com navegador continua vencendo o terminal.
+
+Turno 3 do mesmo reteste: "baixa o vídeo do YouTube…" caiu na guarda de música
+("baixa" + serviço), e o turno de música tira `run_command` e
+`browser_local_task`. `_MUSIC_DOWNLOAD` (intent_router) tira "baixa/baixar +
+(determinante) + vídeo/música/áudio/…" da guarda. No corpus saem 2 mensagens,
+as duas pedidos de baixar vídeo, e nenhum "baixa o volume" é afetado.

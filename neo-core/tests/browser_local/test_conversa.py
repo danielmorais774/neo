@@ -971,6 +971,37 @@ async def test_menu_de_outra_extensao_pede_para_fechar_e_religa_na_mesma_aba():
     assert driver._tab_ref == 42
 
 
+class _MenuQueFechaComBlur(_AbaComOutraExtensao):
+    """98c8bac7: o blur pela extensão fecha o menu — ninguém precisa ser chamado."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.soltou = 0
+
+    async def act(self, action, args, timeout):
+        if action == "browser.soltar_menu":
+            self.soltou += 1
+            self.menu_aberto = False
+            return {"ok": True, "blur": True, "removidos": 0}
+        return await super().act(action, args, timeout)
+
+
+@pytest.mark.asyncio
+async def test_menu_de_outra_extensao_fecha_sozinho_e_religa_sem_perguntar():
+    device = _MenuQueFechaComBlur()
+    c = conversas.abrir("job-98c8", session_id="s-98c8")
+    driver, ctx = _driver(
+        [{"action": "extract", "args": {}}, {"action": "done", "args": {"answer": "ok"}}],
+        device,
+        conversa=c,
+    )
+    result = await driver.run("atualizar o perfil", start_url=FORM)
+    assert result.status == "completed"
+    assert device.soltou == 1
+    assert ctx.perguntas == [] and c.pergunta is None
+    assert device.reabertas == [] and driver._tab_ref == 42
+
+
 @pytest.mark.parametrize(
     ("texto", "opcao", "para"),
     [
@@ -1106,3 +1137,133 @@ async def test_resposta_dele_a_uma_pergunta_nao_vira_mensagem_respondida():
 
     assert [m.texto for m in driver.mensagens_do_daniel] == ["Conforme"], "a resposta chegou"
     assert driver._respondidas == {}
+
+
+# ── job 136453ab: o ciclo de dois passos no `edit` ao lado do nome ─────────
+
+PERFIL = "https://www.geekhunter.com/candidates/preview"
+
+
+class _PerfilComModalDoNome(_Device):
+    """`edit` [8] abre o modal de foto e nome; CANCELAR [12] volta ao perfil."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.modal = False
+        self.cliques: list[int] = []
+
+    def _snap(self) -> dict:
+        if self.modal:
+            return {
+                "url": PERFIL, "title": "GeekHunter", "ready": "complete", "stop": False,
+                "tela": "Foto\ncancel\nCarregar uma foto\nNome completo",
+                "elements": [
+                    {"ref": 11, "tag": "input", "text": "Digite seu nome completo", "value": "Daniel Morais"},
+                    {"ref": 12, "tag": "button", "text": "CANCELAR"},
+                    {"ref": 13, "tag": "button", "text": "SALVAR"},
+                ],
+                "text": "Foto Nome completo",
+            }
+        return {
+            "url": PERFIL, "title": "GeekHunter", "ready": "complete", "stop": False,
+            "tela": "Daniel Morais\nNode.js React\nedit\nApresentação",
+            "elements": [
+                {"ref": 7, "tag": "div", "text": "NODE.JSREACT"},
+                {"ref": 8, "tag": "i", "text": "edit"},
+                {"ref": 10, "tag": "i", "text": "edit"},
+            ],
+            "text": "Daniel Morais Node.js React Apresentação",
+        }
+
+    async def act(self, action, args, timeout):
+        if action == "browser.snapshot":
+            self.acted.append((action, dict(args)))
+            return self._snap()
+        if action == "browser.click":
+            self.acted.append((action, dict(args)))
+            self.cliques.append(args.get("ref"))
+            if args.get("ref") == 8:
+                self.modal = True
+            elif args.get("ref") == 12:
+                self.modal = False
+            return {"ok": True, "label": "edit" if args.get("ref") == 8 else "CANCELAR"}
+        return await super().act(action, args, timeout)
+
+
+@pytest.mark.asyncio
+async def test_clique_que_ja_abriu_duas_vezes_o_mesmo_modal_e_recusado_com_o_que_ele_abre():
+    device = _PerfilComModalDoNome()
+    driver, ctx = _driver(
+        [
+            # Com algo anotado, como no job real: a trava de "mesma tela 3x" só
+            # vale sem notas, e foi por isso que as onze voltas passaram.
+            {"action": "note", "args": {"texto": "perfil atual: headline Node.js React"}},
+            {"action": "click", "args": {"ref": 8}},
+            {"action": "click", "args": {"ref": 12}},
+            {"action": "click", "args": {"ref": 8}},
+            {"action": "click", "args": {"ref": 12}},
+            {"action": "click", "args": {"ref": 8}},   # terceira: recusada
+            {"action": "click", "args": {"ref": 10}},  # e ele vai para outro bloco
+            {"action": "done", "args": {"answer": "ok"}},
+        ],
+        device,
+    )
+    await driver.run("atualizar a headline do perfil", start_url=PERFIL)
+    assert device.cliques == [8, 12, 8, 12, 10]
+    prompts = [c["messages"][-1].content for c in ctx.provider.calls]
+    recusa = next(p for p in prompts if "nesta mesma tela 2 vezes" in p)
+    assert "Foto · cancel · Carregar uma foto · Nome completo" in recusa
+
+
+# ── sessão 74d069b7: desmarcar de propósito não é "o clique não pegou" ─────
+
+
+class _CaixaQueAlterna(_Device):
+    def __init__(self, marcada: bool) -> None:
+        super().__init__()
+        self.marcada = marcada
+        self.cliques = 0
+
+    async def act(self, action, args, timeout):
+        if action == "browser.snapshot":
+            self.acted.append((action, dict(args)))
+            estado = {"checked": self.marcada}
+            return {
+                "url": PERFIL, "title": "GeekHunter", "ready": "complete", "stop": False,
+                "tela": "De\nTrabalho aqui atualmente" + ("" if self.marcada else "\nAté"),
+                "elements": [{"ref": 7, "tag": "label", "text": "Trabalho aqui atualmente", **estado}],
+                "text": "Experiência",
+            }
+        if action == "browser.click":
+            self.acted.append((action, dict(args)))
+            self.cliques += 1
+            antes, self.marcada = self.marcada, not self.marcada
+            return {"ok": True, "label": "Trabalho aqui atualmente", "checked": self.marcada, "antes": antes}
+        return await super().act(action, args, timeout)
+
+
+@pytest.mark.asyncio
+async def test_desmarcar_caixa_marcada_sai_como_desmarcado_e_nao_como_falha():
+    device = _CaixaQueAlterna(marcada=True)
+    driver, ctx = _driver(
+        [{"action": "click", "args": {"ref": 7}}, {"action": "done", "args": {"answer": "ok"}}],
+        device,
+    )
+    await driver.run("desmarque trabalho atual", start_url=PERFIL)
+    prompts = [c["messages"][-1].content for c in ctx.provider.calls]
+    assert "DESMARCADO (estava marcado; o clique pegou)" in prompts[1]
+    assert "NÃO ficou selecionado" not in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_caixa_alternando_nao_cai_na_trava_de_clique_repetido():
+    device = _CaixaQueAlterna(marcada=True)
+    driver, ctx = _driver(
+        [{"action": "note", "args": {"texto": "x"}}]
+        + [{"action": "click", "args": {"ref": 7}}] * 5
+        + [{"action": "done", "args": {"answer": "ok"}}],
+        device,
+    )
+    await driver.run("alternar", start_url=PERFIL)
+    prompts = "\n".join(c["messages"][-1].content for c in ctx.provider.calls)
+    assert "nesta mesma tela" not in prompts
