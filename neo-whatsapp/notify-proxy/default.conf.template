@@ -1,0 +1,42 @@
+# Reverse proxy that exposes ONLY POST /notify from the neo-whatsapp gateway.
+# Everything else is 404. A shared secret header (X-Notify-Token) is required.
+# ${NOTIFY_TOKEN} is substituted at container start by the nginx image's
+# envsubst step (only real env vars are replaced; nginx's own $vars survive).
+
+# Modest rate limit: sending too many WhatsApp messages can get the account
+# flagged/banned, so cap even authenticated callers.
+limit_req_zone $binary_remote_addr zone=notify_zone:10m rate=1r/s;
+
+server {
+    listen 80;
+    server_name _;
+
+    # Hide nginx version and keep the surface tiny.
+    server_tokens off;
+
+    # Anything that isn't exactly /notify does not exist here.
+    location / {
+        return 404;
+    }
+
+    location = /notify {
+        # Only POST is meaningful; reject the rest.
+        limit_except POST {
+            deny all;
+        }
+
+        # Shared-secret gate. Missing/wrong token => 403.
+        if ($http_x_notify_token != "${NOTIFY_TOKEN}") {
+            return 403;
+        }
+
+        limit_req zone=notify_zone burst=5 nodelay;
+
+        # Forward to the internal gateway (docker network name, not host port).
+        proxy_pass http://neo-whatsapp:3030/notify;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 60s;
+    }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "neo-whatsapp",
+  "version": "2.0.0",
+  "description": "WhatsApp gateway for Neo using venom-bot",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@wppconnect-team/wppconnect": "^1.39.1",
+    "express": "^4.21.2",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
