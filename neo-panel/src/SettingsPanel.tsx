@@ -6,6 +6,7 @@ import ProvidersTab from './settings/ProvidersTab';
 import VozTab from './settings/VozTab';
 import ArquivosTab from './settings/ArquivosTab';
 import ClaudeCodeTab from './settings/ClaudeCodeTab';
+import TranscricaoTab from './settings/TranscricaoTab';
 import SessionsTab from './SessionsTab';
 import ConnectedDevicesPanel from './ConnectedDevicesPanel';
 
@@ -18,6 +19,7 @@ const SettingsPanel = () => {
     { id: 'voz', label: 'Voz', render: () => <VozTab reloadToken={reloadToken} /> },
     { id: 'arquivos', label: 'Arquivos', render: () => <ArquivosTab reloadToken={reloadToken} /> },
     { id: 'claude-code', label: 'Claude Code', render: () => <ClaudeCodeTab reloadToken={reloadToken} /> },
+    { id: 'transcricao', label: 'Transcrição', render: () => <TranscricaoTab reloadToken={reloadToken} /> },
     { id: 'comunicacoes', label: 'Comunicações', render: () => <SessionsTab /> },
     { id: 'dispositivos', label: 'Dispositivos', render: () => <ConnectedDevicesPanel /> },
   ];
