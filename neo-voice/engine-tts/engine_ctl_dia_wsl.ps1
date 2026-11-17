@@ -1,0 +1,31 @@
+# Controle MANUAL do neo-voice Nari Dia engine no WSL2.
+# Sobe destacado via WMI (sobrevive ao SSH). NAO auto-inicia no boot.
+#   engine_ctl_dia_wsl.ps1 start | stop | status | restart
+param([string]$cmd = "status")
+$ErrorActionPreference = "SilentlyContinue"
+
+$inner = 'cd /opt/neo-dia && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NEO_DIA_PORT=5008 .venv/bin/python neo_dia_engine.py >/opt/neo-dia/dia.log 2>&1'
+
+function Get-Proc {
+    Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Where-Object { $_.CommandLine -like '*neo_dia_engine*' }
+}
+function Stop-It {
+    wsl -d Ubuntu -u root -- pkill -f neo_dia_engine.py 2>$null
+    Get-Proc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+}
+function Start-It {
+    $cl = 'wsl -d Ubuntu -u root -- bash -lc "' + $inner + '"'
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl }
+    Write-Host "Win32_Process.Create ReturnValue=$($r.ReturnValue) PID=$($r.ProcessId)"
+}
+
+switch ($cmd.ToLower()) {
+    "start"   { Stop-It; Start-Sleep 2; Start-It }
+    "stop"    { Stop-It; Write-Host "parado" }
+    "restart" { Stop-It; Start-Sleep 2; Start-It }
+    default {
+        if (Get-Proc) { Write-Host "RODANDO" } else { Write-Host "PARADO" }
+        Write-Host "--- dia.log (tail) ---"
+        wsl -d Ubuntu -u root -- tail -n 15 /opt/neo-dia/dia.log 2>$null
+    }
+}

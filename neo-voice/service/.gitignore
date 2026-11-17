@@ -1,0 +1,9 @@
+# segredos locais — nunca versionar
+.env
+
+# estado de runtime (override do fallback STT, etc.)
+state/
+
+# venvs
+.venv-sys/
+.venv/

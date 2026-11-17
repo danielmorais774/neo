@@ -1,0 +1,25 @@
+[Unit]
+Description=neo-stt engine (Parakeet TDT 0.6B v3, ONNX CPU)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/neo-stt-cpu
+Environment=NEO_STT_PROVIDERS=CPUExecutionProvider
+Environment=NEO_STT_QUANT=int8
+Environment=NEO_STT_THREADS=8
+Environment=NEO_STT_HOST=0.0.0.0
+Environment=NEO_STT_PORT=5005
+# onnxruntime respeita intra_op_num_threads, mas as libs BLAS por baixo criam
+# seus proprios pools; sem isto o i9 abre 20 threads e briga consigo mesmo.
+Environment=OMP_NUM_THREADS=8
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+ExecStart=/opt/neo-stt-cpu/.venv/bin/python /opt/neo-stt-cpu/neo_stt_engine.py
+Restart=on-failure
+RestartSec=5
+# o modelo int8 pica em ~2.1 GB; o teto deixa margem sem deixar o LXC (8 GB) swapar
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>neo-voice · painel</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#121823; --panel2:#0e141d; --line:#1e2937;
+    --txt:#e6edf3; --muted:#8b97a7; --accent:#3ddc97; --accent2:#4aa3ff;
+    --warn:#ffb454; --err:#ff5d5d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
+    background:radial-gradient(1200px 600px at 50% -10%,#11202e 0,var(--bg) 60%);color:var(--txt);
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px}
+  header{width:100%;max-width:860px;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:.3px}
+  .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}
+  .pills{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{font-size:12px;padding:5px 10px;border-radius:999px;background:var(--panel);border:1px solid var(--line);color:var(--muted);display:flex;gap:6px;align-items:center}
+  .pill b{color:var(--txt);font-weight:600}
+  .pill .s{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .pill.ok .s{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .pill.bad .s{background:var(--err)}
+  .tabs{width:100%;max-width:860px;display:flex;gap:6px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:5px;margin-bottom:18px}
+  .tab{flex:1;text-align:center;padding:10px;border-radius:8px;cursor:pointer;color:var(--muted);font-weight:600;font-size:14px;border:none;background:transparent;transition:.15s}
+  .tab.active{background:linear-gradient(180deg,#1b2735,#131b26);color:var(--txt);box-shadow:inset 0 0 0 1px var(--line)}
+  main{width:100%;max-width:860px;display:flex;flex-direction:column;gap:18px}
+  .view{display:none;flex-direction:column;gap:18px}
+  .view.active{display:flex}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:18px;padding:24px}
+  .mic-card{display:flex;flex-direction:column;align-items:center;gap:14px}
+  .mic-btn{position:relative;width:104px;height:104px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(180deg,#1b2735,#131b26);color:var(--txt);display:flex;align-items:center;justify-content:center;
+    box-shadow:0 6px 24px rgba(0,0,0,.4),inset 0 0 0 1px var(--line);transition:transform .1s}
+  .mic-btn:hover{transform:translateY(-1px)}
+  .mic-btn svg{width:42px;height:42px}
+  .mic-btn.rec{background:linear-gradient(180deg,#10261f,#0c1a16);box-shadow:inset 0 0 0 1px #1f5a44}
+  .mic-btn.rec::after{content:"";position:absolute;inset:-6px;border-radius:50%;border:2px solid var(--accent);animation:pulse 1.4s ease-out infinite;opacity:0}
+  @keyframes pulse{0%{transform:scale(.95);opacity:.7}100%{transform:scale(1.25);opacity:0}}
+  .hint{color:var(--muted);font-size:13px;text-align:center;min-height:18px}
+  .meter{width:240px;height:8px;border-radius:6px;background:#0c121b;border:1px solid var(--line);overflow:hidden}
+  .meter>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .06s linear}
+  .live{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-height:64px}
+  .live .lbl{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:6px}
+  .live .txt{font-size:20px;line-height:1.4;color:#cdd9e5;font-weight:500}
+  .live .txt .cursor{display:inline-block;width:9px;height:20px;background:var(--accent);margin-left:3px;vertical-align:-3px;animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .log{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px}
+  .log .head{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;color:var(--muted);font-size:12px}
+  .log .head button{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:4px 10px;cursor:pointer;font-size:12px}
+  .log .head button:hover{color:var(--txt);border-color:#2c3a4d}
+  .items{max-height:42vh;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:4px}
+  .item{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .item .t{font-size:16px;line-height:1.45}
+  .item .m{font-size:11px;color:var(--muted);margin-top:4px;display:flex;gap:10px;align-items:center}
+  .item.resp{border-color:#23405f;background:#0d1722}.item.resp .t{color:var(--accent2)}
+  .empty{color:var(--muted);font-size:13px;text-align:center;padding:18px}
+  textarea{width:100%;min-height:120px;resize:vertical;background:#0c121b;border:1px solid var(--line);border-radius:12px;color:var(--txt);
+    padding:14px;font-size:16px;line-height:1.5;font-family:inherit}
+  textarea:focus{outline:none;border-color:#2c3a4d}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:12px}
+  .field{display:flex;flex-direction:column;gap:4px}
+  .field label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)}
+  select,input[type=text]{background:#0c121b;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:9px 12px;font-size:14px;font-family:inherit}
+  select:focus,input:focus{outline:none;border-color:#2c3a4d}
+  .grow{flex:1;min-width:160px}
+  .btn{background:linear-gradient(180deg,#16432f,#0f3023);border:1px solid #1f5a44;color:#dffbef;border-radius:10px;
+    padding:11px 20px;font-size:15px;font-weight:600;cursor:pointer;display:flex;gap:8px;align-items:center}
+  .btn:hover{filter:brightness(1.1)}
+  .btn:disabled{opacity:.55;cursor:default;filter:none}
+  .spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .playing .spinner{display:inline-block}
+  footer{color:var(--muted);font-size:12px;margin-top:8px;text-align:center;max-width:860px}
+  code{background:#0c121b;border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:#cbd5e1}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span> neo-voice</div>
+  <div class="pills">
+    <div id="pill-ws" class="pill"><span class="s"></span> WS <b id="ws-state">off</b></div>
+    <div id="pill-stt" class="pill"><span class="s"></span> STT <b id="stt-state">—</b></div>
+    <div id="pill-tts" class="pill"><span class="s"></span> Qwen <b id="tts-state">—</b></div>
+    <div id="pill-coqui" class="pill"><span class="s"></span> Coqui <b id="coqui-state">—</b></div>
+    <div id="pill-cosyvoice" class="pill"><span class="s"></span> CosyVoice3 <b id="cosyvoice-state">—</b></div>
+    <div id="pill-f5" class="pill"><span class="s"></span> F5-PTBR <b id="f5-state">—</b></div>
+    <div id="pill-chatterbox" class="pill"><span class="s"></span> Chatterbox <b id="chatterbox-state">—</b></div>
+    <div id="pill-dia" class="pill"><span class="s"></span> Dia <b id="dia-state">—</b></div>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-tab="stt">🎙️ Ouvir (STT)</button>
+  <button class="tab" data-tab="tts">🔊 Falar (TTS)</button>
+</div>
+
+<main>
+  <!-- ====================== STT ====================== -->
+  <section id="view-stt" class="view active">
+    <div class="card mic-card">
+      <button id="mic" class="mic-btn" title="Falar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1.8a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0v-6a3 3 0 0 0-3-3z"/>
+          <path d="M5 10.5a7 7 0 0 0 14 0"/><path d="M12 17.5V21"/><path d="M8.5 21h7"/>
+        </svg>
+      </button>
+      <div class="meter"><i id="meter"></i></div>
+      <div id="hint" class="hint">Clique no microfone e comece a falar.</div>
+    </div>
+    <div class="live">
+      <div class="lbl">Ao vivo</div>
+      <div id="live" class="txt"><span class="cursor" style="display:none"></span></div>
+    </div>
+    <div class="log">
+      <div class="head"><span>Transcrição</span><button id="clear-stt">limpar</button></div>
+      <div id="items" class="items"><div class="empty">Nada ainda — fale algo.</div></div>
+    </div>
+  </section>
+
+  <!-- ====================== TTS ====================== -->
+  <section id="view-tts" class="view">
+    <div class="card">
+      <textarea id="tts-text" placeholder="Escreva o que o Neo deve falar…">Olá! Eu sou o Neo, sua voz rodando direto na RTX do PC gamer.</textarea>
+      <div class="row">
+        <div class="field">
+          <label>Motor</label>
+          <select id="tts-backend">
+            <option value="qwen">Qwen3-TTS</option>
+            <option value="coqui">Coqui XTTS</option>
+            <option value="cosyvoice">CosyVoice3</option>
+            <option value="f5">F5-TTS (PT-BR)</option>
+            <option value="chatterbox">Chatterbox ML</option>
+            <option value="dia">Nari Dia (EN)</option>
+          </select>
+        </div>
+        <div class="field grow">
+          <label>Voz</label>
+          <select id="tts-voice"></select>
+        </div>
+        <div class="field grow">
+          <label>Estilo (opcional)</label>
+          <input id="tts-instruct" type="text" placeholder="ex: animado, sussurrando, sério…" />
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button id="tts-speak" class="btn"><span class="spinner"></span><span>Falar</span></button>
+        </div>
+      </div>
+      <div id="tts-clone-row" class="row" style="display:none;border-top:1px solid var(--line);padding-top:14px;margin-top:14px">
+        <div class="field grow">
+          <label>🎤 Clonar voz — áudio de referência (~6–20s, fala limpa)</label>
+          <input id="tts-clone-file" type="file" accept="audio/*" style="color:var(--muted);font-size:13px" />
+        </div>
+        <div class="field grow">
+          <label>Nome da voz clonada</label>
+          <input id="tts-clone-name" type="text" placeholder="ex: minha voz" />
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button id="tts-clone-btn" class="btn"><span class="spinner"></span><span>Clonar</span></button>
+        </div>
+      </div>
+      <div id="tts-hint" class="hint" style="margin-top:12px;text-align:left"></div>
+      <audio id="tts-audio" style="width:100%;margin-top:8px;display:none" controls></audio>
+    </div>
+    <div class="log">
+      <div class="head"><span>Gerados</span><button id="clear-tts">limpar</button></div>
+      <div id="tts-items" class="items"><div class="empty">Nada gerado ainda.</div></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  STT (Parakeet v3) + TTS (Qwen3-TTS) processados no PC gamer na GPU. Mic exige
+  <code>http://localhost:5002</code> (contexto seguro).
+</footer>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+const TARGET_SR = 16000, CHUNK = 1600;
+let ws=null, ctx=null, stream=null, node=null, src=null, recording=false;
+
+// ---- tabs ----
+document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  b.classList.add('active');
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  $('view-'+b.dataset.tab).classList.add('active');
+}));
+
+// ---- health ----
+async function loadHealth(){
+  try{
+    const h = await (await fetch('/health')).json();
+    const e=h.engine||{}, t=h.tts||{};
+    const sttOk=e.on_gpu===true;
+    $('stt-state').textContent = sttOk?(e.gpu||'GPU'):(e.error?'offline':'cpu');
+    $('pill-stt').className='pill '+(sttOk?'ok':'bad');
+    const ttsOk = t && t.status==='ok';
+    $('tts-state').textContent = ttsOk?(t.gpu?'GPU':'ok'):(t.error?'offline':(t.status||'—'));
+    $('pill-tts').className='pill '+(ttsOk?'ok':'bad');
+    const c=h.coqui||{}, cOk = c && c.status==='ok';
+    $('coqui-state').textContent = cOk?(c.gpu?'GPU':'ok'):(c.error?'offline':(c.status||'—'));
+    $('pill-coqui').className='pill '+(cOk?'ok':'bad');
+    const cv=h.cosyvoice||{}, cvOk = cv && cv.status==='ok';
+    $('cosyvoice-state').textContent = cvOk?(cv.gpu?'GPU':'ok'):(cv.error?'offline':(cv.status||'—'));
+    $('pill-cosyvoice').className='pill '+(cvOk?'ok':'bad');
+    const f5=h.f5||{}, f5Ok = f5 && f5.status==='ok';
+    $('f5-state').textContent = f5Ok?(f5.gpu?'GPU':'ok'):(f5.error?'offline':(f5.status||'—'));
+    $('pill-f5').className='pill '+(f5Ok?'ok':'bad');
+    const cb=h.chatterbox||{}, cbOk = cb && cb.status==='ok';
+    $('chatterbox-state').textContent = cbOk?(cb.gpu?'GPU':'ok'):(cb.error?'offline':(cb.status||'—'));
+    $('pill-chatterbox').className='pill '+(cbOk?'ok':'bad');
+    const dd=h.dia||{}, dOk = dd && dd.status==='ok';
+    $('dia-state').textContent = dOk?(dd.gpu?'GPU':'ok'):(dd.error?'offline':(dd.status||'—'));
+    $('pill-dia').className='pill '+(dOk?'ok':'bad');
+    // popula vozes quando o engine do backend selecionado sobe
+    const sel=$('tts-backend').value, selOk={qwen:ttsOk,coqui:cOk,cosyvoice:cvOk,f5:f5Ok,chatterbox:cbOk,dia:dOk}[sel];
+    if(selOk && $('tts-voice').options.length===0) loadVoices();
+  }catch(e){ ['stt','tts','coqui','cosyvoice','f5','chatterbox','dia'].forEach(p=>$('pill-'+p).className='pill bad'); }
+}
+loadHealth(); setInterval(loadHealth, 8000);
+
+function escapeHtml(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* =========================== STT =========================== */
+const workletSrc = `
+class PCMCapture extends AudioWorkletProcessor {
+  process(inputs){ const c=inputs[0][0]; if(c) this.port.postMessage(c.slice(0)); return true; }
+}
+registerProcessor('pcm-capture', PCMCapture);`;
+const workletURL = URL.createObjectURL(new Blob([workletSrc],{type:'application/javascript'}));
+
+function makeResampler(inRate){
+  const ratio=inRate/TARGET_SR; let buf=new Float32Array(0),pos=0;
+  if(Math.abs(ratio-1)<1e-6) return (f)=>f;
+  return (frame)=>{
+    const nb=new Float32Array(buf.length+frame.length); nb.set(buf,0); nb.set(frame,buf.length); buf=nb;
+    const out=[];
+    while(Math.floor(pos)+1<buf.length){ const i0=Math.floor(pos),fr=pos-i0; out.push(buf[i0]*(1-fr)+buf[i0+1]*fr); pos+=ratio; }
+    const c=Math.floor(pos); buf=buf.subarray(c); pos-=c; return Float32Array.from(out);
+  };
+}
+let pend=[], pendLen=0, resample=null;
+function f2i(x){ x=Math.max(-1,Math.min(1,x)); return x<0?x*32768:x*32767; }
+function onFrame(f){
+  let s=0; for(let i=0;i<f.length;i++) s+=f[i]*f[i];
+  $('meter').style.width=Math.min(100,Math.sqrt(s/f.length)*320)+'%';
+  const r=resample(f); pend.push(r); pendLen+=r.length;
+  while(pendLen>=CHUNK){
+    const out=new Int16Array(CHUNK); let filled=0;
+    while(filled<CHUNK){ const head=pend[0],need=CHUNK-filled;
+      if(head.length<=need){ for(let i=0;i<head.length;i++) out[filled+i]=f2i(head[i]); filled+=head.length; pend.shift(); }
+      else { for(let i=0;i<need;i++) out[filled+i]=f2i(head[i]); pend[0]=head.subarray(need); filled+=need; } }
+    pendLen-=CHUNK; if(ws&&ws.readyState===1) ws.send(out.buffer);
+  }
+}
+function setLive(t){ $('live').innerHTML=(t?escapeHtml(t):'')+'<span class="cursor"></span>'; }
+function clearLive(){ $('live').innerHTML='<span class="cursor" style="display:none"></span>'; }
+function addItem(text,meta,cls){
+  const box=$('items'); const e=box.querySelector('.empty'); if(e) e.remove();
+  const d=document.createElement('div'); d.className='item'+(cls?' '+cls:'');
+  d.innerHTML='<div class="t">'+escapeHtml(text)+'</div>'+(meta?'<div class="m">'+meta+'</div>':'');
+  box.appendChild(d); box.scrollTop=box.scrollHeight;
+}
+$('mic').addEventListener('click',()=> recording?stopRec():startRec());
+$('clear-stt').addEventListener('click',()=>{ $('items').innerHTML='<div class="empty">Nada ainda — fale algo.</div>'; });
+
+async function startRec(){
+  if(!navigator.mediaDevices?.getUserMedia){ $('hint').textContent='Navegador sem getUserMedia (use localhost/https).'; return; }
+  try{
+    ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/panel');
+    ws.binaryType='arraybuffer';
+    ws.onopen=()=>{ $('ws-state').textContent='on'; $('pill-ws').className='pill ok'; startAudio(); };
+    ws.onclose=()=>{ $('ws-state').textContent='off'; $('pill-ws').className='pill'; };
+    ws.onerror=()=>{ $('hint').textContent='Erro de WebSocket.'; };
+    ws.onmessage=(ev)=>{ let m; try{m=JSON.parse(ev.data)}catch(_){return}
+      if(m.type==='partial') setLive(m.text);
+      else if(m.type==='final'){ clearLive(); const meta=(m.infer_ms?'⚡ '+Math.round(m.infer_ms)+'ms':'')+(m.on_gpu?'  ·  GPU':''); addItem(m.text,meta); }
+      else if(m.type==='response') addItem(m.text,'neo','resp');
+    };
+  }catch(e){ $('hint').textContent='Falha ao conectar: '+e.message; }
+}
+async function startAudio(){
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+  catch(e){ $('hint').textContent='Permissão de microfone negada.'; cleanupRec(); return; }
+  ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:TARGET_SR});
+  await ctx.audioWorklet.addModule(workletURL);
+  resample=makeResampler(ctx.sampleRate); pend=[]; pendLen=0;
+  src=ctx.createMediaStreamSource(stream);
+  node=new AudioWorkletNode(ctx,'pcm-capture'); node.port.onmessage=(e)=>onFrame(e.data);
+  src.connect(node); node.connect(ctx.destination);
+  recording=true; $('mic').classList.add('rec'); $('hint').textContent='Ouvindo… fale. (clique para parar)';
+  $('live').querySelector('.cursor').style.display='inline-block';
+}
+function stopRec(){ if(ws&&ws.readyState===1){ try{ws.send('flush')}catch(_){} } cleanupRec(); $('hint').textContent='Parado. Clique para falar.'; }
+function cleanupRec(){
+  recording=false; $('mic').classList.remove('rec'); $('meter').style.width='0';
+  try{node&&node.disconnect()}catch(_){}; try{src&&src.disconnect()}catch(_){}
+  try{stream&&stream.getTracks().forEach(t=>t.stop())}catch(_){}; try{ctx&&ctx.close()}catch(_){}
+  setTimeout(()=>{ try{ws&&ws.close()}catch(_){} },300); clearLive();
+}
+
+/* =========================== TTS =========================== */
+async function loadVoices(){
+  const backend=$('tts-backend').value;
+  $('tts-clone-row').style.display = (backend==='coqui'||backend==='qwen'||backend==='cosyvoice'||backend==='f5'||backend==='chatterbox') ? 'flex' : 'none';  // clone: Coqui, Qwen, CosyVoice, F5 e Chatterbox
+  const sel=$('tts-voice'); sel.innerHTML='';
+  $('tts-hint').textContent='Carregando vozes do '+backend+'…';
+  try{
+    const d=await (await fetch('/voices?backend='+encodeURIComponent(backend))).json();
+    (d.voices||[]).forEach(v=>{ const o=document.createElement('option'); o.value=v.name;
+      o.textContent=v.name+(v.desc?(' — '+v.desc):''); sel.appendChild(o); });
+    if(d.default) sel.value=d.default;
+    $('tts-hint').textContent = backend==='dia'
+      ? '⚠️ Dia gera só em INGLÊS. Use tags [S1]/[S2] p/ diálogo e (laughs), (sighs)… p/ sons.'
+      : backend==='cosyvoice'
+      ? 'CosyVoice3 (0.5B): PT via cross-lingual — clona o timbre da voz de referência. Pode variar/esticar a duração.'
+      : backend==='f5'
+      ? 'F5-TTS pt-br: rápido (RTF~0.2) e PT nativo. Clona a ref; a transcrição da ref é feita pelo Parakeet (STT).'
+      : backend==='chatterbox'
+      ? 'Chatterbox ML (0.5B): 23 idiomas, clona sem transcrição. Mais lento (RTF~0.43); tem controle de expressividade.'
+      : '';
+  }catch(e){ $('tts-hint').textContent='Não consegui listar as vozes do '+backend+' (engine offline?).'; }
+}
+$('tts-backend').addEventListener('change', loadVoices);
+loadVoices();
+
+// ---- clonagem de voz (Coqui XTTS) ----
+$('tts-clone-btn').addEventListener('click', cloneVoice);
+async function cloneVoice(){
+  const f=$('tts-clone-file').files[0];
+  if(!f){ $('tts-hint').textContent='Escolha um arquivo de áudio de referência primeiro.'; return; }
+  const name=$('tts-clone-name').value.trim();
+  const btn=$('tts-clone-btn'); btn.disabled=true; btn.classList.add('playing');
+  $('tts-hint').textContent='Processando o áudio e extraindo a voz na GPU…';
+  try{
+    const fd=new FormData(); fd.append('file', f); fd.append('name', name); fd.append('backend', $('tts-backend').value);
+    const res=await fetch('/clone',{method:'POST',body:fd});
+    if(!res.ok) throw new Error('HTTP '+res.status+' '+(await res.text()));
+    const d=await res.json();
+    await loadVoices();
+    $('tts-voice').value=d.voice;             // seleciona a voz clonada
+    $('tts-clone-name').value=''; $('tts-clone-file').value='';
+    $('tts-hint').textContent='✅ Voz "'+d.name+'" clonada e selecionada. Escreva algo e clique em Falar.';
+  }catch(e){ $('tts-hint').textContent='Falha ao clonar: '+e.message; }
+  finally{ btn.disabled=false; btn.classList.remove('playing'); }
+}
+
+$('clear-tts').addEventListener('click',()=>{ $('tts-items').innerHTML='<div class="empty">Nada gerado ainda.</div>'; });
+$('tts-speak').addEventListener('click', speak);
+$('tts-text').addEventListener('keydown',(e)=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') speak(); });
+
+// streaming por frases: toca cada pedaço (PCM int16 24kHz) conforme chega
+let ttsCtx=null, ttsPlayhead=0;
+function ttsEnsureCtx(){ if(!ttsCtx||ttsCtx.state==='closed'){ ttsCtx=new (window.AudioContext||window.webkitAudioContext)(); } return ttsCtx; }
+function ttsPlayChunk(int16, sr){
+  const ctx=ttsEnsureCtx();
+  const f32=new Float32Array(int16.length);
+  for(let i=0;i<int16.length;i++) f32[i]=int16[i]/32768;
+  const buf=ctx.createBuffer(1, f32.length, sr); buf.copyToChannel(f32,0);
+  const s=ctx.createBufferSource(); s.buffer=buf; s.connect(ctx.destination);
+  // Folga adaptativa: 30ms em fluxo contínuo; 150ms no 1º buffer / retomada
+  // pós-underrun (agendar colado no "agora" faz o WebKit comer o começo).
+  const now=ctx.currentTime, primed=ttsPlayhead>now;
+  const t=Math.max(now+(primed?0.03:0.15), ttsPlayhead); s.start(t); ttsPlayhead=t+buf.duration;
+}
+function pcmToWav(chunks, sr){
+  let total=0; chunks.forEach(c=>total+=c.length);
+  const data=new Int16Array(total); let off=0; chunks.forEach(c=>{ data.set(c,off); off+=c.length; });
+  const bytes=total*2, ab=new ArrayBuffer(44+bytes), v=new DataView(ab);
+  const w=(o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4,36+bytes,true); w(8,'WAVE'); w(12,'fmt '); v.setUint32(16,16,true);
+  v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,'data'); v.setUint32(40,bytes,true);
+  new Int16Array(ab,44).set(data);
+  return new Blob([ab],{type:'audio/wav'});
+}
+function speak(){
+  const text=$('tts-text').value.trim(); if(!text) return;
+  const voice=$('tts-voice').value; const instruct=$('tts-instruct').value.trim()||null;
+  const backend=$('tts-backend').value;
+  const btn=$('tts-speak'); btn.disabled=true; btn.classList.add('playing');
+  $('tts-hint').textContent='Sintetizando ('+backend+') na GPU…';
+  const ctx=ttsEnsureCtx();
+  // resume() AGUARDADO antes de abrir o WS: agendar num contexto ainda suspenso
+  // descartava o começo do 1º áudio no WebKit.
+  const ready=(ctx.state==='suspended')?ctx.resume().catch(()=>{}):Promise.resolve();
+  ttsPlayhead=ctx.currentTime;
+  let header=null, chunks=[], sr=24000, nSent=0;
+  const t0=performance.now();
+  const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/tts');
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=> ready.then(()=> ws.send(JSON.stringify({text, voice, instruct, backend})));
+  ws.onmessage=(ev)=>{
+    if(typeof ev.data==='string'){
+      const m=JSON.parse(ev.data);
+      if(m.type==='start'){ sr=m.sr||24000; nSent=m.sentences; $('tts-hint').textContent='Gerando '+nSent+' frase(s)…'; }
+      else if(m.type==='chunk'){ header=m; if(m.first_ms!=null) $('tts-hint').textContent='1º som em '+m.first_ms+'ms · tocando ao vivo…'; }
+      else if(m.type==='done'){ done(); ws.close(); }
+      else if(m.type==='error'){ $('tts-hint').textContent='Falha: '+m.error; reset(); ws.close(); }
+    } else {
+      const int16=new Int16Array(ev.data); chunks.push(int16);
+      ttsPlayChunk(int16, (header&&header.sr)||sr);
+    }
+  };
+  ws.onerror=()=>{ $('tts-hint').textContent='Erro de WebSocket TTS.'; reset(); };
+  function reset(){ btn.disabled=false; btn.classList.remove('playing'); }
+  function done(){
+    reset();
+    const total=Math.round(performance.now()-t0);
+    const url=URL.createObjectURL(pcmToWav(chunks, sr));
+    $('tts-hint').textContent='';
+    addTtsItem(text, '🔊 '+backend+' · '+voice+' · '+nSent+' frase(s) · '+total+'ms total', url);
+  }
+}
+function addTtsItem(text, meta, url){
+  const box=$('tts-items'); const e=box.querySelector('.empty'); if(e) e.remove();
+  const d=document.createElement('div'); d.className='item';
+  d.innerHTML='<div class="t">'+escapeHtml(text)+'</div><div class="m"><span>'+escapeHtml(meta)+'</span></div>';
+  const play=document.createElement('button'); play.textContent='▶ tocar';
+  play.style.cssText='background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:2px 8px;cursor:pointer;font-size:12px';
+  play.onclick=()=>{ new Audio(url).play(); };
+  d.querySelector('.m').appendChild(play);
+  box.appendChild(d); box.scrollTop=box.scrollHeight;
+}
+</script>
+</body>
+</html>

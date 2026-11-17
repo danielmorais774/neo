@@ -1,0 +1,19 @@
+# venvs locais (criados no Mac) — nunca entram na imagem
+service/.venv-sys/
+service/.venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+
+# segredos e infra local
+service/.env
+service/state/
+*.log
+
+# nada de engine do PC gamer (roda no Windows/WSL, fora do container)
+engine-stt/
+engine-tts/
+
+# amostras/áudios de teste
+**/samples/
+**/*.wav

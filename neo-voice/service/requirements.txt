@@ -1,0 +1,11 @@
+# neo-stt service (Mac). Python 3.11+.
+fastapi>=0.116
+uvicorn[standard]>=0.35
+httpx>=0.28
+python-dotenv>=1.0    # carrega service/.env (ex.: OPENROUTER_API_KEY do fallback STT)
+python-multipart>=0.0.9  # endpoint /clone (UploadFile/Form) — necessario no container
+numpy>=1.26
+soundfile>=0.12       # embrulha PCM->WAV (proxy de TTS e fallback STT p/ OpenRouter)
+sounddevice>=0.5      # so para mic_to_engine.py (teste)
+silero-vad>=5.1       # VAD por frame (usa torch)
+# torch e pre-requisito do silero-vad; geralmente ja presente nos projetos neo.
