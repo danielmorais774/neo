@@ -1,0 +1,454 @@
+/* Aba Memória › Grafo. Segue os tokens de src/ui/neo-ui.css. */
+
+.kg-root {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: #06060b;
+  color: var(--neo-text);
+  font-family: var(--neo-font);
+}
+
+/* ── Barra ─────────────────────────────────────────────────── */
+
+.kg-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--neo-hairline);
+  background: var(--neo-surface-bar);
+  backdrop-filter: blur(8px);
+  flex-shrink: 0;
+  z-index: 2;
+}
+
+.kg-bar-select {
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: rgba(20, 20, 31, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--neo-text);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+}
+.kg-bar-select:focus {
+  border-color: rgba(139, 92, 246, 0.5);
+}
+.kg-bar-select option {
+  background: #14141f;
+}
+
+.kg-search {
+  width: 190px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: rgba(20, 20, 31, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--neo-text);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+}
+.kg-search:focus {
+  border-color: rgba(139, 92, 246, 0.5);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+}
+.kg-search::placeholder {
+  color: var(--neo-text-faint);
+}
+
+.kg-btn {
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.12);
+  color: var(--neo-violet-pale);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.kg-btn:hover:not(:disabled) {
+  background: rgba(139, 92, 246, 0.24);
+  box-shadow: 0 0 16px rgba(139, 92, 246, 0.25);
+}
+.kg-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.kg-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: transparent;
+  color: var(--neo-text-muted);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.kg-toggle.is-on {
+  color: var(--neo-violet-pale);
+  border-color: rgba(139, 92, 246, 0.45);
+  background: rgba(139, 92, 246, 0.1);
+}
+
+.kg-count {
+  font-size: 12.5px;
+  color: var(--neo-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.kg-hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--neo-text-faint);
+}
+
+/* ── Legenda ───────────────────────────────────────────────── */
+
+.kg-legend {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 18px 10px;
+  border-bottom: 1px solid var(--neo-hairline);
+  background: var(--neo-surface-bar);
+  flex-shrink: 0;
+  z-index: 2;
+}
+
+.kg-fam {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.kg-fam-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px 5px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--neo-text-dim);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.kg-fam-head:hover {
+  color: var(--neo-text);
+}
+.kg-fam.is-off .kg-fam-head {
+  opacity: 0.4;
+}
+
+/* O ponto colorido é a AMOSTRA da marca; o nome ao lado é o que carrega a
+   identidade. Nunca só cor — é o que permite 5 matizes darem conta de 17
+   tipos sem quebrar os pisos de daltonismo. */
+.kg-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 8px currentColor;
+}
+
+.kg-fam-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 240px;
+}
+
+.kg-type {
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--neo-text-faint);
+  font-size: 10.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+.kg-type:hover {
+  color: var(--neo-text-dim);
+}
+.kg-type.is-off {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
+
+/* ── Palco ─────────────────────────────────────────────────── */
+
+.kg-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.kg-canvas {
+  display: block;
+  touch-action: none;
+}
+
+.kg-status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  text-align: center;
+  padding: 24px;
+  pointer-events: none;
+}
+
+.kg-status.is-error {
+  color: var(--neo-rose);
+  pointer-events: auto;
+}
+
+.kg-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(139, 92, 246, 0.2);
+  border-top-color: var(--neo-violet);
+  animation: spin 0.8s linear infinite;
+}
+
+.kg-settling {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(10, 10, 16, 0.75);
+  border: 1px solid var(--neo-hairline);
+  color: var(--neo-text-faint);
+  font-size: 11.5px;
+  pointer-events: none;
+}
+
+.kg-zoom {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.kg-zoom button {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid var(--neo-hairline);
+  background: rgba(10, 10, 16, 0.8);
+  color: var(--neo-text-dim);
+  font-size: 15px;
+  font-family: inherit;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: color 0.15s, border-color 0.15s;
+}
+.kg-zoom button:hover {
+  color: var(--neo-text);
+  border-color: rgba(139, 92, 246, 0.4);
+}
+
+/* ── Cartão de detalhe ─────────────────────────────────────── */
+
+.kg-detail {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 310px;
+  max-height: calc(100% - 28px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 13px;
+  border: 1px solid var(--neo-hairline);
+  background: rgba(10, 10, 17, 0.9);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.kg-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 14px 14px 11px;
+  border-bottom: 1px solid var(--neo-hairline);
+}
+
+.kg-detail-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 14.5px;
+  font-weight: 650;
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.kg-detail-type {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--neo-text-faint);
+}
+
+.kg-close {
+  border: none;
+  background: transparent;
+  color: var(--neo-text-faint);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.kg-close:hover {
+  color: var(--neo-text);
+}
+
+.kg-detail-body {
+  padding: 12px 14px 16px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.kg-sec {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(167, 139, 250, 0.7);
+  margin: 14px 0 6px;
+}
+.kg-sec:first-child {
+  margin-top: 0;
+}
+
+.kg-kv {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  line-height: 1.45;
+}
+.kg-kv > b {
+  color: var(--neo-text-dim);
+  font-weight: 600;
+  flex-shrink: 0;
+  min-width: 82px;
+}
+.kg-kv > span {
+  color: var(--neo-text-muted);
+  min-width: 0;
+  word-break: break-word;
+}
+
+/* Linha própria, e não dentro do <span> do valor: encaixado na linha flex o
+   medidor transbordava por cima da linha de baixo. */
+.kg-meter {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+  margin: 2px 0 6px 90px;
+}
+.kg-meter > i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--neo-violet);
+}
+
+.kg-rel {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  line-height: 1.4;
+}
+.kg-rel-type {
+  color: var(--neo-text-faint);
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+.kg-rel-peer {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--neo-violet-light);
+  font-size: 11.5px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  word-break: break-word;
+}
+.kg-rel-peer:hover {
+  text-decoration: underline;
+}
+
+.kg-chip {
+  display: inline-block;
+  padding: 2px 7px;
+  margin: 0 4px 4px 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--neo-text-muted);
+  font-size: 10.5px;
+}
+
+.kg-id {
+  margin-top: 12px;
+  font-size: 9.5px;
+  color: rgba(241, 240, 246, 0.22);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ── Etiqueta do hover ─────────────────────────────────────── */
+
+.kg-hud {
+  position: absolute;
+  left: 16px;
+  top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 13px;
+  border-radius: 9px;
+  background: rgba(10, 10, 17, 0.85);
+  border: 1px solid var(--neo-hairline);
+  backdrop-filter: blur(10px);
+  font-size: 12.5px;
+  pointer-events: none;
+  max-width: 340px;
+}
+.kg-hud small {
+  color: var(--neo-text-faint);
+  font-size: 11px;
+}
