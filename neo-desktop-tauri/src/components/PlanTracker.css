@@ -1,0 +1,370 @@
+/* ========================================
+   PLAN TRACKER — checklist/timeline do plano multi-step
+
+   Tudo aqui sai dos tokens de tema (--accent, --surface-1, --text-*), não de
+   cores fixas: o cartão aparece dentro do chat e precisa acompanhar o tema
+   ativo (o azul cravado que existia aqui destoava no "Cyberpunk", que é
+   vermelho sobre preto). Ver src/styles/themes.css.
+   ======================================== */
+
+.plan-tracker {
+  --pt-radius: 12px;
+  --pt-line: var(--surface-border, var(--border-color, rgba(255, 255, 255, 0.12)));
+  --pt-done: var(--success, #22c55e);
+  --pt-fail: var(--error, #ef4444);
+
+  border-radius: var(--pt-radius);
+  background: var(--surface-1, rgba(20, 27, 45, 0.8));
+  border: 1px solid var(--pt-line);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  overflow: hidden;
+  max-width: 620px;
+  animation: planFadeIn 0.25s ease-out;
+}
+
+.plan-tracker.active {
+  border-color: var(--accent-border, var(--pt-line));
+}
+
+.plan-tracker.complete {
+  border-color: var(--pt-line);
+}
+
+@keyframes planFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- Header ---- */
+.plan-tracker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 6px;
+  cursor: pointer;
+  user-select: none;
+  gap: 8px;
+}
+
+.plan-tracker-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.plan-status-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.plan-goal {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #e6edf3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.plan-tracker-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.plan-progress-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary, #7d8590);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-collapse-icon {
+  color: var(--text-secondary, #7d8590);
+  font-size: 11px;
+  transition: transform 0.15s ease;
+  display: inline-block;
+}
+
+.plan-collapse-icon.expanded {
+  transform: rotate(90deg);
+}
+
+/* ---- Progress bar ---- */
+.plan-progress-bar-container {
+  height: 2px;
+  background: var(--pt-line);
+  margin: 0 14px 4px;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.plan-progress-bar {
+  height: 100%;
+  background: var(--accent, #3b82f6);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+.plan-progress-bar.success {
+  background: var(--pt-done);
+}
+
+.plan-progress-bar.failed {
+  background: var(--pt-fail);
+}
+
+/* ---- Body / step list ---- */
+.plan-tracker-body {
+  padding: 6px 12px 12px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.plan-tracker-body::-webkit-scrollbar {
+  width: 4px;
+}
+
+.plan-tracker-body::-webkit-scrollbar-thumb {
+  background: var(--pt-line);
+  border-radius: 4px;
+}
+
+.plan-tracker.collapsed .plan-tracker-body {
+  display: none;
+}
+
+.plan-tracker-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* ---- Passo individual ---- */
+.plan-tracker-step {
+  display: flex;
+  gap: 10px;
+  padding: 3px 0;
+  position: relative;
+}
+
+.plan-tracker-step.active {
+  background: var(--selected-bg, rgba(255, 255, 255, 0.05));
+  border-radius: 8px;
+  margin: 0 -6px;
+  padding: 5px 6px;
+}
+
+/* Coluna da timeline */
+.step-timeline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  width: 20px;
+  position: relative;
+}
+
+/* Caixinha de status (checkbox) */
+.step-icon {
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 700;
+  flex-shrink: 0;
+  z-index: 1;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.step-icon.pending {
+  background: transparent;
+  border: 1.5px solid var(--pt-line);
+}
+
+.step-icon.completed {
+  background: color-mix(in srgb, var(--pt-done) 18%, transparent);
+  border: 1.5px solid color-mix(in srgb, var(--pt-done) 60%, transparent);
+  color: var(--pt-done);
+}
+
+.step-icon.failed {
+  background: color-mix(in srgb, var(--pt-fail) 18%, transparent);
+  border: 1.5px solid color-mix(in srgb, var(--pt-fail) 60%, transparent);
+  color: var(--pt-fail);
+}
+
+.step-icon.running {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1.5px solid var(--accent, #3b82f6);
+}
+
+.step-icon.skipped {
+  background: transparent;
+  border: 1.5px solid var(--pt-line);
+  color: var(--text-secondary, #7d8590);
+  font-size: 9px;
+}
+
+/* Ponto pulsando dentro da caixa do passo em execução */
+.pulse-dot {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--accent, #3b82f6);
+  animation: pulseDot 1.2s ease-in-out infinite;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 0.35; transform: scale(0.75); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+/* Linha vertical ligando os passos */
+.step-connector {
+  flex: 1;
+  width: 2px;
+  min-height: 10px;
+  margin: 2px 0;
+  background: var(--pt-line);
+  border-radius: 1px;
+}
+
+.step-connector.completed {
+  background: color-mix(in srgb, var(--pt-done) 45%, transparent);
+}
+
+/* Conteúdo do passo */
+.step-body {
+  flex: 1;
+  min-width: 0;
+  padding-bottom: 4px;
+}
+
+.step-header-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.step-number {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-secondary, #7d8590);
+  font-variant-numeric: tabular-nums;
+  min-width: 14px;
+}
+
+.step-desc {
+  font-size: 12.5px;
+  color: var(--text-primary, #e6edf3);
+  line-height: 1.4;
+  opacity: 0.92;
+}
+
+.plan-tracker-step.pending .step-desc {
+  opacity: 0.6;
+}
+
+.plan-tracker-step.completed .step-desc {
+  opacity: 0.68;
+}
+
+.plan-tracker-step.active .step-desc {
+  opacity: 1;
+  font-weight: 500;
+}
+
+.tool-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--control-bg, rgba(255, 255, 255, 0.05));
+  color: var(--text-secondary, #7d8590);
+  border: 1px solid var(--pt-line);
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.step-result-preview,
+.step-error-preview {
+  font-size: 11px;
+  margin-top: 3px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.step-result-preview {
+  color: var(--text-secondary, #7d8590);
+}
+
+.step-error-preview {
+  color: var(--pt-fail);
+}
+
+/* ---- Sub-plano ---- */
+.sub-plan-section {
+  margin: 4px 0 2px 9px;
+  border-left: 2px solid var(--pt-line);
+  padding-left: 10px;
+}
+
+.sub-plan-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--accent, #3b82f6);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+  width: 100%;
+  text-align: left;
+}
+
+.sub-plan-toggle:hover {
+  color: var(--accent-hover, #60a5fa);
+}
+
+.sub-plan-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 10px;
+}
+
+.sub-plan-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.sub-plan-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-plan-progress {
+  font-size: 10px;
+  color: var(--text-secondary, #7d8590);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.sub-plan-steps {
+  padding-left: 4px;
+}

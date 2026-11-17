@@ -1,0 +1,889 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: #0a0e1a;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  position: relative;
+  /* WebKit fix: force the rounded corners to be clipped on a stable
+     compositing layer. Without this, the backdrop-filter glass flickers
+     at the corners while the (transparent) window is dragged on macOS.
+     This does NOT remove glass/transparency — it only stabilises the
+     corner mask during compositing. */
+  -webkit-mask-image: -webkit-radial-gradient(white, black);
+  -webkit-mask-image: radial-gradient(white, black);
+  isolation: isolate;
+}
+
+/* ========================================
+   GLASSMORPHISM BACKGROUND WITH ORBS
+   ======================================== */
+
+.bg-orbs {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.orb {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.8) 0%, rgba(37, 99, 235, 0.4) 50%, transparent 75%);
+  filter: blur(25px);
+}
+
+/* Enorme — topo esquerdo, domina o canto */
+.orb-1 {
+  width: 30vh;
+  height: 30vh;
+  top: -5%;
+  left: -2%;
+  animation: floatOrb1 20s ease-in-out infinite;
+}
+
+/* Grande — inferior direito */
+.orb-2 {
+  width: 24vh;
+  height: 24vh;
+  bottom: -3%;
+  right: -1%;
+  animation: floatOrb2 26s ease-in-out infinite;
+}
+
+/* Micro — perto da orb-1, se sobrepõe */
+.orb-3 {
+  width: 6vh;
+  height: 6vh;
+  top: 12%;
+  left: 18%;
+  animation: floatOrb3 11s ease-in-out infinite;
+}
+
+/* Média — centro, cruza com orb-2 na animação */
+.orb-4 {
+  width: 14vh;
+  height: 14vh;
+  bottom: 20%;
+  right: 15%;
+  animation: floatOrb4 17s ease-in-out infinite;
+}
+
+/* Pequena — anda bastante, passa por cima das outras */
+.orb-5 {
+  width: 9vh;
+  height: 9vh;
+  top: 45%;
+  left: 35%;
+  animation: floatOrb5 14s ease-in-out infinite;
+}
+
+/* Orb 1 — lenta, respiração ampla, desce bastante */
+@keyframes floatOrb1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  20% { transform: translate(50px, 60px) scale(1.15); }
+  45% { transform: translate(-10px, 100px) scale(0.88); }
+  70% { transform: translate(60px, 20px) scale(1.1); }
+}
+
+/* Orb 2 — sobe e vai pra esquerda, encontra a orb-4 */
+@keyframes floatOrb2 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(-60px, -50px) scale(1.12); }
+  55% { transform: translate(30px, -80px) scale(0.85); }
+  80% { transform: translate(-20px, 15px) scale(1.08); }
+}
+
+/* Orb 3 — micro rápida, orbita perto da orb-1 */
+@keyframes floatOrb3 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  20% { transform: translate(-30px, -15px) scale(1.3); }
+  40% { transform: translate(-50px, 10px) scale(0.7); }
+  60% { transform: translate(-20px, 30px) scale(1.4); }
+  80% { transform: translate(10px, 15px) scale(0.9); }
+}
+
+/* Orb 4 — elíptica larga, cruza território da orb-2 */
+@keyframes floatOrb4 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  20% { transform: translate(40px, -50px) scale(1.1); }
+  50% { transform: translate(-50px, -30px) scale(0.9); }
+  75% { transform: translate(20px, 40px) scale(1.15); }
+}
+
+/* Orb 5 — viajante, percorre bastante a tela */
+@keyframes floatOrb5 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  15% { transform: translate(-60px, -40px) scale(1.2); }
+  35% { transform: translate(50px, -70px) scale(0.75); }
+  55% { transform: translate(80px, 20px) scale(1.3); }
+  75% { transform: translate(-30px, 50px) scale(0.85); }
+}
+
+/* Unified glass layer that covers both header and body seamlessly */
+.app::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: rgba(15, 20, 35, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* All content above the glass layer (resize handles and the sessions sidebar
+   keep their own absolute positioning — including them here would force them
+   into the flex flow and push the titlebar down, creating a gap at the top). */
+.app > *:not(.bg-orbs):not(.resize-handle):not(.sessions-sidebar):not(.sessions-sidebar-overlay) {
+  position: relative;
+  z-index: 2;
+}
+
+.resize-handle {
+  position: absolute;
+  z-index: 50;
+  -webkit-app-region: no-drag;
+}
+
+.resize-handle-n,
+.resize-handle-s {
+  left: 12px;
+  right: 12px;
+  height: 8px;
+}
+
+.resize-handle-n {
+  top: 0;
+  cursor: ns-resize;
+}
+
+.resize-handle-s {
+  bottom: 0;
+  cursor: ns-resize;
+}
+
+.resize-handle-w,
+.resize-handle-e {
+  top: 12px;
+  bottom: 12px;
+  width: 8px;
+}
+
+.resize-handle-w {
+  left: 0;
+  cursor: ew-resize;
+}
+
+.resize-handle-e {
+  right: 0;
+  cursor: ew-resize;
+}
+
+.resize-handle-nw,
+.resize-handle-ne,
+.resize-handle-sw,
+.resize-handle-se {
+  width: 14px;
+  height: 14px;
+}
+
+.resize-handle-nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.resize-handle-ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.resize-handle-sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.resize-handle-se {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}
+
+/* ========================================
+   WINDOW TITLEBAR
+   ======================================== */
+
+.window-titlebar {
+  height: 32px;
+  display: grid;
+  grid-template-columns: 96px 1fr 96px;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--window-titlebar-bg);
+  border-bottom: 1px solid var(--window-titlebar-border);
+  -webkit-app-region: drag;
+  cursor: grab;
+  user-select: none;
+}
+
+.window-titlebar:active {
+  cursor: grabbing;
+}
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+  cursor: default;
+  flex-shrink: 0;
+}
+
+.window-control {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18), 0 1px 4px rgba(0, 0, 0, 0.16);
+}
+
+.window-control::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.18);
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.window-controls:hover .window-control::after {
+  opacity: 1;
+}
+
+.window-control-close {
+  background: #ff5f57;
+}
+
+.window-control-minimize {
+  background: #febc2e;
+}
+
+.window-control-maximize {
+  background: #28c840;
+}
+
+.window-title {
+  justify-self: center;
+  color: var(--window-titlebar-text);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+
+.window-titlebar-spacer {
+  min-width: 0;
+}
+
+/* ========================================
+   HEADER - WhatsApp Style
+   ======================================== */
+
+.titlebar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 56px;
+  background: transparent;
+  border-bottom: 1px solid rgba(59, 130, 246, 0.12);
+  padding: 0 12px;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.titlebar-drag {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  cursor: grab;
+  user-select: none;
+  min-width: 0;
+}
+
+.titlebar-drag:active {
+  cursor: grabbing;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  flex-shrink: 0;
+}
+
+.header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.header-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6edf3;
+  line-height: 1.2;
+}
+
+.header-status {
+  font-size: 11px;
+  color: #22c55e;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  line-height: 1.2;
+}
+
+.status-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  display: inline-block;
+  animation: pulseGreen 2s infinite;
+}
+
+.header-status.checking {
+  color: #facc15;
+}
+
+.header-status.checking .status-indicator {
+  background: #facc15;
+  animation: pulseAmber 1.6s infinite;
+}
+
+.header-status.disconnected {
+  color: #f87171;
+}
+
+.header-status.disconnected .status-indicator {
+  background: #ef4444;
+  animation: none;
+}
+
+@keyframes pulseGreen {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+  50% { opacity: 0.8; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+}
+
+@keyframes pulseAmber {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(250, 204, 21, 0.35); }
+  50% { opacity: 0.7; box-shadow: 0 0 0 4px rgba(250, 204, 21, 0); }
+}
+
+.executing-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: linear-gradient(135deg, var(--accent), #f472b6);
+  color: white;
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+  animation: pulse-badge 1.5s infinite;
+}
+
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.titlebar-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  -webkit-app-region: no-drag;
+}
+
+/* Novo chat button in header */
+.btn-new-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 4px;
+  padding: 5px 12px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.22);
+  border-radius: 16px;
+  color: #93c5fd;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-new-chat-header:hover {
+  background: rgba(59, 130, 246, 0.22);
+  border-color: rgba(59, 130, 246, 0.4);
+  color: #bfdbfe;
+}
+
+/* Sessions button in header */
+.btn-sessions-header {
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-sessions-header:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+/* Settings button in header */
+.btn-settings-header {
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-settings-header:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+/* ========================================
+   TITLEBAR TABS
+   ======================================== */
+
+.titlebar-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+.tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  color: rgba(147, 197, 253, 0.6);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.tab-btn:hover {
+  background: rgba(59, 130, 246, 0.08);
+  color: rgba(147, 197, 253, 0.9);
+}
+
+.tab-btn.active {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: #93c5fd;
+}
+
+/* ========================================
+   APP CONTENT
+   ======================================== */
+
+.app-content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ========================================
+   DEVICES TAB
+   ======================================== */
+
+.devices-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 100%;
+  width: 100%;
+  color: rgba(147, 197, 253, 0.6);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.devices-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 100%;
+  width: 100%;
+  color: #f87171;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.devices-error button {
+  padding: 6px 16px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.22);
+  border-radius: 16px;
+  color: #93c5fd;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.devices-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  width: 100%;
+  color: rgba(147, 197, 253, 0.5);
+  text-align: center;
+  padding: 20px;
+  box-sizing: border-box;
+}
+
+.devices-empty svg {
+  opacity: 0.3;
+}
+
+.devices-empty p {
+  font-size: 15px;
+  font-weight: 600;
+  color: rgba(147, 197, 253, 0.7);
+  margin: 0;
+}
+
+.devices-empty span {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.devices-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  overflow-y: auto;
+  height: 100%;
+}
+
+.device-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 14px;
+  background: rgba(59, 130, 246, 0.06);
+  border: 1px solid rgba(59, 130, 246, 0.12);
+  border-radius: 12px;
+  transition: all 0.2s;
+}
+
+.device-card:hover {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
+.device-card.current {
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.device-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #60a5fa;
+  flex-shrink: 0;
+}
+
+.device-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.device-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-type {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.device-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  background: rgba(34, 197, 94, 0.15);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 8px;
+  color: #4ade80;
+}
+
+.device-model {
+  font-size: 12px;
+  color: rgba(147, 197, 253, 0.7);
+}
+
+/* ── Pareamento e nome do dispositivo (docs/device-control-plan.md) ── */
+
+.device-badge-control {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.35);
+  color: #93c5fd;
+}
+
+.device-name {
+  cursor: pointer;
+  border-bottom: 1px dashed rgba(147, 197, 253, 0.35);
+}
+
+.device-name:hover {
+  color: rgba(191, 219, 254, 0.95);
+}
+
+.device-name-input,
+.pairing-input {
+  font: inherit;
+  padding: 4px 8px;
+  color: rgba(226, 232, 240, 0.95);
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 6px;
+  outline: none;
+}
+
+.device-name-input:focus,
+.pairing-input:focus {
+  border-color: rgba(59, 130, 246, 0.6);
+}
+
+.pairing-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* O código tem 6 dígitos: largura fixa e tabular para não dançar ao digitar. */
+.pairing-input {
+  width: 110px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 2px;
+}
+
+.pairing-input-name {
+  width: 200px;
+  letter-spacing: normal;
+}
+
+.pairing-fields button {
+  padding: 4px 14px;
+  color: #bfdbfe;
+  cursor: pointer;
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 6px;
+}
+
+.pairing-fields button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pairing-error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.device-remove {
+  margin-top: 8px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: rgba(203, 213, 225, 0.75);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 6px;
+}
+
+.device-remove:hover {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.device-remove.danger {
+  color: #fca5a5;
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.device-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.device-remove-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: rgba(252, 165, 165, 0.9);
+}
+
+.device-remove-confirm .device-remove {
+  margin-top: 0;
+}
+
+.device-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: rgba(147, 197, 253, 0.5);
+  margin-top: 2px;
+}
+
+.device-time {
+  font-size: 10px;
+  color: rgba(147, 197, 253, 0.4);
+  margin-top: 4px;
+}
+
+.spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(59, 130, 246, 0.2);
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Token da ponte da extensão (aba Dispositivos) ──────────────────────────
+   A credencial que a extensão de música apresenta no handshake da ponte local.
+   Mostrada mascarada por padrão: ela vive numa tela que fica aberta, e um
+   screenshot ou um ombro é o jeito mais banal de uma credencial vazar.
+   Ver neo-core/docs/api-auth-plan.md §11.                                    */
+.ext-token-card {
+  border-style: dashed;
+}
+
+.ext-token-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ext-token-value {
+  flex: 1;
+  min-width: 200px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.5px;
+  word-break: break-all;
+}
+
+.ext-token-error {
+  color: #fca5a5;
+}
+
+/* ── Navegador aninhado na máquina (aba Dispositivos) ───────────────────────
+   Superfície de navegador é uma linha própria no registro de dispositivos, mas
+   mostrá-la solta ao lado do computador convida a revogar a errada — e revogar o
+   computador tira o Neo do ar na máquina. Ver browser-surface-plan.md §12.2.  */
+.device-surface {
+  margin-top: 10px;
+  margin-left: 14px;
+  padding: 8px 10px;
+  border-left: 2px solid rgba(139, 92, 246, 0.35);
+  border-radius: 0 6px 6px 0;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.device-surface-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-surface-tipo {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #a78bfa;
+}

@@ -1,0 +1,540 @@
+/* Visor do caderno de trabalho — layout de preview de .md (lista | corpo).
+ *
+ * z-index 1100: o visor abre a partir do SettingsModal (1000) e precisa ficar
+ * por cima dele, senão o clique no botão parece não fazer nada.
+ *
+ * Todas as cores saem dos tokens de styles/themes.css — a tela acompanha os 4
+ * temas sem precisar de regra por tema (ver neo-desktop-theme-system). */
+
+.wm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.5);
+  -webkit-app-region: no-drag;
+}
+
+.wm-screen {
+  width: min(1020px, 100%);
+  height: min(720px, calc(100vh - 36px));
+  display: flex;
+  flex-direction: column;
+  color: var(--text-primary);
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 16px;
+  box-shadow: var(--modal-shadow);
+  backdrop-filter: blur(var(--modal-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--modal-blur)) saturate(150%);
+  overflow: hidden;
+}
+
+/* ── cabeçalho ─────────────────────────────────────────────────────────── */
+
+.wm-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-header-copy h2 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.2;
+}
+
+.wm-header-copy p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wm-header-copy strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.wm-origin-split {
+  cursor: help;
+  border-bottom: 1px dotted var(--text-secondary);
+}
+
+.wm-header-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.wm-icon-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--control-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.wm-icon-btn:hover {
+  background: var(--control-bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── duas colunas ──────────────────────────────────────────────────────── */
+
+.wm-columns {
+  flex: 1 1 auto;
+  display: grid;
+  /* Coluna fixa à esquerda: o markdown do corpo é a parte que precisa de
+     largura, e uma lista elástica encolheria o preview a cada nota longa. */
+  grid-template-columns: 288px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.wm-list-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border-color, var(--surface-border));
+  background: var(--surface-1);
+}
+
+.wm-search {
+  flex: 0 0 auto;
+  padding: 10px;
+  border-bottom: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--control-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.wm-search input:focus {
+  border-color: var(--accent-border-strong, var(--accent-border));
+}
+
+.wm-search input::placeholder {
+  color: var(--text-secondary);
+}
+
+.wm-list {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.wm-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  margin-bottom: 4px;
+  text-align: left;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.wm-item:hover {
+  background: var(--control-bg);
+}
+
+.wm-item.current {
+  background: var(--selected-bg);
+  border-color: var(--accent-border);
+}
+
+.wm-item-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wm-item-title {
+  flex: 1 1 auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  /* Duas linhas e corta: título de nota automática é sempre o mesmo texto, e
+     deixá-lo crescer empurraria o resumo (que é o que diferencia) pra fora. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.wm-item-slug {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wm-item-summary {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.wm-item-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.wm-item-dot {
+  opacity: 0.5;
+}
+
+.wm-expiring {
+  color: var(--accent);
+}
+
+/* ── selos ─────────────────────────────────────────────────────────────── */
+
+.wm-badge {
+  padding: 1px 6px;
+  border-radius: 20px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+/* Distinguir `auto` de `do Neo` é o ponto da tela: nota automática significa
+   que o Neo NÃO anotou por conta e o backstop registrou o turno por ele. */
+.wm-badge-auto {
+  color: var(--text-secondary);
+  background: var(--control-bg);
+  border-color: var(--surface-border);
+}
+
+.wm-badge-model {
+  color: var(--accent);
+  background: var(--selected-bg);
+  border-color: var(--accent-border);
+}
+
+.wm-badge-pin,
+.wm-badge-done {
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border-color: var(--surface-border);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+}
+
+/* ── painel do preview ─────────────────────────────────────────────────── */
+
+.wm-preview-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.wm-preview-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-color, var(--surface-border));
+  background: var(--surface-1);
+}
+
+.wm-preview-facts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.wm-preview-facts code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--text-primary);
+  padding: 1px 5px;
+  background: var(--control-bg);
+  border-radius: 5px;
+}
+
+.wm-links {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-link {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  padding: 2px 7px;
+  color: var(--text-secondary);
+  background: var(--control-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+}
+
+.wm-link-nav {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  cursor: pointer;
+}
+
+.wm-link-nav:hover {
+  background: var(--selected-bg);
+}
+
+/* O markdown em si. Mesma família de regras do MessageBubble, mas com escala de
+   documento (h1/h2 maiores, mais respiro) — a nota é um .md inteiro, não uma
+   bolha de chat. */
+.wm-md {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px 28px;
+  font-size: 13px;
+  line-height: 1.62;
+}
+
+.wm-md > :first-child {
+  margin-top: 0;
+}
+
+.wm-md h1,
+.wm-md h2,
+.wm-md h3,
+.wm-md h4 {
+  margin: 20px 0 8px;
+  line-height: 1.28;
+  font-weight: 650;
+}
+
+.wm-md h1 {
+  font-size: 19px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-md h2 {
+  font-size: 15.5px;
+  color: var(--accent);
+}
+
+.wm-md h3 {
+  font-size: 13.5px;
+}
+
+.wm-md p,
+.wm-md ul,
+.wm-md ol {
+  margin: 0 0 10px;
+}
+
+.wm-md ul,
+.wm-md ol {
+  padding-left: 22px;
+}
+
+.wm-md li {
+  margin-bottom: 3px;
+}
+
+.wm-md li::marker {
+  color: var(--text-secondary);
+}
+
+.wm-md a {
+  color: var(--accent);
+  /* Sem navegação: a nota guarda URL que o Neo coletou, e abrir isso do visor
+     seria ação, não leitura. Fica visível e copiável. */
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  pointer-events: none;
+}
+
+.wm-md blockquote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--accent-border);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.wm-md hr {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  padding: 1px 5px;
+  background: var(--control-bg);
+  border-radius: 5px;
+  /* O corpo carrega dumps de tool com JSON de uma linha só; sem isto a nota
+     esticaria o painel e o scroll horizontal iria para a tela inteira. */
+  overflow-wrap: anywhere;
+}
+
+.wm-md table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  /* Tabela larga rola dentro do próprio painel, não na tela. */
+  display: block;
+  overflow-x: auto;
+}
+
+.wm-md th,
+.wm-md td {
+  padding: 5px 9px;
+  text-align: left;
+  border: 1px solid var(--border-color, var(--surface-border));
+}
+
+.wm-md th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+/* ── estados ───────────────────────────────────────────────────────────── */
+
+.wm-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: auto;
+  padding: 24px 20px;
+  max-width: 400px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.wm-state-error {
+  color: var(--text-primary);
+}
+
+.wm-state code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  background: var(--control-bg);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
+.wm-retry {
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--accent);
+  background: var(--selected-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.wm-retry:hover {
+  border-color: var(--accent-border-strong, var(--accent-border));
+}
+
+/* Janela estreita: o preview vira a tela toda e a lista fica mais curta em
+   cima. Empilhar é melhor que espremer o markdown a 150px. */
+@media (max-width: 760px) {
+  .wm-columns {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(120px, 34%) minmax(0, 1fr);
+  }
+
+  .wm-list-pane {
+    border-right: none;
+    border-bottom: 1px solid var(--border-color, var(--surface-border));
+  }
+}
+
+/* ── modo janela própria ───────────────────────────────────────────────────
+ *
+ * A janela do caderno tem decoração NATIVA e fundo opaco, então aqui não há
+ * backdrop para escurecer nem cantos flutuando sobre o chat: a tela ocupa a
+ * janela inteira, quadrada e sem sombra. Só isto muda — a lista, o preview e
+ * todos os estados são exatamente os mesmos do overlay. */
+
+.wm-screen.wm-standalone {
+  width: 100%;
+  height: 100vh;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  /* Sólido: `--modal-bg` é translúcido e, sem nada atrás, mostraria o cinza do
+     sistema. `--sessions-bg` é o equivalente opaco que os 4 temas definem. */
+  background: var(--sessions-bg, var(--app-bg));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* A barra de título nativa já dá o nome da janela; o cabeçalho de dentro fica
+   como subtítulo, um pouco mais discreto para não repetir o mesmo peso. */
+.wm-standalone .wm-header {
+  padding: 14px 18px;
+}
+
+.wm-standalone .wm-header-copy h2 {
+  font-size: 15px;
+}

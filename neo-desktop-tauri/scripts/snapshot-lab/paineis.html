@@ -1,0 +1,23 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Formas de painel</title>
+<style>body{margin:0;font:15px/1.4 Arial} main{padding:24px;max-width:900px;margin:0 auto}
+.fixo{position:fixed;background:#fff;box-shadow:0 0 8px #0005;padding:12px;box-sizing:border-box}</style></head><body>
+<header><nav><a href="/">Início</a><a href="/sobre">Sobre</a></nav></header>
+<main><h1>Plano Família</h1><p>O Plano Família custa R$ 129,90 por mês e inclui seis perfis com acesso simultâneo em todos os aparelhos da casa, sem fidelidade e sem taxa de adesão, com cancelamento a qualquer momento.</p>
+<a href="/assinar">Assinar agora</a></main>
+<script>
+const caso = new URLSearchParams(location.search).get('caso');
+const add = (html, css, attrs) => { const d = document.createElement('div'); d.className='fixo'; d.style.cssText=css; d.innerHTML=html;
+  for (const [k,v] of Object.entries(attrs||{})) d.setAttribute(k,v); document.body.appendChild(d); return d; };
+const cookie = 'Usamos cookies para melhorar sua experiência neste site e medir audiência, conforme nossa política de privacidade.<button>Aceitar</button>';
+if (caso === 'cookie') add(cookie, 'left:0;right:0;bottom:0', {role:'dialog', 'aria-label':'Cookies'});
+if (caso === 'gaveta') {
+  const f = document.createElement('div'); f.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5)'; document.body.appendChild(f);
+  add('<h3>Seu carrinho</h3>Plano Família adicionado com sucesso ao seu carrinho.<a href="/fechar-pedido">Finalizar pedido</a>', 'top:0;right:0;bottom:0;width:380px', {role:'dialog','aria-label':'Seu carrinho'});
+}
+if (caso === 'filtros') {
+  // `role=dialog` EM FLUXO, mais alto que a janela: a coluna de filtros da busca da Amazon.
+  const c = document.createElement('div'); c.setAttribute('role','dialog'); c.setAttribute('aria-label','Filtros');
+  c.style.cssText='width:260px;height:2400px'; c.innerHTML='<a href="/f/1">Marca ASUS</a><br><a href="/f/2">Marca Dell</a>'; document.body.prepend(c);
+}
+if (caso === 'tapume') add('<h2>Assine a newsletter</h2>Receba novidades toda semana no seu e-mail, sem spam nenhum.<button>Agora não</button>', 'inset:0', {role:'dialog','aria-modal':'true','aria-label':'Newsletter'});
+</script></body></html>

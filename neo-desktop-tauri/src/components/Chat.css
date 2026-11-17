@@ -1,0 +1,933 @@
+/* ========================================
+   CHAT CONTAINER
+   ======================================== */
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ========================================
+   TOP BAR - Novo Chat + Settings
+   ======================================== */
+
+.chat-top-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.btn-new-chat-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 20px;
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  -webkit-app-region: no-drag;
+}
+
+.btn-new-chat-top:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.22);
+  border-color: rgba(59, 130, 246, 0.4);
+  color: #bfdbfe;
+}
+
+.btn-new-chat-top:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-settings-top {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  -webkit-app-region: no-drag;
+}
+
+.btn-settings-top:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+/* ========================================
+   MESSAGES CONTAINER
+   ======================================== */
+
+/* Enable selection inside messages container (overrides global body setting) */
+.messages-container {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* A barra de rolagem nasce colada na borda direita do BORDER-BOX (padding
+     não a move). Colada na borda da janela ela ficava debaixo do
+     `.resize-handle-e` (8px, z-index 50, App.css): o mousedown virava
+     "redimensionar janela" (com preventDefault) e o arrasto da barra nunca
+     chegava a acontecer — era o único scroll do app encostado na borda, por
+     isso só ele parecia quebrado. A margem tira a barra de baixo do handle. */
+  margin-right: 12px;
+  padding: 8px 4px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  z-index: 1;
+  /* A âncora de scroll é feita à mão (lib/messageVirtualizer.ts); a nativa, onde
+     existir, corrigiria em dobro. `position: relative` acima também é usado lá:
+     faz desta lista o offsetParent dos slots. */
+  overflow-anchor: none;
+}
+
+/* Cada mensagem mora num slot que, longe da tela, fica vazio com a altura que a
+   bolha tinha (MessageList.tsx). O slot é coluna flex pra bolha dentro dele
+   continuar se alinhando como antes (`.message.user` usa align-self/margin-left
+   auto). `flex-shrink: 0` é obrigatório: um slot vazio não tem conteúdo que
+   segure a altura e a coluna o espremeria até zero. */
+.message-slot {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.messages-container .message-slot--static > * {
+  animation: none;
+}
+
+/* Mais larga que a global (6px): aqui a barra é alvo de arrasto, não só
+   indicador. A cor do thumb fica com as regras globais/de tema (index.css,
+   styles/themes.css) — sobrescrever aqui empataria em especificidade com os
+   `[data-theme=...]` e a barra do chat sairia da paleta do tema. */
+.messages-container::-webkit-scrollbar {
+  width: 10px;
+}
+
+/* ========================================
+   WELCOME MESSAGE
+   ======================================== */
+
+.welcome-message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  padding: 24px;
+}
+
+.welcome-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  animation: float 3s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+.welcome-message h2 {
+  font-size: 20px;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.welcome-message p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+.welcome-subtitle {
+  font-size: 12px;
+  color: var(--accent);
+  margin-top: -12px;
+  margin-bottom: 20px;
+  opacity: 0.8;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.suggestions button {
+  padding: 10px 16px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 20px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  backdrop-filter: blur(10px);
+}
+
+.suggestions button:hover {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.3);
+  transform: translateY(-2px);
+}
+
+/* ========================================
+   INPUT CONTAINER
+   ======================================== */
+
+.input-container {
+  padding: 12px 16px 10px;
+  background: rgba(10, 14, 26, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid rgba(59, 130, 246, 0.08);
+  flex-shrink: 0;
+}
+
+.input-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  background: rgba(20, 27, 45, 0.8);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 24px;
+  padding: 6px 8px 6px 6px;
+  transition: all 0.2s;
+  margin-bottom: 8px;
+  backdrop-filter: blur(10px);
+}
+
+.input-wrapper:focus-within {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.15), 0 0 20px rgba(59, 130, 246, 0.05);
+}
+
+/* Anexos pendentes de envio (File Store): pill acima do campo, some no send. */
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 6px 4px 10px;
+  background: rgba(20, 27, 45, 0.8);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 14px;
+  font-size: 12px;
+  color: var(--text-primary);
+  backdrop-filter: blur(10px);
+}
+
+.attachment-chip.attachment-error {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-size {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.attachment-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.attachment-remove:hover {
+  color: var(--text-primary);
+}
+
+.attachment-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(59, 130, 246, 0.25);
+  border-top-color: rgba(59, 130, 246, 0.9);
+  border-radius: 50%;
+  animation: attachment-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes attachment-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.btn-attachment {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-attachment:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-attachment:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.input-wrapper textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  min-height: 22px;
+  max-height: 120px;
+  font-family: inherit;
+  padding: 2px 0 4px;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.input-wrapper textarea::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+
+.btn-mic {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-mic:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Modo Live — botão ativo (pulsa) */
+.btn-mic.live-active {
+  color: #fff;
+  background: rgba(239, 68, 68, 0.9);
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6);
+  animation: live-pulse 1.6s ease-out infinite;
+}
+
+.btn-mic.live-active:hover {
+  background: rgba(239, 68, 68, 1);
+}
+
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+  70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+/* Modo Live — barra de status acima do input */
+.live-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 12px;
+  border-radius: 14px;
+  background: rgba(20, 27, 45, 0.8);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.live-bar .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #3b82f6;
+}
+
+.live-bar.live-listening .live-dot {
+  background: #22c55e;
+  animation: live-blink 1.2s ease-in-out infinite;
+}
+
+.live-bar.live-thinking .live-dot {
+  background: #f59e0b;
+  animation: live-blink 0.8s ease-in-out infinite;
+}
+
+.live-bar.live-speaking .live-dot {
+  background: #3b82f6;
+  animation: live-blink 0.6s ease-in-out infinite;
+}
+
+@keyframes live-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.live-bar .live-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.live-bar .live-meter {
+  width: 48px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.live-bar .live-meter-fill {
+  display: block;
+  height: 100%;
+  background: #22c55e;
+  border-radius: 2px;
+  transition: width 0.08s linear;
+}
+
+.live-bar .live-partial {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.live-bar.live-error {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.live-bar.live-error .live-label {
+  color: #fca5a5;
+  font-weight: 500;
+  white-space: normal;
+}
+
+.btn-send {
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  color: white;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-send:hover:not(:disabled) {
+  transform: scale(1.08);
+  box-shadow: 0 0 16px rgba(59, 130, 246, 0.35);
+}
+
+.btn-send:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  transform: scale(1);
+}
+
+.btn-send svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Botão stop inline no input */
+.input-wrapper .btn-stop-inline {
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: white;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  font-size: 16px;
+  animation: pulse-stop 1.5s infinite;
+}
+
+.input-wrapper .btn-stop-inline:hover {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  transform: scale(1.05);
+}
+
+/* ========================================
+   INPUT CONTROLS (Agent/Model selects)
+   ======================================== */
+
+.input-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.chat-mode-select,
+.model-select {
+  background: rgba(20, 27, 45, 0.6);
+  border: 1px solid rgba(59, 130, 246, 0.12);
+  color: var(--text-primary);
+  padding: 5px 24px 5px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s;
+  font-family: inherit;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23a0a0a0' d='M6 8L2 4h8z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+.chat-mode-select {
+  font-weight: 600;
+  min-width: 75px;
+}
+
+.model-select {
+  font-weight: 500;
+  min-width: 100px;
+  color: var(--text-secondary);
+}
+
+.chat-mode-select:hover,
+.model-select:hover {
+  background-color: rgba(30, 40, 65, 0.8);
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
+.chat-mode-select:focus,
+.model-select:focus {
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+.chat-mode-select option,
+.model-select option {
+  background: #141b2d;
+  color: var(--text-primary);
+  padding: 10px;
+}
+
+/* ========================================
+   AGENT SYSTEM - Progress, Thinking, Plans, Steps
+   ======================================== */
+
+/* Botão Stop */
+.btn-stop {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  border: none;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  animation: pulse-stop 1.5s infinite;
+  transition: all 0.2s;
+}
+
+.btn-stop:hover {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  transform: scale(1.02);
+}
+
+@keyframes pulse-stop {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+/* Barra de progresso do agente */
+.agent-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: rgba(15, 20, 35, 0.6);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.1);
+}
+
+.progress-bar-container {
+  flex: 1;
+  height: 4px;
+  background: rgba(59, 130, 246, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #06b6d4);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* Thinking Indicator */
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  margin: 4px 0;
+  background: rgba(74, 222, 128, 0.06);
+  border-left: 3px solid rgba(74, 222, 128, 0.4);
+  border-radius: 8px;
+  animation: fadeInSlide 0.3s ease-out;
+  backdrop-filter: blur(8px);
+}
+
+@keyframes fadeInSlide {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.thinking-spinner {
+  flex-shrink: 0;
+}
+
+.thinking-spinner .spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(74, 222, 128, 0.2);
+  border-top-color: rgba(74, 222, 128, 0.8);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.thinking-text-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex: 1;
+  min-width: 0;
+}
+
+.thinking-label {
+  color: rgba(74, 222, 128, 0.9);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.thinking-detail {
+  color: var(--text-secondary);
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Faixa do Claude Code (ClaudeBar.tsx): o passo atual, numa linha, sem virar
+   mensagem. Mesmo corpo da live-bar. A linha abre a caixa do diário logo
+   abaixo; "ver ›" abre a janela Tarefas. */
+.claude-bar {
+  margin-bottom: 8px;
+  border-radius: 14px;
+  background: var(--surface-1, rgba(20, 27, 45, 0.8));
+  border: 1px solid var(--surface-border, rgba(59, 130, 246, 0.15));
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  overflow: hidden;
+}
+
+.claude-bar:hover,
+.claude-bar.claude-bar-open {
+  border-color: var(--accent-border, rgba(59, 130, 246, 0.3));
+}
+
+.claude-row {
+  display: flex;
+  align-items: center;
+}
+
+.claude-toggle,
+.claude-open {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.claude-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px 6px 12px;
+  text-align: left;
+}
+
+.claude-open {
+  flex-shrink: 0;
+  padding: 6px 12px 6px 8px;
+  opacity: 0.75;
+}
+
+.claude-open:hover,
+.claude-toggle:hover .claude-chevron {
+  opacity: 1;
+  color: var(--text-primary);
+}
+
+.claude-toggle:focus-visible,
+.claude-open:focus-visible {
+  outline: 2px solid var(--accent, #3b82f6);
+  outline-offset: -2px;
+  border-radius: 12px;
+}
+
+.claude-bar .claude-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #3b82f6;
+  animation: live-blink 1.4s ease-in-out infinite;
+}
+
+.claude-bar.claude-bar-waiting .claude-dot {
+  background: #f59e0b;
+  animation: none;
+}
+
+.claude-bar .claude-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.claude-bar .claude-step {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.claude-bar .claude-time,
+.claude-bar .claude-chevron {
+  flex-shrink: 0;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+/* a caixa do diário: o fim do trace.md, uma linha por passo */
+.claude-box {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--surface-border, rgba(59, 130, 246, 0.15));
+  background: rgba(0, 0, 0, 0.22);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #c9d3df;
+}
+
+.claude-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.claude-line .claude-ts {
+  color: #5b6573;
+  margin-right: 10px;
+}
+
+.claude-line .think { color: #c4b5fd; }
+.claude-line .deny { color: #fcd34d; }
+.claude-line .round { color: #9cc2ff; }
+.claude-line .end { color: #86efac; }
+
+.claude-line code {
+  font-family: inherit;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+/* "terminal": retoma a sessão no Terminal do Mac. Espera enquanto a tarefa roda. */
+.claude-open.claude-terminal {
+  padding-right: 4px;
+}
+
+.claude-open:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.claude-bar .claude-step.claude-step-erro {
+  color: #fca5a5;
+}
+
+/* A saída de um comando no diário (linhas "│" sob o "↳"): mais apagada. */
+.claude-line .out { color: #8b95a3; }
+
+/* Encerrada (aparece pelo balão): o ponto para de piscar e diz como acabou. */
+.claude-bar.claude-bar-done .claude-dot {
+  background: #22c55e;
+  animation: none;
+}
+
+.claude-bar.claude-bar-ended .claude-dot {
+  background: #64748b;
+  animation: none;
+}
+
+/* O processo aberto dentro do balão (ClaudeNoBalao). */
+.claude-bar.claude-no-balao {
+  margin: 10px 0 0;
+}
+
+/* A pílula no balão que pediu (ou entregou) a tarefa: fechada, não consulta nada. */
+.claude-anexo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  max-width: 100%;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--surface-border, rgba(59, 130, 246, 0.15));
+  background: var(--surface-1, rgba(20, 27, 45, 0.8));
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.claude-anexo:hover {
+  border-color: var(--accent-border, rgba(59, 130, 246, 0.3));
+  color: var(--text-primary);
+}
+
+.claude-anexo:focus-visible {
+  outline: 2px solid var(--accent, #3b82f6);
+  outline-offset: 2px;
+}
+
+.claude-anexo-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #3b82f6;
+}
+
+.claude-anexo-label {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.claude-anexo-acao {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.claude-anexo-chevron {
+  opacity: 0.75;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .claude-bar .claude-dot { animation: none; }
+}

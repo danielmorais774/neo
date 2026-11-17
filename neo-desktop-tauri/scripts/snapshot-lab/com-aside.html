@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Artigo com barra lateral gorda</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  .topo { background: #eee; padding: 10px; }
+  .colunas { display: flex; gap: 24px; padding: 20px; }
+  .artigo { flex: 1 1 60%; }
+  aside { flex: 0 0 34%; background: #f6f6f6; padding: 12px; }
+  aside li { margin: 6px 0; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: o artigo tem um <aside> com MAIS texto que ele. Sem landmark <main>, o
+  critério "maior texto ganha" elegia o wrapper .colunas (artigo + aside) ou o
+  próprio aside.
+
+  O <aside> está no conjunto do DESCONTO (NEO.CHROME_DESCONTO) mas NÃO no
+  NEO.CHROME — a distinção é de propósito: descontar nunca esconde texto de
+  ninguém, só muda qual bloco é adicionado na frente; carimbar como moldura
+  esconde, e foi assim que o painel de detalhes do Drive virou invisível no job
+  9025d9f8.
+
+  Então: o wrapper .colunas tem ~todo o texto, mas descontando o aside sobra
+  pouco mais que o artigo → empate dentro de 10% → ganha o mais PROFUNDO, que é
+  o .artigo. Se o aside passar a ser o eleito, o desconto está invertido.
+-->
+<div class="topo">
+  <a href="/">Portal</a> <a href="/a">A</a> <a href="/b">B</a> <a href="/c">C</a>
+</div>
+<div class="colunas">
+  <div class="artigo">
+    <h1>A reportagem</h1>
+    <p>O artigo de verdade começa aqui. Este é o bloco que a tarefa quer, e ele
+    tem texto suficiente para passar o piso de 150 caracteres sem precisar da
+    barra lateral.</p>
+    <p>Mais um parágrafo do artigo, para que o bloco tenha corpo. A barra ao
+    lado, de propósito, tem mais caracteres do que isto.</p>
+    <p>Terceiro parágrafo, para o artigo passar com folga o piso de 8% do
+    viewport que a eleição exige — sem ele o caso passaria ou falharia por
+    causa da altura da janela, que não é o que está sob teste.</p>
+  </div>
+  <aside aria-label="Mais lidas">
+    <h2>Mais lidas da semana</h2>
+    <ul>
+      <li>Primeira manchete da lista de mais lidas, com texto longo o bastante para somar</li>
+      <li>Segunda manchete da lista de mais lidas, também comprida para somar caracteres</li>
+      <li>Terceira manchete da lista de mais lidas, idem, comprida de propósito aqui</li>
+      <li>Quarta manchete da lista de mais lidas, mesma função de encher a lateral</li>
+      <li>Quinta manchete da lista de mais lidas, para a lateral passar o artigo</li>
+      <li>Sexta manchete da lista de mais lidas, continuando a somar caracteres</li>
+      <li>Sétima manchete da lista de mais lidas, ainda somando para a lateral</li>
+      <li>Oitava manchete da lista de mais lidas, e esta fecha a conta da lateral</li>
+    </ul>
+  </aside>
+</div>
+</body>
+</html>

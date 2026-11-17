@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required so macOS/WKWebView can prompt for and grant microphone access
+	     used by the Live (voice) mode. Tauri v2 merges this into the generated
+	     Info.plist for both dev and bundled builds. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>O Neo usa o microfone no Modo Live para transcrever sua fala e conversar por voz.</string>
+	<!-- O neo-voice roda no neo-host da LAN (192.168.4.210) e o desktop fala com
+	     ele por ws:// inseguro. WKWebView aplica App Transport Security tambem a
+	     WebSockets, entao liberamos cargas inseguras p/ a rede local: o IP do
+	     neo-voice (e o do PC gamer, 192.168.4.185, usado pelo painel de engines).
+	     NSAllowsLocalNetworking cobre nomes locais; as excecoes explicitas
+	     garantem os IPs RFC1918 (que nao sao link-local). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>192.168.4.210</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+			<key>192.168.4.185</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

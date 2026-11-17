@@ -1,0 +1,157 @@
+/* Sidebar de sessões anteriores. Usa os tokens de themes.css para acompanhar
+   os temas do app (inclusive o Cyberpunk, que zera os raios de borda). */
+
+.sessions-sidebar-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 60;
+  animation: sessionsFadeIn 0.15s ease-out;
+}
+
+.sessions-sidebar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  width: 300px;
+  max-width: 85%;
+  /* Opaca: só esta sidebar foge do vidro dos modais (--modal-bg é translúcido). */
+  background: var(--sessions-bg, var(--modal-bg));
+  border-left: 1px solid var(--modal-border);
+  box-shadow: var(--modal-shadow);
+  z-index: 61;
+  display: flex;
+  flex-direction: column;
+  animation: sessionsSlideIn 0.22s ease-out;
+}
+
+@keyframes sessionsFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes sessionsSlideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.sessions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--surface-border);
+  flex-shrink: 0;
+}
+
+.sessions-header h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--text-primary, #e6edf3);
+}
+
+.sessions-close-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: var(--control-bg);
+  color: var(--text-secondary, rgba(230, 237, 243, 0.7));
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, color 0.2s;
+}
+
+.sessions-close-btn:hover {
+  background: var(--control-bg-hover);
+  color: var(--text-primary, #e6edf3);
+}
+
+.sessions-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.sessions-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sessions-list::-webkit-scrollbar-thumb {
+  background: var(--surface-border);
+  border-radius: 3px;
+}
+
+.sessions-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary, rgba(147, 197, 253, 0.6));
+}
+
+.sessions-state-error {
+  color: #f87171;
+}
+
+.sessions-retry {
+  padding: 5px 14px;
+  background: var(--control-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 14px;
+  color: var(--text-primary, #93c5fd);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.sessions-retry:hover {
+  background: var(--control-bg-hover);
+}
+
+/* Cada item é um <button> — daí o reset de aparência. */
+.session-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 14px;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.15s;
+}
+
+.session-item:hover {
+  background: var(--control-bg-hover);
+}
+
+.session-item.current {
+  background: var(--selected-bg);
+  border-left-color: var(--accent-border-strong);
+}
+
+.session-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-primary, #e6edf3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+
+.session-meta {
+  font-size: 10.5px;
+  color: var(--text-secondary, rgba(147, 197, 253, 0.55));
+}

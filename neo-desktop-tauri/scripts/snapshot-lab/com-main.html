@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Com main declarado</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  nav, header, footer { background: #eee; padding: 12px; }
+  nav a { display: block; }
+  main { padding: 24px; max-width: 760px; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: o site bem-comportado. Tem <main>, e o caminho rápido da eleição
+  (querySelectorAll('main,[role=main],...')) deve resolver sem chegar ao
+  fallback. O que esta fixture protege: o desempate por PROFUNDIDADE não pode
+  roubar o <main> para um filho dele, nem o wrapper da página pode ganhar por
+  ter mais texto bruto.
+-->
+<nav aria-label="Atalhos">
+  <h2>Pular para</h2>
+  <a href="#conteudo">Conteúdo principal</a>
+  <a href="#rodape">Rodapé</a>
+</nav>
+<header>
+  <a href="/">Jornal Exemplo</a>
+  <a href="/politica">Política</a><a href="/economia">Economia</a>
+  <a href="/esportes">Esportes</a><a href="/cultura">Cultura</a>
+  <a href="/mundo">Mundo</a><a href="/ciencia">Ciência</a>
+  <a href="/tecnologia">Tecnologia</a><a href="/saude">Saúde</a>
+  <a href="/educacao">Educação</a><a href="/clima">Clima</a>
+  <a href="/opiniao">Opinião</a><a href="/cidades">Cidades</a>
+  <a href="/agro">Agro</a><a href="/imoveis">Imóveis</a>
+  <a href="/carros">Carros</a><a href="/empregos">Empregos</a>
+  <a href="/loterias">Loterias</a><a href="/horoscopo">Horóscopo</a>
+  <a href="/receitas">Receitas</a><a href="/viagem">Viagem</a>
+</header>
+
+<main id="conteudo">
+  <h1>A matéria</h1>
+  <p>O corpo da matéria começa aqui e é o que a tarefa quer ler. Ele precisa ser
+  longo o suficiente para passar o piso de 150 caracteres da eleição, e para que
+  o bloco eleito seja este e não o wrapper da página inteira.</p>
+  <p>Segundo parágrafo, para dar volume de texto ao bloco certo. Um site assim
+  não deveria exigir heurística nenhuma: o landmark está declarado e é só
+  obedecer.</p>
+  <p>Terceiro parágrafo, mesma função. Se a eleição errar AQUI, ela erra em
+  qualquer lugar.</p>
+</main>
+
+<footer id="rodape">
+  <a href="/sobre">Sobre</a><a href="/privacidade">Privacidade</a>
+  <a href="/termos">Termos</a><a href="/contato">Contato</a>
+</footer>
+</body>
+</html>

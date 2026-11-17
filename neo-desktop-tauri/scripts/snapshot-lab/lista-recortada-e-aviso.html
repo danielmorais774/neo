@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Questionário com lista recortada e aviso</title>
+<style>
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #f4f4f4; }
+  .topo { position: fixed; top: 0; left: 0; right: 0; height: 40px; background: #fff; display: flex; gap: 16px; align-items: center; padding: 0 16px; z-index: 5; }
+  .pagina { display: flex; gap: 16px; padding: 56px 16px 16px; }
+  .questao { flex: 3; background: #fff; padding: 16px; }
+  .lista { flex: 1; background: #fff; padding: 8px; }
+  .lista li { list-style: none; margin: 6px 0; }
+  .lista .resumo { height: 40px; overflow: hidden; text-transform: uppercase; font-size: 11px; }
+  .lista .linha { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 200px; }
+  .lista .conversa { height: 60px; overflow: auto; }
+  .alternativa { display: block; margin: 6px 0; }
+  #toast-container { position: fixed; top: 44px; left: 200px; right: 16px; z-index: 10; }
+  .toast { background: #222; color: #fff; padding: 10px 14px; }
+  .novos { position: fixed; bottom: 10px; right: 10px; background: #2a7; color: #fff; padding: 8px; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: questionário com uma lista lateral que mostra DUAS linhas de cada
+  enunciado e esconde o resto com `overflow: hidden`. O texto escondido contava
+  como "na tela", estourava o teto da leitura, e o que vinha depois no DOM era
+  cortado: o enunciado da questão atual e o aviso que a página acabou de mostrar
+  (job 21c563c1, Portal: "Você respondeu todas as questões, lembre-se de
+  Finalizar o questionário" nunca chegou ao modelo).
+
+  `?aviso=1|2` acrescenta o aviso no fim do <body>, como o toastr faz.
+-->
+<div class="topo"><a href="#">Fale com mediador</a><a href="#">Notificações</a><a href="#">Atividades</a><a href="#">Contraste</a><button>Minha conta</button></div>
+<div class="pagina">
+  <ul class="lista" id="lista"></ul>
+  <div class="questao">
+    <h3>QUESTÃO 10</h3>
+    <p>A partir da revisão sistemática dos impactos das mídias nos comportamentos de saúde, assinale a alternativa correta.</p>
+    <label class="alternativa"><input type="radio" name="a"> Alternativa 1: O consumo de mídias sociais otimiza as escolhas de saúde.</label>
+    <label class="alternativa"><input type="radio" name="a" checked> Alternativa 3: A exposição contínua a corpos idealizados promove dietas restritivas.</label>
+    <button disabled>Responder</button> <button>Finalizar</button>
+  </div>
+</div>
+<div class="novos">Novos avisos! <a href="#">Clique aqui e acesse o Fale com o Mediador</a> <button>×</button></div>
+<script>
+  const longo = (n) => `Q${n} ` + Array.from({length: 14}, (_, i) => `Texto de apoio ${n}.${i} do enunciado que a lista só mostra pela metade.`).join(' ');
+  const lista = document.getElementById('lista');
+  for (let n = 1; n <= 10; n++) {
+    const li = document.createElement('li');
+    li.innerHTML = `<div class="resumo">${longo(n)}</div>`;
+    lista.appendChild(li);
+  }
+  // Uma linha só, cortada com reticências, e uma caixa com rolagem: as outras
+  // duas formas comuns de esconder texto sem tirá-lo do DOM.
+  lista.insertAdjacentHTML('beforeend',
+    '<li><div class="linha">Linha única cortada com reticências ' + 'e mais texto escondido à direita '.repeat(6) + '</div></li>' +
+    '<li><div class="conversa">' + Array.from({length: 12}, (_, i) => `<p>Mensagem ${i + 1} da conversa</p>`).join('') + '</div></li>');
+  // aviso=1: com `aria-live`, como o toastr marca. aviso=2: sem ARIA nenhuma,
+  // só a camada `fixed` presa ao <body>, que é o que sobra para reconhecer.
+  const aviso = new URLSearchParams(location.search).get('aviso');
+  if (aviso) {
+    document.body.insertAdjacentHTML('beforeend',
+      `<div id="toast-container"><div class="toast"${aviso === '1' ? ' aria-live="polite"' : ''}><b>Finalizar questionário</b><div>Você respondeu todas as questões, lembre-se de Finalizar o questionário.</div><button>×</button></div></div>`);
+  }
+</script>
+</body>
+</html>

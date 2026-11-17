@@ -1,0 +1,71 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Neo Desktop",
+  "version": "1.0.0",
+  "identifier": "com.neo.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5176",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Neo Assistant",
+        "width": 560,
+        "height": 720,
+        "resizable": true,
+        "minWidth": 540,
+        "minHeight": 640,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": true,
+        "url": "index.html"
+      },
+      {
+        "label": "notification",
+        "title": "Neo Notification",
+        "width": 360,
+        "height": 110,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "focusable": false,
+        "shadow": false,
+        "url": "notification.html"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:* https://localhost:* http://127.0.0.1:* ws://127.0.0.1:* http://192.168.4.210:* ws://192.168.4.210:* http://192.168.4.185:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "deb", "appimage"],
+    "category": "Utility",
+    "shortDescription": "Neo AI Assistant for Desktop",
+    "longDescription": "Neo AI Assistant - GNOME Desktop Integration with AI agent, command execution, and device sync.",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {}
+}

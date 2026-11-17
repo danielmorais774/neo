@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Artigo com header e footer próprios</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  body > header, body > footer { background: #eee; padding: 12px 24px; }
+  body > header a { margin-right: 16px; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px; }
+  article > header h1 { font-size: 34px; margin: 0 0 8px; }
+  article > footer { color: #555; border-top: 1px solid #ddd; padding-top: 8px; }
+  .relacionados { border: 1px solid #ddd; padding: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<!--
+  FORMA: o post de blog ou a notícia com HTML semântico. Título, autor e data
+  ficam no `<header>` do `<article>`; as etiquetas, no `<footer>` dele; e o
+  bloco de relacionados é um `<section>` com cabeçalho próprio. Nenhum dos três
+  é moldura: é o conteúdo que a tarefa quer ler.
+
+  Controle negativo: o `<header>` e o `<footer>` filhos do `<body>` são o banner
+  e o rodapé do site, e continuam fora da leitura.
+-->
+<header>
+  <a href="/">Diário Exemplo</a>
+  <a href="/assinar">Assine já</a>
+  <a href="/entrar">Entrar na conta</a>
+</header>
+<main>
+  <article>
+    <header>
+      <h1>Prefeitura anuncia nova linha de ônibus noturna</h1>
+      <p>Por Ana Ribeiro · 3 de novembro de 2026</p>
+    </header>
+    <p>A linha começa a rodar na segunda-feira e liga o centro aos bairros da zona
+    norte entre meia-noite e cinco da manhã, com saídas a cada vinte minutos.</p>
+    <p>A tarifa é a mesma das linhas diurnas e o cartão de integração vale nos
+    terminais de transferência.</p>
+    <footer>
+      <p>Etiquetas: transporte, mobilidade urbana</p>
+    </footer>
+  </article>
+  <section class="relacionados">
+    <header><h2>Leia também</h2></header>
+    <p>Metrô amplia horário aos sábados</p>
+  </section>
+</main>
+<footer>
+  <p>© 2026 Diário Exemplo · Termos de uso · Política de privacidade</p>
+</footer>
+</body>
+</html>

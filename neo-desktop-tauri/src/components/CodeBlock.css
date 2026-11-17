@@ -1,0 +1,114 @@
+/* A moldura (fundo, borda, cantos) é do wrapper, não do <pre>: assim a barra de
+   topo e a área de código dividem a mesma caixa e o `overflow: hidden` corta os
+   cantos do <pre> que rola. */
+.code-block {
+  position: relative;
+  margin: 8px 0;
+  border: 1px solid var(--surface-border, rgba(59, 130, 246, 0.15));
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.32);
+  overflow: hidden;
+}
+
+/* Especificidade acima de `.message-text pre` (MessageBubble.css), que ainda
+   desenharia a moldura antiga por dentro desta. */
+.code-block > pre.code-block-pre {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+
+.code-block-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  min-height: 30px;
+  background: rgba(255, 255, 255, 0.035);
+  border-bottom: 1px solid var(--surface-border, rgba(59, 130, 246, 0.12));
+}
+
+.code-block-lang {
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary, rgba(226, 232, 240, 0.55));
+  opacity: 0.75;
+  user-select: none;
+}
+
+/* Um ÚNICO elemento rola: o <pre>. O tema do highlight.js põe `overflow-x: auto`
+   no <code> (`pre code.hljs`), então blocos COM linguagem rolavam por dentro,
+   com uma barra curta e deslocada, e blocos sem linguagem rolavam no <pre> —
+   duas caixas de código com comportamento diferente. */
+.code-block > pre.code-block-pre > code {
+  overflow: visible;
+}
+
+/* A barra horizontal padrão do WebKit tem ~15px de altura (o `::-webkit-scrollbar`
+   global em index.css só ajusta `width`, que vale pra vertical) — era a tarja
+   grossa embaixo do código. 10px + trilho visível: fina, mas ainda um alvo de
+   arrasto óbvio. A COR do polegar continua vindo do tema (index.css/themes.css). */
+.code-block > pre.code-block-pre::-webkit-scrollbar {
+  height: 10px;
+}
+
+.code-block > pre.code-block-pre::-webkit-scrollbar-track {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+/* linha muito longa (uma chave ssh, por exemplo) deixaria o polegar minúsculo */
+.code-block > pre.code-block-pre::-webkit-scrollbar-thumb {
+  min-width: 40px;
+}
+
+.code-copy-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary, rgba(226, 232, 240, 0.6));
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.code-copy-button:hover {
+  background: var(--control-bg-hover, rgba(255, 255, 255, 0.1));
+  border-color: var(--surface-border, rgba(255, 255, 255, 0.14));
+  color: var(--text-primary, #e2e8f0);
+}
+
+.code-copy-button:focus-visible {
+  outline: 2px solid var(--accent-border-strong, rgba(125, 211, 252, 0.58));
+  outline-offset: 1px;
+}
+
+.code-copy-button.is-copied {
+  color: var(--success, #22c55e);
+}
+
+.code-copy-button.is-error {
+  color: var(--error, #ef4444);
+}
+
+.code-copy-label {
+  font-size: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .code-copy-button {
+    transition: none;
+  }
+}

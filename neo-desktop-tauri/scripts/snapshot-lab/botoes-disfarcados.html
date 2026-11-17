@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Botões disfarçados</title>
+<style>
+  body { font: 15px system-ui; margin: 0; padding: 70px 24px 1500px; }
+  section { margin: 0 0 18px; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; max-width: 620px; }
+  h2 { font-size: 12px; margin: 0 0 8px; color: #666; font-weight: 500; }
+  #barra { position: fixed; top: 0; left: 0; right: 0; height: 52px; background: #222; color: #fff; z-index: 50; padding: 16px 24px; }
+
+  /* A forma da Amazon: input transparente esticado sobre um desenho. */
+  .botao { position: relative; display: inline-block; width: 200px; height: 32px; background: #ffd814; border-radius: 16px; }
+  .botao .dentro { display: block; width: 100%; height: 100%; }
+  .botao input { position: absolute; left: 0; top: 0; width: 100%; height: 100%; margin: 0; opacity: .01; cursor: pointer; }
+  .botao .texto { display: block; text-align: center; line-height: 32px; }
+
+  /* Rosto pintado por cima, sem receber clique, com o controle ao lado. */
+  .sobreposto { position: relative; display: inline-block; width: 200px; height: 32px; }
+  .sobreposto .pintura { position: absolute; inset: 0; background: #cde; pointer-events: none; text-align: center; line-height: 32px; z-index: 2; }
+  .sobreposto input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; margin: 0; z-index: 1; }
+
+  .opcao { display: block; padding: 6px; cursor: pointer; }
+  .opcao input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .cartao { position: relative; width: 240px; padding: 12px; background: #eef; }
+  .cartao a.esticado::after { content: ''; position: absolute; inset: 0; }
+  #sobPainel { position: absolute; right: 30px; top: 90px; }
+  #neo-browser-local-overlay { position: fixed; right: 0; top: 80px; width: 180px; height: 120px; background: rgba(0,0,0,.08); z-index: 60; }
+  .menu-fechado { display: none; }
+</style>
+</head>
+<body>
+<div id="barra">barra fixa do site</div>
+<div id="neo-browser-local-overlay">painel do Neo</div>
+<button id="sobPainel" onclick="contar('sob-painel')">Debaixo do painel</button>
+
+<section data-cena="amazon"><h2>input transparente sobre desenho, nome em aria-labelledby</h2>
+  <form onsubmit="return false">
+    <span class="botao" id="c1"><span class="dentro">
+      <input id="botao-real" type="button" aria-labelledby="anuncio" onclick="contar('amazon')">
+      <span class="texto" id="anuncio" aria-hidden="true">Adicionar ao carrinho</span>
+    </span></span>
+  </form>
+</section>
+
+<section data-cena="irmao"><h2>rosto com pointer-events:none, controle irmão atrás, sem nome próprio</h2>
+  <span class="sobreposto">
+    <span class="pintura">Enviar proposta</span>
+    <input type="submit" onclick="contar('irmao'); return false">
+  </span>
+</section>
+
+<section data-cena="so-value"><h2>só o value dá nome (sem nó de texto)</h2>
+  <span class="botao"><span class="dentro"><input type="submit" value="Confirmar presença" onclick="contar('so-value'); return false"></span></span>
+</section>
+
+<section data-cena="nativo"><h2>botão nativo com ícone e span</h2>
+  <button onclick="contar('nativo')"><svg width="14" height="14"><rect width="14" height="14"/></svg> <span>Salvar nota</span></button>
+</section>
+
+<section data-cena="so-aria"><h2>botão de ícone: nome só em aria-label</h2>
+  <button aria-label="Fechar aviso" onclick="contar('so-aria')"><svg width="20" height="20"><circle cx="10" cy="10" r="9"/></svg></button>
+</section>
+
+<section data-cena="so-title"><h2>nome só em title</h2>
+  <a href="#x" title="Abrir relatório" onclick="contar('so-title'); return false"><svg width="20" height="20"><rect width="20" height="20"/></svg></a>
+</section>
+
+<section data-cena="so-alt"><h2>nome só no alt da imagem</h2>
+  <a href="#y" onclick="contar('so-alt'); return false"><img alt="Baixar fatura" width="24" height="24" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="></a>
+</section>
+
+<section data-cena="link"><h2>link com div dentro</h2>
+  <a href="#z" onclick="contar('link'); return false"><div><span>Ver detalhes do pedido</span></div></a>
+</section>
+
+<section data-cena="handler"><h2>div com handler, sem papel</h2>
+  <div onclick="contar('handler')" style="cursor:pointer">Escolher entrega expressa</div>
+</section>
+
+<section data-cena="confiavel"><h2>handler que exige isTrusted</h2>
+  <button id="confiavel" onclick="if (event.isTrusted) contar('confiavel')">Validar assinatura</button>
+</section>
+
+<section data-cena="radio"><h2>label com rádio escondido</h2>
+  <label class="opcao"><input type="radio" name="q" value="a" onchange="contar('radio')"><span>Alternativa correta</span></label>
+</section>
+
+<section data-cena="some"><h2>opção que desmonta o próprio cartão ao ser escolhida (a última pergunta do 12axes)</h2>
+  <div class="cartao-pergunta"><button type="button" role="radio" aria-checked="false"
+    onclick="contar('some'); this.closest('.cartao-pergunta').replaceWith(Object.assign(document.createElement('p'), {textContent: 'Etapa 2 de 6'}))">Discordo totalmente</button></div>
+</section>
+
+<section data-cena="caixa-sem-label"><h2>rádio escondido em caixa sem label, a caixa é que escuta</h2>
+  <div class="opcao" onclick="const r=this.querySelector('input'); r.checked=true; contar('caixa-sem-label')"><input type="radio" name="p"><span>Plano mensal</span></div>
+</section>
+
+<section data-cena="aceite"><h2>label com link no meio: o clique tem de marcar, não abrir o link</h2>
+  <label style="display:block;width:300px"><input type="checkbox" onchange="contar('aceite')"> Li e aceito os
+    <a href="#termos" onclick="contar('aceite-link'); return false">termos de uso</a> deste serviço</label>
+</section>
+
+<section data-cena="cartao"><h2>card com link esticado por cima do texto</h2>
+  <div class="cartao"><p>Plano familiar</p><a class="esticado" href="#c" onclick="contar('cartao'); return false">Assinar plano</a></div>
+</section>
+
+<section data-cena="sombra"><h2>botão dentro de shadow DOM</h2>
+  <caixa-sombra></caixa-sombra>
+</section>
+
+<section data-cena="iframe"><h2>iframe de mesma origem</h2>
+  <iframe id="quadro" width="300" height="60" srcdoc="<button onclick='parent.contar(&quot;iframe&quot;)'>Pagar boleto dentro do quadro</button>"></iframe>
+</section>
+
+<section data-cena="igual"><h2>mesmo nome escondido e visível</h2>
+  <div class="menu-fechado"><button onclick="contar('igual-escondido')">Duplicar item</button></div>
+  <button onclick="contar('igual')">Duplicar item</button>
+</section>
+
+<section data-cena="so-escondido"><h2>existe, mas está fechado</h2>
+  <div class="menu-fechado"><button onclick="contar('so-escondido')">Excluir rascunho</button></div>
+</section>
+
+<section data-cena="desabilitado"><h2>desabilitado</h2>
+  <button disabled onclick="contar('desabilitado')">Avançar etapa</button>
+</section>
+
+<section data-cena="select"><h2>select escondido atrás de um desenho</h2>
+  <span class="dropdown"><select name="quantidade" style="position:absolute;opacity:0;width:1px;height:1px"><option>1</option><option>2</option><option>3</option></select><span>Quantidade: 1</span></span>
+</section>
+
+<section data-cena="longe" style="margin-top:900px"><h2>transparente abaixo da dobra</h2>
+  <span class="botao"><span class="dentro"><input type="button" aria-labelledby="anuncio2" onclick="contar('longe')"><span class="texto" id="anuncio2">Reservar horário</span></span></span>
+</section>
+
+<script>
+  window.contagem = {};
+  window.contar = (k) => { contagem[k] = (contagem[k] || 0) + 1; };
+  customElements.define('caixa-sombra', class extends HTMLElement {
+    connectedCallback() {
+      const s = this.attachShadow({ mode: 'open' });
+      s.innerHTML = '<button id="b">Gerar segunda via</button>';
+      s.getElementById('b').onclick = () => contar('sombra');
+    }
+  });
+</script>
+</body>
+</html>
