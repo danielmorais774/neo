@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Neo Music Bridge",
+  "version": "1.4.0",
+  "description": "Ponte enxuta entre o Neo Desktop e o navegador: reporta abas de música (YouTube/Spotify) e executa o comando de play vindo do Neo.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Neo Music Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

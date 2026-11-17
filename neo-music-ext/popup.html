@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        width: 300px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #0f1117;
+        color: #e5e7eb;
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 14px;
+        border-bottom: 1px solid #1e2235;
+      }
+      .header img { width: 20px; height: 20px; border-radius: 5px; }
+      .header .title { font-weight: 700; font-size: 14px; }
+      .header .title span { color: #a78bfa; }
+      .status { display: flex; align-items: center; gap: 10px; padding: 14px; }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        background: #6b7280;
+      }
+      .dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
+      .dot.connecting { background: #f59e0b; box-shadow: 0 0 8px #f59e0b88; }
+      .dot.off { background: #ef4444; }
+      .meta { display: flex; flex-direction: column; }
+      .label { font-size: 13px; font-weight: 600; }
+      .sub { font-size: 11px; color: #64748b; margin-top: 2px; }
+      .section { padding: 0 14px 12px; }
+      .section h4 {
+        margin: 0 0 6px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #64748b;
+        font-weight: 600;
+      }
+      .tabs {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-height: 168px;
+        overflow: auto;
+      }
+      .tab {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        background: #13161f;
+        border: 1px solid #1e2235;
+        border-radius: 8px;
+        padding: 7px 9px;
+      }
+      .site {
+        font-size: 10px;
+        font-weight: 700;
+        padding: 1px 6px;
+        border-radius: 6px;
+        flex-shrink: 0;
+        text-transform: capitalize;
+      }
+      .site.youtube { background: #ef444422; color: #f87171; }
+      .site.spotify { background: #22c55e22; color: #4ade80; }
+      .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #cbd5e1; }
+      .playing { margin-left: auto; font-size: 10px; color: #4ade80; flex-shrink: 0; }
+      /* Segunda linha: os sinais que a ponte manda ao Neo além do título. */
+      .sig {
+        flex-basis: 100%;
+        font-size: 10px;
+        color: #64748b;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .empty { font-size: 12px; color: #64748b; padding: 6px 0; }
+      .footer {
+        padding: 10px 14px 14px;
+        border-top: 1px solid #1e2235;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      button {
+        background: #7c3aed;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover { background: #6d28d9; }
+      .port { font-size: 10px; color: #475569; font-family: ui-monospace, monospace; }
+      .test-btn { width: 100%; background: #1e2235; color: #cbd5e1; margin-top: 2px; }
+      .test-btn:hover { background: #2a2f45; }
+      .test-result { font-size: 11px; margin-top: 6px; min-height: 14px; color: #64748b; }
+      .test-result.ok { color: #4ade80; }
+      .test-result.err { color: #f87171; }
+      /* Credencial da ponte: a extensão só conecta apresentando este token. */
+      .token-row { display: flex; gap: 6px; margin-top: 2px; }
+      .token-input {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 8px;
+        border: 1px solid #2a2f45;
+        border-radius: 6px;
+        background: #12162a;
+        color: #cbd5e1;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+      }
+      .token-input:focus { outline: none; border-color: #8b5cf6; }
+      .token-hint { font-size: 11px; margin-top: 6px; color: #64748b; line-height: 1.4; }
+      .token-hint.ok { color: #4ade80; }
+      .token-hint.err { color: #f87171; }
+      .controlled {
+        margin: 8px 0 4px;
+        padding: 8px 10px;
+        border: 1px solid #8b5cf6;
+        border-radius: 8px;
+        background: rgba(139, 92, 246, 0.12);
+      }
+      .controlled-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: #c4b5fd;
+      }
+      .controlled-sub {
+        margin-top: 3px;
+        font-size: 11px;
+        opacity: 0.8;
+        word-break: break-all;
+      }
+      .pulse {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #8b5cf6;
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.25; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <img src="icons/icon32.png" alt="" />
+      <div class="title">Neo <span>Music Bridge</span></div>
+    </div>
+
+    <div class="status">
+      <div id="dot" class="dot"></div>
+      <div class="meta">
+        <div id="label" class="label">Verificando…</div>
+        <div id="sub" class="sub"></div>
+      </div>
+    </div>
+
+    <!-- Fila do Neo: só aparece quando o neo-core está dirigindo esta janela.
+         É a diferença visível entre "a extensão está conectada" e "o Neo está
+         no comando do player agora". -->
+    <div id="controlled" class="controlled" hidden>
+      <div class="controlled-head">
+        <span class="pulse"></span>
+        <strong>Controlado pelo neo-core</strong>
+      </div>
+      <div id="controlledSub" class="controlled-sub"></div>
+    </div>
+
+    <div class="section">
+      <h4>Abas de música</h4>
+      <ul id="tabs" class="tabs"></ul>
+      <div id="empty" class="empty" hidden>Nenhuma aba de YouTube/Spotify aberta.</div>
+    </div>
+
+    <div class="section">
+      <h4>Navegador do Neo</h4>
+      <div id="surfState" class="token-hint">verificando…</div>
+      <div class="token-row">
+        <button id="surfPair" class="test-btn">Parear este navegador com o Neo</button>
+      </div>
+      <div class="token-row">
+        <button id="surfUnpair" class="test-btn" hidden>Desparear</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Credencial da ponte</h4>
+      <div class="token-row">
+        <input
+          id="token"
+          class="token-input"
+          type="password"
+          placeholder="cole o token do Neo Desktop"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="tokenSave">Salvar</button>
+      </div>
+      <div id="tokenHint" class="token-hint">
+        Aba <b>Dispositivos</b> do Neo Desktop → cartão "Extensão de música" → Copiar.
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Diagnóstico</h4>
+      <button id="test" class="test-btn">▶ Testar play na aba (sem o Neo)</button>
+      <div id="testResult" class="test-result"></div>
+    </div>
+
+    <div class="footer">
+      <span class="port" id="port">ws://127.0.0.1:17872</span>
+      <button id="reconnect">Reconectar</button>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
