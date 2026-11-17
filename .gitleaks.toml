@@ -1,0 +1,16 @@
+# Configuração do gitleaks: regras padrão + falsos positivos conferidos em 17/11/2026.
+# Por caminho (e não por fingerprint) para sobreviver a reescritas de histórico.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fixtures dos testes do redator e do cofre: chaves geradas na hora ou de mentira"
+paths = [
+  '''neo-core/tests/gateway/test_credentials\.py''',
+  '''neo-core/tests/gateway/test_redact\.py''',
+  '''neo-core/tests/transcricao/conftest\.py''',
+]
+
+[[allowlists]]
+description = "Chave PÚBLICA da extensão (fixa o ID); a privada .pem não está no repo"
+paths = ['''neo-browser-local/manifest\.json''']

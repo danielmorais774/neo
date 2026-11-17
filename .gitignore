@@ -4,7 +4,7 @@
 !/.gitignore
 !/.gitattributes
 !/.mailmap
-!/.gitleaksignore
+!/.gitleaks.toml
 !/README.md
 !/README.en.md
 !/LICENSE
