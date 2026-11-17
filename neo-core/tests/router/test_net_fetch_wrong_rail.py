@@ -176,3 +176,40 @@ def test_palavra_curl_no_meio_de_outra_nao_conta():
         history=[{"role": "assistant", "content": "tem o `nota.md` em ~/Projetos/curly"}],
     )
     assert d.intent is IntentType.CLIENT_TOOL
+
+
+# ── baixador de vídeo (session-ca1d65ef, 17/11) ───────────────────────────
+
+JESSICA = 'baixa o vídeo do YouTube "Já acabou, Jéssica?" e me manda aqui no chat'
+
+
+def test_yt_dlp_com_id_inventado_volta_pro_cerebro():
+    d = _decide(
+        'yt-dlp -f "bv*+ba/b" --merge-output-format mp4 -o '
+        '"/Users/daniel/Downloads/%(title)s.%(ext)s" "https://www.youtube.com/watch?v=VIDEO_ID"',
+        user_message=JESSICA,
+        needs_plan=True,
+    )
+    assert d.intent != IntentType.CLIENT_TOOL
+    assert d.raw_command is None
+
+
+def test_yt_dlp_com_url_da_conversa_continua_no_mac():
+    url = "https://www.youtube.com/watch?v=nRuiacgrY0w"
+    d = _decide(
+        f'cd /Users/daniel/Downloads && yt-dlp "{url}"',
+        user_message="faz para mim pela minha maquina",
+        history=[{"role": "assistant", "content": f"O vídeo é {url}, mas o sandbox foi barrado."}],
+    )
+    assert d.intent == IntentType.CLIENT_TOOL
+
+
+def test_yt_dlp_com_busca_cega_volta_pro_cerebro():
+    """`ytsearch1:` baixa o 1º da busca sem comparar (session-94621cc8): quem
+    escolhe é o cérebro, com `neo_video_candidatos`."""
+    d = _decide(
+        "yt-dlp -f 'bestvideo+bestaudio/best' --merge-output-format mp4 -o "
+        "'/Users/daniel/Downloads/%(title)s [%(id)s].%(ext)s' 'ytsearch1:Já acabou, Jéssica?'",
+        user_message=JESSICA,
+    )
+    assert d.intent != IntentType.CLIENT_TOOL

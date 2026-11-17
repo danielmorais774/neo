@@ -1,0 +1,238 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1780" width="1000" height="1780" role="img" aria-label="Mapa do intent router do Neo">
+<defs>
+  <marker id="seta" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8A9099"/></marker>
+  <marker id="seta-warn" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#C2412D"/></marker>
+  <marker id="seta-brain" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6D4AFF"/></marker>
+</defs>
+<rect width="1000" height="1780" rx="18" fill="#FAF8F4"/>
+<text x="40.0" y="58.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="28" font-weight="750" fill="#1F2328" text-anchor="start">Intent router do Neo</text>
+<text x="40.0" y="86.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="400" fill="#5B616B" text-anchor="start">Como cada mensagem escolhe o trilho, e por que quase tudo cai no cérebro</text>
+<circle cx="51" cy="135" r="11" fill="#1F2328"/>
+<text x="51.0" y="139.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<text x="70.0" y="140.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">O caminho da decisão</text>
+<rect x="40.0" y="162.0" width="164.8" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="54.0" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Mensagem</text>
+<text x="54.0" y="236.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">chat, voz, WhatsApp,</text>
+<text x="54.0" y="256.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">agenda ou fim de job,</text>
+<text x="54.0" y="276.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">com histórico</text>
+<text x="54.0" y="296.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">e contexto</text>
+<text x="190.8" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8A9099" text-anchor="end">0</text>
+<path d="M208.8 250.0 L224.8 250.0" stroke="#8A9099" stroke-width="1.6" fill="none" marker-end="url(#seta)"/>
+<rect x="228.8" y="162.0" width="164.8" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="242.8" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Atalhos</text>
+<text x="242.8" y="208.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="500" fill="#8A9099" text-anchor="start">pulam o classificador</text>
+<text x="242.8" y="236.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">pergunta pendente,</text>
+<text x="242.8" y="256.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">missão de WhatsApp,</text>
+<text x="242.8" y="276.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">Claude esperando,</text>
+<text x="242.8" y="296.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">force_intent</text>
+<text x="379.6" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8A9099" text-anchor="end">1</text>
+<path d="M397.6 250.0 L413.6 250.0" stroke="#8A9099" stroke-width="1.6" fill="none" marker-end="url(#seta)"/>
+<rect x="417.6" y="162.0" width="164.8" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="431.6" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Guardas</text>
+<text x="431.6" y="208.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="500" fill="#8A9099" text-anchor="start">antes do LLM</text>
+<text x="431.6" y="236.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">regex de alta precisão:</text>
+<text x="431.6" y="256.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">treino, “lembra que…”,</text>
+<text x="431.6" y="276.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">condicional, música,</text>
+<text x="431.6" y="296.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">“alexa, …” → cérebro</text>
+<text x="568.4" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8A9099" text-anchor="end">2</text>
+<path d="M586.4000000000001 250.0 L602.4000000000001 250.0" stroke="#8A9099" stroke-width="1.6" fill="none" marker-end="url(#seta)"/>
+<rect x="606.4" y="162.0" width="164.8" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="620.4" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Classificador</text>
+<text x="620.4" y="208.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="500" fill="#8A9099" text-anchor="start">LLM flash, JSON</text>
+<text x="620.4" y="236.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">hoje MiniMax m3.1</text>
+<text x="620.4" y="256.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">JSON com intent,</text>
+<text x="620.4" y="276.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">onde, needs_plan,</text>
+<text x="620.4" y="296.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">speech_act, confidence</text>
+<text x="757.2" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8A9099" text-anchor="end">3</text>
+<path d="M775.2 250.0 L791.2 250.0" stroke="#8A9099" stroke-width="1.6" fill="none" marker-end="url(#seta)"/>
+<rect x="795.2" y="162.0" width="164.8" height="176.0" rx="14" fill="#FFFFFF" stroke="#6D4AFF" stroke-width="1.4"/>
+<text x="809.2" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Vieses</text>
+<text x="809.2" y="208.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="500" fill="#8A9099" text-anchor="start">código, depois do LLM</text>
+<text x="809.2" y="236.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="400" fill="#1F2328" text-anchor="start">bias_to_brain</text>
+<text x="809.2" y="256.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="400" fill="#1F2328" text-anchor="start">bias_local_browser</text>
+<text x="809.2" y="276.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="400" fill="#1F2328" text-anchor="start">bias_claude_code</text>
+<text x="809.2" y="296.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="400" fill="#1F2328" text-anchor="start">afeto → cérebro</text>
+<text x="809.2" y="316.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5B616B" text-anchor="start">+ agenda: sem o Mac</text>
+<text x="946.0" y="190.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8A9099" text-anchor="end">4</text>
+<path d="M688.8000000000001 340 L688.8000000000001 370" stroke="#C2412D" stroke-width="1.6" fill="none" stroke-dasharray="5 5" marker-end="url(#seta-warn)"/>
+<rect x="40.0" y="372.0" width="755.2" height="58.0" rx="14" fill="#FDEDEA" stroke="#C2412D" stroke-width="1"/>
+<text x="56.0" y="395.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="650" fill="#C2412D" text-anchor="start">Se o provedor do classificador cai: fallback por palavra-chave</text>
+<text x="56.0" y="415.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#1F2328" text-anchor="start">Os vieses rodam, mas o bias_to_brain não: HA (0,6) e WhatsApp (0,7) disparam direto</text>
+<path d="M877.6 340 L877.6 454" stroke="#1F2328" stroke-width="1.6" fill="none" marker-end="url(#seta)"/>
+<text x="867.6" y="406.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#5B616B" text-anchor="end">intent</text>
+<text x="867.6" y="422.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#5B616B" text-anchor="end">decidido</text>
+<circle cx="51" cy="479" r="11" fill="#1F2328"/>
+<text x="51.0" y="483.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<text x="70.0" y="484.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Os trilhos, com exemplos</text>
+<rect x="40.0" y="506.0" width="920.0" height="286.0" rx="14" fill="#FFFFFF" stroke="#6D4AFF" stroke-width="1.6"/>
+<rect x="40.0" y="506.0" width="920.0" height="64.0" rx="14" fill="#F2EEFF" stroke="none" stroke-width="1"/>
+<rect x="40" y="556" width="920" height="14" fill="#F2EEFF"/>
+<text x="62.0" y="536.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="18" font-weight="750" fill="#6D4AFF" text-anchor="start">DIRECT_RESPONSE</text>
+<text x="238.7" y="536.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="650" fill="#6D4AFF" text-anchor="start">· o cérebro</text>
+<text x="62.0" y="557.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1F2328" text-anchor="start">Padrão na dúvida. Laço de LLM com todas as tools, PKS, web e sandbox.</text>
+<rect x="822.6" y="526.0" width="115.4" height="22.0" rx="11" fill="#FFFFFF" stroke="#6D4AFF" stroke-width="0.8"/>
+<text x="830.6" y="541.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#6D4AFF" text-anchor="start">padrão na dúvida</text>
+<rect x="62.0" y="590" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="74.0" y="603.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“como você está hoje?”</text>
+<text x="74.0" y="620.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">conversa · onde=nenhum, persona a 0,9</text>
+<rect x="62.0" y="640" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="74.0" y="653.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“pega na Wikipédia os 10 países mais populosos em xlsx”</text>
+<text x="74.0" y="670.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">sandbox + file_save · onde=sandbox, 1ª rodada a 0,3</text>
+<rect x="62.0" y="690" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="74.0" y="703.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“o que eu treino na sexta?”</text>
+<text x="74.0" y="720.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">dado pessoal: vem do PKS, sem tool</text>
+<rect x="62.0" y="740" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="74.0" y="753.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“cotação do dólar hoje”</text>
+<text x="74.0" y="770.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">notícia, cotação, esporte: ele busca na web sozinho</text>
+<rect x="514.0" y="590" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="526.0" y="603.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“lembra que meu CEP mudou”</text>
+<text x="526.0" y="620.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">diretiva de memória: a guarda pega antes do LLM</text>
+<rect x="514.0" y="640" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="526.0" y="653.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“se eu costumo dormir às 23h, apaga a luz”</text>
+<text x="526.0" y="670.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">condicional: o cérebro lê o PKS e aciona o HA por handoff</text>
+<rect x="514.0" y="690" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="526.0" y="703.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“no meu navegador, preenche esse formulário”</text>
+<text x="526.0" y="720.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">bias_local_browser → browser_local_task</text>
+<rect x="514.0" y="740" width="3" height="34" rx="1.5" fill="#6D4AFF"/>
+<text x="526.0" y="753.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“pede pro Claude criar um script de backup”</text>
+<text x="526.0" y="770.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">bias_claude_code → claude_task</text>
+<rect x="40.0" y="810.0" width="920.0" height="46.0" rx="12" fill="#F2EEFF" stroke="none" stroke-width="1"/>
+<path d="M70 846 L70 818" stroke="#6D4AFF" stroke-width="1.6" fill="none" marker-end="url(#seta-brain)"/>
+<text x="90.0" y="829.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="650" fill="#6D4AFF" text-anchor="start">Os vieses devolvem ao cérebro o que não é ordem clara para uma skill</text>
+<text x="90.0" y="847.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#1F2328" text-anchor="start">não é imperativo ou confiança &lt; 0,75 · “no meu navegador” · cita “claude” · o Neo está irritado</text>
+<path d="M930 846 L930 818" stroke="#6D4AFF" stroke-width="1.6" fill="none" marker-end="url(#seta-brain)"/>
+<rect x="40.0" y="878.0" width="360.0" height="270.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<rect x="40" y="878" width="360" height="5" rx="2.5" fill="#0E8A7E"/>
+<rect x="41" y="880" width="358" height="12" fill="#FFFFFF"/>
+<path d="M54 878 H386" stroke="#0E8A7E" stroke-width="4" stroke-linecap="round"/>
+<text x="58.0" y="912.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="750" fill="#0E8A7E" text-anchor="start">SERVER_TOOL</text>
+<text x="58.0" y="932.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Tool rápida que roda no neo-core</text>
+<rect x="58" y="950" width="3" height="34" rx="1.5" fill="#0E8A7E"/>
+<text x="70.0" y="963.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“como vai estar o tempo amanhã?”</text>
+<text x="70.0" y="980.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">get_weather</text>
+<rect x="58" y="998" width="3" height="34" rx="1.5" fill="#0E8A7E"/>
+<text x="70.0" y="1011.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“quais vozes você tem?”</text>
+<text x="70.0" y="1028.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">voice_list</text>
+<rect x="58" y="1046" width="3" height="34" rx="1.5" fill="#0E8A7E"/>
+<text x="70.0" y="1059.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“troca a voz do TTS”</text>
+<text x="70.0" y="1076.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">config_set tts.voice</text>
+<rect x="58" y="1094" width="3" height="34" rx="1.5" fill="#0E8A7E"/>
+<text x="70.0" y="1107.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“tira um print do browser”</text>
+<text x="70.0" y="1124.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">browser_screenshot, do servidor</text>
+<rect x="420.0" y="878.0" width="540.0" height="270.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<rect x="420" y="878" width="540" height="5" rx="2.5" fill="#2563EB"/>
+<rect x="421" y="880" width="538" height="12" fill="#FFFFFF"/>
+<path d="M434 878 H946" stroke="#2563EB" stroke-width="4" stroke-linecap="round"/>
+<text x="438.0" y="912.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="750" fill="#2563EB" text-anchor="start">CLIENT_TOOL</text>
+<text x="438.0" y="932.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Só o que exige o Mac dele. Três tools e nenhuma outra</text>
+<rect x="438" y="950" width="3" height="34" rx="1.5" fill="#2563EB"/>
+<text x="450.0" y="963.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“quanto espaço livre tenho no disco?”</text>
+<text x="450.0" y="980.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">run_command no Mac, aprovação pela política</text>
+<rect x="438" y="998" width="3" height="34" rx="1.5" fill="#2563EB"/>
+<text x="450.0" y="1011.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“salva aquela planilha no Desktop”</text>
+<text x="450.0" y="1028.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">save_generated_file com o file_id do histórico</text>
+<rect x="438" y="1046" width="3" height="34" rx="1.5" fill="#2563EB"/>
+<text x="450.0" y="1059.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“manda aquele pdf da nota fiscal que tá no Downloads”</text>
+<text x="450.0" y="1076.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">needs_plan=true: o plano faz ls/find antes de assumir o nome</text>
+<rect x="438" y="1094" width="3" height="34" rx="1.5" fill="#2563EB"/>
+<text x="450.0" y="1107.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“grava esse texto em ~/notas.txt”</text>
+<text x="450.0" y="1124.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">write_file, só com o texto ditado nesta mensagem</text>
+<rect x="40.0" y="1168.0" width="293.3" height="230.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<rect x="40" y="1168" width="293.3333333333333" height="5" rx="2.5" fill="#B86E00"/>
+<rect x="41" y="1170" width="291.3333333333333" height="12" fill="#FFFFFF"/>
+<path d="M54 1168 H319.3333333333333" stroke="#B86E00" stroke-width="4" stroke-linecap="round"/>
+<text x="58.0" y="1202.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="750" fill="#B86E00" text-anchor="start">HOME_ASSISTANT</text>
+<text x="58.0" y="1222.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Skill da casa. Só imperativo claro</text>
+<rect x="58" y="1240" width="3" height="34" rx="1.5" fill="#B86E00"/>
+<text x="70.0" y="1253.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“acende a luz da sala”</text>
+<text x="70.0" y="1270.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">imperativo, confiança ≥ 0,75: dispara</text>
+<rect x="58" y="1288" width="3" height="34" rx="1.5" fill="#B86E00"/>
+<text x="70.0" y="1301.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“ativa o modo cinema”</text>
+<text x="70.0" y="1318.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">dispara; a skill acha a entidade</text>
+<rect x="58" y="1336" width="3" height="34" rx="1.5" fill="#B86E00"/>
+<text x="70.0" y="1349.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“se escurecer, liga a luz?”</text>
+<text x="70.0" y="1366.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">condicional: vai ao cérebro</text>
+<rect x="353.3" y="1168.0" width="293.3" height="230.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<rect x="353.3333333333333" y="1168" width="293.3333333333333" height="5" rx="2.5" fill="#1A9150"/>
+<rect x="354.3333333333333" y="1170" width="291.3333333333333" height="12" fill="#FFFFFF"/>
+<path d="M367.3333333333333 1168 H632.6666666666666" stroke="#1A9150" stroke-width="4" stroke-linecap="round"/>
+<text x="371.3" y="1202.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="750" fill="#1A9150" text-anchor="start">WHATSAPP_MESSAGING</text>
+<text x="371.3" y="1222.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Mensagem em nome dele</text>
+<rect x="371.3333333333333" y="1240" width="3" height="34" rx="1.5" fill="#1A9150"/>
+<text x="383.3" y="1253.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“avisa minha mãe que chego tarde”</text>
+<text x="383.3" y="1270.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">“minha mãe” é resolvido na agenda</text>
+<rect x="371.3333333333333" y="1288" width="3" height="34" rx="1.5" fill="#1A9150"/>
+<text x="383.3" y="1301.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“pede uma pizza pelo zap”</text>
+<text x="383.3" y="1318.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">comercial também é este trilho</text>
+<rect x="371.3333333333333" y="1336" width="3" height="34" rx="1.5" fill="#1A9150"/>
+<text x="383.3" y="1349.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“se o Zé não responder, manda de novo”</text>
+<text x="383.3" y="1366.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">condicional: vai ao cérebro</text>
+<rect x="666.7" y="1168.0" width="293.3" height="230.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<rect x="666.6666666666666" y="1168" width="293.3333333333333" height="5" rx="2.5" fill="#C2387A"/>
+<rect x="667.6666666666666" y="1170" width="291.3333333333333" height="12" fill="#FFFFFF"/>
+<path d="M680.6666666666666 1168 H946.0" stroke="#C2387A" stroke-width="4" stroke-linecap="round"/>
+<text x="684.7" y="1202.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="750" fill="#C2387A" text-anchor="start">MUSIC</text>
+<text x="684.7" y="1222.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Nunca direto: chega por handoff</text>
+<rect x="684.6666666666666" y="1240" width="3" height="34" rx="1.5" fill="#C2387A"/>
+<text x="696.7" y="1253.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“toca Djavan”</text>
+<text x="696.7" y="1270.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">cérebro lê o gosto → [[HANDOFF:music]]</text>
+<rect x="684.6666666666666" y="1288" width="3" height="34" rx="1.5" fill="#C2387A"/>
+<text x="696.7" y="1301.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“pausa a música”</text>
+<text x="696.7" y="1318.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">handoff com a ação pausar</text>
+<rect x="684.6666666666666" y="1336" width="3" height="34" rx="1.5" fill="#C2387A"/>
+<text x="696.7" y="1349.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#1F2328" text-anchor="start">“o que tá tocando?”</text>
+<text x="696.7" y="1366.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5B616B" text-anchor="start">status da mídia, sem comando</text>
+<circle cx="51" cy="1449" r="11" fill="#1F2328"/>
+<text x="51.0" y="1453.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+<text x="70.0" y="1454.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1F2328" text-anchor="start">Os campos que acompanham o intent</text>
+<rect x="40.0" y="1476.0" width="215.0" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="56.0" y="1504.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="13.5" font-weight="700" fill="#1F2328" text-anchor="start">onde</text>
+<text x="56.0" y="1528.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Só muda o cérebro: o aviso</text>
+<text x="56.0" y="1546.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">de sandbox e a 1ª rodada</text>
+<text x="56.0" y="1564.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">a 0,3 em vez de 0,9.</text>
+<rect x="56.0" y="1590.0" width="63.0" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="64.0" y="1605.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">sandbox</text>
+<rect x="125.0" y="1590.0" width="63.0" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="133.0" y="1605.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">maquina</text>
+<rect x="56.0" y="1616.0" width="76.4" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="64.0" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">navegador</text>
+<rect x="138.4" y="1616.0" width="56.3" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="146.4" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">nenhum</text>
+<rect x="275.0" y="1476.0" width="215.0" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="291.0" y="1504.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="13.5" font-weight="700" fill="#1F2328" text-anchor="start">needs_plan</text>
+<text x="291.0" y="1528.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Só vale no CLIENT_TOOL:</text>
+<text x="291.0" y="1546.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">o PlanManager sonda antes</text>
+<text x="291.0" y="1564.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">de agir. No cérebro, é ignorado.</text>
+<rect x="291.0" y="1616.0" width="42.8" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="299.0" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">true</text>
+<rect x="339.8" y="1616.0" width="49.5" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="347.8" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">false</text>
+<rect x="395.4" y="1616.0" width="63.0" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="403.4" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">forçado</text>
+<rect x="510.0" y="1476.0" width="215.0" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="526.0" y="1504.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="13.5" font-weight="700" fill="#1F2328" text-anchor="start">speech_act + confidence</text>
+<text x="526.0" y="1528.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Skill com efeito colateral</text>
+<text x="526.0" y="1546.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">só dispara com imperativo</text>
+<text x="526.0" y="1564.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">e confiança ≥ 0,75.</text>
+<rect x="526.0" y="1590.0" width="83.1" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="534.0" y="1605.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">imperative</text>
+<rect x="615.1" y="1590.0" width="69.7" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="623.1" y="1605.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">question</text>
+<rect x="526.0" y="1616.0" width="89.8" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="534.0" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">conditional</text>
+<rect x="745.0" y="1476.0" width="215.0" height="176.0" rx="14" fill="#FFFFFF" stroke="#E2DED6" stroke-width="1"/>
+<text x="761.0" y="1504.0" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="13.5" font-weight="700" fill="#1F2328" text-anchor="start">pipeline_plan</text>
+<text x="761.0" y="1528.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">Cascata declarada de 2 ou</text>
+<text x="761.0" y="1546.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">mais passos com intents</text>
+<text x="761.0" y="1564.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#5B616B" text-anchor="start">diferentes, em fila.</text>
+<rect x="761.0" y="1616.0" width="63.0" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="769.0" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">passo 1</text>
+<rect x="830.0" y="1616.0" width="63.0" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="838.0" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">passo 2</text>
+<rect x="898.9" y="1616.0" width="22.7" height="22.0" rx="11" fill="#F3F1EC" stroke="#1F2328" stroke-width="0.8"/>
+<text x="906.9" y="1631.5" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#1F2328" text-anchor="start">…</text>
+<rect x="40.0" y="1680.0" width="920.0" height="64.0" rx="14" fill="#1F2328" stroke="none" stroke-width="1"/>
+<text x="64.0" y="1707.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#FFFFFF" text-anchor="start">Regra de ouro: na dúvida, DIRECT_RESPONSE.</text>
+<text x="64.0" y="1728.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#D8DCE2" text-anchor="start">Quem roteia é o intent. Os outros campos só valem dentro do trilho que ele escolheu.</text>
+<text x="960.0" y="1766.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#8A9099" text-anchor="end">neo-core · core/router/intent_router.py · 15/11/2026</text>
+</svg>

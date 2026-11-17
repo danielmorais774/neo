@@ -91,7 +91,9 @@ def test_prompt_stays_within_budget():
     Não é um alvo de compressão — é um alarme para quando ele voltar a crescer
     por acúmulo de exemplo/regra repetida (v1 tinha 22.977 chars).
     """
-    assert len(PROMPT) < 17_000, f"prompt cresceu para {len(PROMPT):,} chars — revise a repetição"
+    # 17.000 → 17.700 em 16/11/2026: o campo `midia` (fala × tela de vídeo/áudio,
+    # sessão e9947724) custou ~650 chars. Campo novo medido pelo eval, não repetição.
+    assert len(PROMPT) < 17_700, f"prompt cresceu para {len(PROMPT):,} chars — revise a repetição"
 
 
 def test_examples_do_not_repeat_a_message():

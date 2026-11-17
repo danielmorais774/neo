@@ -145,13 +145,22 @@ def check(case: dict[str, Any], decision: Any) -> tuple[bool, str, str]:
 
     # DIRECT_RESPONSE é alias de COGNITIVE (mesmo value, "cognitive") — o golden
     # set escreve o nome histórico, então compare pelo membro do enum.
-    expected_intent = IntentType[case["expect_intent"]]
+    # Sem `expect_intent`, o caso confere só os outros campos (ex.: o rótulo de
+    # mídia de "pausa o vídeo", cujo trilho não é o que ele mede).
+    expected_intent = IntentType[case["expect_intent"]] if case.get("expect_intent") else None
     intent = decision.intent.value if hasattr(decision.intent, "value") else str(decision.intent)
-    got = case["expect_intent"] if decision.intent == expected_intent else intent
+    got = case["expect_intent"] if expected_intent and decision.intent == expected_intent else intent
     problems: list[str] = []
 
-    if decision.intent != expected_intent:
+    if expected_intent is not None and decision.intent != expected_intent:
         problems.append(f"intent={intent} (esperado {case['expect_intent']})")
+
+    if (expected := case.get("expect_midia")) is not None:
+        # Lista = rótulos equivalentes para o trilho (só fala e tela desviam).
+        aceitos = expected if isinstance(expected, list) else [expected]
+        got += f"/midia={decision.midia}"
+        if decision.midia not in aceitos:
+            problems.append(f"midia={decision.midia} (esperado {expected})")
 
     if (expected := case.get("expect_tool")) is not None:
         actual = decision.tool_name

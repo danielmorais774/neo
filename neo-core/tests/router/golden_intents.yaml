@@ -9,7 +9,8 @@
 #   id             identificador curto (aparece no relatório)
 #   message        a mensagem do usuário
 #   history        opcional, [{role, content}] — contexto dos turnos anteriores
-#   expect_intent  intent esperado (obrigatório)
+#   expect_intent  intent esperado (sem ele, o caso só confere os outros campos)
+#   expect_midia   rótulo `midia` esperado (fala|tela|editar|tocar|nenhuma), ou lista de aceitos
 #   expect_tool    tool_name esperado (opcional; "null" exige tool_name vazio)
 #   expect_skill   skill_name esperado (opcional)
 #   expect_speech  speech_act esperado (opcional)
@@ -304,3 +305,78 @@
   expect_intent: DIRECT_RESPONSE
   expect_gravity: alta
   note: sinal de tom, não muda o roteamento
+
+# ── Mídia: o que o pedido quer do CONTEÚDO de um vídeo/áudio (16/11/2026) ─────
+# Sessão e9947724: "transcreve o vídeo ~/Downloads/x.mp4" virou plano de whisper
+# no Mac. Em 12/09 "transcrição" de gravação de tela de chat era OCR. O modelo
+# rotula `midia`; quem desvia ao cérebro é `_bias_midia` (fala exige a chave do
+# Groq no ambiente do eval). Frases sintéticas: as reais ficam no Postgres
+# (scripts/eval_midia_gate.py), nunca no repo.
+- id: midia-fala-disco
+  message: "Transcreve o vídeo ~/Downloads/aula.mp4 e me mostra o texto"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+  note: o caso da e9947724 — o arquivo está no disco, mas a transcrição é do cérebro
+
+- id: midia-fala-parafrase
+  message: "passa esse áudio pra texto: ~/Downloads/nota-de-voz.m4a"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+  note: sem a palavra "transcrever"
+
+- id: midia-fala-o-que-diz
+  message: "o que o cara fala nesse vídeo ~/Movies/entrevista.mov?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-fala-ata
+  message: "faz a ata da reunião que gravei, tá em ~/Documents/reuniao-segunda.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-fala-legenda
+  message: "gera uma legenda .srt pro vídeo ~/Desktop/tutorial.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-tela-transcricao
+  message: "faz a transcrição dessa gravação de tela, é uma conversa de WhatsApp rolando: ~/Desktop/Gravação de Tela 2026-11-02.mov"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: tela
+  note: 'a "transcrição" que é OCR (12/09): o texto está na imagem, não na fala'
+
+- id: midia-tela-slides
+  message: "lê o texto dos slides que aparecem nesse vídeo ~/Downloads/palestra.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: tela
+
+- id: midia-editar-extrair
+  message: "extrai o áudio desse vídeo em mp3: ~/Downloads/show.mp4"
+  expect_midia: editar
+  note: extrair o áudio como ARQUIVO não é transcrever
+
+- id: midia-editar-cortar
+  message: "corta os 10 primeiros segundos do vídeo ~/Movies/clip.mp4"
+  expect_midia: editar
+
+- id: midia-tocar-abrir
+  message: "abre no meu navegador o vídeo mais recente do canal do Super Xandão"
+  expect_midia: [tocar, nenhuma]
+  note: 'não pode virar fala/tela; tocar × nenhuma dá o mesmo trilho (16/11 o modelo disse nenhuma). "pausa o vídeo" cai na guarda de música antes do LLM e nem recebe rótulo'
+
+- id: midia-nenhuma-placa
+  message: "qual placa de vídeo é melhor pra jogar, a 5070 ti ou a 4080?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: nenhuma
+
+- id: midia-nenhuma-sobre
+  message: "vi um vídeo ontem dizendo que café em jejum faz mal, é verdade?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: nenhuma
+  note: falar SOBRE um vídeo não é pedir o conteúdo dele
+
+- id: midia-nenhuma-organizar
+  message: "move os vídeos da pasta Downloads para uma pasta Videos"
+  expect_midia: nenhuma
+  note: organizar arquivos (11/15 no corpus) não é mexer no conteúdo
+
