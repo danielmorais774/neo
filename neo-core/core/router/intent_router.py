@@ -378,8 +378,18 @@ _BROWSER_MEDIA_URL_COMMAND = re.compile(
 # A guarda é estreita: só dispara quando a URL NÃO foi dita na conversa. URL que
 # o usuário deu ("baixa https://x/y.pdf pro meu desktop") continua CLIENT_TOOL —
 # ali o shell dele funciona e é o caminho mais curto. O que morre é o palpite.
-_NET_FETCH_COMMAND = re.compile(r"(?:^|[\s;&|(`$])(?:curl|wget)(?:$|[\s])", re.I)
+#
+# Baixador de vídeo entra pelo mesmo motivo (session-ca1d65ef, 17/11): "baixa o
+# vídeo do YouTube 'Já acabou, Jéssica?'" virou `yt-dlp ".../watch?v=VIDEO_ID"`,
+# o plano trocou o placeholder por `y-5-5-5-5-5`, e o usuário recebeu "This
+# video is unavailable" cru. O id de vídeo não se adivinha: o cérebro procura
+# com `web_search` e, barrado no sandbox, roda o yt-dlp no Mac (aviso de origem
+# bloqueada). `ytsearch1:<título>` não tem URL e passa.
+_NET_FETCH_COMMAND = re.compile(
+    r"(?:^|[\s;&|(`$])(?:curl|wget|yt-dlp|youtube-dl|gallery-dl)(?:$|[\s])", re.I
+)
 _URL_IN_COMMAND = re.compile(r"https?://[^\s'\"`)>|;]+", re.I)
+_BUSCA_CEGA_DE_VIDEO = re.compile(r"\bytsearch\d*:", re.I)
 # Endereço que não exige conhecimento do mundo: não é palpite, é convenção.
 _URL_HOSTS_LOCAIS = re.compile(
     r"^https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|"
@@ -447,6 +457,17 @@ _MUSIC_FILE_WORK = re.compile(
     r"\b(mp3|mp4|wav|ogg|m4a|flac|aac|arquivos?|download|"
     r"junta|juntar|concatena|concatenar|converte|converter|"
     r"corta|cortar|recorta|recortar|edita|editar)\b"
+)
+# "baixa o vídeo do YouTube…" é DOWNLOAD, não "baixa (o volume)". O verbo é o
+# mesmo, e com o serviço na frase o turno virava música: a session-3ed86282
+# (17/11) perdeu `run_command` e `browser_local_task` (o turno de música tira
+# os dois da mesa) e respondeu "pede pelo app do desktop" — no app do desktop.
+# Medido nas 2869 mensagens: tira 2 da fatia de música, os dois pedidos de
+# baixar vídeo; nenhum "baixa o volume" casa (o objeto tem que vir logo depois).
+_MUSIC_DOWNLOAD = re.compile(
+    r"\bbaix(?:a|ar|e|em|ou)\b(?:\s+(?:pra|para)\s+(?:mim|gente|nos))?"
+    r"(?:\s+(?:o|a|os|as|esse|essa|esses|essas|este|esta|aquele|aquela|um|uma|meu|minha))?"
+    r"\s+(?:videos?|musicas?|audios?|clipes?|clips?|podcasts?|episodios?|faixas?|albuns?|album)\b"
 )
 _MUSIC_COMPLAINT = re.compile(
     r"\bn[ãa]o\s+(mutou|pausou|pulou|tocou|parou|retomou|abaixou|aumentou)\b"
@@ -743,6 +764,9 @@ Nunca invente um `file_id` nem um caminho que o usuário não mencionou.
 - **WHATSAPP_MESSAGING**: enviar QUALQUER mensagem de WhatsApp em nome do usuário — pessoal ("avisa minha mãe que vou chegar tarde"), comercial (pizza, delivery, farmácia, mercado, encomenda) ou pra telefone/JID direto. Extraia sempre em `tool_arguments` os campos `text` (o texto) e `recipient` (JID, telefone OU apelido cru como "minha mãe", "pai", "Ana" — NÃO interprete o apelido, o pipeline resolve na agenda). `contact_source` ("whatsapp" = agenda do WhatsApp | "saved" = contatos salvos do Neo) só quando o usuário disser a fonte EXPLICITAMENTE; senão omita.
 - **HOME_ASSISTANT**: a casa inteligente do usuário — luz, tomada/interruptor, clima/termostato, persiana, cena, script, automação ("acende a luz da sala", "ativa o modo cinema", "qual a temperatura do termostato?"). É uma SKILL: use `intent=HOME_ASSISTANT`, `skill_name="home_assistant"` e PARE — NÃO escolha tools `ha_*`, NÃO preencha `entity_id`/`tool_arguments` (a skill resolve o dispositivo sozinha) e nunca invente entity_id. NÃO confundir com `list_connected_devices`, que é dos dispositivos do PRÓPRIO Neo (desktop/celular).
 
+## Mídia: preencha `midia` (só o rótulo; o trilho é do código)
+`fala` = o que é DITO (transcrever, legenda .srt, ata, "o que ele fala no vídeo"); `tela` = o TEXTO na imagem (gravação de tela de chat, slides, OCR), mesmo se ele disser "transcrever"; `editar` = cortar, converter, juntar, extrair o áudio como arquivo; `tocar` = tocar/pausar/abrir vídeo ou música; `nenhuma` = o resto (falar SOBRE um vídeo, placa de vídeo, mover arquivos).
+
 ## Ato de fala (decida ANTES do intent)
 Classifique o **ato de fala** e preencha `speech_act`:
 - `imperative` — ordem para fazer AGORA ("acende a luz", "manda um oi pra mãe").
@@ -796,6 +820,7 @@ REGRA DURA: só use HOME_ASSISTANT ou WHATSAPP_MESSAGING quando `speech_act=impe
   "needs_plan": false,
   "tipo_tarefa": "simples|multi_etapas|analitica|criacao",
   "onde": "sandbox"|"maquina"|"navegador"|"nenhum",
+  "midia": "fala"|"tela"|"editar"|"tocar"|"nenhuma",
   "skill_name": "whatsapp_messaging, home_assistant or null",
   "pipeline_plan": null,
   "gravity": "normal"|"alta"|"critica",
@@ -813,6 +838,8 @@ User: "abre o VSCode" / "instala o ffmpeg na minha máquina" → CLIENT_TOOL, "r
 User: "qual o comando pra ver quanto espaço tem no disco?" → DIRECT_RESPONSE (quer o TEXTO do comando, não a execução)
 User: "relatorio de financas em csv na minha area de trabalho" → DIRECT_RESPONSE (nenhum arquivo existente foi citado — o cérebro GERA e entrega; nunca chute "relatorio.csv")
 User: "manda pra mim aquele pdf da nota fiscal que tá no downloads" → CLIENT_TOOL, "run_command", needs_plan: true (o arquivo existe mas só foi descrito: o plano faz `ls`/`find` antes de decidir o nome real)
+
+User: "transcreve o vídeo ~/Downloads/aula.mp4" → midia "fala"; "faz a transcrição da gravação de tela do chat ~/Desktop/chat.mov" → midia "tela"
 
 # Ato de fala, skills e cascata
 User: "acende a luz da sala" → speech_act "imperative", HOME_ASSISTANT, skill_name "home_assistant", pipeline_plan null
@@ -845,6 +872,31 @@ def _onde(valor: Any) -> str | None:
     """O campo ``onde`` do classificador, normalizado (``máquina`` → ``maquina``)."""
     texto = str(valor or "").strip().lower().replace("á", "a")
     return texto if texto in _ONDE else None
+
+
+_MIDIA = frozenset({"fala", "tela", "editar", "tocar", "nenhuma"})
+
+
+def _midia(valor: Any) -> str | None:
+    """O campo ``midia`` do classificador, normalizado. Valor fora da lista = não disse."""
+    texto = _strip_accents(str(valor or "").strip().lower())
+    return texto if texto in _MIDIA else None
+
+
+#: Rede para quando o classificador NÃO rotulou (provider caído, JSON quebrado):
+#: pedido de transcrição/legenda (afordância) sobre um vídeo/áudio (âncora). Medido
+#: em 16/11/2026 nas 2820 mensagens reais: 4 casam a afordância, e todas eram pedido
+#: sobre o conteúdo de um vídeo. Não decide fala × tela: manda ao cérebro, que tem
+#: as duas ferramentas.
+#: Nome de arquivo de mídia na frase (extensão). Também tira o pedido do atalho
+#: de "pergunta referencial", para o classificador poder rotular.
+_MIDIA_ARQUIVO = re.compile(r"\.(mp4|mov|mkv|webm|avi|m4a|mp3|wav|ogg|opus|flac)\b")
+#: As duas são aplicadas ao texto SEM acento e em minúsculas (`_strip_accents`).
+_TRANSCRICAO_AFORDANCIA = re.compile(r"\b(?:transcrev\w*|transcric\w*|legend\w*)|\.srt\b")
+_MIDIA_ANCORA = re.compile(
+    r"\b(video|audio|gravacao|gravado|reuniao|podcast|aula|entrevista)\w*"
+    r"|" + _MIDIA_ARQUIVO.pattern
+)
 
 
 def _teto_raciocinio() -> int | None:
@@ -1204,6 +1256,7 @@ class IntentRouter:
             }
             decision = self._bias_local_browser(decision, user_message, system_context)
             decision = self._bias_claude_code(decision, user_message)
+            decision = self._bias_midia(decision, user_message)
             return self._apply_affect_bias(decision, affect_force_brain)
 
         except Exception as e:
@@ -1217,6 +1270,7 @@ class IntentRouter:
             ], "error": str(e)}
             fallback = self._bias_local_browser(fallback, user_message, system_context)
             fallback = self._bias_claude_code(fallback, user_message)
+            fallback = self._bias_midia(fallback, user_message)
             return self._apply_affect_bias(fallback, affect_force_brain)
 
     def _resolve_artifact_paths(
@@ -1555,6 +1609,27 @@ class IntentRouter:
                 tool_arguments = None
                 raw_command = None
 
+        # Trabalho no SANDBOX não termina no SERVER_TOOL. O agente desse trilho não
+        # enxerga `file_*` nem `neo_*` (`server_tool_can_run`: são do laço do
+        # cognitivo), só os jobs. Sessão 6e483f5d: "pega a foto do email, coloca num
+        # pdf e me devolve" saiu SERVER_TOOL/`email_inbox` com `onde=sandbox`; o
+        # agente achou o email, guardou o anexo e, sem `file_stage` para seguir,
+        # abriu um job para "procurar uma ferramenta de staging" — o PDF só saiu
+        # na continuação automática, que já roda no cognitivo. O cognitivo tem as
+        # tools de email E as do sandbox na mesma mesa. Medido nos session logs
+        # (15/11): das 174 decisões SERVER_TOOL, as 2 com `onde=sandbox` eram os
+        # dois pedidos de "foto do email → PDF".
+        if intent == IntentType.SERVER_TOOL and _onde(data.get("onde")) == "sandbox":
+            logger.warning(
+                "Router: SERVER_TOOL(%s) com onde=sandbox — devolvendo ao cognitivo "
+                "(é onde estão file_stage/neo_bash/file_save)",
+                tool_name or "agent",
+            )
+            intent = IntentType.DIRECT_RESPONSE
+            tool_name = None
+            tool_arguments = None
+            raw_command = None
+
         # Rede do áudio do navegador (ver _BROWSER_AUDIO_COMMAND): qualquer
         # comando improvisado para mexer no som/player de um navegador vira
         # pedido de música — o cognitivo decide e o bloco atua pela extensão.
@@ -1623,6 +1698,11 @@ class IntentRouter:
                     str(m.get("content", "")) for m in (conversation_history or [])[-8:]
                 )).lower()
                 _urls_chutadas = _urls_nao_fundamentadas(str(_cmd_net), _hay)
+                # `yt-dlp "ytsearch1:…"` não tem URL, mas é o mesmo chute: baixa o
+                # 1º resultado da busca do YouTube sem comparar (session-94621cc8,
+                # 17/11). Quem compara é o cérebro, com `neo_video_candidatos`.
+                if not _urls_chutadas and _BUSCA_CEGA_DE_VIDEO.search(str(_cmd_net)):
+                    _urls_chutadas = ["ytsearch (1º resultado às cegas)"]
                 if _urls_chutadas:
                     logger.warning(
                         "Router: CLIENT_TOOL baixando da internet com URL que ninguém "
@@ -1736,6 +1816,7 @@ class IntentRouter:
             needs_plan=needs_plan or needs_plan_forced,
             tipo_tarefa=data.get("tipo_tarefa", "simples"),
             onde=_onde(data.get("onde")),
+            midia=_midia(data.get("midia")),
             skill_name=data.get("skill_name"),
             pipeline_plan=pipeline_plan,
             speech_act=speech_act,
@@ -1804,10 +1885,32 @@ class IntentRouter:
         if not getattr(get_settings(), "browser_local_enabled", False):
             return decision
         from core.browser_local.conversa import MARCA_DO_BLOCO
-        from core.browser_local.gate import local_browser_requested
+        from core.browser_local.gate import local_browser_requested, machine_only_request
 
         tarefa_viva = bool(system_context) and MARCA_DO_BLOCO in system_context
         pediu_local = local_browser_requested(user_message)
+        # "Faz pela minha máquina" sem palavra de navegador: o alvo é a MÁQUINA,
+        # e o terminal também roda nela. Quando o próprio classificador disse
+        # `onde=maquina` (ou escolheu um comando de shell), o portão não tem o
+        # que corrigir. Na session-3ed86282 (17/11) o classificador escolheu
+        # `run_command yt-dlp` no Mac, o portão trocou por navegador e o turno
+        # mandou o Edge dele para o SaveFrom de novo. No corpus, 36 das 233
+        # marcações do portão são só pela máquina, e quase todas são de
+        # terminal ("quantas chaves ssh tenho no meu pc", "abre o editor de
+        # texto da minha máquina"). Tocar música "no meu macbook" não passa por
+        # aqui: a guarda de música decide antes.
+        if (
+            pediu_local
+            and machine_only_request(user_message)
+            and (
+                getattr(decision, "onde", None) == "maquina"
+                or (
+                    decision.intent == IntentType.CLIENT_TOOL
+                    and str(decision.tool_name or "") in ("run_command", "execute_command")
+                )
+            )
+        ):
+            return decision
         # Pediu com todas as letras: o cognitivo recebe o aviso de abrir o
         # navegador nesta resposta, mesmo quando o classificador não escolheu a
         # tool. Na sessão d9fae447 o pedido dizia "no meu navegador local", o
@@ -1882,6 +1985,63 @@ class IntentRouter:
         decision.explanation = (
             "Roteado ao núcleo cognitivo: o pedido cita o Claude, e a tool que delega a "
             "ele (claude_task) só existe lá."
+        )
+        return decision
+
+    def _bias_midia(
+        self, decision: RoutingDecision, user_message: str
+    ) -> RoutingDecision:
+        """Pedido sobre o CONTEÚDO de um vídeo/áudio (fala ou tela)? Quem atende é o cérebro.
+
+        As duas ferramentas moram lá: ``neo_transcrever`` (a fala) e a skill
+        ``ocr-video`` (o texto na tela). Sem este desvio, a regra mestra do
+        classificador ("arquivo no disco dele → CLIENT_TOOL") montava um plano de
+        shell no Mac: na sessão e9947724 foram ``ffmpeg`` → ``whisper`` (não
+        instalado) → ``pip install`` (barrado) e o turno morreu.
+
+        O classificador só ROTULA (``midia``); a decisão é daqui. ``fala`` só
+        desvia com a transcrição disponível (chave do Groq): sem ela, o cérebro não
+        tem como transcrever. Sem rótulo (provider caído), a rede é palavra-chave:
+        pedido de transcrição/legenda sobre um vídeo/áudio. Errar para o cérebro
+        sai barato, porque ele é o caminho geral e escolhe entre fala e tela.
+        """
+        midia = decision.midia
+        if midia is None:
+            texto = _strip_accents((user_message or "").lower())
+            if _TRANSCRICAO_AFORDANCIA.search(texto) and _MIDIA_ANCORA.search(texto):
+                midia = decision.midia = "conteudo"
+        if midia not in ("fala", "tela", "conteudo"):
+            return decision
+        if midia == "fala":
+            from core.transcricao import config as transcricao
+
+            if not transcricao.disponivel():
+                return decision
+        if decision.intent in (IntentType.COGNITIVE, IntentType.DIRECT_RESPONSE):
+            return decision
+        antigo = decision.intent
+        logger.info(
+            "Intent: %s → COGNITIVE (midia=%s: o conteúdo do vídeo/áudio é do cérebro; conf=%.2f)",
+            antigo.value, midia, decision.confidence,
+        )
+        decision.intent = IntentType.COGNITIVE
+        decision.skill_name = None
+        decision.tool_name = None
+        decision.tool_arguments = None
+        decision.raw_command = None
+        decision.needs_plan = False
+        decision.needs_memory = True
+        if decision.pipeline_plan:
+            # Cascata ("transcreve e manda pro fulano"): só o passo do vídeo muda de
+            # trilho; os outros seguem como o classificador declarou.
+            for spec in decision.pipeline_plan:
+                if spec.intent == antigo:
+                    spec.intent = IntentType.COGNITIVE
+                    spec.skill_name = None
+                    break
+        decision.explanation = (
+            f"Roteado ao núcleo cognitivo: o pedido é sobre o conteúdo de um vídeo/áudio "
+            f"(midia={midia}); a transcrição e o OCR de vídeo só existem lá."
         )
         return decision
 
@@ -2145,6 +2305,12 @@ class IntentRouter:
         is_question = "?" in compact or compact.startswith(_INTERROGATIVE_STARTS)
         if not is_question:
             return False
+        # Citar um ARQUIVO de mídia pelo nome não é voltar ao histórico: "o que o
+        # cara fala nesse vídeo ~/Movies/x.mov?" tem que passar pelo classificador,
+        # que rotula `midia` (fala × tela). O atalho a mandava ao cérebro sem rótulo,
+        # e sem rótulo não há aviso de qual ferramenta usar (16/11/2026).
+        if _MIDIA_ARQUIVO.search(compact.lower()):
+            return False
         return any(marker in compact for marker in _REFERENTIAL_DEMONSTRATIVES)
 
     def _referential_question_decision(self, message: str) -> RoutingDecision:
@@ -2255,7 +2421,7 @@ class IntentRouter:
         if not compact:
             return False
         # Mexer num ARQUIVO de áudio não é tocar nem controlar: o classificador decide.
-        if _MUSIC_FILE_WORK.search(compact.lower()):
+        if _MUSIC_FILE_WORK.search(compact.lower()) or _MUSIC_DOWNLOAD.search(compact.lower()):
             return False
         # Unambiguous resume phrases ("dá play de novo", "volta a tocar") → music
         # even without a media noun, so they reach the cognitive music handoff

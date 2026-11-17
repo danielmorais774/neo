@@ -279,6 +279,17 @@ class RoutingDecision(BaseModel):
     # que não chega ao cérebro, e o cérebro foi procurar com `find` no Mac.
     onde: str | None = None
 
+    # O que o pedido quer do CONTEÚDO de um vídeo/áudio, rotulado pelo classificador
+    # (docs/transcricao-groq.md §roteamento): fala (o que é DITO: transcrição,
+    # legenda, ata) | tela (o TEXTO que aparece na imagem: OCR de conversa gravada,
+    # slides) | editar (cortar, converter, juntar) | tocar (player/navegador) |
+    # nenhuma | conteudo (fala OU tela: o rótulo veio da rede de palavra-chave, sem o
+    # classificador). None = ninguém disse. O modelo só
+    # rotula; quem decide o trilho é `IntentRouter._bias_midia`. Na sessão
+    # e9947724 "transcreve o vídeo ~/Downloads/x.mp4" virou um plano de `whisper`
+    # no Mac; e em 12/09 "transcrição" de uma gravação de tela de chat era OCR.
+    midia: str | None = None
+
     # --- Phase 4: declared cascade (Modo B) ---
     # When the message has 2+ INDEPENDENT actions, the classifier fills this with
     # the ordered steps; the orchestrator runs them as a chain. None → single step.

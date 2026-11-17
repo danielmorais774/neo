@@ -45,6 +45,50 @@ _PEDE_ARQUIVO = re.compile(
 #: lista do `_com_itens` do dispatcher.
 _RODAPE_DA_ENTREGA = ("-", "•", "⏸", "⬇", "⏳", "📸", "(")
 
+#: Marcas do texto da continuação automática (`_enqueue_continuation`). O
+#: montador e o leitor (`intencao_da_continuacao`) usam as MESMAS constantes,
+#: senão um texto novo no montador cegaria o leitor em silêncio.
+CONTINUACAO_PREFIXO = (
+    "[Continuação automática — não é mensagem do usuário. Uma tarefa sua em "
+    "segundo plano terminou.]\n"
+)
+_MARCA_COMBINADO = "O que você deixou combinado para este momento — faça AGORA, até o fim:\n"
+_MARCA_FIM_COMBINADO = (
+    "Se o combinado é entregar um arquivo, grave-o (neo_write_file) e entregue com "
+)
+#: Primeira linha do contrato de leitura (`render_continuation_contract`), que
+#: vem logo depois do combinado nos jobs `deep_read`.
+_MARCA_CONTRATO = "Contrato desta leitura ("
+
+
+def intencao_da_continuacao(texto: str | None) -> str | None:
+    """Título do job + o combinado (``then``) de uma continuação automática.
+
+    ``None`` quando o texto não é uma continuação. É o pedaço que o PRÓPRIO Neo
+    escreveu como intenção; o resto é a saída crua do job e o texto fixo do
+    sistema — e casar skill por palavra-chave ali é ruído. Medido nos session
+    logs (15/11): das 11 continuações que carregavam skill, 9 eram `compras` por
+    causa de "preço" no aviso fixo dos jobs de navegador (quiz, formulário,
+    Portal, cota do Claude) e a 6e483f5d carregou `financas` pelo `ls` do job.
+    Só no título + combinado, sobra a legítima ("AliExpress: preços NV3").
+    """
+    t = str(texto or "")
+    if not t.startswith(CONTINUACAO_PREFIXO.rstrip("\n")):
+        return None
+    titulo = re.search(r"^Job: '(.*?)' \(job_id=", t, re.M)
+    combinado = ""
+    if _MARCA_COMBINADO in t:
+        # A ÚLTIMA ocorrência: a saída do job, que vem antes, pode conter a marca.
+        combinado = t.rsplit(_MARCA_COMBINADO, 1)[1]
+        cortes = [
+            i for i in (combinado.find(_MARCA_FIM_COMBINADO), combinado.find(_MARCA_CONTRATO))
+            if i >= 0
+        ]
+        if cortes:
+            combinado = combinado[: min(cortes)]
+    partes = [titulo.group(1).strip() if titulo else "", combinado.strip()]
+    return "\n".join(p for p in partes if p)
+
 
 def _nome_de_arquivo(titulo: str) -> str:
     """O título do job como nome de arquivo: sem acento, minúsculo, com hífen."""
@@ -393,9 +437,8 @@ class JobManager:
             if skill else ""
         )
         texto = (
-            "[Continuação automática — não é mensagem do usuário. Uma tarefa sua em "
-            "segundo plano terminou.]\n"
-            f"Job: '{job.title}' (job_id={job.id}), estado {terminal.get('status')}.\n"
+            CONTINUACAO_PREFIXO
+            + f"Job: '{job.title}' (job_id={job.id}), estado {terminal.get('status')}.\n"
             f"Resultado (pode estar truncado):\n{resumo[:6000] or '(sem saída)'}\n\n"
             + leitura_skill
             + (
@@ -417,12 +460,12 @@ class JobManager:
                 "resposta e sairia cortado.\n"
                 if arquivo_dos_itens else ""
             )
-            + "O que você deixou combinado para este momento — faça AGORA, até o fim:\n"
-            f"{then}\n"
+            + _MARCA_COMBINADO
+            + f"{then}\n"
             + (_deep_read_contract(job) if job.kind == "deep_read" else "")
             + "\n"
-            "Se o combinado é entregar um arquivo, grave-o (neo_write_file) e entregue com "
-            "file_save — o botão de download vai junto desta mensagem. Na resposta, diga em "
+            + _MARCA_FIM_COMBINADO
+            + "file_save — o botão de download vai junto desta mensagem. Na resposta, diga em "
             "poucas frases o que entregou; NÃO cole o arquivo inteiro no chat. Se o combinado "
             "pede para MOSTRAR um trecho (uma saída, um resultado), cole esse trecho."
         )

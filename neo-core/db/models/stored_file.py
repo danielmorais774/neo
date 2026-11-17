@@ -21,6 +21,8 @@ from sqlmodel import Field, SQLModel
 # Origem da ingestão — de onde o arquivo entrou no store.
 FILE_ORIGINS = (
     "upload-desktop", "upload-panel", "whatsapp", "url", "workbench", "research", "job",
+    # Anexo de um email da caixa do Neo (`email_anexo`).
+    "email",
 )
 RETENTIONS = ("temp", "perm")
 # available: usável · expired: TTL venceu (blob já foi) · deleted: soft-delete do usuário

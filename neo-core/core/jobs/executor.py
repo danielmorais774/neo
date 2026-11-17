@@ -61,10 +61,10 @@ _GATE_REWROTE_NOTE: dict[tuple[str, str], str] = {
 # Os alcances (quantas mensagens/tarefas, quanto tempo vale um site) moram no
 # `config/neo.toml`, seção [navegador.janela].
 
-# As falas do Daniel que vão para o agente do navegador (`_falas_do_daniel`).
+# As falas do Daniel que vão para o agente do navegador (`_falas_do_daniel`). O
+# teto em caracteres mora no neo.toml, [navegador.tarefa] falas_max.
 _FALAS_JANELA = timedelta(minutes=60)
 _FALAS_LOOKBACK = 6
-_FALAS_MAX = 1500
 
 # Tarefa de browser no servidor repetida: mesmo endereço, mesma conversa, ainda na
 # fila ou rodando.
@@ -777,20 +777,49 @@ class JobToolExecutor:
     async def _falas_do_daniel(self) -> str:
         """As últimas falas do Daniel nesta conversa, em ordem, nas palavras dele.
 
+        Formatadas para o prompt do agente, até `[navegador.tarefa] falas_max`. A
+        mais recente nunca some: passando do teto, perde o MEIO (sessão be8d195e:
+        o pedido colado tinha 1732 caracteres, o teto era 1500, e a fala inteira
+        era descartada — o agente não viu uma palavra do que ele pediu).
+        """
+        from core.browser_local.pedido import cortar_falas
+        from shared.ajustes import ajustes
+
+        return cortar_falas(await self._falas_lista(), ajustes().navegador.tarefa.falas_max)
+
+    async def _arquivos_do_catalogo(self) -> list[dict]:
+        """Os arquivos desta conversa no catálogo, que o `upload` pode enviar."""
+        if self.session_id is None or self.db is None:
+            return []
+        try:
+            from core.browser_local.pedido import arquivos_do_catalogo
+            from core.files.ledger import FileLedger
+
+            views = await FileLedger(self.db).views(self.session_id, self.user_id)
+            return arquivos_do_catalogo(views)
+        except Exception as exc:  # noqa: BLE001 — sem registro, só o disco dele vale
+            logger.warning("[browser-local] catálogo da conversa indisponível: %s", exc)
+            return []
+
+    async def _falas_lista(self) -> list[str]:
+        """As falas do Daniel, inteiras e em ordem (a do turno por último).
+
         Só mensagens DELE: o "[Continuação automática…]" que o Neo grava como
         user fica de fora. Janela e quantidade são de propósito curtas — é o
         pedido em andamento, não a conversa inteira.
         """
         atual = (self.user_message or "").strip()
+        if atual.startswith("[Continuação automática"):
+            atual = ""
         if self.session_id is None:
-            return atual[:_FALAS_MAX]
+            return [atual] if atual else []
         try:
             msgs = await self.db.fetch_session_messages(
                 self.session_id, limit=_FALAS_LOOKBACK, roles=["user"]
             )
         except Exception as exc:  # noqa: BLE001 — sem histórico, a fala do turno
             logger.debug("[browser-local] histórico indisponível para as falas: %s", exc)
-            return atual[:_FALAS_MAX]
+            return [atual] if atual else []
         cutoff = datetime.utcnow() - _FALAS_JANELA
         falas: list[str] = []
         for msg in msgs or []:
@@ -805,11 +834,7 @@ class JobToolExecutor:
                 falas.append(texto)
         if atual and atual not in falas:
             falas.append(atual)
-        # As mais recentes valem mais e cabem primeiro: corta pelo começo.
-        linhas = [f"- {f}" for f in falas]
-        while linhas and len("\n".join(linhas)) > _FALAS_MAX:
-            linhas.pop(0)
-        return "\n".join(linhas)
+        return falas
 
     async def _modo_da_sessao(self) -> tuple[str | None, str]:
         """Com janela ou sem? A ÚLTIMA escolha desta conversa, lida do banco.
@@ -1436,6 +1461,21 @@ class JobToolExecutor:
         )
         if recusa:
             return recusa
+        # Ele mandou alterar e a tarefa manda só ler: a divisão "mapear → ele
+        # aprova → gravar" é do cérebro, não dele (core/browser_local/pedido.py).
+        # Recusar aqui sai barato: o navegador dele ainda não foi tocado, e o
+        # cérebro reenvia a tarefa inteira na mesma rodada.
+        from core.browser_local.pedido import (
+            caminhos_citados,
+            recusa_tarefa_encolhida,
+            tarefa_encolhida,
+        )
+
+        falas_lista = await self._falas_lista()
+        verbo = tarefa_encolhida(task, "\n".join(falas_lista))
+        if verbo:
+            logger.info("[browser-local] tarefa só-leitura recusada: ele mandou «%s»", verbo)
+            return {"ok": False, "error": recusa_tarefa_encolhida(verbo)}
         title = str(args.get("title") or "Tarefa no seu navegador").strip()[:256]
         # ── Com janela ou sem? ───────────────────────────────────────────────
         #
@@ -1512,6 +1552,17 @@ class JobToolExecutor:
         falas = await self._falas_do_daniel()
         if falas:
             spec["falas"] = falas
+        # Os arquivos do disco DELE que ele citou: os únicos que a ação `upload`
+        # envia a um site. A tarefa do cérebro não entra: quem escolhe o arquivo
+        # é ele, nunca o modelo nem a página.
+        arquivos = caminhos_citados("\n".join(falas_lista))
+        if arquivos:
+            spec["arquivos_do_daniel"] = arquivos
+        # E os do CATÁLOGO desta conversa (o Neo gerou, ou ele anexou): não estão
+        # no disco dele, então o core manda o conteúdo (sessão d7ad32a0).
+        catalogo = await self._arquivos_do_catalogo()
+        if catalogo:
+            spec["arquivos_do_neo"] = catalogo
         # Headless é da MÁQUINA, não da superfície: extensão não inicia navegador.
         # Sem ele, cair para a aba visível é melhor que falhar — mesma escada de
         # sempre (fetch → headless → tela), só que agora escolhida por capacidade
@@ -1529,9 +1580,14 @@ class JobToolExecutor:
         # cérebro para de adivinhar (na 7bc7caa1 ele culpou uma extensão
         # pareada offline por uma tarefa que rodava, sem janela, de propósito).
         spec["motivo_janela"] = motivo_modo[:200]
+        # Material de referência (o texto do currículo que ele mandou usar): o
+        # teto era 2000 fixo, e um currículo de uma página tem 4000.
+        from shared.ajustes import ajustes
+
         context = str(args.get("context") or "").strip()
+        contexto_max = ajustes().navegador.tarefa.contexto_max
         if context:
-            spec["context"] = context[:2000]
+            spec["context"] = context[:contexto_max]
         start_url = str(args.get("start_url") or "").strip()
         if start_url.startswith(("http://", "https://")):
             spec["start_url"] = start_url[:500]
@@ -1636,6 +1692,23 @@ class JobToolExecutor:
                 "Tarefa enfileirada no navegador DO USUÁRIO, com janela — ele vai ver "
                 "acontecendo na tela dele. Diga que ele pode acompanhar e que você avisa "
                 "quando terminar."
+            )
+        if len(context) > contexto_max:
+            nota += (
+                f" O `context` passou de {contexto_max} caracteres e foi cortado no fim: "
+                "o agente não vê o resto. Resuma o material, se o fim importar."
+            )
+        if arquivos:
+            nota += (
+                " Arquivos do disco dele que o agente pode enviar ao site (ação `upload`, "
+                "sem janela de arquivos): " + "; ".join(arquivos) + "."
+            )
+        if catalogo:
+            nota += (
+                " Arquivos do SEU catálogo desta conversa que o agente também envia "
+                "(pelo nome, sem baixar para o disco dele antes): "
+                + "; ".join(f"{c['nome']} (file_id={c['file_id']})" for c in catalogo)
+                + "."
             )
         return {
             "ok": True,

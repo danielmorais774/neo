@@ -196,3 +196,71 @@ async def test_juntar_nao_repete_a_ordem_que_ja_esta_combinada():
         _servico(db), str(job.id), "compare os 3 anúncios e diga qual compensa mais", juntar=True
     ) is True
     assert db.jobs[job.id].spec_json["then"] == "Compare os 3 anúncios e diga qual compensa mais."
+
+
+# ── turno RETOMADO (sessão be8d195e) ───────────────────────────────────────
+#
+# `ls` da foto aprovado → o turno parou no cliente e foi retomado com
+# `enable_handoff=False`. O job "só mapear" abriu na retomada, a resposta prometeu
+# "te aviso com a lista do que pretendo mudar", e o bloco do verificador nunca
+# rodou: o job acabou em 26 s e ninguém voltou.
+
+_RESPOSTA_BE8D = (
+    "Abrindo o GeekHunter na sua tela agora — a aba vai aparecer e você acompanha cada "
+    "passo.\n\nPrimeiro eu mapeio o perfil atual e só depois mexo. Quando terminar o "
+    "mapeamento eu te aviso aqui com a lista, e em seguida eu vou gravar as alterações "
+    "no perfil."
+)
+# (A resposta REAL de be8d195e — "Primeiro eu mapeio… e só depois mexo" — nem passa
+# no pré-filtro de promessa. Esse caso quem fecha é a recusa da tarefa só-leitura,
+# core/browser_local/pedido.py; aqui o que se testa é o buraco da retomada.)
+
+
+def _servico_da_retomada(db, synth_texto):
+    chamadas = []
+
+    async def _verificar(user_message, reply, note, dispatched):
+        chamadas.append(dispatched)
+        return SimpleNamespace(input_text=synth_texto) if synth_texto else None
+
+    servico = SimpleNamespace(db=db, _verify_promise_continuation=_verificar)
+    servico._pendurar_no_job = lambda job_id, ordem, **kw: AIService._pendurar_no_job(
+        servico, job_id, ordem, **kw
+    )
+    return servico, chamadas
+
+
+@pytest.mark.asyncio
+async def test_retomada_pendura_a_promessa_no_job_que_ela_abriu():
+    db = _FakeDB()
+    job = _job()
+    db.jobs[job.id] = job
+    servico, chamadas = _servico_da_retomada(db, "aplicar as mudanças do currículo no perfil")
+    trace = [{"tool": "browser_local_task", "async_job": True, "job_id": str(job.id), "then": False}]
+
+    ok = await AIService._pendurar_promessa_da_retomada(
+        servico, "atualize meu perfil", _RESPOSTA_BE8D, trace, {}, None
+    )
+    assert ok is True
+    assert db.jobs[job.id].spec_json["then"] == "aplicar as mudanças do currículo no perfil"
+    assert chamadas and "job em segundo plano" in chamadas[0][0]
+
+
+@pytest.mark.asyncio
+async def test_retomada_sem_job_so_com_aviso_ou_com_then_nao_pendura():
+    db = _FakeDB()
+    job = _job()
+    db.jobs[job.id] = job
+    servico, chamadas = _servico_da_retomada(db, "qualquer coisa")
+    aberto = [{"tool": "browser_local_task", "async_job": True, "job_id": str(job.id), "then": False}]
+
+    # sem job aberto
+    assert not await AIService._pendurar_promessa_da_retomada(servico, "x", _RESPOSTA_BE8D, [], {}, None)
+    # só o "te aviso quando terminar": quem avisa é o JobManager
+    so_aviso = "Abri a tarefa no seu navegador. Te aviso quando terminar."
+    assert not await AIService._pendurar_promessa_da_retomada(servico, "x", so_aviso, aberto, {}, None)
+    # job já com continuação combinada
+    com_then = [{**aberto[0], "then": True}]
+    assert not await AIService._pendurar_promessa_da_retomada(servico, "x", _RESPOSTA_BE8D, com_then, {}, None)
+    assert chamadas == []
+    assert "then" not in db.jobs[job.id].spec_json

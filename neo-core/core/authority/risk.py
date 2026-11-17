@@ -57,6 +57,8 @@ _BY_NAME: dict[str, frozenset[str]] = {
     # (leitura privada). As duas coisas ao mesmo tempo.
     "email_inbox": frozenset({_F, _L}),
     "email_message": frozenset({_F, _L}),
+    # Baixa o anexo para o catálogo: lê conteúdo de fora, não age para fora.
+    "email_anexo": frozenset({_F, _L}),
     # Arquivo de terceiro tem texto de terceiro dentro (PDF com injection).
     "deep_read": frozenset({_F, _L}),
     # Claude Code delegado: lê web e arquivos (o relatório que volta é fonte
@@ -69,6 +71,13 @@ _BY_NAME: dict[str, frozenset[str]] = {
     "claude_sessoes": frozenset({_L}),
     "claude_enviar": frozenset({_A}),
     "file_read": frozenset({_F, _L}),
+    # A fala transcrita de um vídeo de terceiro é texto de terceiro (injection
+    # falada). O áudio vai ao Groq, mas o destino é fixo e escolhido pelo dono no
+    # painel: não é um canal que o conteúdo controla, então não conta revelação.
+    "neo_transcrever": frozenset({_F, _L}),
+    # Lê a busca do YouTube e as miniaturas (texto e imagem de terceiro). Não
+    # baixa nem escreve nada fora do sandbox.
+    "neo_video_candidatos": frozenset({_F}),
     # O que o modelo de visão lê na página renderizada pode ser texto de terceiro
     # (o PDF anexado com injection vira imagem e volta como descrição).
     "file_olhar": frozenset({_F, _L}),

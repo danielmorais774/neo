@@ -100,6 +100,12 @@ class ConversaNoNavegador(_Secao):
     #: Enquanto ele escreve no painel o agente não mexe na página (roubaria o
     #: foco do campo). Teto dessa espera por ação, em segundos.
     digitando_espera_max_s: float = Field(90.0, ge=5, le=600)
+    #: Na conferência antes do Salvar/Enviar, cada valor aparece inteiro até este
+    #: tamanho; maior, sai começo e fim com o total de caracteres.
+    conferencia_valor_max: int = Field(1500, ge=200, le=8000)
+    #: Maior pergunta que o painel da aba mostra, em caracteres (a conferência de
+    #: um formulário inteiro é a mais longa).
+    pergunta_painel_max: int = Field(4000, ge=600, le=20000)
 
 
 class JulgamentoNoNavegador(_Secao):
@@ -136,11 +142,57 @@ class JanelaDoNavegador(_Secao):
     site_vale_por_horas: float = Field(12.0, gt=0, le=168)
 
 
+class TarefaNoNavegador(_Secao):
+    """O que a tarefa leva para o agente do navegador e o que ele pode enviar a um
+    site (core/browser_local/pedido.py)."""
+
+    #: As palavras do Daniel que o agente lê em todo passo, em caracteres. Mensagem
+    #: maior perde o MEIO (começo e fim ficam).
+    falas_max: int = Field(4000, ge=500, le=20000)
+    #: Material de referência que o cérebro manda junto (o `context`: o texto de
+    #: um currículo, os dados de um pedido), em caracteres.
+    contexto_max: int = Field(8000, ge=500, le=40000)
+    #: Maior arquivo do disco dele que a ação `upload` envia a um site, em MB.
+    arquivo_max_mb: float = Field(25.0, gt=0, le=500)
+    #: Maior arquivo do CATÁLOGO do Neo (gerado no sandbox, anexado no chat) que o
+    #: `upload` envia, em MB. O conteúdo vai pelo canal do desktop em base64 (+33%)
+    #: e o quadro do websocket do desktop aceita até 16 MiB.
+    catalogo_max_mb: float = Field(10.0, gt=0, le=11)
+
+
+class VisaoNoNavegador(_Secao):
+    """Prints de CONFIRMAÇÃO no navegador local: o código tira print nos momentos
+    em que errar custa (campo editado, envio, modal, navegação, upload). Plano em
+    docs/browser-visao-confirmacao-plan.md. Nesta fase os prints só vão para o
+    diário; a análise pela visão vem depois."""
+
+    #: O caminho que o Daniel escolhe: com prints de confirmação (mais seguro e
+    #: mais lento — cada print custa ~2 s hoje) ou só pela DOM, como sempre foi.
+    confirmacao_visual: bool = False
+    #: Teto de prints de confirmação por tarefa (o `look` e o print do fim não contam).
+    prints_max: int = Field(60, ge=0, le=500)
+    #: No print recortado de um campo, quanto da área ABAIXO dele entra (é onde o
+    #: site escreve "campo obrigatório"), em px de CSS.
+    recorte_margem_px: int = Field(120, ge=0, le=600)
+    #: Análises pela visão por tarefa (o print continua até `prints_max`).
+    analises_max: int = Field(40, ge=0, le=300)
+    #: Análises rodando em paralelo enquanto o agente segue.
+    paralelas_max: int = Field(2, ge=1, le=8)
+    #: Largura máxima do print de tela inteira, em px: medido em 17/11, a 1276 px a
+    #: visão lê o formulário igual e a imagem tem 1/3 dos bytes.
+    largura_max_px: int = Field(1280, ge=480, le=4000)
+    #: Teto do raciocínio do modelo de visão por conferência (o glm-5.3-flash não
+    #: deixa desligar).
+    teto_raciocinio: int = Field(200, ge=0, le=4000)
+
+
 class Navegador(_Secao):
     decisao: TetoDeUso = TetoDeUso(reserva_resposta=600, piso=2000, maximo=6000)
     conversa: ConversaNoNavegador = ConversaNoNavegador()
     julgamento: JulgamentoNoNavegador = JulgamentoNoNavegador()
     janela: JanelaDoNavegador = JanelaDoNavegador()
+    tarefa: TarefaNoNavegador = TarefaNoNavegador()
+    visao: VisaoNoNavegador = VisaoNoNavegador()
 
 
 class Trabalho(_Secao):
@@ -183,6 +235,11 @@ class Cerebro(_Secao):
     #: Quanto do resultado anterior volta no aviso de chamada repetida (a chamada
     #: em si leva a metade disto).
     repeticao_trecho_max: int = Field(800, ge=100, le=20000)
+    #: Imagens do sandbox (`[[IMAGE:/workspace/…]]`) que a resposta mostra SEM ter
+    #: publicado: quantas o servidor publica sozinho por resposta, para o chat
+    #: conseguir desenhar. 0 = desligado (volta o cartão de erro). Na
+    #: session-6e483f5d o recorte da notinha não apareceu por isso.
+    imagens_publicadas_max: int = Field(6, ge=0, le=50)
 
 
 class Roteador(_Secao):
@@ -290,6 +347,107 @@ class Grpc(_Secao):
     mensagem_max_mb: int = Field(16, ge=4, le=128)
 
 
+class CotaGratuitaGroq(_Secao):
+    """Os limites do plano gratuito do Groq para o Whisper (docs/transcricao-groq.md).
+
+    Com "só a cota gratuita" ligado no painel, o Neo para ANTES de passar destes
+    números, mesmo que a conta aceite mais. Os de hora e de pedidos por dia
+    vieram dos cabeçalhos da conta do Daniel em 15/11/2026; o de dia e o de
+    pedidos por minuto, da documentação do Groq.
+    """
+
+    audio_s_por_hora: int = Field(7200, ge=0, le=1_000_000)
+    audio_s_por_dia: int = Field(28800, ge=0, le=10_000_000)
+    pedidos_por_minuto: int = Field(20, ge=0, le=10_000)
+    pedidos_por_dia: int = Field(2000, ge=0, le=1_000_000)
+    #: Maior arquivo que um pedido aceita no plano gratuito, em MB.
+    arquivo_max_mb: int = Field(25, ge=1, le=100)
+    #: Segundos de áudio que ficam sem usar em cada balde, para não encostar no
+    #: limite por causa de arredondamento entre a conta do Neo e a do Groq.
+    folga_s: int = Field(30, ge=0, le=3600)
+
+
+class Transcricao(_Secao):
+    """A tool ``neo_transcrever``: o sandbox tira o áudio e o Groq transcreve."""
+
+    #: Duração máxima de cada pedaço mandado ao Groq, em segundos. Também cai
+    #: sozinho se o pedaço passaria do tamanho máximo de arquivo da cota.
+    parte_max_s: int = Field(1200, ge=60, le=7200)
+    #: Bitrate do opus em kbps. 32 kbps a 16 kHz mono dá ~4 KB/s.
+    bitrate_kbps: int = Field(32, ge=12, le=128)
+    #: Vídeo mais longo que isto é recusado antes de gastar cota, em segundos.
+    duracao_max_s: int = Field(7200, ge=60, le=86_400)
+    #: Quanto a tool espera a cota encher no meio do trabalho, em segundos. Acima
+    #: disso ela para e diz quando dá para continuar.
+    espera_max_s: int = Field(60, ge=0, le=600)
+    #: Idioma padrão do áudio (código ISO-639-1). "auto" deixa o Whisper detectar.
+    idioma_padrao: str = Field("pt", min_length=2, max_length=8)
+    #: Prazo de cada pedido ao Groq, em segundos.
+    pedido_timeout_s: float = Field(120.0, ge=10, le=600)
+    #: Prazo do ffprobe e do ffmpeg no sandbox, em segundos.
+    extracao_timeout_s: int = Field(600, ge=30, le=1800)
+    #: Quanto da transcrição volta para o cérebro, em caracteres. O texto
+    #: inteiro fica no arquivo, e a tool diz quando cortou.
+    previa_max: int = Field(6000, ge=500, le=50_000)
+    #: Abaixo disto (fração do áudio com som), a tool recusa antes de gastar cota:
+    #: é gravação de tela sem fala, e o Whisper inventaria frases. Medido em
+    #: 16/11: vídeos com fala dão 100%, gravação de tela com ruído de fundo, 0%.
+    som_min_fracao: float = Field(0.05, ge=0, le=1)
+    #: O que conta como silêncio no ``silencedetect`` (dB) e por quanto tempo (s).
+    silencio_db: float = Field(-40.0, ge=-90, le=0)
+    silencio_min_s: float = Field(1.0, ge=0.1, le=30)
+    #: Trecho que o Whisper marca como não-fala é descartado: a regra padrão da
+    #: implementação de referência dele (no_speech_prob acima de 0,6 E
+    #: avg_logprob abaixo de −1). Corta a alucinação em música e silêncio.
+    sem_fala_prob: float = Field(0.6, ge=0, le=1)
+    sem_fala_logprob: float = Field(-1.0, ge=-20, le=0)
+    cota: CotaGratuitaGroq = CotaGratuitaGroq()
+
+
+class Video(_Secao):
+    """A tool ``neo_video_candidatos``: escolher o vídeo do YouTube antes de baixar."""
+
+    #: Quantos resultados da busca do YouTube entram na comparação.
+    candidatos: int = Field(8, ge=2, le=20)
+    #: Prazo da busca no sandbox, em segundos (a busca leva ~2 s).
+    busca_timeout_s: int = Field(45, ge=5, le=300)
+    #: Fração dos termos do pedido que precisa aparecer no título ou no canal
+    #: para o vídeo concorrer.
+    cobertura_min: float = Field(0.5, ge=0, le=1)
+    #: Vantagem de nota que o 1º precisa ter sobre o 2º para ser escolhido só
+    #: pelos dados. Abaixo disso, a tool compara os quadros.
+    margem: float = Field(0.15, ge=0, le=1)
+    #: Quantos candidatos empatados vão para a comparação de quadros (1 imagem
+    #: por candidato, com 4 quadros).
+    comparar_max: int = Field(4, ge=2, le=4)
+    #: Meme: até isto, duração nota cheia; até `medio_max_s`, meia; acima, zero.
+    curto_max_s: int = Field(90, ge=5, le=3600)
+    medio_max_s: int = Field(240, ge=10, le=7200)
+    #: Pesos da nota. Penalidade é subtraída quando o título/canal tem um termo
+    #: de cópia (lista abaixo) que o pedido não tem.
+    peso_titulo: float = Field(0.45, ge=0, le=1)
+    peso_frase: float = Field(0.10, ge=0, le=1)
+    peso_views: float = Field(0.30, ge=0, le=1)
+    peso_duracao: float = Field(0.15, ge=0, le=1)
+    peso_penalidade: float = Field(0.50, ge=0, le=2)
+    #: Termos de cópia/derivado. Comparados sem acento e por palavra inteira.
+    penalidades: list[str] = Field(
+        default_factory=lambda: [
+            "reação", "reagindo", "react", "reaction", "zoeira", "zueira", "dark",
+            "remix", "paródia", "compilação", "compilation", "mashup", "edit",
+            "editado", "explicando", "entrevista", "reportagem", "documentário",
+            "nova versão", "como está", "anos depois", "anos após", "por onde anda",
+            "ouça", "podcast", "dublado", "karaokê", "cover", "lyric", "lyrics",
+            "slowed", "reverb", "sped up", "8d",
+        ]
+    )
+    #: Prazo para baixar as miniaturas e montar as grades no sandbox, em segundos.
+    quadros_timeout_s: int = Field(60, ge=10, le=300)
+    #: Quanto tempo um vídeo escolhido pela tool pode ser baixado sem nova
+    #: comparação, em segundos ("baixa de novo" horas depois).
+    escolha_validade_s: int = Field(21600, ge=60, le=604_800)
+
+
 class Ajustes(_Secao):
     teto_adaptativo: AprendizadoDoTeto = AprendizadoDoTeto()
     navegador: Navegador = Navegador()
@@ -301,6 +459,8 @@ class Ajustes(_Secao):
     faxina: Faxina = Faxina()
     comando_no_computador: ComandoNoComputador = ComandoNoComputador()
     grpc: Grpc = Grpc()
+    transcricao: Transcricao = Transcricao()
+    video: Video = Video()
 
 
 def caminho() -> Path:

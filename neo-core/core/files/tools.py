@@ -30,7 +30,7 @@ FILE_TOOLS: list[ToolSchema] = [
             ),
             "origin": ToolParameter(
                 type="string", description="Filtra pela origem da ingestão",
-                enum=["upload-desktop", "upload-panel", "whatsapp", "url", "workbench", "research", "job"],
+                enum=["upload-desktop", "upload-panel", "whatsapp", "url", "workbench", "research", "job", "email"],
                 required=False,
             ),
             "q": ToolParameter(

@@ -1,7 +1,7 @@
 ---
 name: produtos
 description: 'Catálogo de produtos da loja: cadastrar, consultar preço e estoque, atualizar. Use quando falarem de produto, preço, estoque ou pedido de cliente.'
-keywords: [produto, produtos, preço, preco, estoque, catálogo, catalogo, caneca, camiseta]
+keywords: [produto, produtos, preço, preco, estoque, caneca, camiseta]
 kind: tool_backed
 group: cadastros
 discovery: keyword

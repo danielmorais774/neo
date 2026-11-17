@@ -93,6 +93,36 @@ def _render_tool_trace_note(extra_metadata: dict[str, Any] | None) -> str | None
             lines.append(f"- {tool} → `{entry.get('command')}` (exit={entry.get('exit_code')})")
         elif tool == "file_save":
             lines.append(f"- {tool} → '{entry.get('name')}' salvo no catálogo")
+        elif tool == "email_inbox":
+            msgs = entry.get("mensagens") or []
+            lines.append(
+                f"- {tool} (janela {entry.get('janela_min')} min): {len(msgs)} mensagem(ns)"
+            )
+            for m in msgs[:3]:
+                anexos = ", ".join(str(a) for a in (m.get("anexos") or [])[:3])
+                lines.append(
+                    f"  · id {m.get('id')} · '{m.get('assunto')}' · de {m.get('de')} · "
+                    f"{m.get('quando')}" + (f" · anexos: {anexos}" if anexos else "")
+                )
+        elif tool == "email_message":
+            anexos = ", ".join(
+                f"{a.get('indice')}={a.get('nome')}" for a in (entry.get("anexos") or [])[:3]
+            )
+            lines.append(
+                f"- {tool} id {entry.get('id')}: '{entry.get('assunto')}' de {entry.get('de')}, "
+                f"texto {entry.get('texto_chars')} chars"
+                + (f", anexos: {anexos}" if anexos else ", sem anexo")
+            )
+        elif tool == "email_anexo":
+            lines.append(
+                f"- {tool} → '{entry.get('name')}' no catálogo (file_id={entry.get('file_id')})"
+            )
+        elif entry.get("async_job"):
+            # Job aberto: o resumo genérico sai vazio ("neo_bash_background: "),
+            # e o que o próximo turno precisa é saber QUAL job está rodando.
+            lines.append(
+                f"- {tool} → job '{entry.get('job_title') or '?'}' (job_id={entry.get('job_id')})"
+            )
         else:
             lines.append(f"- {tool}: {str(entry.get('summary', ''))[:120]}")
     for f in files[:5]:

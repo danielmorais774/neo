@@ -506,10 +506,13 @@ class PlanManager:
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-            parsed = json.loads(raw)
+            parsed = self._normalizar_refined_step(json.loads(raw))
+            if parsed is None:
+                logger.warning(f"[PLAN] refine do passo {step.index} veio sem objeto utilizável — mantendo o passo")
+                return step
             step.tool_name = parsed.get("tool_name", step.tool_name)
             step.tool_arguments = parsed.get("tool_arguments", step.tool_arguments)
-            step.raw_command = step.tool_arguments.get("command", step.raw_command)
+            step.raw_command = (step.tool_arguments or {}).get("command", step.raw_command)
             step.requires_approval = parsed.get("requires_approval", step.requires_approval)
 
             logger.info(f"[PLAN] Refined step {step.index}: {step.tool_name} → {step.raw_command or step.tool_arguments}")
@@ -878,7 +881,7 @@ class PlanManager:
                 },
                 "decision": parsed.get("decision", "continue"),
                 "reason": parsed.get("reason", ""),
-                "refined_step": parsed.get("refined_step"),
+                "refined_step": self._normalizar_refined_step(parsed.get("refined_step")),
                 "subplan_steps": parsed.get("subplan_steps"),
                 "retry_classification": parsed.get("retry_classification"),
             }
@@ -894,6 +897,45 @@ class PlanManager:
                 "subplan_steps": None,
                 "retry_classification": None,
             }
+
+    @staticmethod
+    def _normalizar_refined_step(valor: Any) -> dict | None:
+        """O ``refined_step`` como objeto, com ``tool_arguments`` sempre dict (ou ausente).
+
+        Os quatro lugares que aplicam o refinamento fazem
+        ``tool_arguments.get("command")``. Na sessão e9947724 (16/11/2026) o modelo
+        devolveu ``tool_arguments`` como TEXTO no retry de um passo que falhou, e
+        o ``.get`` derrubou o turno inteiro com ``AttributeError`` no gRPC.
+
+        Texto que é JSON vira objeto. Texto solto não vira comando: não dá para
+        saber se é o comando ou uma frase, e adivinhar mandaria uma frase para o
+        shell do usuário. Aí a chave sai e o passo segue com os argumentos que já
+        tinha (e com as guardas de passo indespachável). ``None`` quando o próprio
+        ``refined_step`` não é um objeto.
+        """
+        if isinstance(valor, str):
+            try:
+                valor = json.loads(valor)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("[PLAN] refined_step veio como texto solto — descartado")
+                return None
+        if not isinstance(valor, dict):
+            return None
+        if "tool_arguments" not in valor:
+            return valor
+        args = valor.get("tool_arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = None
+        if isinstance(args, dict):
+            return {**valor, "tool_arguments": args}
+        logger.warning(
+            "[PLAN] refined_step.tool_arguments não é objeto (%s) — mantendo os argumentos do passo",
+            type(valor.get("tool_arguments")).__name__,
+        )
+        return {k: v for k, v in valor.items() if k != "tool_arguments"}
 
     @staticmethod
     def _flatten_decision(parsed: dict, next_step: "PlanStep | None") -> dict:

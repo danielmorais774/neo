@@ -35,7 +35,7 @@ for _noisy in ("pymongo", "grpc", "grpc._cython", "httpcore", "httpx", "hpack"):
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, llm_catalog, model_config, voice_config, file_edit_config, claude_code_config, spotify, skills, research, files, connections, datasets, events, schedules, release
+from api.routes import affect, auth, context, desktop, health, debug, quick_help, session_logs, knowledge_graph, whatsapp, missions, devices, app_logs, intent_config, llm_catalog, model_config, voice_config, file_edit_config, claude_code_config, transcricao_config, spotify, skills, research, files, connections, datasets, events, schedules, release
 from api.auth import assert_secret_configured, auth_mode, require_owner, require_principal
 from api.security import require_panel_jwt
 from core import (
@@ -188,7 +188,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.neo_email_send_enabled:
             _email_tools += EMAIL_SEND_TOOLS
         _tool_registry.register_many(_email_tools)
-        _tool_executor.register_module_executor("email", MailboxToolExecutor(_cred_store))
+        # O catálogo nasce mais abaixo no boot: o `email_anexo` o resolve na hora.
+        _tool_executor.register_module_executor(
+            "email",
+            MailboxToolExecutor(
+                _cred_store, get_file_store=lambda: getattr(app.state, "file_store", None)
+            ),
+        )
         _nomes = "/".join(t.name for t in _email_tools)
         print(f"✅ Cofre wired (vault_list + {_nomes})")
 
@@ -256,6 +262,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.workbench_sandbox = _workbench_sandbox
         print(f"✅ Workbench sandbox wired (container={settings.workbench_container})")
+
+        # Transcrição (docs/transcricao-groq.md): o sandbox tira o áudio e o core
+        # manda ao Groq com a chave do painel. A tool fica no registry sempre;
+        # quem a põe no toolset do cérebro é `_agent_action_tools`, só com chave.
+        from core.transcricao import TRANSCRICAO_TOOLS, TranscricaoExecutor
+
+        _tool_registry.register_many(TRANSCRICAO_TOOLS)
+        _tool_executor.register_module_executor(
+            "transcricao",
+            TranscricaoExecutor(
+                sandbox=_workbench_sandbox,
+                db=_db,
+                workspace_local=settings.workbench_workspace_root,
+                get_file_store=lambda: getattr(app.state, "file_store", None),
+            ),
+        )
+
+        # Vídeo do YouTube por nome: escolher pelos dados (e quadros) antes de
+        # baixar. A busca e as grades de quadros rodam no sandbox; a visão, aqui.
+        from core.video import VIDEO_TOOLS, VideoExecutor
+
+        _tool_registry.register_many(VIDEO_TOOLS)
+        _tool_executor.register_module_executor(
+            "video",
+            VideoExecutor(
+                sandbox=_workbench_sandbox,
+                llm=_llm_router,
+                workspace_local=settings.workbench_workspace_root,
+            ),
+        )
 
         # Faxina do /workspace: nada mais apagava o que o Neo baixa ou gera ali.
         # Regras e liga/desliga em `[faxina]` no neo.toml (core/workbench/faxina.py).
@@ -970,6 +1006,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     print(f"✅ Claude Code integrado: {'ligado' if _chave_claude.ligado() else 'desligado'} ({_chave_claude.origem()})")
 
+    # Transcrição (neo-panel → Transcrição): chave do Groq, modelo e "só a cota gratuita".
+    from core.transcricao import config as _transcricao_cfg
+
+    await _transcricao_cfg.carregar(_db)
+    transcricao_config.set_dependencies(
+        _db, tool_montada=_tool_registry.exists("neo_transcrever")
+    )
+    print(
+        f"✅ Transcrição: chave {_transcricao_cfg.origem_da_chave()}, modelo {_transcricao_cfg.modelo()}, "
+        f"só cota gratuita={'sim' if _transcricao_cfg.so_gratuita() else 'não'}"
+    )
+
     # Wire Spotify OAuth route (neo-panel → Music page)
     spotify.set_dependencies(_db)
 
@@ -1148,6 +1196,7 @@ app.include_router(llm_catalog.router, prefix="/api/v1", dependencies=[Depends(r
 app.include_router(voice_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(file_edit_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(claude_code_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
+app.include_router(transcricao_config.router, prefix="/api/v1", dependencies=[Depends(require_panel_jwt)])
 app.include_router(datasets.install_router)
 app.include_router(datasets.router)
 app.include_router(events.router)

@@ -275,6 +275,10 @@ class DocView:
     #: Conversas em que o documento teve movimento, e se a do turno é uma delas.
     sessions: set[str] = field(default_factory=set)
     in_session: bool = True
+    #: Teve movimento DE VERDADE nesta conversa (não só `adopted`, que nasce de uma
+    #: palavra do nome batendo com a mensagem). É o que libera mandar o arquivo a
+    #: um site (`core/browser_local/pedido.arquivos_do_catalogo`).
+    worked_in_session: bool = True
     #: Nomes e caminhos que este documento já teve — é por eles que uma mensagem o cita.
     aliases: set[str] = field(default_factory=set)
 
@@ -346,6 +350,7 @@ def build_views(events: Iterable[Any], *, session_id: Any = None) -> list[DocVie
         copias: dict[str, HostCopy] = {}
         sandbox_sha: str | None = None
 
+        trabalhadas: set[str] = set()
         for e in evs:
             acao = _get(e, "action")
             fid = _sid(_get(e, "file_id"))
@@ -354,6 +359,8 @@ def build_views(events: Iterable[Any], *, session_id: Any = None) -> list[DocVie
             quando = _get(e, "created_at")
             if _sid(_get(e, "session_id")):
                 view.sessions.add(str(_get(e, "session_id")))
+                if acao != "adopted":
+                    trabalhadas.add(str(_get(e, "session_id")))
             for apelido in (_get(e, "name"), _get(e, "sandbox_path"), host):
                 if apelido:
                     view.aliases.add(str(apelido))
@@ -435,6 +442,7 @@ def build_views(events: Iterable[Any], *, session_id: Any = None) -> list[DocVie
                 view.sandbox_state = "atual"
         # Evento sem conversa (registro antigo, teste) não tira o documento dela.
         view.in_session = sessao is None or not view.sessions or sessao in view.sessions
+        view.worked_in_session = sessao is None or not view.sessions or sessao in trabalhadas
         views.append(view)
 
     views.sort(key=lambda v: v.last_at or datetime.min, reverse=True)

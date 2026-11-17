@@ -180,6 +180,12 @@ _LIVE_STYLE_INSTRUCTION = (
 # caminho, ao contrário de `![](markdown)`).
 INLINE_IMAGE_MARKER_PREFIX = "[[IMAGE:"
 
+# Arquivo que JÁ está no disco do usuário (baixado na máquina dele): o chat mostra
+# um cartão com nome, tamanho e "Mostrar no Finder" em vez do botão de download do
+# catálogo, que serve para arquivo gerado no sandbox. Nasceu da session-3ed86282
+# (17/11): o vídeo do YouTube só baixa da máquina dele, e lá ele já está entregue.
+LOCAL_FILE_MARKER_PREFIX = "[[FILE:"
+
 # Injetado quando o turno veio do microfone (metadata["input_source"] == "voice").
 # É o contrário do _LIVE_STYLE_INSTRUCTION: aquele fala da SAÍDA (será falada),
 # este fala da ENTRADA (foi transcrita, e o ASR erra). Medido no corpus de produção
@@ -235,6 +241,22 @@ _INLINE_IMAGE_INSTRUCTION = (
     "lido em voz alta — é substituído pela imagem."
 )
 
+_LOCAL_FILE_INSTRUCTION = (
+    "## Arquivo que já está na máquina dele\n"
+    "Quando um arquivo foi parar no disco DO USUÁRIO (baixado por `run_command` na "
+    "máquina dele, ou pelo navegador dele), ele já está entregue: NÃO traga para o "
+    "sandbox nem publique com `file_save` só para dar um botão de download. Mostre "
+    "o arquivo escrevendo numa linha só `[[FILE:/caminho/absoluto/do/arquivo.mp4]]` "
+    "(espaços e acentos ficam como estão, sem aspas). O chat troca o marcador por um "
+    "cartão com o nome, o tamanho e o botão \"Mostrar no Finder\".\n"
+    "- O caminho tem que ter aparecido numa saída desta conversa (a linha do "
+    "`--print after_move:filepath` do yt-dlp, um `ls`, o resultado do `downloads`). "
+    "Nunca monte o nome de cabeça: se não souber, rode `ls -t ~/Downloads | head` antes.\n"
+    "- Caminho do sandbox (`/workspace/...`) NÃO vale aqui: esse continua sendo "
+    "`file_save` + botão de download.\n"
+    "- Escreva o marcador junto de uma frase curta, um por arquivo."
+)
+
 #: `[[IMAGE:/workspace/…]]`: caminho do SANDBOX num marcador de imagem.
 _IMAGEM_DO_SANDBOX = re.compile(r"\[\[IMAGE:\s*(/workspace/[^\]|]+?)\s*(\|[^\]]*)?\]\]")
 
@@ -280,6 +302,25 @@ def _imagens_do_sandbox_para_catalogo(
         return f"[[IMAGE:file:{fid}{(m.group(2) or '').rstrip()}]]"
 
     return _IMAGEM_DO_SANDBOX.sub(_troca, texto), trocados
+
+
+#: Extensões que o chat desenha. Um `[[IMAGE:/workspace/relatorio.pdf]]` não é
+#: imagem: publicar não faria aparecer nada, então fica como está.
+_EXTENSOES_DE_IMAGEM = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif")
+
+
+def _imagens_do_sandbox_soltas(texto: str) -> list[str]:
+    """Caminhos de `[[IMAGE:/workspace/…]]` que sobraram no texto, sem repetição.
+
+    Chamada DEPOIS de `_imagens_do_sandbox_para_catalogo`: o que ainda tem
+    `/workspace` é imagem que o modelo mostrou sem publicar.
+    """
+    vistos: list[str] = []
+    for m in _IMAGEM_DO_SANDBOX.finditer(texto or ""):
+        caminho = posixpath.normpath(m.group(1).strip())
+        if caminho.lower().endswith(_EXTENSOES_DE_IMAGEM) and caminho not in vistos:
+            vistos.append(caminho)
+    return vistos
 
 
 # Download no sandbox com URL que não veio de busca nem do Daniel, e que falhou.
@@ -371,6 +412,175 @@ def _urls_de_memoria(nome: str, argumentos: Any) -> list[str]:
         return _urls_sem_procedencia(argumentos if isinstance(argumentos, dict) else {}, autoridade)
     except Exception:  # noqa: BLE001 — o aviso é extra, nunca custa o round
         return []
+
+
+# O site recusou o SANDBOX (IP de datacenter), não o pedido. Na session-3ed86282
+# (17/11) o yt-dlp levou "Sign in to confirm you're not a bot" três vezes, trocando
+# de cliente, e o cérebro caiu num job do navegador mandando usar SaveFrom/y2mate:
+# link do googlevideo preso ao IP do SaveFrom (player preto), só vídeo sem áudio,
+# popup de anúncio e 23 passos até falhar. O mesmo yt-dlp no Mac dele (IP
+# residencial) baixou o vídeo em 3,4 s, com áudio.
+#: Frases do yt-dlp quando o site exige login/cookie: a do YouTube e a genérica
+#: de todo extrator (Instagram, TikTok…), que vem no fim da mesma mensagem.
+_ORIGEM_BLOQUEOU = re.compile(
+    r"confirm you(?:'|’)?re not a bot"
+    r"|Use --cookies-from-browser or --cookies for the authentication",
+    re.IGNORECASE,
+)
+
+#: Comando que funcionou no Mac (17/11): mp4 com áudio, e a última linha da saída
+#: é o caminho final do arquivo, que é o que o cartão `[[FILE:…]]` precisa.
+_YTDLP_NA_MAQUINA_DELE = (
+    'yt-dlp -P ~/Downloads -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b" '
+    '--merge-output-format mp4 --print after_move:filepath "<url>"'
+)
+
+_AVISO_ORIGEM_BLOQUEADA = (
+    "(aviso do sistema) O site barrou o SANDBOX, não o pedido: o sandbox sai por IP "
+    "de datacenter e o site exige login/cookie dele. Trocar cliente, formato ou versão "
+    "do yt-dlp NÃO resolve. Também não mande o navegador dele para site de download de "
+    "terceiros (SaveFrom, y2mate…): o link sai preso ao IP do site, vem sem áudio e "
+    "cheio de anúncio. Rode o MESMO download na máquina do Daniel, que tem IP "
+    f"residencial: `run_command` com `{_YTDLP_NA_MAQUINA_DELE}`. A última linha da saída "
+    "é o caminho do arquivo no disco dele: entregue com `[[FILE:<esse caminho>]]`, sem "
+    "trazer para o sandbox e sem `file_save`. Se a saída disser que o yt-dlp não existe "
+    "lá, conte isso a ele e ofereça `brew install yt-dlp`."
+)
+
+#: Sem `run_command` no turno (cliente sem máquina para atuar) não há rota certa.
+_AVISO_ORIGEM_BLOQUEADA_SEM_MAQUINA = (
+    "(aviso do sistema) O site barrou o SANDBOX, não o pedido: o sandbox sai por IP "
+    "de datacenter e o site exige login/cookie dele. Trocar cliente, formato ou versão "
+    "do yt-dlp NÃO resolve, e site de download de terceiros também não. Diga ao Daniel "
+    "que daqui não baixa e que, pelo app do desktop, o download roda na máquina dele."
+)
+
+
+def _origem_bloqueou(nome: str, resultado: Any) -> bool:
+    """O `neo_bash` levou bot-check/login do site (bloqueio pelo IP do sandbox)."""
+    if nome != "neo_bash" or not isinstance(resultado, dict):
+        return False
+    saida = f"{resultado.get('stdout') or ''}\n{resultado.get('stderr') or ''}"
+    return _ORIGEM_BLOQUEOU.search(saida) is not None
+
+
+def _aviso_origem_bloqueada(tools: list[Any]) -> str:
+    """O aviso certo para o toolset do turno: com máquina dele ou sem."""
+    if any(getattr(t, "name", None) == "run_command" for t in tools or []):
+        return _AVISO_ORIGEM_BLOQUEADA
+    return _AVISO_ORIGEM_BLOQUEADA_SEM_MAQUINA
+
+
+# Vídeo/áudio que JÁ está no Mac subindo para o catálogo só para virar botão de
+# download. Nas sessions b4f87e4d e 20fb0a92 (17/11) o yt-dlp do Mac baixou o
+# vídeo e o cérebro, com a instrução do `[[FILE:…]]` na mesa, fez
+# `request_user_file(stage=false)` + `file_offer`: 3,8 MB e 12 MB indo do Mac
+# para a VPS para voltar como uma segunda cópia. A instrução proibia
+# `file_save`, e ele achou a outra porta. Processar (transcrever, cortar)
+# usa `stage=true` e não passa por aqui.
+_EXTENSOES_DE_MIDIA = (
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+    ".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".aac",
+)
+
+_AVISO_MIDIA_JA_ESTA_NO_MAC = (
+    "(aviso do sistema) NÃO rodou: esse arquivo já está no disco do Daniel, e subir para "
+    "o catálogo só para dar um botão de download faz o vídeo atravessar a internet duas "
+    "vezes e criar uma segunda cópia. Entregue escrevendo `[[FILE:{caminho}]]` numa linha "
+    "própria: o chat mostra o arquivo com o botão \"Mostrar no Finder\". Se você PRECISA "
+    "do conteúdo aqui (transcrever, cortar, converter), chame de novo com `stage=true`; se "
+    "ele pediu para mandar o arquivo para outro lugar (e-mail, WhatsApp), chame de novo "
+    "igual e ele roda."
+)
+
+
+_AVISO_VIDEO_SEM_ESCOLHA = (
+    "(aviso do sistema) NÃO rodou: {motivo}. Antes de baixar vídeo do YouTube que o Daniel "
+    "não mandou o link, chame `neo_video_candidatos` com `consulta` = o nome que ele falou (e "
+    "`descricao` de como a cena é, se souber): ela compara título, canal, duração e views e, se "
+    "empatar, os quadros dos vídeos, e devolve qual baixar. Se ele já confirmou ESTE vídeo, "
+    "chame de novo igual e roda."
+)
+
+
+def _escolha_de_video_pendente(nome: str, argumentos: Any, pedido: str | None) -> str | None:
+    """Download do YouTube às cegas (busca do yt-dlp, ou link que não veio dele nem da
+    `neo_video_candidatos`)? Devolve o motivo; None se pode rodar. Nunca levanta.
+
+    Session-94621cc8 (17/11): o cérebro baixou o 1º do `web_search` (uma paródia) e o
+    classificador, o 1º do `ytsearch1:`. Ninguém comparava os candidatos.
+    """
+    if nome not in ("neo_bash", "run_command") or not isinstance(argumentos, dict):
+        return None
+    try:
+        from core.video.escolha import escolha_pendente
+        from shared.ajustes import ajustes
+
+        return escolha_pendente(
+            str(argumentos.get("command") or ""), pedido, ajustes().video.escolha_validade_s
+        )
+    except Exception as exc:  # noqa: BLE001 — trava extra, nunca derruba o round
+        logger.warning("[video] conferência do download falhou: %s", exc)
+        return None
+
+
+def _upload_so_para_entregar(nome: str, argumentos: Any) -> str | None:
+    """Caminho do vídeo/áudio do Mac que o cérebro quer subir sem processar.
+
+    Devolve o caminho quando a chamada é `request_user_file` de mídia, por caminho,
+    sem `stage` — o formato exato das duas sessões de 17/11. Qualquer outra coisa,
+    None.
+    """
+    if nome != "request_user_file" or not isinstance(argumentos, dict):
+        return None
+    caminho = str(argumentos.get("path") or "").strip()
+    if not caminho or str(argumentos.get("mode") or "path") != "path":
+        return None
+    if argumentos.get("stage") in (True, "true", "True", 1):
+        return None
+    return caminho if caminho.lower().endswith(_EXTENSOES_DE_MIDIA) else None
+
+
+#: Link markdown para caminho do disco dele (`[x](/Users/…/a.mp4)`): no chat não
+#: abre nada. O resumo do plano da session-94621cc8 (17/11) entregou o trecho
+#: cortado assim, sem o cartão. Vira `[[FILE:…]]` quando o cliente desenha o cartão.
+_LINK_LOCAL = re.compile(
+    r"\[[^\]\n]*\]\(\s*<?((?:/Users/|/home/|~/)[^)\n>]*?\.[A-Za-z0-9]{1,5})>?\s*\)"
+)
+
+
+def _links_locais_para_cartao(texto: str) -> str:
+    """Troca link markdown de arquivo local por `[[FILE:…]]` (sem mexer no resto)."""
+    if not texto or "](" not in texto:
+        return texto
+    return _LINK_LOCAL.sub(lambda m: f"{LOCAL_FILE_MARKER_PREFIX}{m.group(1).strip()}]]", texto)
+
+
+#: `open <arquivo>` / `open -a App <arquivo>` como follow-up de um download: o
+#: follow-up da session-94621cc8 abriu o vídeo no player "para anexar no chat",
+#: que ninguém pediu. Só passa se a mensagem pediu para abrir/tocar/ver.
+_FOLLOWUP_ABRE_ARQUIVO = re.compile(r"^\s*(?:open|xdg-open|start)\b", re.I)
+_PEDIU_PARA_ABRIR = re.compile(
+    r"\b(?:abr[ae]|abrir|abre|abri|open|toca|tocar|reproduz\w*|assist\w*|player|ver|veja|mostra|mostrar)\b",
+    re.I,
+)
+
+
+def _followup_abre_sem_pedido(comando: str, user_message: str) -> bool:
+    """O follow-up quer ABRIR um arquivo e o pedido não falou em abrir/tocar/ver?"""
+    return bool(_FOLLOWUP_ABRE_ARQUIVO.search(comando or "")) and not _PEDIU_PARA_ABRIR.search(
+        user_message or ""
+    )
+
+
+#: `QuickTime\\ Player`: o classificador escapou a barra duas vezes (JSON), e o
+#: shell quebrou o nome em `QuickTime\` + `Player` ("The file …/Player does not
+#: exist", session-94621cc8). Barra dupla antes de espaço vira a barra simples.
+_BARRA_DUPLA_ANTES_DE_ESPACO = re.compile(r"(?<!\\)\\\\ ")
+
+
+def _barra_dupla_para_simples(command: str) -> str:
+    return _BARRA_DUPLA_ANTES_DE_ESPACO.sub(lambda _m: "\\ ", command or "")
 
 
 _CLARIFICATION_INSTRUCTION = (
@@ -1173,7 +1383,7 @@ _ASYNC_JOB_TOOLS = frozenset({
 _WM_HEAVY_TOOLS = frozenset({
     "neo_bash", "neo_write_file", "file_read", "file_stage", "file_save",
     "deep_research", "deep_read", "web_fetch", "run_command", "browser_task",
-    "browser_local_task",
+    "browser_local_task", "neo_transcrever",
 })
 
 #: Passos que o caderno anota NA HORA (`_note_trace_step`), além do piso do fim do
@@ -1475,6 +1685,44 @@ def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[
             "size_bytes": result.get("size_bytes"), "path": arguments.get("path"),
             "versao_de": arguments.get("versao_de"),
         }
+    # ── caixa de email: QUEM mandou, o QUÊ e o id, que é como se volta nela ──
+    # O resumo genérico (`str(result)[:200]`) gastava os 200 caracteres com
+    # "caixa"/"credencial" e cortava antes do assunto. Na 19b47475 o turno
+    # seguinte respondeu "não tem assunto nem remetente" sobre um email que a
+    # tool tinha devolvido com os dois.
+    if name == "email_inbox" and isinstance(result, dict) and result.get("ok"):
+        return {
+            "tool": name, "ok": True, "janela_min": result.get("janela_min"),
+            "count": result.get("count"),
+            "mensagens": [
+                {
+                    "id": m.get("id"), "de": str(m.get("de") or "")[:80],
+                    "assunto": str(m.get("assunto") or "")[:100],
+                    "quando": m.get("quando"), "anexos": list(m.get("anexos") or [])[:5],
+                }
+                for m in (result.get("mensagens") or [])[:5]
+                if isinstance(m, dict)
+            ],
+        }
+    if name == "email_message" and isinstance(result, dict) and result.get("ok"):
+        msg = result.get("mensagem") or {}
+        return {
+            "tool": name, "ok": True, "id": msg.get("id"),
+            "de": str(msg.get("de") or "")[:80], "assunto": str(msg.get("assunto") or "")[:100],
+            "texto_chars": len(str(msg.get("texto") or "")),
+            "anexos": [
+                {"indice": a.get("indice"), "nome": a.get("nome"), "tipo": a.get("tipo")}
+                for a in (msg.get("anexos") or [])[:5]
+                if isinstance(a, dict)
+            ],
+            "note_detail": _note_detail(result),
+        }
+    if name == "email_anexo" and isinstance(result, dict) and result.get("ok"):
+        return {
+            "tool": name, "ok": True, "file_id": result.get("file_id"),
+            "name": result.get("name"), "size_bytes": result.get("size_bytes"),
+            "mime": result.get("mime"), "assunto": str(result.get("assunto") or "")[:100],
+        }
     if name == "claude_reply" and isinstance(result, dict) and result.get("job_id"):
         # O `job_id` em campo próprio: com a tarefa parada, a continuação nasce com
         # id NOVO, e é por ele que o balão desta resposta acha o processo
@@ -1487,6 +1735,59 @@ def _summarize_tool_call(name: str, arguments: dict[str, Any], tr: Any) -> dict[
         "tool": name, "ok": True, "summary": str(result)[:200],
         "note_detail": _note_detail(result),
     }
+
+
+def _server_tool_trace(steps: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Os passos do agente do SERVER_TOOL → ``(tool_trace, arquivos publicados)``.
+
+    O laço cognitivo monta as duas coisas enquanto roda; o ``AgentExecutor``, que
+    é quem executa o SERVER_TOOL, não monta nenhuma, e o turno salvava só o texto
+    final. Sessão 19b47475: no turno 5 o agente achou o email ("Chegou. Foto
+    para PDF…" no meio do laço), mas a resposta final foi "Job enfileirado…";
+    nos turnos 7 e 8 o Neo afirmou que a mensagem não tinha assunto nem
+    remetente. "Foto para PDF" não aparece nenhuma vez no histórico.
+
+    Mesmo resumo do cognitivo (`_summarize_tool_call`), então a nota do próximo
+    turno, o caderno e o registro de arquivos leem os dois trilhos igual. Aceita
+    ``AgentStep`` ou dict: o contrato do retorno do agente não promete o tipo.
+    """
+    trace: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+
+    def _get(obj: Any, attr: str) -> Any:
+        return obj.get(attr) if isinstance(obj, dict) else getattr(obj, attr, None)
+
+    for passo in steps or []:
+        calls = list(_get(passo, "tool_calls") or [])
+        results = list(_get(passo, "tool_results") or [])
+        por_id = {str(_get(r, "tool_call_id")): r for r in results}
+        for i, tc in enumerate(calls):
+            tr = por_id.get(str(_get(tc, "id")))
+            if tr is None and i < len(results):
+                tr = results[i]
+            if tr is None:
+                continue
+            nome = str(_get(tc, "name") or "")
+            argumentos = _get(tc, "arguments") or {}
+            try:
+                trace.append(_summarize_tool_call(nome, argumentos, tr))
+            except Exception as exc:  # noqa: BLE001 — resumo nunca derruba o turno
+                logger.debug("[server_tool] resumo de %s falhou: %s", nome, exc)
+                continue
+            resultado = _get(tr, "result")
+            if (
+                nome in ("file_save", "file_offer")
+                and not _get(tr, "error")
+                and isinstance(resultado, dict)
+                and resultado.get("file_id")
+            ):
+                files.append({
+                    "file_id": str(resultado["file_id"]),
+                    "name": resultado.get("name"),
+                    "size_bytes": resultado.get("size_bytes"),
+                    "path": str(argumentos.get("path") or ""),
+                })
+    return trace, files
 
 
 _HANDOFF_INSTRUCTION_RULES = (
@@ -1682,6 +1983,7 @@ _TOOL_PROGRESS_LABEL: dict[str, str] = {
     "skill_read": "abrindo a skill",
     "email_inbox": "olhando a caixa de email",
     "email_message": "lendo o email",
+    "email_anexo": "pegando o anexo do email",
     "email_send": "enviando o email",
     "get_weather": "consultando o clima",
     "device_control": "falando com o aparelho",
@@ -1689,6 +1991,8 @@ _TOOL_PROGRESS_LABEL: dict[str, str] = {
     "browser_task": "abrindo o navegador do servidor",
     "deep_research": "abrindo a pesquisa profunda",
     "deep_read": "delegando a leitura dos documentos",
+    "neo_transcrever": "transcrevendo o áudio",
+    "neo_video_candidatos": "comparando os vídeos encontrados",
     "claude_task": "passando a tarefa para o Claude Code",
     "claude_reply": "falando com o Claude Code",
     "claude_sessoes": "olhando as sessões do Claude no Mac",
@@ -2391,6 +2695,53 @@ def _aviso_rota(decision: Any) -> str | None:
     return _AVISO_ROTA_SANDBOX
 
 
+#: O que o classificador leu do pedido sobre um vídeo/áudio (`decision.midia`,
+#: docs/transcricao-groq.md). Sem isto o cérebro escolhia sozinho entre
+#: transcrever a fala e fazer OCR da tela — e as duas coisas se chamam
+#: "transcrição" na boca do Daniel (12/09: gravação de tela de chat era OCR).
+#: A nota de casamento das skills ainda aponta "transcricao do video" para a
+#: ocr-video; o aviso vai por último, que é a posição que o modelo segue.
+_TRAZER_DO_DISCO = (
+    "Arquivo no computador do Daniel: traga antes com `request_user_file(mode=\"path\", "
+    "path=<o caminho que ele citou>, stage=true)` e use o caminho em /workspace que voltar."
+)
+_AVISO_MIDIA = {
+    "fala": (
+        "## Este pedido é sobre a FALA de um vídeo/áudio\n"
+        "Use `neo_transcrever`: o sandbox tira o áudio e o Whisper do Groq transcreve. "
+        + _TRAZER_DO_DISCO
+        + " Não rode whisper nem ffmpeg na máquina dele e não instale reconhecedor de fala "
+        "no sandbox. A skill ocr-video é para TEXTO na tela: não serve aqui."
+    ),
+    "tela": (
+        "## Este pedido é sobre o TEXTO que aparece na tela do vídeo\n"
+        "É OCR, não transcrição de fala: leia a skill `ocr-video` (`skill_read`) e siga-a. "
+        "Não use `neo_transcrever`, que só lê o que é falado."
+    ),
+    "conteudo": (
+        "## Este pedido é sobre o conteúdo de um vídeo/áudio\n"
+        "Decida primeiro o que ele quer: a FALA (o que é dito) é `neo_transcrever`; o TEXTO "
+        "que aparece na tela (gravação de conversa, slides) é a skill `ocr-video`. "
+        + _TRAZER_DO_DISCO
+    ),
+}
+
+
+def _aviso_midia(decision: Any, tools: list[Any]) -> str | None:
+    """O aviso deste turno quando o pedido é sobre a fala ou a tela de um vídeo."""
+    midia = getattr(decision, "midia", None)
+    if midia not in _AVISO_MIDIA:
+        return None
+    if getattr(decision, "intent", None) != IntentType.DIRECT_RESPONSE:
+        return None
+    tem_transcricao = any(getattr(t, "name", "") == "neo_transcrever" for t in tools)
+    if midia == "fala" and not tem_transcricao:
+        return None
+    if midia == "conteudo" and not tem_transcricao:
+        return _AVISO_MIDIA["tela"]
+    return _AVISO_MIDIA[midia]
+
+
 def _drop_music_handoff_after_browser(
     handoffs: list[Handoff], browser_actuated: bool
 ) -> list[Handoff]:
@@ -2513,6 +2864,21 @@ def _norm_user_path(path: Any, metadata: dict[str, Any] | None = None) -> str:
     if len(p) > 1:
         p = p.rstrip("/")
     return p.casefold()
+
+
+def _home_expandido(path: Any, metadata: dict[str, Any] | None = None) -> Any:
+    """``~`` e ``~/…`` trocados pelo ``home_dir`` do desktop; o resto, intacto.
+
+    Para o caminho que VAI ao cliente: sem casefold nem colapso de barras (os de
+    cima são chaves de comparação). Sem ``home_dir`` no metadata, devolve como veio.
+    """
+    if not isinstance(path, str):
+        return path
+    p = path.strip()
+    home = str((metadata or {}).get("home_dir") or "").rstrip("/")
+    if home and (p == "~" or p.startswith("~/")):
+        return home + p[1:]
+    return path
 
 
 def _ledger_host_path(path: Any, metadata: dict[str, Any] | None = None) -> str | None:
@@ -2922,6 +3288,13 @@ def _near_repeated_actuation(
     for verbo, opcoes, alvos in forma:
         achou = False
         for i, passo in enumerate(steps or [], 1):
+            # Passo que FALHOU não respondeu nada: a saída dele é o erro. Na
+            # session-94621cc8 (17/11) `open -a QuickTime\\ Player x.mp4` falhou
+            # pela barra dupla, e a correção `open -a "QuickTime Player" x.mp4`
+            # foi barrada como "os passos 1 já cobriram esses caminhos". O
+            # comando IDÊNTICO continua barrado por `_repeated_actuation`.
+            if (passo or {}).get("ok") is False:
+                continue
             for v_ant, o_ant, alvos_ant in _actuation_shape((passo or {}).get("command")):
                 if v_ant != verbo or o_ant != opcoes or not alvos_ant:
                     continue
@@ -3568,7 +3941,10 @@ class AIService:
                     + "\n".join(linhas)
                     + "\nA senha está no cofre e você não a vê: quem preenche é a tool "
                     "(browser_task com `credentials`). Para ler a caixa (código/link de "
-                    "confirmação que você mesmo provocou), use `email_inbox`."
+                    "confirmação que você mesmo provocou), use `email_inbox`. O usuário "
+                    "também pode te mandar ARQUIVO por email: o `email_inbox` lista os "
+                    "anexos e o `email_anexo` traz um deles para o catálogo (depois, "
+                    "`file_stage` leva ao sandbox)."
                     + (
                         "\nVocê também ENVIA: `email_send` manda um email a partir dessa "
                         "caixa, com você como remetente. Vale para 'manda um email pra "
@@ -4564,7 +4940,9 @@ class AIService:
         if self._client_renders_inline_images(metadata):
             self._image_capable_sessions.add(str(sid))
             sys_context = "\n\n".join(
-                part for part in (sys_context, _INLINE_IMAGE_INSTRUCTION) if part
+                part
+                for part in (sys_context, _INLINE_IMAGE_INSTRUCTION, _LOCAL_FILE_INSTRUCTION)
+                if part
             )
         else:
             self._image_capable_sessions.discard(str(sid))
@@ -5584,8 +5962,17 @@ class AIService:
         ):
             try:
                 sticky = await self._active_skill(session_id)
-                _kw_match = self.skill_library.keyword_match(user_message)
-                _autoload = self.skill_library.autoload_for(user_message, sticky=sticky)
+                # Na continuação automática, só o título do job e o combinado
+                # contam: a saída do job e o texto fixo do sistema carregavam skill
+                # por acaso (ver `intencao_da_continuacao`). A skill ativa da sessão
+                # (sticky) e o `skill_read` pedido pelo job seguem valendo.
+                from core.jobs.manager import intencao_da_continuacao
+
+                _texto_da_skill = intencao_da_continuacao(user_message)
+                if _texto_da_skill is None:
+                    _texto_da_skill = user_message
+                _kw_match = self.skill_library.keyword_match(_texto_da_skill)
+                _autoload = self.skill_library.autoload_for(_texto_da_skill, sticky=sticky)
             except Exception as e:  # noqa: BLE001 — autoload nunca derruba o turno
                 logger.warning("[SkillLibrary] autoload_for falhou: %s", e)
                 _autoload = None
@@ -6149,6 +6536,14 @@ class AIService:
                             "Rota do classificador",
                             "onde=sandbox: aviso no fim do prompt (internet + sandbox, não a máquina dele).",
                         )
+                _aviso_da_midia = _aviso_midia(decision, cognitive_tools)
+                if _aviso_da_midia:
+                    messages.append(Message(role=MessageRole.SYSTEM, content=_aviso_da_midia))
+                    if slog:
+                        slog.log_event(
+                            "Mídia do classificador",
+                            f"midia={decision.midia}: aviso no fim do prompt.",
+                        )
                 _skill_tool_names = {t.name for t in _autoloaded_tools}
                 _used_tools: set[str] = set()
                 # Progresso ao vivo: o loop empurra linhas numa fila e o drenador
@@ -6177,6 +6572,7 @@ class AIService:
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
                     annotate_result=self._origin_annotator(user_id, session_id),
+                    pedido=user_message,
                 ):
                     yield _bolha
                 full_response = _run.text
@@ -6292,6 +6688,7 @@ class AIService:
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
                     annotate_result=self._origin_annotator(user_id, session_id),
+                    pedido=user_message,
                 ):
                     yield _bolha
                 full_response = _run2.text
@@ -6313,6 +6710,7 @@ class AIService:
                 slog=slog,
                 depth=_actuation_depth,
                 steps=_actuation_steps,
+                midia=getattr(decision, "midia", None),
             ):
                 yield resp
             return
@@ -6377,6 +6775,13 @@ class AIService:
         full_response, _imagens_trocadas = _imagens_do_sandbox_para_catalogo(
             full_response, produced_files
         )
+        # O que sobrou com `/workspace` é imagem mostrada SEM `file_save`: o servidor
+        # publica e troca, em vez de deixar o cartão de erro.
+        if await self._publicar_imagens_soltas(
+            full_response, produced_files, user_id=user_id, session_id=session_id, slog=slog
+        ):
+            full_response, _mais = _imagens_do_sandbox_para_catalogo(full_response, produced_files)
+            _imagens_trocadas += _mais
         if _imagens_trocadas and slog:
             slog.log_event(
                 "Imagem do sandbox → catálogo",
@@ -6536,6 +6941,16 @@ class AIService:
                         f"A resposta prometeu trabalho sem emitir o bloco — "
                         f"sintetizado: {synth.input_text}",
                     )
+        elif not enable_handoff and _allow_self:
+            # Turno RETOMADO (depois de um comando aprovado na máquina dele) roda sem
+            # handoff, e o bloco acima nunca rodava: a promessa que depende do job
+            # aberto aqui se perdia. Sessão be8d195e: `ls` da foto → retomada →
+            # job "só mapear" + "te aviso com a lista do que vou mudar" → o job
+            # acabou em 26 s e ninguém voltou. Sem orquestrador, a sobra só tem um
+            # destino: o `then` do job.
+            await self._pendurar_promessa_da_retomada(
+                user_message, full_response, tool_trace, metadata, slog
+            )
 
         # Voice imitation: pull any [[VOICE:name]]…[[/VOICE]] spans out of the reply
         # into ordered speech segments so the renderer switches TTS voice per span.
@@ -6824,6 +7239,25 @@ class AIService:
                 tools += list(WORKBENCH_TOOLS)
         except Exception as e:  # noqa: BLE001
             logger.warning("[Workbench] could not load workbench tools: %s", e)
+        # Transcrição (docs/transcricao-groq.md): só com chave do Groq em uso — sem
+        # ela a tool seria uma promessa vazia, e o modelo iria instalar whisper.
+        try:
+            from core.transcricao import TRANSCRICAO_TOOLS
+            from core.transcricao import config as _transcricao
+
+            if self.agent.tool_registry.exists("neo_transcrever") and _transcricao.disponivel():
+                tools += list(TRANSCRICAO_TOOLS)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Transcrição] tool fora do toolset: %s", e)
+        # Escolher o vídeo do YouTube antes de baixar (core/video): só com o
+        # sandbox, que é onde a busca roda.
+        try:
+            from core.video import VIDEO_TOOLS
+
+            if self.agent.tool_registry.exists("neo_video_candidatos"):
+                tools += list(VIDEO_TOOLS)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Vídeo] tool fora do toolset: %s", e)
         if self.job_manager is not None:
             try:
                 from core.jobs import JOB_TOOLS
@@ -7523,6 +7957,11 @@ class AIService:
         para todo o pós-processamento (handoff, segmentos de fala, guardas).
         """
         fila: asyncio.Queue[str] = asyncio.Queue()
+        # O cliente desenha `[[FILE:…]]`? Mesmo gate do `[[IMAGE:…]]`.
+        loop_kwargs.setdefault(
+            "arquivo_local_no_chat",
+            str(session_id) in (getattr(self, "_image_capable_sessions", None) or set()),
+        )
         task = asyncio.create_task(self._run_cognitive_tool_loop(progress=fila, **loop_kwargs))
         try:
             while True:
@@ -7706,6 +8145,8 @@ class AIService:
         progress: "asyncio.Queue[str] | None" = None,
         on_step: Any = None,
         annotate_result: Any = None,
+        arquivo_local_no_chat: bool = False,
+        pedido: str | None = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -7747,6 +8188,11 @@ class AIService:
         ("cade os arquivos?") refaça do zero um trabalho que já foi feito.
         """
         max_rounds = self.settings.cognitive_max_tool_rounds
+        # Mídia do Mac que já foi recusada uma vez neste turno: a 2ª chamada igual
+        # passa (ver `_AVISO_MIDIA_JA_ESTA_NO_MAC`).
+        midia_avisada: set[str] = set()
+        # Download de vídeo às cegas já avisado neste turno: o 2º igual passa.
+        video_avisado: set[str] = set()
         # Chamada já feita neste turno → o texto do resultado que ela deu, para o
         # aviso de repetição mostrar ao modelo O QUE ele repetiu.
         seen: dict[tuple[str, str], str] = {}
@@ -8264,6 +8710,42 @@ class AIService:
                     # in-process. Quebra o loop AGORA (antes de qualquer bookkeeping) e
                     # deixa _handle_direct_response emitir o tool_request; o turno retoma
                     # em process_tool_result quando o desktop devolver o resultado.
+                    motivo_video = (
+                        _escolha_de_video_pendente(tc.name, tc.arguments, pedido)
+                        if any(getattr(t, "name", None) == "neo_video_candidatos" for t in tools)
+                        else None
+                    )
+                    comando_video = str((tc.arguments or {}).get("command") or "") if motivo_video else ""
+                    if motivo_video and comando_video not in video_avisado:
+                        video_avisado.add(comando_video)
+                        result_lines.append(
+                            f"Tool: {tc.name}\nResult: "
+                            + _AVISO_VIDEO_SEM_ESCOLHA.format(motivo=motivo_video)
+                        )
+                        if slog:
+                            slog.log_event(
+                                "Aviso de vídeo sem escolha",
+                                f"`{tc.name}` não rodou ({motivo_video}): {comando_video[:160]}",
+                            )
+                        continue
+                    caminho_midia = (
+                        _upload_so_para_entregar(tc.name, tc.arguments)
+                        if arquivo_local_no_chat
+                        else None
+                    )
+                    if caminho_midia and caminho_midia not in midia_avisada:
+                        midia_avisada.add(caminho_midia)
+                        result_lines.append(
+                            f"Tool: {tc.name}\nResult: "
+                            + _AVISO_MIDIA_JA_ESTA_NO_MAC.format(caminho=caminho_midia)
+                        )
+                        if slog:
+                            slog.log_event(
+                                "Aviso de mídia já no Mac",
+                                f"`request_user_file` de {caminho_midia} sem stage — não rodou; "
+                                "aviso para entregar com [[FILE:…]].",
+                            )
+                        continue
                     if tc.name in _ALL_ACTUATION_TOOLS:
                         if slog:
                             slog.log_event("Cognitive Tool (client-actuating)", f"→ `{tc.name}` {tc.arguments}")
@@ -8322,7 +8804,15 @@ class AIService:
                         result_lines.append(nota_extra)
                         if slog:
                             slog.log_event("Aviso de origem", f"`{tc.name}` → {nota_extra}")
-                    if urls_de_memoria and not tr.error and _download_falhou(tr.result):
+                    if not tr.error and _origem_bloqueou(tc.name, tr.result):
+                        result_lines.append(_aviso_origem_bloqueada(tools))
+                        if slog:
+                            slog.log_event(
+                                "Aviso de origem bloqueada",
+                                "O site barrou o sandbox (bot-check/login) — aviso para "
+                                "rodar na máquina do Daniel.",
+                            )
+                    elif urls_de_memoria and not tr.error and _download_falhou(tr.result):
                         result_lines.append(_AVISO_URL_DE_MEMORIA)
                         if slog:
                             slog.log_event(
@@ -8943,6 +9433,10 @@ class AIService:
         # Para achar os jobs que ESTE turno abriu, se ele falhar depois (ver
         # `_note_jobs_opened`). Naive UTC, como o `created_at` do banco.
         desde = datetime.utcnow()
+        # O que as tools do agente devolveram e os arquivos que ele publicou —
+        # ver `_server_tool_trace`. Vazios se o agente nem chegou a rodar.
+        tool_trace: list[dict[str, Any]] = []
+        produced_files: list[dict[str, Any]] = []
         try:
             # Executor por-request: é ele que dá usuário às tools server-side.
             # O stack vive em build_request_executor porque a agenda usa o MESMO
@@ -9114,6 +9608,16 @@ class AIService:
                 return len(calls or [])
 
             chamadas = sum(_n_calls(p) for p in (result.get("steps") or []))
+            tool_trace, produced_files = _server_tool_trace(result.get("steps"))
+            for _entrada in tool_trace:
+                # Caderno + registro de arquivos, como o `on_step` do cognitivo
+                # faz a cada passo (é o que dá dono ao `file_save`/`email_anexo`).
+                try:
+                    await self._note_trace_step(
+                        _entrada, user_id=user_id, session_id=session_id, slog=slog
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[server_tool] passo não anotado: %s", exc)
             if slog:
                 nome = decision.tool_name or "agent"
                 meta = result.get("metadata") or {}
@@ -9164,7 +9668,13 @@ class AIService:
                 final_text, user_id=user_id, session_id=session_id, since=desde
             )
 
-        # Save response
+        # Save response — com o que as tools devolveram (nota técnica do próximo
+        # turno, ver session_manager._render_tool_trace_note) e os arquivos.
+        _msg_metadata: dict[str, Any] = {}
+        if tool_trace:
+            _msg_metadata["tool_trace"] = _strip_note_detail(tool_trace)
+        if produced_files:
+            _msg_metadata["files"] = produced_files
         await self.sessions.add_message(
             session_id=session_id,
             role="assistant",
@@ -9172,8 +9682,18 @@ class AIService:
             tool_name=decision.tool_name,
             generate_embedding=False,
             user_id=user_id,
+            metadata=_msg_metadata or None,
         )
         if slog:
+            if tool_trace:
+                slog.log_event(
+                    "Tools do agente do SERVER_TOOL (vão para o próximo turno)",
+                    "\n".join(
+                        f"- `{e.get('tool')}` "
+                        + ("ok" if e.get("ok", True) else f"falhou: {e.get('error')}")
+                        for e in tool_trace[:12]
+                    ),
+                )
             slog.log_message_saved("assistant", final_text, str(session_id))
             slog.log_final_response(final_text, "SERVER_TOOL", iterations=iterations)
 
@@ -9183,6 +9703,9 @@ class AIService:
             message=final_text,
             is_final=True,
             iterations=iterations,
+            # Botão de download do que o agente publicou com file_save — o
+            # gRPC só lê `files` do metadata da resposta final.
+            metadata={"files": produced_files} if produced_files else None,
         )
 
     # ---------------------------------------------------------------
@@ -9721,6 +10244,48 @@ class AIService:
                 continue
             mantidos.append(h)
         return mantidos
+
+    async def _pendurar_promessa_da_retomada(
+        self,
+        user_message: str,
+        full_response: str,
+        tool_trace: list[dict[str, Any]] | None,
+        metadata: dict[str, Any] | None,
+        slog: Any = None,
+    ) -> bool:
+        """A promessa de um turno retomado vira o `then` do job que ele abriu.
+
+        Mesma regra do turno normal: só com job aberto sem `then` e só se sobrar
+        promessa depois de tirar o "te aviso quando terminar". Nunca levanta.
+        """
+        try:
+            job_aberto = _ultimo_job_sem_continuacao(tool_trace)
+            if not job_aberto or not _promise_beyond_notice(full_response):
+                return False
+            jobs_linhas, tem_continuacao = _open_jobs(tool_trace)
+            if tem_continuacao:
+                return False
+            synth = await self._verify_promise_continuation(
+                user_message,
+                full_response,
+                (metadata or {}).get("pipeline_work_note"),
+                jobs_linhas,
+            )
+            if synth is None or not await self._pendurar_no_job(job_aberto, synth.input_text):
+                return False
+        except Exception as exc:  # noqa: BLE001 — o turno já respondeu; isto é extra
+            logger.warning("[SELF-HANDOFF] retomada: não pendurei a promessa: %s", exc)
+            return False
+        logger.info(
+            "[SELF-HANDOFF] retomada: continuação pendurada no job %s: %s",
+            job_aberto, synth.input_text[:120],
+        )
+        if slog:
+            slog.log_event(
+                "Continuação pendurada no job (turno retomado)",
+                f"job {job_aberto}: {synth.input_text} — roda quando ele terminar",
+            )
+        return True
 
     async def _pendurar_no_job(self, job_id: str, ordem: str, *, juntar: bool = False) -> bool:
         """A continuação vira o `then` do job aberto — se ele ainda não acabou.
@@ -10547,6 +11112,10 @@ class AIService:
         """`_quote_known_paths` com as fontes da sessão, e sem nunca levantar."""
         if not command:
             return command
+        sem_barra_dupla = _barra_dupla_para_simples(command)
+        if sem_barra_dupla != command:
+            logger.info("[shell] barra dupla antes de espaço: %r → %r", command, sem_barra_dupla)
+            command = sem_barra_dupla
         try:
             conhecidos = self._known_paths(session_id, tool_arguments)
             if not conhecidos:
@@ -10828,6 +11397,64 @@ class AIService:
             logger.warning("[FileLedger] bloco indisponível: %s", exc)
             return None
 
+    async def _publicar_imagens_soltas(
+        self,
+        texto: str,
+        produced_files: list[dict[str, Any]],
+        *,
+        user_id: "UUID | None",
+        session_id: "UUID | None",
+        slog: Any = None,
+    ) -> list[str]:
+        """Publica no catálogo as imagens do sandbox que a resposta mostrou sem `file_save`.
+
+        O marcador é desenhado no Mac, que não enxerga o `/workspace`. Na
+        session-6e483f5d (turno 8) o Neo escreveu `[[IMAGE:/workspace/pdf-foto/op_1.png]]`
+        sem publicar, o Daniel viu o cartão de erro e, dois turnos depois, o Neo
+        culpou "4 MB de PNG" (o limite do desktop é 24 MB). A instrução já mandava
+        publicar antes; aqui vira código. Mesmo `harvest` do `file_save` (guarda de
+        caminho, `perm`), e cada uma entra em ``produced_files`` — a troca por
+        `file:<id>` e o botão de download saem iguais aos de um `file_save`. Devolve
+        os caminhos publicados; falha numa imagem só deixa aquele marcador como está.
+        """
+        store = getattr(self, "file_store", None)
+        if store is None:
+            return []
+        soltas = _imagens_do_sandbox_soltas(texto)
+        if not soltas:
+            return []
+        try:
+            teto = ajustes().cerebro.imagens_publicadas_max
+        except Exception:  # noqa: BLE001 — ajuste ilegível não derruba a resposta
+            teto = 6
+        publicadas: list[str] = []
+        for caminho in soltas[: max(0, teto)]:
+            try:
+                entrada = await store.harvest(
+                    caminho, retention="perm", user_id=user_id, session_id=session_id
+                )
+            except Exception as exc:  # noqa: BLE001 — sem a imagem, fica o cartão de erro
+                logger.warning("[imagens] %s não foi publicada: %s", caminho, exc)
+                continue
+            item = {
+                "file_id": str(entrada.id),
+                "name": entrada.name,
+                "size_bytes": entrada.size_bytes,
+                "path": caminho,
+            }
+            produced_files.append(item)
+            publicadas.append(caminho)
+            await self._record_file_link(
+                {"tool": "file_save", "ok": True, **item},
+                user_id=user_id, session_id=session_id,
+            )
+        if publicadas and slog:
+            slog.log_event(
+                "Imagem do sandbox publicada pelo servidor",
+                "A resposta mostrava sem `file_save`: " + ", ".join(publicadas[:6]),
+            )
+        return publicadas
+
     async def _record_file_link(
         self, entry: dict[str, Any], *, user_id: "UUID | None", session_id: "UUID | None"
     ) -> None:
@@ -10862,6 +11489,19 @@ class AIService:
                     sandbox_path=entry.get("path"), file_id=entry["file_id"],
                     sha256=getattr(entrada, "sha256", None), size_bytes=entry.get("size_bytes"),
                     versao_de=entry.get("versao_de"),
+                )
+            elif tool == "email_anexo" and entry.get("file_id"):
+                # O anexo que ele mandou por email é, para a conversa, um arquivo
+                # que ele ANEXOU: entra no anel 1 e ganha dono (o executor de email
+                # é global e não sabe de quem é o turno).
+                entrada = await catalogo(entry["file_id"])
+                if store is not None:
+                    await store.assign_owner(entry["file_id"], user_id=user_id, session_id=session_id)
+                await ledger.record(
+                    user_id=user_id, session_id=session_id, action="attached",
+                    name=entry.get("name") or getattr(entrada, "name", ""),
+                    file_id=entry["file_id"], sha256=getattr(entrada, "sha256", None),
+                    size_bytes=entry.get("size_bytes"),
                 )
             elif tool == "file_stage" and entry.get("file_id"):
                 entrada = await catalogo(entry["file_id"])
@@ -11116,6 +11756,7 @@ class AIService:
         slog: "SessionFileLogger | None",
         depth: int = 0,
         steps: list[dict[str, Any]] | None = None,
+        midia: str | None = None,
     ) -> AsyncIterator[AIServiceResponse]:
         """Emite o ``tool_request`` de uma tool de arquivo client-actuating.
 
@@ -11294,6 +11935,7 @@ class AIService:
                 # Transcript acumulado do turno: sem isto cada retomada recomeça
                 # do zero e o cérebro repete o comando que acabou de rodar.
                 "steps": list(steps or []),
+                "midia": midia,
             }
             if trace is not None:
                 self._pending_traces[sid] = trace
@@ -11536,6 +12178,13 @@ class AIService:
                     caminho_rebaixado = path
                     args.pop("path", None)
             args["mode"] = mode
+            # O desktop sobe o caminho com `upload_path_to_store`, que vai direto ao
+            # `tokio::fs::metadata` e NÃO expande "~" (os outros handlers de arquivo
+            # expandem). "~/Downloads/x.mp4" voltava "No such file or directory" duas
+            # vezes seguidas (sessão 916fe494). Expande DEPOIS da guarda, que julga o
+            # caminho como o modelo o escreveu.
+            if mode == "path" and args.get("path"):
+                args["path"] = _home_expandido(args["path"], metadata)
             if mode == "path" and _repeated_actuation(
                 steps, f"request_user_file {args.get('path')}"
             ):
@@ -11561,6 +12210,11 @@ class AIService:
             "file_id": args.get("file_id"),
             "source_path": fonte_escrita or None,
             "steps": list(steps or []),
+            # O rótulo do classificador atravessa a retomada: sem ele o aviso de
+            # mídia (`_aviso_midia`) sumia justo no turno que já tem o vídeo no
+            # sandbox, e a nota de skills ("transcricao do video" → ocr-video)
+            # ficava sozinha para decidir entre fala e tela.
+            "midia": midia,
         }
         if trace is not None:
             self._pending_traces[sid] = trace
@@ -11657,6 +12311,8 @@ class AIService:
             # `temperatura_com_ferramentas` (session-1bbdd7c5: as duas repetições
             # literais saíram dessas rodadas). Ver [cerebro] no neo.toml.
             onde="maquina",
+            # Fala × tela do vídeo, como o classificador leu no começo do pedido.
+            midia=(pend or {}).get("midia"),
         )
         depth = int((pend or {}).get("depth", 0)) + 1
         # enable_handoff=False: a retomada existe pra LER/ENTREGAR o arquivo e
@@ -12803,6 +13459,8 @@ class AIService:
                     can_show_images=str(session_id) in self._image_capable_sessions,
                     history=_fmt_hist,
                 )
+            if str(session_id) in self._image_capable_sessions:
+                final_text = _links_locais_para_cartao(final_text)
 
             # ── MULTI-STEP FOLLOW-UP: only when NOT using plan-based execution ──
             if not active_plan and _followup_count < MAX_FOLLOWUP_STEPS:
@@ -12815,6 +13473,9 @@ class AIService:
                 if followup and followup.get("needed"):
                     followup_cmd = followup.get("command", "")
                     followup_explanation = followup.get("explanation", "Executando próximo passo...")
+                    if followup_cmd and _followup_abre_sem_pedido(followup_cmd, user_message):
+                        logger.info("[FOLLOWUP] descartado: abrir arquivo que ninguém pediu (%s)", followup_cmd)
+                        followup_cmd = ""
                     if followup_cmd and not self._is_blocking_command(followup_cmd):
                         logger.info(
                             f"[FOLLOWUP] Step {_followup_count + 1}: {followup_cmd}"
@@ -14129,6 +14790,16 @@ class AIService:
             if can_show_images
             else ""
         )
+        # Arquivo que o comando BAIXOU/CRIOU na máquina dele (yt-dlp, curl): o
+        # cartão `[[FILE:…]]` mostra e abre no Finder. Mesmo gate do IMAGE.
+        if can_show_images:
+            image_rule += (
+                "\nSe o comando baixou ou criou o arquivo que ele pediu, entregue com "
+                "`[[FILE:/caminho/absoluto/do/arquivo]]` numa linha própria (o chat mostra "
+                "o arquivo com o botão \"Mostrar no Finder\"). Caminho relativo na saída "
+                "(`Merging formats into \"x.mp4\"`) se resolve pela pasta do `cd` do "
+                "comando; não invente nome que não apareceu."
+            )
         # Só as últimas trocas, e cortadas: isto é contexto para desambiguar um
         # pedido curto, não o turno cognitivo inteiro.
         historico_bloco = ""
@@ -14275,7 +14946,8 @@ class AIService:
             "Exemplos de quando ESTÁ completo:\n"
             '- Usuário pediu "liste os arquivos" e o comando listou.\n'
             '- Usuário pediu "mostre o conteúdo do arquivo" e o comando já mostrou o conteúdo.\n'
-            '- Usuário pediu "qual meu IP" e o comando retornou o IP.\n\n'
+            '- Usuário pediu "qual meu IP" e o comando retornou o IP.\n'
+            '- Usuário pediu "baixa X e me manda aqui no chat" e o comando baixou: a resposta mostra o arquivo no chat; NÃO abra o arquivo nem rode nada para "anexar".\n\n'
             "Responda APENAS com JSON válido (sem markdown fences):\n"
             '{"needed": false} se o pedido já foi completamente atendido.\n'
             '{"needed": true, "command": "comando_shell_para_completar", "explanation": "explicação curta em português"}\n'

@@ -65,6 +65,11 @@ mensagem_max = 1500
 # Enquanto você escreve no painel da aba, o agente não mexe na página (senão o
 # cursor sai do campo). Até quantos segundos ele espera, por ação.
 digitando_espera_max_s = 90.0
+# Na conferência antes de Salvar/Enviar, cada campo aparece com o valor inteiro
+# até este tamanho (caracteres); maior, aparece começo e fim com o total.
+conferencia_valor_max = 1500
+# Maior pergunta que o painel da aba mostra, em caracteres.
+pergunta_painel_max = 4000
 
 
 [navegador.julgamento]
@@ -104,6 +109,48 @@ mensagens_lidas = 300
 tarefas_lidas = 60
 # Por quanto tempo (h) a última tarefa num site decide a próxima no mesmo site.
 site_vale_por_horas = 12.0
+
+
+[navegador.tarefa]
+# O que cada tarefa no navegador leva para o agente, e o que ele pode enviar a
+# um site.
+
+# As suas palavras que o agente lê em todo passo, em caracteres. Mensagem maior
+# perde o meio (começo e fim ficam).
+falas_max = 4000
+# Material de referência que o Neo manda junto com a tarefa (o texto de um
+# currículo, os dados de um pedido), em caracteres. Entra em todo passo: maior
+# custa mais tokens.
+contexto_max = 8000
+# Maior arquivo do seu disco que o agente envia a um site (foto, PDF), em MB.
+# Só sai arquivo cujo caminho você escreveu na conversa.
+arquivo_max_mb = 25.0
+# Maior arquivo que o próprio Neo gerou ou que você anexou no chat (fica no
+# catálogo, não no seu disco) que o agente envia a um site, em MB. Vai pelo canal
+# do desktop, que aceita até ~11 MB de arquivo.
+catalogo_max_mb = 10.0
+
+[navegador.visao]
+# Prints de CONFIRMAÇÃO: o Neo tira print sozinho antes e depois de cada campo
+# que edita, antes e depois de enviar um formulário, quando abre um modal, quando
+# muda de página e depois de um upload. Ligado é mais seguro e mais lento (cada
+# print custa ~2 s hoje); desligado, ele decide pela página em texto, como
+# sempre. Por enquanto os prints só vão para o diário da tarefa.
+confirmacao_visual = true
+# Máximo de prints de confirmação por tarefa.
+prints_max = 60
+# No print de um campo, quanto da área abaixo dele entra (onde aparece "campo
+# obrigatório"), em px.
+recorte_margem_px = 120
+# Cada print é conferido pela visão (pergunta fechada: "o campo mostra o que foi
+# digitado? há erro na tela?") enquanto o agente segue; o resultado entra no
+# passo seguinte. Máximo de conferências por tarefa e quantas ao mesmo tempo.
+analises_max = 40
+paralelas_max = 2
+# Largura máxima do print de tela inteira (px). Menor = mais rápido e barato.
+largura_max_px = 1280
+# Teto do raciocínio do modelo de visão em cada conferência (tokens).
+teto_raciocinio = 200
 
 [trabalho]
 # O Neo nas sessões do Claude Code que você usa no Mac (VSCode ou terminal):
@@ -150,6 +197,10 @@ repeticoes_seguidas_max = 3
 # Quanto do resultado anterior volta no aviso de chamada repetida, em
 # caracteres (a chamada repetida leva a metade disto).
 repeticao_trecho_max = 800
+# Imagem do sandbox que a resposta mostra ([[IMAGE:/workspace/…]]) sem ter sido
+# publicada com file_save: quantas o servidor publica sozinho por resposta, para
+# o chat conseguir desenhar (o Mac não enxerga o /workspace). 0 = desligado.
+imagens_publicadas_max = 6
 
 
 [roteador]
@@ -238,3 +289,103 @@ fora_do_ar_min = 10
 # Maior mensagem entre o desktop e o Neo, em MB. Só vale depois de reiniciar o
 # neo-core. O desktop já corta cada resultado em 1 MB: isto é a folga.
 mensagem_max_mb = 16
+
+
+[transcricao]
+# A tool neo_transcrever: o sandbox tira o áudio do vídeo (ffmpeg) e o Groq
+# transcreve (Whisper). Chave, modelo e "só a cota gratuita" ficam no neo-panel,
+# em Configurações → Transcrição. Detalhes em neo-core/docs/transcricao-groq.md.
+
+# Duração máxima de cada pedaço mandado ao Groq, em segundos. Diminui sozinho
+# se o pedaço passaria do tamanho máximo de arquivo da cota.
+parte_max_s = 1200
+# Bitrate do áudio extraído (opus), em kbps. 32 kbps a 16 kHz mono dá ~4 KB/s.
+bitrate_kbps = 32
+# Vídeo mais longo que isto é recusado antes de gastar cota, em segundos.
+duracao_max_s = 7200
+# Quanto a tool espera a cota encher no meio do trabalho, em segundos. Acima
+# disso ela para e diz quando dá para continuar.
+espera_max_s = 60
+# Idioma padrão do áudio (código ISO-639-1). "auto" deixa o Whisper detectar.
+idioma_padrao = "pt"
+# Prazo de cada pedido ao Groq, em segundos.
+pedido_timeout_s = 120
+# Prazo do ffprobe e do ffmpeg no sandbox, em segundos.
+extracao_timeout_s = 600
+# Quanto da transcrição volta para o Neo ler na hora, em caracteres. O texto
+# inteiro fica no arquivo .txt.
+previa_max = 6000
+# Abaixo desta fração do áudio com som, a tool recusa antes de gastar cota: é
+# gravação de tela sem fala (aí o caminho é a skill ocr-video). Vídeos com fala
+# dão ~100%; gravação de tela com ruído de fundo, 0%.
+som_min_fracao = 0.05
+# O que conta como silêncio na medição acima: abaixo deste volume (dB)...
+silencio_db = -40.0
+# ...por pelo menos este tempo (segundos).
+silencio_min_s = 1.0
+# Trecho que o Whisper marca como não-fala sai da transcrição: probabilidade de
+# não-fala acima disto E confiança média (logprob) abaixo da linha de baixo. É a
+# regra padrão do próprio Whisper; corta frase inventada em música e silêncio.
+sem_fala_prob = 0.6
+sem_fala_logprob = -1.0
+
+
+[transcricao.cota]
+# Limites do plano gratuito do Groq para o Whisper. Com "só a cota gratuita"
+# ligado no painel, o Neo para antes de passar destes números. Hora e pedidos
+# por dia vieram dos cabeçalhos da conta (15/11/2026); dia e minuto, da
+# documentação do Groq.
+
+# Segundos de áudio por hora (7200 = 2 h).
+audio_s_por_hora = 7200
+# Segundos de áudio por dia (28800 = 8 h).
+audio_s_por_dia = 28800
+# Pedidos por minuto.
+pedidos_por_minuto = 20
+# Pedidos por dia.
+pedidos_por_dia = 2000
+# Maior arquivo que um pedido aceita, em MB.
+arquivo_max_mb = 25
+# Segundos de áudio que ficam sem usar em cada balde, para não encostar no limite.
+folga_s = 30
+
+
+[video]
+# A tool neo_video_candidatos: antes de baixar um vídeo do YouTube pelo nome, o
+# Neo compara os resultados da busca pelos dados (título, canal, duração, views)
+# e, se empatar, pelos quadros do vídeo. Download às cegas fica travado.
+
+# Quantos resultados da busca entram na comparação.
+candidatos = 8
+# Prazo da busca no sandbox, em segundos (leva ~2 s).
+busca_timeout_s = 45
+# Fração dos termos do pedido que precisa estar no título ou no canal para o
+# vídeo concorrer.
+cobertura_min = 0.5
+# Vantagem de nota do 1º sobre o 2º para escolher só pelos dados. Abaixo disso,
+# compara os quadros.
+margem = 0.15
+# Quantos empatados vão para a comparação de quadros.
+comparar_max = 4
+# Meme: até curto_max_s a duração vale nota cheia, até medio_max_s meia.
+curto_max_s = 90
+medio_max_s = 240
+# Pesos da nota (a penalidade é subtraída).
+peso_titulo = 0.45
+peso_frase = 0.10
+peso_views = 0.30
+peso_duracao = 0.15
+peso_penalidade = 0.50
+# Termos de cópia/derivado: título ou canal com um destes (e o pedido sem) não concorre.
+penalidades = [
+  "reação", "reagindo", "react", "reaction", "zoeira", "zueira", "dark",
+  "remix", "paródia", "compilação", "compilation", "mashup", "edit",
+  "editado", "explicando", "entrevista", "reportagem", "documentário",
+  "nova versão", "como está", "anos depois", "anos após", "por onde anda",
+  "ouça", "podcast", "dublado", "karaokê", "cover", "lyric", "lyrics",
+  "slowed", "reverb", "sped up", "8d",
+]
+# Prazo para montar as grades de quadros no sandbox, em segundos.
+quadros_timeout_s = 60
+# Por quanto tempo o vídeo escolhido pode ser baixado sem comparar de novo.
+escolha_validade_s = 21600

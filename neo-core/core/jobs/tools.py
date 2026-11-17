@@ -328,6 +328,20 @@ JOB_TOOLS: list[ToolSchema] = [
                 description=(
                     "A tarefa em linguagem natural, clara e auto-contida (site, "
                     "objetivo, critério de pronto). Quem executa não vê a conversa. "
+                    "UMA tarefa com o pedido INTEIRO: se ele mandou atualizar/"
+                    "preencher/corrigir, a tarefa lê a página, compara, altera e salva "
+                    "numa chamada só — NÃO divida em 'só mapear' e voltar com uma lista "
+                    "para ele aprovar, se ele não pediu isso (é recusado). Dúvida no "
+                    "meio, quem executa PERGUNTA ao vivo na aba e espera; todo Salvar "
+                    "com campo escrito pelo Neo para numa conferência antes. Arquivo do "
+                    "disco dele que o site precisa receber (foto, PDF): escreva o "
+                    "caminho exato que ele citou — quem executa envia direto ao campo, "
+                    "sem a janela de arquivos do sistema. Arquivo do SEU catálogo desta "
+                    "conversa (que você gerou no sandbox ou ele anexou no chat): escreva "
+                    "só o NOME dele — quem executa também envia, sem baixar para o disco "
+                    "dele antes, e nunca invente uma pasta no Mac dele para ele. "
+                    "Não confira o arquivo antes "
+                    "com comando na máquina dele: o envio já diz se ele não existe. "
                     "Dado pessoal do Daniel (CEP, CPF, endereço, nome…) NUNCA vai "
                     "escrito: mande preencher o campo com o marcador «pks:cep», "
                     "«pks:cpf» etc. Sem liberação para o site, a tarefa para no "
@@ -371,8 +385,13 @@ JOB_TOOLS: list[ToolSchema] = [
             "context": ToolParameter(
                 type="string",
                 description=(
-                    "Contexto de continuação (opcional): o que já foi feito antes "
-                    "nesta mesma tarefa."
+                    "Material que quem executa precisa LER para fazer a tarefa "
+                    "(opcional, até ~8000 caracteres): o texto do currículo/documento "
+                    "que ele mandou usar como fonte (extraia antes com file_stage + "
+                    "neo_bash e cole aqui o conteúdo útil), dados de um pedido, ou o que "
+                    "já foi feito antes nesta mesma tarefa. É o ÚNICO jeito de um "
+                    "material chegar lá: quem executa não vê a conversa, o caderno nem "
+                    "os arquivos."
                 ),
                 required=False,
             ),

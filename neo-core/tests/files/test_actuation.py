@@ -437,3 +437,70 @@ async def test_delivery_conflict_reenters_with_existing_metadata():
     note = rec[0]["extra_note"]
     assert "CONFLITO" in note and "rel.pdf" in note and "overwrite=true" in note
     assert out[-1].message == "[reentrada]"
+
+
+@pytest.mark.asyncio
+async def test_pull_path_com_til_sai_expandido_pelo_home_do_desktop():
+    """Sessão 916fe494: o desktop não expande "~" no upload e devolvia ENOENT."""
+    pedido = "Transcreve o vídeo ~/Downloads/superxandao-pichau.mp4 e me mostra o texto."
+    svc = _svc(history=[{"role": "user", "content": pedido}])
+    sid = uuid4()
+    car = ClientActuationRequested(
+        "request_user_file", {"mode": "path", "path": "~/Downloads/superxandao-pichau.mp4", "stage": True}, "tc9"
+    )
+    out = await _collect(svc._emit_client_actuation(
+        car, session_id=sid, user_message=pedido, user_id=None,
+        metadata={"client": "neo-desktop-tauri", "home_dir": "/Users/daniel"}, trace=None, slog=None,
+    ))
+    req = next(r for r in out if r.tool_request)
+    args = req.tool_request["arguments"]
+    assert '"mode": "path"' in args
+    assert '"/Users/daniel/Downloads/superxandao-pichau.mp4"' in args
+    assert "~/" not in args
+
+
+def test_home_expandido_so_mexe_no_til():
+    from modules.desktop.ai_service import _home_expandido
+
+    md = {"home_dir": "/Users/daniel/"}
+    assert _home_expandido("~/Downloads/a b.mp4", md) == "/Users/daniel/Downloads/a b.mp4"
+    assert _home_expandido("~", md) == "/Users/daniel"
+    assert _home_expandido("/tmp/x", md) == "/tmp/x"
+    assert _home_expandido("~outro/x", md) == "~outro/x"
+    assert _home_expandido("~/x", None) == "~/x"
+
+
+@pytest.mark.asyncio
+async def test_rotulo_de_midia_atravessa_a_retomada():
+    """Sem o rótulo, o aviso de fala × tela sumia no turno que já tem o vídeo no sandbox."""
+    pedido = "faz a transcrição do vídeo ~/Downloads/aula.mp4"
+    svc = _svc(history=[{"role": "user", "content": pedido}])
+    sid = uuid4()
+    car = ClientActuationRequested(
+        "request_user_file", {"mode": "path", "path": "~/Downloads/aula.mp4", "stage": True}, "tc10"
+    )
+    await _collect(svc._emit_client_actuation(
+        car, session_id=sid, user_message=pedido, user_id=None,
+        metadata={"home_dir": "/Users/daniel"}, trace=None, slog=None, midia="fala",
+    ))
+    pend = svc._pending_actuations[str(sid)]
+    assert pend["midia"] == "fala"
+
+    vistas = []
+
+    async def _hdr(sid_, user_message, history, decision, trace, sys_context, **kw):
+        vistas.append(decision)
+        if False:
+            yield None
+
+    async def _vazio(*a, **k):
+        return ""
+
+    svc._handle_direct_response = _hdr
+    svc._build_system_context = lambda md: ""
+    svc._build_attachments_manifest = _vazio
+    svc._file_links_block = _vazio
+    await _collect(svc._reenter_cognitive(
+        sid, user_message=pedido, pend=pend, extra_note=None, slog=None, trace=None,
+    ))
+    assert vistas and vistas[0].midia == "fala"
