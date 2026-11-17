@@ -1354,7 +1354,7 @@ class WhatsAppMessagingPipeline(SkillPipeline):
 
         # ── Dev mode phone block ─────────────────────────────────────────
         import os
-        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "5511912345678")
+        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "")  # vazio = bloqueia todo envio
         jid_digits = "".join(filter(str.isdigit, target_jid or ""))
         if jid_digits and jid_digits != allowed_phone:
             slog.log_event(

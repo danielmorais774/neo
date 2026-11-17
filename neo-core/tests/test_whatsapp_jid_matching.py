@@ -31,7 +31,7 @@ def test_mission_matches_lid_from_last_outbound_id() -> None:
     mission = SimpleNamespace(
         contact_jid="5511912345678@c.us",
         extra_metadata={
-            "contact_phone_e164": "+5511912345678",
+            "contact_phone_e164": "5511912345678",
             "last_outbound_id": "true_234020537397350@lid_3EB09B7798FBAA0F87CE52",
         },
     )

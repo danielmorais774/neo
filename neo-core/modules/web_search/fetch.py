@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Formato exigido pela política de UA da Wikimedia (nome/versão + contato +
 # lib); sem o contato, wikipedia.org responde 403.
-USER_AGENT = "NeoAssistant/1.0 (personal assistant; contact: daniel.morais@acme.com.br) python-httpx"
+USER_AGENT = "NeoAssistant/1.0 (personal assistant) python-httpx"
 
 # ── Perfil de headers ────────────────────────────────────────────────────────
 #

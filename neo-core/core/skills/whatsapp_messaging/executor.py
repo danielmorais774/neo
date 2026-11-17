@@ -118,7 +118,7 @@ class WhatsAppMessagingExecutor:
     ) -> dict[str, Any]:
         # ── Dev mode phone block ─────────────────────────────────────────
         import os
-        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "5511912345678")
+        allowed_phone = os.environ.get("ALLOWED_WHATSAPP_PHONE", "")  # vazio = bloqueia todo envio
         target_jid = None
         if recipient:
             contact = await self.db.search_whatsapp_contact(user_id, recipient)
