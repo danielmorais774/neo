@@ -1,0 +1,10 @@
+# Falsos positivos conferidos em 17/11/2026:
+# - tests/: chaves geradas ou de mentira usadas nos testes do redator e do cofre
+# - neo-browser-local/manifest.json: chave PÚBLICA da extensão (fixa o ID; a privada não está no repo)
+cffe63dd8bd652abc594bd27b56fa69e766b2011:neo-browser-local/manifest.json:generic-api-key:52
+93f885295d4ff373b4a774b477355b48a2f048cf:neo-core/tests/transcricao/conftest.py:generic-api-key:172
+0cfd2c0dfe8d7abbd41cd838b983f6aba1ea852e:neo-core/tests/gateway/test_redact.py:jwt:26
+0cfd2c0dfe8d7abbd41cd838b983f6aba1ea852e:neo-core/tests/gateway/test_credentials.py:generic-api-key:114
+0cfd2c0dfe8d7abbd41cd838b983f6aba1ea852e:neo-core/tests/gateway/test_credentials.py:generic-api-key:124
+0cfd2c0dfe8d7abbd41cd838b983f6aba1ea852e:neo-core/tests/gateway/test_credentials.py:generic-api-key:148
+0cfd2c0dfe8d7abbd41cd838b983f6aba1ea852e:neo-core/tests/gateway/test_credentials.py:generic-api-key:158
