@@ -1,73 +1,42 @@
-# React + TypeScript + Vite
+# neo-desktop-tauri
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+O app do Neo no Mac. É o único cliente que **executa coisas na máquina**: comandos no terminal, arquivos locais, o navegador do usuário e o Claude Code. Também cuida da voz: wake word, modo live e o "notch" nativo.
 
-Currently, two official plugins are available:
+## Como conversa com o resto
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```mermaid
+flowchart LR
+    UI["React (chat, painéis)"] <-->|"comandos Tauri"| RS["Rust (Tauri 2)"]
+    RS <-->|"gRPC bidirecional :50051"| CORE["neo-core"]
+    RS <-->|"WebSocket /ws/devices/*"| CORE
+    RS <-->|"host nativo · JSON-RPC"| EXT["neo-browser-local"]
+    RS <-->|"WebSocket 127.0.0.1:17872"| MUS["neo-music-ext"]
+    RS <-->|"STT · TTS na LAN"| VO["neo-voice"]
+    RS --> CC["claude (CLI)"]
+    RS <--> SW["Swift: notch"]
+    RS <--> WK["sidecar: wake word"]
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Onde fica cada coisa
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+| Caminho | O que tem |
+|---|---|
+| `src/` | Interface em React: chat com streaming, planos, jobs, caderno, arquivos locais, ajustes de voz |
+| `src-tauri/src/services/shell.rs`, `command_policy.rs` | Execução de comandos no Mac e a política de risco: o que roda sozinho e o que pede confirmação |
+| `src-tauri/src/services/browser_local.rs` | Ponte com o navegador do usuário: snapshot da página, ações e conferência visual |
+| `src-tauri/src/services/claude_cli.rs`, `claude_sessoes.rs` | Abre e acompanha sessões do Claude Code delegadas pelo core |
+| `src-tauri/src/services/local_jobs.rs` | Comando lento vira tarefa local, com o resultado devolvido ao core no fim |
+| `src-tauri/src/services/wake.rs`, `sidecar/wake/` | Wake word ("ei Neo") com openWakeWord, e o treino do modelo |
+| `src-tauri/src/services/audio_route.rs` | Escolha de microfone e cancelamento de eco por rota de áudio |
+| `src-tauri/macos/NeoNotchHost.swift` | O "notch": ilha nativa que mostra o estado do Neo e o modo live |
+| `src-tauri/crates/neo-imagem/` | Marcações e recortes do print do navegador, numa crate separada para compilar otimizada em dev: de ~5 s para ~0,14 s por print Retina |
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Rodar e testar
+
+```bash
+npm install
+npm start                          # compila o front e abre o tauri dev
+cd src-tauri && cargo test         # 156 testes
 ```
+
+O app espera o neo-core em `127.0.0.1:50051` (gRPC) e `:8000` (HTTP).
