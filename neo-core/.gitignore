@@ -1,0 +1,38 @@
+# Ignore Python artifacts and local environment
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+ENV/
+env/
+.Python
+*.dist-info/
+*.egg
+*.db
+*.sqlite3
+*.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+instance/
+.webassets-cache
+# Ignore local settings and secrets
+.env
+.env.*
+# Ignore generated proto and build artifacts
+*.pyc
+__pycache__/
+*.so
+*.dylib
+*.dll
+*.exe
+*.cache
+*.vscode/
+.idea/
+.DS_Store
+Thumbs.db

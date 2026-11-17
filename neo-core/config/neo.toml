@@ -1,0 +1,391 @@
+# Ajustes do Neo — os números de comportamento que você pode adaptar.
+#
+# Segredos, endereços e liga/desliga de feature ficam no .env da raiz. Aqui
+# ficam tetos, limiares e fatores. Os valores abaixo são os padrões: mude o que
+# quiser, e apagar uma linha volta ao padrão.
+#
+# Vale na próxima chamada, sem reiniciar. Arquivo com erro não derruba nada: o
+# Neo segue com a última versão boa e avisa no log (procure "[ajustes]").
+#
+# Padrões, faixas válidas e validação: neo-core/shared/ajustes.py.
+
+
+[teto_adaptativo]
+# Como o teto de saída aprende quanto cada modelo raciocina antes de responder.
+# É o cálculo do timeout do TCP: teto = média + desvios × desvio + reserva.
+# Teto não é gasto: o provedor cobra o que o modelo gera, não o teto.
+
+# Peso de cada medida nova na média (0 a 1). Maior reage mais rápido e oscila mais.
+peso_media = 0.125
+# Peso de cada medida nova no desvio (0 a 1).
+peso_desvio = 0.25
+# Quantos desvios acima da média o teto fica. Maior corta menos e espera mais
+# no pior passo.
+desvios = 4.0
+# Num corte, o raciocínio real era MAIOR que o medido: a medida entra
+# multiplicada por este fator.
+fator_corte = 1.5
+# Passo cortado pelo raciocínio é repetido com o teto multiplicado por este
+# fator (até o máximo do uso), antes de virar recusa.
+fator_escada = 2.0
+
+
+[navegador.decisao]
+# Cada passo do agente do navegador: o JSON com o pensamento e a ação.
+
+# Tokens guardados para a resposta. O maior JSON medido foi 356 (job 9c9b5bae).
+reserva_resposta = 600
+# Menor teto: o ponto de partida antes de aprender e o chão depois.
+piso = 2000
+# Teto absoluto. Cada 1000 tokens de raciocínio somam ~5 s: 6000 ≈ 30 s no
+# pior passo.
+maximo = 6000
+
+
+[navegador.conversa]
+# A tarefa no navegador conversa com você enquanto roda: recebe o que você
+# escreve no painel da aba ou no chat, avisa e pergunta sem parar o trabalho.
+# Ver docs/browser-conversa-plan.md.
+
+# Quanto tempo (min) a tarefa espera a sua resposta a uma pergunta, com a aba
+# aberta e tudo na memória. Passou disso, ela para como antes (a aba fica onde
+# estava e o próximo pedido continua dali).
+espera_min = 10.0
+# Esperando, de quanto em quanto tempo (s) olha o painel da aba.
+espera_intervalo_s = 2.0
+# Avisos no chat por tarefa, e o mínimo de passos entre dois seguidos.
+avisos_max = 6
+avisos_intervalo_passos = 3
+# Passos que cada mensagem sua devolve ao orçamento da tarefa (instrução nova é
+# trabalho novo), e o teto absoluto de passos de uma tarefa.
+passos_por_mensagem = 15
+passos_teto = 150
+# Maior mensagem aceita, em caracteres.
+mensagem_max = 1500
+# Enquanto você escreve no painel da aba, o agente não mexe na página (senão o
+# cursor sai do campo). Até quantos segundos ele espera, por ação.
+digitando_espera_max_s = 90.0
+# Na conferência antes de Salvar/Enviar, cada campo aparece com o valor inteiro
+# até este tamanho (caracteres); maior, aparece começo e fim com o total.
+conferencia_valor_max = 1500
+# Maior pergunta que o painel da aba mostra, em caracteres.
+pergunta_painel_max = 4000
+
+
+[navegador.julgamento]
+# Grade de avaliação num formulário (avaliar requisitos, critérios × opções): o
+# agente do navegador não julga. Ele chama um JUIZ mais forte, que lê a página,
+# as anotações e o texto das outras abas (o sistema avaliado) e devolve, por
+# célula, a resposta e o porquê. Ver docs/browser-conversa-plan.md §4.6.
+
+# O MODELO do juiz se escolhe no neo-panel: Configurações → Modelos →
+# "Navegador local — juiz da grade de avaliação" (padrão: Haiku 5.5).
+# Tokens de raciocínio por chamada (0 = sem raciocínio) e teto da resposta.
+raciocinio_max = 4000
+resposta_max = 4000
+# Quanto texto entra, em caracteres: a página julgada e cada OUTRA aba aberta.
+pagina_max = 12000
+evidencia_por_aba = 4000
+# Quanto tempo (s) a tarefa espera o juiz responder.
+timeout_s = 150.0
+
+
+[navegador.janela]
+# Com janela (você vê a aba no seu navegador) ou sem janela (headless, na sua
+# máquina, invisível)? Quem decide é o código, pelo que a conversa já fez,
+# nunca o modelo sozinho:
+#   1. a sua mensagem agora ("no meu navegador" → com janela; "sem janela" /
+#      "não precisa abrir o navegador" → sem);
+#   2. a ÚLTIMA escolha desta conversa: um pedido seu antigo ou uma tarefa que
+#      já rodou com janela nela. Vale pela conversa inteira, até você dizer o
+#      contrário ou abrir um chat novo;
+#   3. o site: se a última tarefa nele (de qualquer conversa) foi com janela,
+#      ou se a sem janela parou no login, a próxima vai com janela.
+# Sem nada disso, sem janela.
+
+# Quantas mensagens suas, desta conversa, são lidas para achar a última escolha.
+mensagens_lidas = 300
+# Quantas tarefas recentes suas (de todas as conversas) são lidas.
+tarefas_lidas = 60
+# Por quanto tempo (h) a última tarefa num site decide a próxima no mesmo site.
+site_vale_por_horas = 12.0
+
+
+[navegador.tarefa]
+# O que cada tarefa no navegador leva para o agente, e o que ele pode enviar a
+# um site.
+
+# As suas palavras que o agente lê em todo passo, em caracteres. Mensagem maior
+# perde o meio (começo e fim ficam).
+falas_max = 4000
+# Material de referência que o Neo manda junto com a tarefa (o texto de um
+# currículo, os dados de um pedido), em caracteres. Entra em todo passo: maior
+# custa mais tokens.
+contexto_max = 8000
+# Maior arquivo do seu disco que o agente envia a um site (foto, PDF), em MB.
+# Só sai arquivo cujo caminho você escreveu na conversa.
+arquivo_max_mb = 25.0
+# Maior arquivo que o próprio Neo gerou ou que você anexou no chat (fica no
+# catálogo, não no seu disco) que o agente envia a um site, em MB. Vai pelo canal
+# do desktop, que aceita até ~11 MB de arquivo.
+catalogo_max_mb = 10.0
+
+[navegador.visao]
+# Prints de CONFIRMAÇÃO: o Neo tira print sozinho antes e depois de cada campo
+# que edita, antes e depois de enviar um formulário, quando abre um modal, quando
+# muda de página e depois de um upload. Ligado é mais seguro e mais lento (cada
+# print custa ~2 s hoje); desligado, ele decide pela página em texto, como
+# sempre. Por enquanto os prints só vão para o diário da tarefa.
+confirmacao_visual = true
+# Máximo de prints de confirmação por tarefa.
+prints_max = 60
+# No print de um campo, quanto da área abaixo dele entra (onde aparece "campo
+# obrigatório"), em px.
+recorte_margem_px = 120
+# Cada print é conferido pela visão (pergunta fechada: "o campo mostra o que foi
+# digitado? há erro na tela?") enquanto o agente segue; o resultado entra no
+# passo seguinte. Máximo de conferências por tarefa e quantas ao mesmo tempo.
+analises_max = 40
+paralelas_max = 2
+# Largura máxima do print de tela inteira (px). Menor = mais rápido e barato.
+largura_max_px = 1280
+# Teto do raciocínio do modelo de visão em cada conferência (tokens).
+teto_raciocinio = 200
+
+[trabalho]
+# O Neo nas sessões do Claude Code que você usa no Mac (VSCode ou terminal):
+# ele lista, escolhe a do assunto e entrega o pedido. Ver
+# docs/ambiente-de-trabalho-plan.md.
+
+# A lista de sessões: as abertas sempre, e as fechadas cuja conversa mexeu nas
+# últimas N horas, até o máximo.
+sessoes_recentes_horas = 24.0
+sessoes_max = 15
+# A ficha de cada sessão, que o cérebro lê para escolher: cortes em caracteres
+# do 1º pedido, de cada um dos últimos pedidos e da última resposta, e quantos
+# pedidos e arquivos entram. Maior escolhe melhor e gasta mais tokens (com os
+# padrões, ~1.500 para 9 sessões).
+ficha_objetivo = 160
+ficha_pedido = 120
+ficha_pedidos = 3
+ficha_resposta = 200
+ficha_arquivos = 5
+# Quanto o Neo espera o Mac entregar o pedido, em segundos. O mensageiro (um
+# claude -p) leva ~10 s.
+envio_timeout_s = 120
+# Depois de entregar: de quanto em quanto tempo (s) olha se a sessão terminou,
+# até quando (min) acompanha, e quantos caracteres da resposta vão para o chat.
+retorno_intervalo_s = 5.0
+retorno_timeout_min = 30
+retorno_resposta_max = 6000
+# Mac fora do ar enquanto acompanha: desiste depois destes minutos.
+fora_do_ar_min = 10
+
+
+[cerebro]
+# O laço do cérebro em cada turno: a resposta e as rodadas de tool.
+
+# Temperatura do primeiro round — a conversa, onde a persona aparece.
+temperatura = 0.9
+# Temperatura das rodadas depois que uma tool rodou no turno: ali o modelo
+# escreve código, comando e argumento de tool, e variação é erro. A resposta
+# final de um turno que usou tool também sai com esta.
+temperatura_com_ferramentas = 0.3
+# Rodadas SEGUIDAS só com chamada repetida (mesma tool, mesmos argumentos) antes
+# de a próxima rodada ir sem tools, pedindo a resposta com o que já tem.
+repeticoes_seguidas_max = 3
+# Quanto do resultado anterior volta no aviso de chamada repetida, em
+# caracteres (a chamada repetida leva a metade disto).
+repeticao_trecho_max = 800
+# Imagem do sandbox que a resposta mostra ([[IMAGE:/workspace/…]]) sem ter sido
+# publicada com file_save: quantas o servidor publica sozinho por resposta, para
+# o chat conseguir desenhar (o Mac não enxerga o /workspace). 0 = desligado.
+imagens_publicadas_max = 6
+
+
+[roteador]
+# O classificador de intenção, que roda antes de todo turno.
+
+# Teto de raciocínio do modelo do classificador quando ele não deixa desligar
+# o raciocínio (GLM-5.3-flash, MiniMax m3.1-flash). Sem teto, o raciocínio
+# comia a resposta inteira e a classificação chegava a 44 s. 0 = sem teto.
+teto_raciocinio = 300
+
+
+[openrouter]
+# Modelos que recusam desligar o raciocínio ("Reasoning is mandatory"). O
+# Neo aprende sozinho na primeira recusa, mas esquece a cada reinício; os
+# daqui nem tentam desligar (e recebem o teto de quem pediu um).
+raciocinio_obrigatorio = [
+    "z-ai/glm-5.3-flash",
+    "minimax/minimax-m3.1-flash",
+]
+# Provedores que o OpenRouter nunca usa, pelo nome da tag deles na lista de
+# endpoints do modelo (open-inference/fp4 → "open-inference"). NÃO fixa
+# provedor: ele continua escolhendo entre todos os outros. Chamada com
+# provedor fixado (modelo@slug) não recebe o filtro.
+provedores_ignorados = ["open-inference"]
+
+
+[web]
+# Leitura de páginas da web (web_fetch).
+
+# Quantos links da página voltam junto com o texto (os do mesmo site
+# primeiro). Sem eles o Neo raspava o HTML no sandbox para achar a próxima
+# página. 0 = não devolve links.
+links_max = 40
+# Quantos caracteres de TABELA da página voltam, somando todas, depois dos
+# links (cada linha com as células separadas por |). O extrator de texto
+# descarta as listas da Wikipédia, e o Neo raspava o código da página com
+# regex. 0 = não devolve tabelas.
+tabelas_max = 4000
+# Idioma que a busca pede ao SearXNG. "all" deixa a consulta puxar o idioma
+# (em português continua vindo site brasileiro). "pt-BR" restringia a páginas
+# em português e busca técnica em inglês voltava lixo ou nada.
+idioma_busca = "all"
+
+
+[faxina]
+# Limpeza automática do /workspace do sandbox. Sem ela nada apagava o que o
+# Neo baixa ou gera ali (o teste do Sintel deixou 1,6 GB). O que foi entregue
+# com file_save continua no catálogo: a faxina só tira a cópia do sandbox.
+
+# Liga a limpeza periódica.
+ligada = true
+# De quanto em quanto tempo ela passa.
+intervalo_horas = 6
+# Arquivo a partir deste tamanho (MB) é "grande": download, vídeo, zip...
+grande_mb = 20
+# ...e é apagado depois de ficar este tempo (horas) sem ser modificado.
+grande_horas = 24
+# Anexos seus copiados para /workspace/files saem depois deste tempo (horas),
+# de qualquer tamanho: é conteúdo pessoal. 0 = desligado. ATENÇÃO: nem todo
+# arquivo ali tem original no catálogo (em 14/11, 19 de 31 não tinham: o do
+# catálogo já tinha expirado, ou nunca foi para lá). Ligar apaga a única cópia.
+anexos_horas = 0
+
+
+[comando_no_computador]
+# Comandos que o Neo roda no seu computador. Um comando que passa do tempo
+# abaixo ainda trabalhando (um zip grande, uma cópia) não morre mais: vira
+# tarefa em segundo plano, o Neo responde na hora e avisa no chat quando
+# terminar. Dá para acompanhar e parar em Configurações → Tarefas em background.
+
+# Segundos em primeiro plano antes de virar tarefa. 0 desliga (o comando morre
+# aos 120 s, como antes).
+segundo_plano_apos_s = 90
+# Teto total de uma tarefa, em minutos, contado do início. Passou, ela é
+# encerrada. O desktop não passa de 6 h (360).
+teto_min = 120
+# Intervalo da conferência da tarefa: começa no mínimo e dobra até o máximo.
+conferir_min_s = 5
+conferir_max_s = 30
+# Minutos que o computador pode ficar sem responder no meio da tarefa antes de
+# o Neo desistir de acompanhar.
+fora_do_ar_min = 10
+
+
+[grpc]
+# Maior mensagem entre o desktop e o Neo, em MB. Só vale depois de reiniciar o
+# neo-core. O desktop já corta cada resultado em 1 MB: isto é a folga.
+mensagem_max_mb = 16
+
+
+[transcricao]
+# A tool neo_transcrever: o sandbox tira o áudio do vídeo (ffmpeg) e o Groq
+# transcreve (Whisper). Chave, modelo e "só a cota gratuita" ficam no neo-panel,
+# em Configurações → Transcrição. Detalhes em neo-core/docs/transcricao-groq.md.
+
+# Duração máxima de cada pedaço mandado ao Groq, em segundos. Diminui sozinho
+# se o pedaço passaria do tamanho máximo de arquivo da cota.
+parte_max_s = 1200
+# Bitrate do áudio extraído (opus), em kbps. 32 kbps a 16 kHz mono dá ~4 KB/s.
+bitrate_kbps = 32
+# Vídeo mais longo que isto é recusado antes de gastar cota, em segundos.
+duracao_max_s = 7200
+# Quanto a tool espera a cota encher no meio do trabalho, em segundos. Acima
+# disso ela para e diz quando dá para continuar.
+espera_max_s = 60
+# Idioma padrão do áudio (código ISO-639-1). "auto" deixa o Whisper detectar.
+idioma_padrao = "pt"
+# Prazo de cada pedido ao Groq, em segundos.
+pedido_timeout_s = 120
+# Prazo do ffprobe e do ffmpeg no sandbox, em segundos.
+extracao_timeout_s = 600
+# Quanto da transcrição volta para o Neo ler na hora, em caracteres. O texto
+# inteiro fica no arquivo .txt.
+previa_max = 6000
+# Abaixo desta fração do áudio com som, a tool recusa antes de gastar cota: é
+# gravação de tela sem fala (aí o caminho é a skill ocr-video). Vídeos com fala
+# dão ~100%; gravação de tela com ruído de fundo, 0%.
+som_min_fracao = 0.05
+# O que conta como silêncio na medição acima: abaixo deste volume (dB)...
+silencio_db = -40.0
+# ...por pelo menos este tempo (segundos).
+silencio_min_s = 1.0
+# Trecho que o Whisper marca como não-fala sai da transcrição: probabilidade de
+# não-fala acima disto E confiança média (logprob) abaixo da linha de baixo. É a
+# regra padrão do próprio Whisper; corta frase inventada em música e silêncio.
+sem_fala_prob = 0.6
+sem_fala_logprob = -1.0
+
+
+[transcricao.cota]
+# Limites do plano gratuito do Groq para o Whisper. Com "só a cota gratuita"
+# ligado no painel, o Neo para antes de passar destes números. Hora e pedidos
+# por dia vieram dos cabeçalhos da conta (15/11/2026); dia e minuto, da
+# documentação do Groq.
+
+# Segundos de áudio por hora (7200 = 2 h).
+audio_s_por_hora = 7200
+# Segundos de áudio por dia (28800 = 8 h).
+audio_s_por_dia = 28800
+# Pedidos por minuto.
+pedidos_por_minuto = 20
+# Pedidos por dia.
+pedidos_por_dia = 2000
+# Maior arquivo que um pedido aceita, em MB.
+arquivo_max_mb = 25
+# Segundos de áudio que ficam sem usar em cada balde, para não encostar no limite.
+folga_s = 30
+
+
+[video]
+# A tool neo_video_candidatos: antes de baixar um vídeo do YouTube pelo nome, o
+# Neo compara os resultados da busca pelos dados (título, canal, duração, views)
+# e, se empatar, pelos quadros do vídeo. Download às cegas fica travado.
+
+# Quantos resultados da busca entram na comparação.
+candidatos = 8
+# Prazo da busca no sandbox, em segundos (leva ~2 s).
+busca_timeout_s = 45
+# Fração dos termos do pedido que precisa estar no título ou no canal para o
+# vídeo concorrer.
+cobertura_min = 0.5
+# Vantagem de nota do 1º sobre o 2º para escolher só pelos dados. Abaixo disso,
+# compara os quadros.
+margem = 0.15
+# Quantos empatados vão para a comparação de quadros.
+comparar_max = 4
+# Meme: até curto_max_s a duração vale nota cheia, até medio_max_s meia.
+curto_max_s = 90
+medio_max_s = 240
+# Pesos da nota (a penalidade é subtraída).
+peso_titulo = 0.45
+peso_frase = 0.10
+peso_views = 0.30
+peso_duracao = 0.15
+peso_penalidade = 0.50
+# Termos de cópia/derivado: título ou canal com um destes (e o pedido sem) não concorre.
+penalidades = [
+  "reação", "reagindo", "react", "reaction", "zoeira", "zueira", "dark",
+  "remix", "paródia", "compilação", "compilation", "mashup", "edit",
+  "editado", "explicando", "entrevista", "reportagem", "documentário",
+  "nova versão", "como está", "anos depois", "anos após", "por onde anda",
+  "ouça", "podcast", "dublado", "karaokê", "cover", "lyric", "lyrics",
+  "slowed", "reverb", "sped up", "8d",
+]
+# Prazo para montar as grades de quadros no sandbox, em segundos.
+quadros_timeout_s = 60
+# Por quanto tempo o vídeo escolhido pode ser baixado sem comparar de novo.
+escolha_validade_s = 21600

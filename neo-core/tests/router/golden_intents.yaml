@@ -1,0 +1,382 @@
+# Golden set do classificador de intenção (ROUTER_SYSTEM_PROMPT).
+#
+# Usado por scripts/eval_router.py para comparar duas versões do prompt (A/B) no
+# modelo real. Cada caso cobre UMA classe de decisão — quando um caso vira bug em
+# produção, adicione-o aqui com a sessão no comentário, não um exemplo novo no
+# prompt (exemplo custa token em toda mensagem; caso de teste, não).
+#
+# Campos:
+#   id             identificador curto (aparece no relatório)
+#   message        a mensagem do usuário
+#   history        opcional, [{role, content}] — contexto dos turnos anteriores
+#   expect_intent  intent esperado (sem ele, o caso só confere os outros campos)
+#   expect_midia   rótulo `midia` esperado (fala|tela|editar|tocar|nenhuma), ou lista de aceitos
+#   expect_tool    tool_name esperado (opcional; "null" exige tool_name vazio)
+#   expect_skill   skill_name esperado (opcional)
+#   expect_speech  speech_act esperado (opcional)
+#   expect_plan    needs_plan esperado (opcional, bool)
+#   expect_args    subconjunto de tool_arguments que precisa bater (opcional)
+#   guarded        true quando um guard determinístico intercepta antes do LLM
+#                  (o caso continua valendo: valida o pipeline, e custa 0 token)
+#   note           por que o caso existe
+
+# ── Regra mestra: sandbox do cérebro × máquina do usuário ────────────────────
+- id: sandbox-primos
+  message: "quantos números primos existem até 1 milhão?"
+  expect_intent: DIRECT_RESPONSE
+  note: computação pura — o cérebro roda no próprio sandbox
+
+- id: sandbox-uuid-hash
+  message: "gera um uuid v4 e me dá o sha256 dele"
+  expect_intent: DIRECT_RESPONSE
+  note: geração — sandbox, não precisa da máquina do usuário
+
+- id: sandbox-download-csv
+  message: "baixa esse csv https://exemplo.com/a.csv e me diz quantas linhas tem"
+  expect_intent: DIRECT_RESPONSE
+  note: baixar de URL + analisar é sandbox (o "baixa" engana o classificador)
+
+- id: sandbox-converte-json
+  message: "converte esse json pra yaml: {\"a\": 1, \"b\": [2,3]}"
+  expect_intent: DIRECT_RESPONSE
+  note: conversão de formato — sandbox
+
+- id: sandbox-qrcode
+  message: "gera um QR code com o link https://neo.local"
+  expect_intent: DIRECT_RESPONSE
+  note: geração de arquivo pelo cérebro (file_save + download), não CLIENT_TOOL
+
+- id: cliente-disco-livre
+  message: "quantos GB livres tem no meu disco?"
+  expect_intent: CLIENT_TOOL
+  expect_tool: run_command
+  note: info do sistema DELE
+
+- id: cliente-le-path-explicito
+  message: "lê o arquivo ~/Downloads/relatorio.pdf"
+  expect_intent: CLIENT_TOOL
+  expect_tool: run_command
+  note: caminho explícito na mensagem → run_command (nunca read_file, que não existe)
+
+- id: cliente-find-env
+  message: "acha os arquivos .env aqui no meu projeto"
+  expect_intent: CLIENT_TOOL
+  expect_tool: run_command
+  note: busca no disco dele; comando exploratório não precisa de plano
+
+- id: cliente-abre-vscode
+  message: "abre o VSCode"
+  expect_intent: CLIENT_TOOL
+  expect_tool: run_command
+  note: abrir programa na máquina dele
+
+- id: cliente-instala-ffmpeg
+  message: "instala o ffmpeg aqui na minha máquina"
+  expect_intent: CLIENT_TOOL
+  expect_tool: run_command
+  note: instalação local
+
+- id: texto-do-comando
+  message: "qual o comando pra ver quanto espaço tem no disco?"
+  expect_intent: DIRECT_RESPONSE
+  note: pediu o TEXTO do comando — exceção da regra "agir é o padrão"
+
+- id: arquivo-inexistente-nao-inventa
+  message: "relatorio de financas em csv na minha area de trabalho"
+  expect_intent: DIRECT_RESPONSE
+  note: "sessão bd7a304d: virava read_file('/Users/.../relatorio.csv') inventado"
+
+- id: arquivo-descrito-precisa-plano
+  message: "manda pra mim aquele pdf da nota fiscal que tá no downloads"
+  expect_intent: CLIENT_TOOL
+  expect_plan: true
+  note: arquivo existe mas só foi descrito → plano com sondagem ls/find antes
+
+- id: followup-executa
+  message: "e quais? lista os nomes"
+  history:
+    - role: user
+      content: "tem algum arquivo grande no meu Downloads?"
+    - role: assistant
+      content: "Sim, encontrei 3 arquivos com mais de 1GB."
+  expect_intent: CLIENT_TOOL
+  note: "sessão 69feab87: follow-up curto é a MESMA tarefa, não conversa"
+
+# ── Skills com efeito colateral × núcleo cognitivo ───────────────────────────
+- id: ha-acende-luz
+  message: "acende a luz da sala"
+  expect_intent: HOME_ASSISTANT
+  expect_skill: home_assistant
+  expect_speech: imperative
+  note: imperativo claro → skill
+
+- id: ha-desliga-quarto
+  message: "desliga as luzes do quarto"
+  expect_intent: HOME_ASSISTANT
+  expect_skill: home_assistant
+  expect_speech: imperative
+
+- id: ha-termostato
+  message: "qual a temperatura do termostato?"
+  expect_intent: HOME_ASSISTANT
+  expect_skill: home_assistant
+  note: consulta à casa inteligente ainda é a skill HA
+
+- id: ha-cena
+  message: "ativa o modo cinema"
+  expect_intent: HOME_ASSISTANT
+  expect_skill: home_assistant
+
+- id: ha-definicao-nao-executa
+  message: "cadastra uma brincadeira: se eu te provocar, você pode desligar a luz ou ameaçar desligar"
+  expect_intent: DIRECT_RESPONSE
+  expect_speech: definition
+  note: definir regra ≠ executar; não pode inventar entity_id
+
+- id: ha-condicional-habito
+  message: "se eu costumo usar o ar nas quintas, pode ligar"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: "sessão 6bb1d340 — guard _is_brain_reasoning_request"
+
+- id: ha-pergunta-preferencia
+  message: "como eu gosto de deixar a temperatura do quarto à noite?"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: pergunta sobre preferência → cérebro lê o PKS
+
+- id: cascata-luz-whatsapp
+  message: "apaga todas as luzes da casa e manda um whatsapp pro porteiro avisando que vou dormir"
+  expect_intent: HOME_ASSISTANT
+  expect_pipeline: 2
+  note: 2 ações independentes → pipeline_plan com 2 steps
+
+# ── WhatsApp ────────────────────────────────────────────────────────────────
+- id: wpp-mae
+  message: "manda uma mensagem para minha mãe que vou chegar mais tarde"
+  expect_intent: WHATSAPP_MESSAGING
+  expect_args:
+    recipient: "minha mãe"
+  note: apelido passa cru, o pipeline resolve na agenda
+
+- id: wpp-telefone
+  message: "manda whatsapp pro 5511988217222: oi tudo bem?"
+  expect_intent: WHATSAPP_MESSAGING
+  expect_args:
+    recipient: "5511988217222"
+
+- id: wpp-comercial
+  message: "pede uma pizza no Domino's"
+  expect_intent: WHATSAPP_MESSAGING
+  note: pedido comercial também é WhatsApp
+
+- id: wpp-contact-source
+  message: "procura o João na lista do WhatsApp e manda um oi"
+  expect_intent: WHATSAPP_MESSAGING
+  expect_args:
+    contact_source: whatsapp
+
+# ── Server tools: config e dispositivos ─────────────────────────────────────
+- id: config-voz-jarvis
+  message: "usa a voz do Jarvis"
+  expect_intent: SERVER_TOOL
+  expect_tool: config_set
+  expect_args:
+    setting: tts.voice
+
+- id: config-voz-ryan
+  message: "fala com a voz do Ryan"
+  expect_intent: SERVER_TOOL
+  expect_tool: config_set
+  expect_args:
+    setting: tts.voice
+  note: variação de fraseado do mesmo intent (exemplo podado do prompt)
+
+- id: config-engine-qwen
+  message: "troca o engine pra qwen"
+  expect_intent: SERVER_TOOL
+  expect_tool: config_set
+  expect_args:
+    setting: tts.engine
+
+- id: config-motor-coqui
+  message: "usa o motor coqui"
+  expect_intent: SERVER_TOOL
+  expect_tool: config_set
+  expect_args:
+    setting: tts.engine
+  note: '"motor" como sinônimo de engine (exemplo podado do prompt)'
+
+- id: config-lista-vozes
+  message: "quais vozes você tem?"
+  expect_intent: SERVER_TOOL
+  expect_tool: voice_list
+
+- id: config-lista-ajustes
+  message: "o que dá pra configurar?"
+  expect_intent: SERVER_TOOL
+  expect_tool: config_list
+
+- id: devices-conectados
+  message: "quais dispositivos estão conectados agora?"
+  expect_intent: SERVER_TOOL
+  expect_tool: list_connected_devices
+  note: ao vivo (WebSocket) — não é HOME_ASSISTANT
+
+- id: devices-conhecidos
+  message: "quais dispositivos eu tenho cadastrados?"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: "sessão e245da98 — conhecimento do PKS, não conexão ao vivo"
+
+- id: clima
+  message: "como tá o tempo hoje?"
+  expect_intent: SERVER_TOOL
+  expect_tool: get_weather
+
+# ── Regras do cérebro ───────────────────────────────────────────────────────
+- id: anexo-pergunta
+  message: "de qual instituição é esse arquivo?"
+  history:
+    - role: user
+      content: "ARQUIVOS ANEXADOS NESTA MENSAGEM:\n- extrato.pdf (file_id=f_123, application/pdf)"
+  expect_intent: DIRECT_RESPONSE
+  note: anexo está no catálogo do Neo — nunca inventar /Users/.../extrato.pdf
+
+- id: imagem-mostra
+  message: "mostra essa imagem aqui no chat: /Users/daniel/Desktop/print.png"
+  expect_intent: DIRECT_RESPONSE
+  note: caminho já citado → o cérebro emite [[IMAGE:...]]; nunca base64/cat
+
+- id: evento-atual
+  message: "qual o jogo do Flamengo hoje?"
+  expect_intent: DIRECT_RESPONSE
+  note: o cérebro busca na web sozinho (web_search inline)
+
+- id: duvida-resposta-anterior
+  message: "tem certeza disso?"
+  history:
+    - role: user
+      content: "quanto custa o plano do Claude?"
+    - role: assistant
+      content: "O plano Pro custa 20 dólares por mês."
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: questionamento → re-verificação pelo cérebro
+
+- id: memoria-lembra
+  message: "lembra que eu prefiro café sem açúcar"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: diretiva de memória → pks_remember no turno, nunca write_file
+
+- id: memoria-salva-ideia
+  message: "salva essa ideia: fazer um painel de custos por sessão"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+
+- id: saudacao
+  message: "oi"
+  expect_intent: DIRECT_RESPONSE
+  expect_memory: false
+  note: needs_memory=false em saudação
+
+- id: continuidade-jogo
+  message: "chuto 42"
+  history:
+    - role: assistant
+      content: "Beleza, pensei em um número de 1 a 100. Pode chutar!"
+  expect_intent: DIRECT_RESPONSE
+  note: jogo em andamento
+
+- id: dados-pessoais
+  message: "quantas gramas de proteína eu como por dia?"
+  expect_intent: DIRECT_RESPONSE
+  note: dado pessoal vem do PKS, sem tool de arquivo
+
+- id: assistente-estrangeiro
+  message: "alexa, liga a luz da sala"
+  expect_intent: DIRECT_RESPONSE
+  guarded: true
+  note: "sessão 2173af2b — persona precisa ver a mensagem"
+
+- id: gravidade-alta
+  message: "socorro, o banco de produção caiu e os clientes estão fora do ar"
+  expect_intent: DIRECT_RESPONSE
+  expect_gravity: alta
+  note: sinal de tom, não muda o roteamento
+
+# ── Mídia: o que o pedido quer do CONTEÚDO de um vídeo/áudio (16/11/2026) ─────
+# Sessão e9947724: "transcreve o vídeo ~/Downloads/x.mp4" virou plano de whisper
+# no Mac. Em 12/09 "transcrição" de gravação de tela de chat era OCR. O modelo
+# rotula `midia`; quem desvia ao cérebro é `_bias_midia` (fala exige a chave do
+# Groq no ambiente do eval). Frases sintéticas: as reais ficam no Postgres
+# (scripts/eval_midia_gate.py), nunca no repo.
+- id: midia-fala-disco
+  message: "Transcreve o vídeo ~/Downloads/aula.mp4 e me mostra o texto"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+  note: o caso da e9947724 — o arquivo está no disco, mas a transcrição é do cérebro
+
+- id: midia-fala-parafrase
+  message: "passa esse áudio pra texto: ~/Downloads/nota-de-voz.m4a"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+  note: sem a palavra "transcrever"
+
+- id: midia-fala-o-que-diz
+  message: "o que o cara fala nesse vídeo ~/Movies/entrevista.mov?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-fala-ata
+  message: "faz a ata da reunião que gravei, tá em ~/Documents/reuniao-segunda.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-fala-legenda
+  message: "gera uma legenda .srt pro vídeo ~/Desktop/tutorial.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: fala
+
+- id: midia-tela-transcricao
+  message: "faz a transcrição dessa gravação de tela, é uma conversa de WhatsApp rolando: ~/Desktop/Gravação de Tela 2026-11-02.mov"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: tela
+  note: 'a "transcrição" que é OCR (12/09): o texto está na imagem, não na fala'
+
+- id: midia-tela-slides
+  message: "lê o texto dos slides que aparecem nesse vídeo ~/Downloads/palestra.mp4"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: tela
+
+- id: midia-editar-extrair
+  message: "extrai o áudio desse vídeo em mp3: ~/Downloads/show.mp4"
+  expect_midia: editar
+  note: extrair o áudio como ARQUIVO não é transcrever
+
+- id: midia-editar-cortar
+  message: "corta os 10 primeiros segundos do vídeo ~/Movies/clip.mp4"
+  expect_midia: editar
+
+- id: midia-tocar-abrir
+  message: "abre no meu navegador o vídeo mais recente do canal do Super Xandão"
+  expect_midia: [tocar, nenhuma]
+  note: 'não pode virar fala/tela; tocar × nenhuma dá o mesmo trilho (16/11 o modelo disse nenhuma). "pausa o vídeo" cai na guarda de música antes do LLM e nem recebe rótulo'
+
+- id: midia-nenhuma-placa
+  message: "qual placa de vídeo é melhor pra jogar, a 5070 ti ou a 4080?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: nenhuma
+
+- id: midia-nenhuma-sobre
+  message: "vi um vídeo ontem dizendo que café em jejum faz mal, é verdade?"
+  expect_intent: DIRECT_RESPONSE
+  expect_midia: nenhuma
+  note: falar SOBRE um vídeo não é pedir o conteúdo dele
+
+- id: midia-nenhuma-organizar
+  message: "move os vídeos da pasta Downloads para uma pasta Videos"
+  expect_midia: nenhuma
+  note: organizar arquivos (11/15 no corpus) não é mexer no conteúdo
+
