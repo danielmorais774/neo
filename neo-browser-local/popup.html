@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Open Browser Use</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="popup-header">
+        <img src="icons/icon-128.png" width="32" height="32" alt="" class="app-icon" />
+        <div class="title-block">
+          <h1>Open Browser Use</h1>
+          <p class="subtitle">Chrome automation bridge</p>
+        </div>
+        <span class="version-pill" id="extension-version" aria-label="Extension version"></span>
+      </header>
+
+      <section class="panel" aria-labelledby="connection-title">
+        <div class="section-heading">
+          <span class="eyebrow" id="connection-title">Connection</span>
+          <span class="status-pill" id="status-pill">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="status-label">Checking</span>
+          </span>
+        </div>
+        <p class="status-message" id="status-message">Checking native host...</p>
+        <dl class="status-details">
+          <div>
+            <dt>Native host</dt>
+            <dd id="host-name">com.ifuryst.open_browser_use.extension</dd>
+          </div>
+          <div>
+            <dt>Last checked</dt>
+            <dd id="last-checked">Now</dd>
+          </div>
+        </dl>
+        <p class="error-message" id="error-message" hidden></p>
+      </section>
+
+      <section class="panel" aria-labelledby="surf-title">
+        <div class="section-heading">
+          <span class="eyebrow" id="surf-title">Conta do Neo</span>
+          <span class="platform-pill" id="surf-pill">—</span>
+        </div>
+        <p class="repo-copy" id="surf-copy">
+          Parear liga este navegador à sua conta do Neo: ele passa a existir na lista
+          de dispositivos, com nome, e o Neo consegue endereçá-lo de qualquer lugar —
+          inclusive do celular. Gere o código no painel (Dispositivos).
+        </p>
+
+        <div class="surf-fields" id="surf-form">
+          <input class="surf-input" id="surf-code" inputmode="numeric" maxlength="6"
+                 placeholder="000000" aria-label="Código de pareamento" />
+          <input class="surf-input surf-input-wide" id="surf-name"
+                 placeholder="Nome (ex.: Edge do macbook)" aria-label="Nome deste navegador" />
+          <button class="repo-link" id="surf-pair" type="button">Parear</button>
+        </div>
+        <p class="repo-copy surf-hint">
+          Dica: ponha a máquina no nome. É assim que "usa o navegador do macbook",
+          dito pelo celular, encontra este aqui.
+        </p>
+
+        <details class="surf-adv">
+          <summary>Avançado</summary>
+          <input class="surf-input surf-input-wide" id="surf-core"
+                 placeholder="http://127.0.0.1:8000" aria-label="Endereço do neo-core" />
+          <label class="surf-check">
+            <input type="checkbox" id="surf-tabs" />
+            <span>
+              Reportar as abas abertas ao Neo — <b>desligado por padrão</b>. Esta
+              extensão enxerga todas as abas; ligar manda títulos e URLs para o
+              neo-core.
+            </span>
+          </label>
+        </details>
+
+        <div class="map-actions">
+          <button class="repo-link ghost" id="surf-unpair" type="button" hidden>Desparear</button>
+        </div>
+        <p class="status-message" id="surf-msg" hidden></p>
+      </section>
+
+      <section class="panel" aria-labelledby="cli-title">
+        <div class="section-heading">
+          <span class="eyebrow" id="cli-title">CLI Install</span>
+          <span class="platform-pill" id="platform-label">Detecting OS</span>
+        </div>
+        <div class="command-list" id="cli-commands" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="map-title">
+        <div class="section-heading">
+          <span class="eyebrow" id="map-title">Inspetor do Neo</span>
+          <span class="platform-pill" id="map-count">—</span>
+        </div>
+        <p class="repo-copy">
+          Desenha na aba os elementos que o agente enxerga, com o mesmo mapeamento
+          que ele usa. Azul = o site declarou · verde = controle escondido por CSS ·
+          âmbar = achado pela varredura por pixel · vermelho tracejado = coberto.
+        </p>
+        <div class="map-actions">
+          <button class="repo-link" id="map-toggle" type="button">Mapear elementos</button>
+          <button class="repo-link ghost" id="map-refresh" type="button" hidden>Remapear</button>
+        </div>
+        <p class="status-message" id="map-summary" hidden></p>
+      </section>
+
+      <section class="panel repo-panel" aria-labelledby="repo-title">
+        <div>
+          <span class="eyebrow" id="repo-title">GitHub</span>
+          <p class="repo-copy">Open source repo, setup notes, and SDK packages.</p>
+        </div>
+        <a
+          class="repo-link"
+          id="repo-link"
+          href="https://github.com/iFurySt/open-browser-use"
+          target="_blank"
+          rel="noreferrer"
+        >
+          View repo
+        </a>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
