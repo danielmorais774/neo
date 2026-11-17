@@ -81,6 +81,32 @@ O prompt do cérebro é montado pelo [PromptContextSelector](../core/agent/conte
 - **Estado emocional**, só quando o límbico sai do repouso.
 - **Histórico** com o `tool_trace` dos turnos anteriores, para um "cadê os arquivos?" não refazer o trabalho do zero.
 
+### Orçamento de contexto
+
+O orçamento é **fixo por camada**, em tokens ([shared/config.py](../shared/config.py), `context_budget_*`). Ele não é calculado a partir da janela do modelo.
+
+| Camada | Teto | No limite |
+|---|---|---|
+| Blocos fixos do PKS (`pinned`) | sem teto | Entram sempre |
+| `NEO_CORE_CTX` | 600 | Sai o candidato de nota mais baixa da camada |
+| `USER_PREFS` | 500 | Idem |
+| `USER_PKS` | 900; até 1.600 com o ranking v2 | Idem |
+| `RETRIEVED` (conversas antigas) | 1.200, e só com nota ≥ 0,25 | Idem |
+| `WORKING_MEM` (índice do caderno) | 700 | Corta as últimas notas do índice; o índice nunca sai inteiro |
+| Histórico da sessão | 40 mensagens e 24.000 tokens | A mensagem grande vira o marcador "OMITIDA desta janela por tamanho" (até 3). Depois, um 2º passe traz de volta até 4 mensagens parecidas com a pergunta |
+
+A única parte elástica é o PKS com ranking v2: um grupo forte estende o bloco de 900 até 1.600 (`pks_rank_budget_max`). A flag `pks_ranker_v2_enabled` vem desligada por padrão.
+
+**Dentro do turno não há corte dinâmico.** Cada rodada do cérebro reenvia tudo, e os resultados das tools se acumulam por até 32 rodadas. O tamanho fica contido pelos tetos de cada tool:
+- `web_fetch`: 40 links e 4.000 caracteres de tabela;
+- leitura de arquivo do sandbox: teto em bytes, com aviso `truncated`;
+- resultado do desktop: cortado em 1 MB;
+- aviso de repetição: 800 caracteres.
+
+Nada compara o prompt com a janela do modelo.
+
+Regra que veio da sessão 7330e40c: **todo corte leva marcador**. Corte mudo vira confabulação, porque o modelo não sabe que há um buraco e preenche com o que alcança.
+
 Lição: uma regra enterrada em 27 mil caracteres de sistema perde para skill ativa e para resultado de tool. A mesma frase logo depois da mensagem do usuário deu 8 de 8 (sessão 455646dd). Posição pesa mais que redação.
 
 ---
@@ -88,6 +114,10 @@ Lição: uma regra enterrada em 27 mil caracteres de sistema perde para skill at
 ## 4. Intent router
 
 Fica em [core/router/intent_router.py](../core/router/intent_router.py). Roda antes de todo turno, num modelo flash barato: hoje `minimax-m3.1-flash@nebius`, com teto de raciocínio de 300 tokens. Devolve um `RoutingDecision` ([shared/types.py](../shared/types.py)).
+
+![Mapa do intent router: o caminho da decisão, os trilhos com exemplos e os campos que acompanham o intent](mapa-intent-router.svg)
+
+*Para mudar o mapa: edite os textos em `scripts/gerar_mapa_intent_router.py` e rode `python3 scripts/gerar_mapa_intent_router.py`.*
 
 ### Os trilhos
 
@@ -104,20 +134,84 @@ Fica em [core/router/intent_router.py](../core/router/intent_router.py). Roda an
 
 - **`onde`** (`sandbox`, `maquina`, `navegador`, `nenhum`): a decisão que mais erra. Quem decide é a **origem** do conteúdo, nunca o destino. Baixar um PDF da internet e salvar no Desktop é `sandbox` + ponte, não `maquina`.
 - **`speech_act`** e **`confidence`**: skill com efeito colateral só dispara com imperativo e confiança ≥ 0,75.
-- **`needs_plan`** e **`tipo_tarefa`**: levam ao PlanManager (§6).
+- **`needs_plan`**: leva ao PlanManager (§6), mas **só no trilho CLIENT_TOOL**. Ver "Como os campos se combinam", abaixo.
+- **`tipo_tarefa`** (`simples`, `multi_etapas`, `analitica`, `criacao`): hoje só alimenta o Registro de Contexto, que está em sombra.
 - **`pipeline_plan`**: uma cascata declarada de 2 ou mais passos.
 - **`skill_name`** / **`skill_hint`**, `needs_memory` e `knowledge_keywords`.
 
 ### Camadas em volta do LLM, na ordem
 
+**Atalhos, antes de chamar o roteador.** O `ai_service` confere, nesta ordem, quatro situações em que o classificador nem é chamado (log `[INTENT-OVERRIDE]`):
+1. o Neo fez uma pergunta de esclarecimento no turno anterior: esta mensagem é a resposta e vai ao cérebro;
+2. há uma missão de WhatsApp ativa e a mensagem parece continuação dela: vai ao WhatsApp;
+3. há uma tarefa do Claude Code esperando resposta nesta sessão: vai ao cérebro, porque só ele tem o `claude_reply`. Sem isso, "pode rodar" virou `run_command` (job decc8224);
+4. `force_intent` no metadata, usado em testes: o trilho pedido.
+
+Fora desses casos, o roteador roda:
+
 1. **Guardas determinísticas antes do LLM.** Pegam treino do Neo, diretiva de memória ("lembra que…"), pergunta sobre aparelhos conhecidos, pergunta referencial ("de onde veio esse 22?"), ação condicional, música, status de mídia e nome de outro assistente ("alexa, …"). Todas caem no cérebro. Regra de ouro do arquivo: não criar padrão por frase para consertar rota errada.
-2. **Classificador LLM**, com saída JSON nativa e reparo de rede.
-3. **Vieses depois do LLM:**
-   - `_bias_to_brain`: devolve ao cérebro o que não for imperativo claro;
-   - `_bias_local_browser` e `_bias_claude_code`;
-   - viés de afeto;
-   - heurísticas de memória.
-4. **Overrides no `ai_service`:** `force_intent` no metadata, tarefa do Claude Code esperando resposta (`[INTENT-OVERRIDE]`), turno agendado sem CLIENT_TOOL e tarefa viva no navegador (vai ao cérebro).
+2. **Classificador LLM**, com saída JSON nativa e reparo de rede. O `_parse_classification` monta o `RoutingDecision` e termina em `_bias_to_brain`.
+3. **Heurísticas de memória e rejeições:** eco do próprio prompt, destinatário de WhatsApp sem lastro na conversa, classificador redigindo arquivo e atalho de recall.
+4. **Vieses finais, nesta ordem:** `_bias_local_browser` → `_bias_claude_code` → `_apply_affect_bias`.
+5. **Correção depois do roteador:** num turno da agenda, sem ninguém na tela (`unattended`), CLIENT_TOOL vira DIRECT_RESPONSE, porque não há Mac para responder.
+
+A tarefa viva no navegador não é atalho do `ai_service`. O `ai_service` só põe o bloco dela no contexto, e quem o lê é o `_bias_local_browser`.
+
+**Caminho de reserva:** se o provedor do classificador cai, entra o `_fallback_classify` por palavra-chave. Depois dele rodam as heurísticas de memória e os três vieses do passo 4. As rejeições do passo 3 e o `_bias_to_brain` não rodam.
+
+### Os vieses, um por um
+
+**Os vieses são código, sem chamada de LLM.** Cada um é uma regra fixa aplicada a dois tipos de entrada: o texto da sua mensagem (regex, o portão do navegador) ou campos que o classificador já preencheu (`speech_act`, `confidence`, `tool_name`). Custam zero token e zero latência. A regra é determinística, mas parte da entrada é um palpite do LLM: se o classificador marcar "acende a luz?" como `imperative` com 0,9, o `_bias_to_brain` deixa passar.
+
+Os quatro fazem a mesma coisa: **tiram a decisão de um trilho estreito e devolvem ao cérebro**. Zeram `skill_name`, `tool_name`, `tool_arguments` e `raw_command`, ligam `needs_memory` e escrevem o motivo em `explanation`, que aparece no diário. Nenhum leva a um trilho mais estreito. O motivo é sempre o mesmo: o cérebro tem o PKS, o modelo forte e todas as tools, e ainda pode acionar a skill depois por handoff.
+
+| Viés | Dispara quando | Leva para | Por que existe |
+|---|---|---|---|
+| `_bias_to_brain` | Intent `HOME_ASSISTANT` ou `WHATSAPP_MESSAGING` que **não** seja imperativo com confiança ≥ 0,75 | `DIRECT_RESPONSE` | A skill com efeito colateral não lê o PKS. "Se eu costumo apagar a luz às 23h…" não é ordem. Troca o conjunto aberto ("pegar o que devia ir ao cérebro") por um fechado ("só passa imperativo claro") |
+| `_bias_local_browser` | `browser_local_enabled` ligado **e** (o portão do navegador casa com a mensagem **ou** há tarefa viva no navegador e o classificador quis abrir outro) | `COGNITIVE` | `browser_local_task` e `job_falar` só existem no cérebro. Sem o viés, o pedido caía no Chromium do servidor: em 28/08/2026 o job terminou em `about:blank` |
+| `_bias_claude_code` | A chave do Claude Code está ligada e a mensagem cita "claude" | `COGNITIVE` | `claude_task` só existe no cérebro. "Roda o Claude no meu Mac" viraria um `claude -p` cru por `run_command`, sem orquestração |
+| `_apply_affect_bias` | O límbico pede (`force_brain`) e o intent é HA ou WhatsApp | `DIRECT_RESPONSE` | A skill não conhece o humor do Neo; o cérebro decide se atende, recusa ou responde atravessado |
+
+Detalhes que não aparecem na tabela:
+- **`_bias_to_brain`** só olha HA e WhatsApp. SERVER_TOOL e CLIENT_TOOL ficam intocados, porque para eles uma pergunta é o gatilho normal. Desliga com `router_bias_to_brain_enabled`; o limiar é `router_skill_confidence_threshold`.
+- **`_bias_local_browser`** também liga `navegador_do_usuario` quando o pedido é imperativo e não há tarefa viva. Com isso o cérebro recebe o aviso de abrir o navegador nesta resposta, mesmo quando o intent já era o cérebro. Uma pergunta ("por que meu navegador travou?") não liga o sinal. O portão foi medido no corpus real: 15 marcações em cerca de 1.700 mensagens, zero falso positivo (`scripts/eval_browser_gate.py`).
+- **`_bias_claude_code`** usa uma âncora larga de propósito. Mandar ao cérebro uma frase que só cita o Claude não custa nada, porque o cérebro é o trilho geral.
+- O de navegador, o do Claude e o de afeto valem também no caminho de reserva. Um provedor caído é justamente quando a palavra-chave erra.
+
+**Achado (15/11/2026):** no caminho de reserva, o fallback devolve HA com confiança 0,6 e WhatsApp com 0,7, ambos abaixo do limiar de 0,75. Se o `_bias_to_brain` rodasse ali, os dois iriam ao cérebro; como não roda, a skill dispara direto. O fallback de WhatsApp casa com palavras comuns como "manda", "mensagem" e "texto".
+
+### Como os campos se combinam
+
+**Quem roteia é o `intent`.** Os outros campos só valem dentro do trilho que ele escolheu, e nenhum código confere um campo contra o outro.
+
+| Campo | Quem lê | Efeito |
+|---|---|---|
+| `intent` | `ai_service` (despacho) | Escolhe o handler |
+| `onde` | Cérebro | `sandbox` com `DIRECT_RESPONSE` injeta o aviso "Onde esta tarefa roda": usar `web_search`, `neo_bash` e `file_save`, não procurar no computador dele nem pedir o link antes de buscar. Qualquer valor de tarefa (`sandbox`, `maquina`, `navegador`) põe a 1ª rodada a 0,3 em vez de 0,9. `nenhum` ou vazio mantêm a persona a 0,9 |
+| `needs_plan` | Só o `_handle_client_tool` | Gera o plano e despacha o passo 1 ao Mac |
+| `pipeline_plan` | `_run_pipeline` | Cascata de 2 ou mais passos com intents diferentes |
+| `tipo_tarefa` | Registro de Contexto (em sombra) | Valor diferente de `simples` vira o registro OFICINA; hoje só loga |
+| `speech_act` + `confidence` | `_bias_to_brain` | Decidem se HA ou WhatsApp dispara |
+| `navegador_do_usuario` | Cérebro | Aviso para abrir o navegador nesta resposta |
+
+**Dá para ter `onde=sandbox` com `needs_plan=true`?** O JSON aceita, mas não muda nada. O prompt do classificador manda deixar `needs_plan` falso fora do CLIENT_TOOL, e o código só lê o campo nesse handler. Com `DIRECT_RESPONSE`, o cérebro planeja sozinho dentro das rodadas: cada rodada é um passo, até 32. O PlanManager serve para o Mac, onde cada passo é uma ida e volta ao desktop e o plano precisa sondar antes de agir (`ls` ou `find` antes de assumir um nome de arquivo).
+
+**Combinações e para onde vão:**
+
+| intent | onde | needs_plan | O que acontece |
+|---|---|---|---|
+| DIRECT_RESPONSE | sandbox | false | Cérebro com aviso de sandbox, 1ª rodada a 0,3. É o caso da planilha da Wikipédia |
+| DIRECT_RESPONSE | sandbox | true | Igual à linha de cima; `needs_plan` ignorado |
+| DIRECT_RESPONSE | nenhum | qualquer | Conversa: persona a 0,9, sem aviso |
+| DIRECT_RESPONSE | navegador | qualquer | Cérebro a 0,3. Se o portão casar e for uma ordem, entra o aviso de abrir o navegador |
+| CLIENT_TOOL | maquina | false | Comando direto ao Mac, com card de aprovação salvo o que a política de auto-aprovação libera |
+| CLIENT_TOOL | maquina | true | O PlanManager gera o plano, despacha o passo 1 e segue em `process_tool_result`. Plano vazio, passo sem comando ou tool fora do catálogo → cérebro |
+| CLIENT_TOOL | qualquer | forçado | Caminho ou URL do comando que não aparece na conversa: o argumento é descartado e o plano começa por uma sondagem |
+| CLIENT_TOOL ou SERVER_TOOL com `browser_local_task` | qualquer | qualquer | Vira DIRECT_RESPONSE, com `needs_plan` zerado e `navegador_do_usuario` ligado |
+| CLIENT_TOOL com tool fora do catálogo | qualquer | false | Vira DIRECT_RESPONSE: despachar travaria o turno |
+| Cascata (`pipeline_plan`) | qualquer | por passo | Passo CLIENT_TOOL sem comando ganha `needs_plan=true` sozinho |
+
+**Descompasso sem guarda:** `onde=sandbox` com `intent=CLIENT_TOOL` vai ao Mac, e o aviso de sandbox não entra, porque ele exige DIRECT_RESPONSE. `onde=maquina` com DIRECT_RESPONSE vai ao cérebro a 0,3, sem aviso nenhum. Se o `onde` virar trava um dia, a guarda entra aqui.
 
 Para medir mudança no prompt: `scripts/eval_router.py` com o golden set em `tests/router/golden_intents.yaml`.
 
@@ -137,6 +231,8 @@ Fica em `_run_cognitive_tool_loop`, no [ai_service.py](../modules/desktop/ai_ser
 | Rodadas seguidas só com repetição antes de cortar as tools | 3 | `repeticoes_seguidas_max` |
 | Trecho do resultado anterior no aviso de repetição | 800 chars | `repeticao_trecho_max` |
 
+**Rodada** é uma chamada ao LLM dentro do laço: o modelo lê tudo, responde ou pede tools, e os resultados abrem a rodada seguinte. **Temperatura** controla o quanto o modelo sorteia a próxima palavra. Perto de 0, ele escolhe quase sempre a mais provável; a 0,9, varia mais. A 1ª rodada sai a 0,9 para a persona soar natural. Depois que uma tool roda, ou quando o `onde` diz que é tarefa, as rodadas saem a 0,3, porque ali o modelo escreve código, comando e argumento, e variação vira erro. Antes dessa regra, as 52 rodadas da sessão 20cb02b6 saíram a 0,9.
+
 **Guardas que viraram código** (cada uma nasceu de uma sessão real):
 
 - **Fim das rodadas:** a última rodada vai sem tools **e** com `_AVISO_FIM_DAS_RODADAS`. Sem o aviso, o DeepSeek devolvia `"\n\n"` (sessão 3229310a).
@@ -146,6 +242,45 @@ Fica em `_run_cognitive_tool_loop`, no [ai_service.py](../modules/desktop/ai_ser
 - **Anti-HANDOFF-de-tool:** `[[HANDOFF:save_generated_file]]` escrito em vez de chamado vira a chamada de verdade.
 - **Auto-continuação:** `[[HANDOFF:continuar]]` abre outro passe. Um verificador pega a resposta que promete trabalho sem o bloco.
 - **`annotate_result`:** o código cola avisos no resultado da tool, como "este arquivo é de OUTRA conversa" e "URL tirada da memória falhou, busque".
+
+### Tetos: o que impede o turno de estourar no meio
+
+Há dois tipos de teto: o de **saída**, que limita quantos tokens uma chamada pode gerar, e o de **trabalho**, que limita rodadas, passos e segundos.
+
+**Teto adaptativo de saída** ([core/llm/teto_adaptativo.py](../core/llm/teto_adaptativo.py)). Hoje só o passo do navegador local usa (`[navegador.decisao]`).
+
+O problema: modelos que não deixam desligar o raciocínio, como o GLM-5.3-flash, gastam o `max_tokens` pensando, e o JSON sai cortado. No job 9c9b5bae, com teto fixo de 2.000, isso aconteceu em 6 de 30 passos, e esses passos foram 28% do custo do job. Os passos que fecharam raciocinaram entre 29 e 1.566 tokens, então nenhum número fixo serve: ou corta a cauda, ou fica largo demais.
+
+A solução usa a mesma conta do timeout do TCP (RFC 6298), com média e desvio móveis por modelo:
+
+```
+teto      = reserva_resposta + orçamento
+orçamento = média + desvios × desvio
+```
+
+| Parâmetro (`[teto_adaptativo]` e `[navegador.decisao]`) | Valor | Papel |
+|---|---|---|
+| `reserva_resposta` | 600 | Espaço do JSON (o maior medido teve 356 tokens) |
+| `piso` / `maximo` | 2.000 / 6.000 | Ponto de partida e limites; 6.000 ≈ 30 s no pior passo |
+| `peso_media` / `peso_desvio` | 0,125 / 0,25 | Quão rápido média e desvio reagem a uma medida nova |
+| `desvios` | 4 | Folga acima da média |
+| `fator_corte` | 1,5 | Num corte, o raciocínio medido entra ×1,5, porque o real era maior |
+| `fator_escada` | 2 | O passo cortado repete a MESMA chamada com o teto ×2, até o máximo, antes de virar recusa |
+
+Um corte acontece quando o raciocínio invade a reserva da resposta. O teto sobe sozinho depois de um passo pesado, desce nos leves e reaprende quando o modelo muda. O aprendido fica na memória do processo, então um reload volta ao piso e a escada cobre o recomeço. **Teto não é gasto:** o provedor cobra o que o modelo gera, e subir o teto só custa no passo que de fato raciocina mais.
+
+**No cérebro, os tetos de saída são fixos, com retentativa:**
+- `max_tokens` de 8.192 por rodada (`default_max_tokens`);
+- resposta vazia repete com o dobro, até 16.384;
+- argumento de tool cortado pelo limite ganha até 2 rodadas de retentativa. Depois, o Neo pede para escrever em partes;
+- teto de 32 rodadas, corte das tools depois de 3 rodadas seguidas de repetição, e aviso de fim na última rodada.
+
+**Tetos de tempo e de trabalho.** Contam por inatividade, não por relógio:
+- **Turno no desktop:** morre com 90 s sem nenhuma mensagem. Enquanto espera o Mac responder, o teto é de 1 h. O gRPC manda keepalive a cada 15 s, só se houve progresso real nos últimos 240 s.
+- **Sandbox:** o `neo_bash` só morre se a árvore de processos ficar parada pela janela de travamento (30 a 300 s, padrão 90). Passou de 120 s trabalhando, vira job.
+- **Comando no Mac:** passou de 90 s, vira tarefa local, com teto de 2 h.
+- **Idas e voltas entre cérebro e Mac num turno:** até 16 (`_MAX_ACTUATION_DEPTH`).
+- **Navegador local:** cada mensagem sua devolve 15 passos ao orçamento da tarefa, com teto de 150.
 
 **Handoffs:** o cérebro aciona uma skill escrevendo `[[HANDOFF:home_assistant]]<ordem>[[/HANDOFF]]`. O [handoff_parser](../core/pipeline/handoff_parser.py) extrai o bloco e o [orchestrator](../core/pipeline/orchestrator.py) enfileira o passo. É assim que música e HA passam pelas regras do PKS.
 
@@ -188,6 +323,7 @@ O [FileLedger](../core/files/ledger.py) registra onde está cada cópia, em dois
 | Leitura do cérebro | `search_pks`, `wm_read`, `conversation_recall`, `get_weather` | neo-core |
 | Web | `web_search` (só o Google CSE está vivo), `web_fetch` | neo-core |
 | Sandbox | `neo_bash`, `neo_read_file`, `file_save`, `file_olhar` | container workbench |
+| Transcrição | `neo_transcrever`: o sandbox tira o áudio, o Whisper do Groq transcreve ([transcricao-groq.md](transcricao-groq.md)) | sandbox + Groq |
 | Documentos | `deep_read`, `docx_*` | job / sandbox |
 | Cliente | `run_command`, `write_file`, `save_generated_file`, `read_user_file`, `edit_user_file` | Mac, via `tool_request` |
 | Jobs | `neo_bash_background`, `job_*`, `job_falar`, `browser_local_task`, `claude_task`, `claude_reply` | JobManager |
@@ -320,6 +456,9 @@ O `AIService` emite um fluxo de `AIServiceResponse`. O gRPC converte em `CoreMes
 Outras saídas:
 - **Arquivo no disco dele:** `save_generated_file`, com caminho literal e criação de pasta.
 - **Imagem no chat:** o marcador `[[IMAGE:caminho]]` vira data URL no cliente; os bytes não passam pelo prompt.
+- **Arquivo que já está no Mac:** o marcador `[[FILE:caminho]]` vira um cartão com nome, tamanho e "Mostrar no Finder" (`stat_local_file` + `reveal_in_folder` no Rust; não abre o arquivo, porque o caminho vem do modelo). Serve para o que foi baixado na máquina dele, em vez de `file_save`. O corpo do marcador vai até o `]]`, porque o yt-dlp põe `[id]` no nome. A instrução (`_LOCAL_FILE_INSTRUCTION`) segue o mesmo gate do `[[IMAGE:…]]`. Se o cérebro tentar `request_user_file(stage=false)` de vídeo/áudio só para entregar, a 1ª chamada não roda e volta `_AVISO_MIDIA_JA_ESTA_NO_MAC`; a 2ª igual passa (e-mail, WhatsApp), e `stage=true` (processar) nunca é barrado.
+- **Vídeo do YouTube por nome:** `neo_video_candidatos` escolhe antes de baixar (dados → quadros → perguntar), e download às cegas fica travado. Ver `docs/video-candidatos.md`.
+- **Site que barra o sandbox:** quando o `neo_bash` recebe bot-check/login do yt-dlp ("confirm you're not a bot", "--cookies-from-browser"), o resultado ganha `_AVISO_ORIGEM_BLOQUEADA`. O aviso manda rodar o mesmo yt-dlp por `run_command` no Mac, que tem IP residencial, e entregar com `[[FILE:…]]`. Sem `run_command` no turno, o aviso só manda contar ao Daniel. Caso de origem: session-3ed86282.
 - **Voz:** no modo live, a resposta final vai ao TTS. `[[VOICE:nome]]` divide em segmentos com outra voz.
 - **Depois do turno:** resultado de job e disparo de agenda chegam pelo ProactiveDispatcher, como bolha nova, notificação no aparelho e replay quando ele voltar.
 - **WhatsApp:** saída pelo `neo-whatsapp`; o `/notify` passa pelo nginx :8091 com `X-Notify-Token`.
@@ -329,9 +468,10 @@ Outras saídas:
 ## 12. Configuração, observabilidade e onde mexer
 
 **Configuração**
-- `config/neo.toml`: números de comportamento, nas seções `[cerebro]`, `[roteador]`, `[navegador.*]`, `[trabalho]`, `[web]`, `[faxina]`, `[comando_no_computador]`, `[grpc]`, `[openrouter]` e `[teto_adaptativo]`. Regra da casa: número novo vai para cá.
+- `config/neo.toml`: números de comportamento, nas seções `[cerebro]`, `[roteador]`, `[navegador.*]`, `[trabalho]`, `[web]`, `[faxina]`, `[comando_no_computador]`, `[grpc]`, `[openrouter]`, `[teto_adaptativo]` e `[transcricao]`. Regra da casa: número novo vai para cá.
 - `.env` **da raiz** do monorepo, que é o único que o container lê. Mudou o `.env`: `docker compose up -d --no-deps neo-core`.
 - Catálogo de LLM, slots, chaves e configuração de intent: Postgres, pelo neo-panel.
+- Transcrição (chave do Groq, modelo, "só a cota gratuita"): Postgres, pelo neo-panel, em Configurações → Transcrição.
 
 **Onde olhar quando algo dá errado**
 
@@ -369,4 +509,6 @@ Outras saídas:
 - **Muita coisa sem commit.** Vários consertos de produção estão só no disco.
 - **Portões em sombra.** Autoridade, auth das rotas e ranking v2 do PKS medem, mas não barram.
 - **Teste de ponta a ponta pendente** em umas 17 features: formulário, docx, cofre, Claude Code, URL de memória e outras.
+- **O prompt não é medido dentro do turno.** Os orçamentos de contexto são fixos e valem na montagem. Nas rodadas, o prompt cresce com os resultados das tools, e nada o compara com a janela do modelo.
+- **Fallback do roteador sem `_bias_to_brain`.** Quando o classificador cai, HA (0,6) e WhatsApp (0,7) disparam direto. Ver §4.
 - **O defeito mais caro é dado errado dito com confiança**, não travar. É por isso que o eval do GAIA separa "errou com confiança" de "não sei".
