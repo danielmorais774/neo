@@ -1,0 +1,37 @@
+# Destinos NEGADos pelo proxy (regex estendida, casada contra o host da requisição).
+# FilterDefaultDeny Off → estas entradas são a denylist; tudo que casa é bloqueado.
+#
+# Cobre todos os ranges privados/loopback/link-local — inclui a LAN de casa
+# (192.168.x via WireGuard), redes docker/ZeroTier (10.x, 172.16-31.x), Proxmox e
+# Home Assistant. IP literal é pego direto; nomes internos (.local/.lan/.internal)
+# também. Limitação conhecida: um nome PÚBLICO que resolva para um IP privado
+# (DNS rebinding) não é pego aqui — endurecer com squid (ACL dst por IP resolvido)
+# é o upgrade se necessário. Ver docs/workbench-background-jobs-plan.md §6.
+
+# --- IPv4 privados / especiais (IP literal no host) ---
+^127\.
+^10\.
+^192\.168\.
+^172\.(1[6-9]|2[0-9]|3[0-1])\.
+^169\.254\.
+^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.
+^0\.
+
+# --- O PRÓPRIO SERVIDOR (medido em 2026-09-22) ---
+# O IP público da VPS não é "privado", então passava pelo filtro — e o Docker
+# faz hairpin: do sandbox, `curl http://203.0.113.10:8000` caía na API do
+# neo-core sem autenticação nenhuma. As portas agora são loopback-only, mas o
+# filtro fecha o caminho por construção, não por configuração de outro arquivo.
+^178\.18\.241\.170$
+^2a02:c207:2333:7942::1$
+
+# --- IPv6 privados / loopback / link-local ---
+^::1$
+^f[cd][0-9a-f]{2}:
+^fe80:
+
+# --- nomes internos ---
+localhost
+\.local$
+\.lan$
+\.internal$

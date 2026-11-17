@@ -1,0 +1,479 @@
+# Neo Project - Docker Compose
+
+services:
+  neo-core:
+    build:
+      context: ./neo-core
+      dockerfile: Dockerfile
+    container_name: neo-core
+    command: /usr/local/bin/entrypoint-dev.sh
+    # Sem isso, um crash do processo deixava a API fora do ar até alguém reiniciar
+    # na mão (docs/deep-research-v2-plan.md §12.6).
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql+asyncpg://neo:${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}@neo-postgres:5432/neodb
+      - DATABASE_URL_SYNC=postgresql://neo:${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}@neo-postgres:5432/neodb
+      - MONGO_URL=mongodb://neo-mongo:27017
+      - MONGO_DB=neo_observability
+      - OLLAMA_BASE_URL=http://neo-ollama:11434
+      - WHATSAPP_GATEWAY_URL=http://neo-whatsapp:3030
+    ports:
+      # Só loopback: o acesso é por TÚNEL SSH (que termina aqui no 127.0.0.1),
+      # então publicar em 0.0.0.0 só servia para (a) quem chega pela ZeroTier/
+      # WireGuard e (b) o sandbox voltando pelo IP público — o caminho que a
+      # auditoria de 2026-09-22 mediu. Ver docs/release-request-plan.md §12.4.
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:50051:50051"
+    # default (todos os serviços) + browser-net (só p/ falar com o
+    # neo-browser-agent — docs/browser-agent-plan.md §6).
+    networks:
+      - default
+      - browser-net
+    depends_on:
+      - neo-postgres
+      - neo-mongo
+    volumes:
+      - ./neo-core:/app
+      - neo-core-logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+      # File Store (docs/file-store-plan.md §3.1): o core é o dono do store —
+      # escreve blobs no upload/harvest e lê nas tools file_*.
+      - neo-files:/data/files
+      # Workspace do sandbox montado READ-ONLY: só para o harvest (file_save)
+      # copiar o que o Neo produziu para o store, sem exec/base64. O core não
+      # escreve no rascunho do sandbox.
+      - neo-workspace:/workspace:ro
+    # `docker ps` passa a dizer a verdade sobre o app (não só sobre o container).
+    # Sem curl na imagem → urllib. start_period cobre o boot + install de deps.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  neo-mongo:
+    image: mongo:7
+    container_name: neo-mongo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - mongodata:/data/db
+
+  neo-postgres:
+    image: pgvector/pgvector:pg15
+    container_name: neo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: neo
+      POSTGRES_PASSWORD: ${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}
+      POSTGRES_DB: neodb
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  neo-postgres-pks-test:
+    image: pgvector/pgvector:pg15
+    container_name: neo-postgres-pks-test
+    restart: unless-stopped
+    profiles:
+      - pks-test
+    environment:
+      POSTGRES_USER: neo
+      POSTGRES_PASSWORD: ${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}
+      POSTGRES_DB: neodb
+    ports:
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - pgdata-pks-test:/var/lib/postgresql/data
+
+  neo-core-pks-test:
+    build:
+      context: ./neo-core
+      dockerfile: Dockerfile
+    container_name: neo-core-pks-test
+    command: /usr/local/bin/entrypoint-dev.sh
+    profiles:
+      - pks-test
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql+asyncpg://neo:${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}@neo-postgres-pks-test:5432/neodb
+      - DATABASE_URL_SYNC=postgresql://neo:${NEO_DB_PASSWORD:?defina NEO_DB_PASSWORD no .env}@neo-postgres-pks-test:5432/neodb
+      - MONGO_URL=mongodb://neo-mongo:27017
+      - MONGO_DB=neo_observability
+      - OLLAMA_BASE_URL=http://neo-ollama:11434
+      - WHATSAPP_GATEWAY_URL=http://neo-whatsapp:3030
+      - API_PORT=8000
+      - GRPC_PORT=50051
+    ports:
+      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:50052:50051"
+    depends_on:
+      - neo-postgres-pks-test
+      - neo-mongo
+    volumes:
+      - ./neo-core:/app
+      - neo-core-pks-test-logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  neo-letta-postgres:
+    image: pgvector/pgvector:pg15
+    container_name: neo-letta-postgres
+    restart: unless-stopped
+    profiles:
+      - letta
+    environment:
+      POSTGRES_USER: letta
+      POSTGRES_PASSWORD: ${LETTA_DB_PASSWORD:?defina LETTA_DB_PASSWORD no .env}
+      POSTGRES_DB: letta
+    ports:
+      # ABERTA NA INTERNET até 2026-09-24.
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - letta-pgdata:/var/lib/postgresql/data
+      - ./docker/letta-postgres/init:/docker-entrypoint-initdb.d:ro
+
+  neo-letta:
+    image: letta/letta:latest
+    container_name: neo-letta
+    restart: unless-stopped
+    profiles:
+      - letta
+    environment:
+      - LETTA_PG_URI=postgresql://letta:${LETTA_DB_PASSWORD:?defina LETTA_DB_PASSWORD no .env}@neo-letta-postgres:5432/letta
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - OLLAMA_BASE_URL=http://neo-ollama:11434/v1
+      - LETTA_UVICORN_WORKERS=1
+    ports:
+      - "127.0.0.1:8283:8283"
+    depends_on:
+      - neo-letta-postgres
+
+  neo-vision:
+    build:
+      context: ./neo-vision
+      dockerfile: Dockerfile
+    container_name: neo-vision
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - NEO_VISION_OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+    ports:
+      - "127.0.0.1:5011:5010"
+    volumes:
+      - ./neo-vision/output:/app/output
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: neo-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - OLLAMA_GPU_LAYERS=40
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_KEEP_ALIVE=-1
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ollama serve &
+      sleep 5 &&
+      ollama pull gemma4:e2b &&
+      ollama run gemma4:e2b '' &
+      wait"
+    networks:
+      - default
+      - shared-dev-network
+
+  neo-whatsapp:
+    build:
+      context: ./neo-whatsapp
+      dockerfile: Dockerfile
+    container_name: neo-whatsapp
+    environment:
+      - NODE_ENV=production
+      - PORT=3030
+      - AUTH_DIR=/app/auth
+      - NEO_CORE_WEBHOOK_URL=http://neo-core:8000
+      - WHATSAPP_WEBHOOK_SECRET=${WHATSAPP_WEBHOOK_SECRET:-dev-secret}
+      - SESSION_NAME=neo-whatsapp
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+      - TOKEN_DIR=/app/auth/venom
+      - ALLOWED_WHATSAPP_PHONE=${ALLOWED_WHATSAPP_PHONE:?defina ALLOWED_WHATSAPP_PHONE no .env}
+      - NOTIFY_WHATSAPP_PHONE=${NOTIFY_WHATSAPP_PHONE:?defina NOTIFY_WHATSAPP_PHONE no .env}
+    ports:
+      # Só interno: acessível na rede docker (neo-whatsapp:3030) e no host via
+      # localhost. Nada externo. Exposição pública é só via notify-proxy (/notify).
+      - "127.0.0.1:3030:3030"
+    volumes:
+      - baileys-auth:/app/auth
+      - whatsapp-session:/app/auth/wa-profile
+    depends_on:
+      - neo-core
+    # Sem isto o container morria e ficava morto (era `no`, o default).
+    restart: unless-stopped
+    # `docker ps` mentia: o Express responde 200 em /health mesmo com a sessão
+    # caída, então o gateway apareceu "Up 2 months" por 8 dias devolvendo 503
+    # em /chats. O healthcheck lê o campo `connected`, não o código HTTP.
+    # Esperar leitura de QR também conta como unhealthy — é a verdade: sem o
+    # celular parear, o serviço não serve.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3030/health').then(r=>r.json()).then(j=>process.exit(j.connected?0:1)).catch(()=>process.exit(1))"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 180s
+
+  # Reverse proxy que expõe SOMENTE POST /notify do neo-whatsapp para fora.
+  # Os demais endpoints (/send, /qr, /chats, /contacts, ...) ficam só na rede
+  # interna + localhost. Abra apenas a porta 8091 no firewall da Contabo.
+  # Exige o header X-Notify-Token igual ao NOTIFY_TOKEN do .env.
+  notify-proxy:
+    image: nginx:1.27-alpine
+    container_name: notify-proxy
+    restart: unless-stopped
+    environment:
+      - NOTIFY_TOKEN=${NOTIFY_TOKEN:?defina NOTIFY_TOKEN no .env}
+    volumes:
+      - ./neo-whatsapp/notify-proxy/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "8091:80"
+    depends_on:
+      - neo-whatsapp
+
+  # Reverse proxy que expõe o session-worker da LAN (10.47.33.109:4100, alcançado
+  # pela VPS via ZeroTier + MASQUERADE do host — mesmo caminho das engines de voz
+  # em 10.47.33.x) na porta pública 4100. Exige o header X-Session-Token igual ao
+  # SESSION_TOKEN do .env; qualquer outra coisa => 403. Abra a 4100 no firewall da
+  # Contabo. Sem depends_on: o alvo é externo (IP ZeroTier), não um serviço docker.
+  session-worker-proxy:
+    image: nginx:1.27-alpine
+    container_name: session-worker-proxy
+    restart: unless-stopped
+    environment:
+      - SESSION_TOKEN=${SESSION_TOKEN:?defina SESSION_TOKEN no .env}
+    volumes:
+      - ./session-worker-proxy/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "4100:80"
+
+  # Sandbox de execução do PRÓPRIO Neo (a "bash do Neo") — ver
+  # neo-core/docs/workbench-background-jobs-plan.md. O neo-core executa comandos
+  # aqui via docker exec (socket já montado); nada trafega pela rede entre eles.
+  # Rede `workbench-net` é `internal: true` → o sandbox NÃO tem rota externa
+  # (nem internet, nem LAN). A única saída é o neo-workbench-proxy, que dá internet
+  # mas recusa destinos privados (RFC1918/LAN). Assim: "internet sim, LAN não",
+  # sem iptables no host. /workspace persiste entre jobs e restarts.
+  neo-workbench:
+    build:
+      context: ./docker/neo-workbench
+      dockerfile: Dockerfile
+    container_name: neo-workbench
+    restart: unless-stopped
+    init: true
+    command: ["sleep", "infinity"]
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - workbench-net
+    environment:
+      # Saída só via proxy (a rede é internal). Ferramentas que respeitam proxy
+      # (pip/curl/npm/git-https) alcançam a internet; socket cru não sai — nem pra
+      # LAN (que é o objetivo).
+      - HTTP_PROXY=http://neo-workbench-proxy:8888
+      - HTTPS_PROXY=http://neo-workbench-proxy:8888
+      - http_proxy=http://neo-workbench-proxy:8888
+      - https_proxy=http://neo-workbench-proxy:8888
+      - NO_PROXY=localhost,127.0.0.1
+      - no_proxy=localhost,127.0.0.1
+    volumes:
+      - neo-workspace:/workspace
+      # Skills declarativas (docs/skills-library-plan.md): scripts prontos das
+      # skills "scripted" ficam visíveis no sandbox em /skills — read-only, o
+      # sandbox pode executar mas nunca alterar a skill.
+      - ./neo-core/skills:/skills:ro
+      # File Store (docs/file-store-plan.md §3.1): blobs visíveis READ-ONLY —
+      # o file_stage copia daqui para /workspace/files/. O sandbox enxerga o
+      # conteúdo mas não corrompe o store (integridade por construção).
+      - neo-files:/files:ro
+    depends_on:
+      - neo-workbench-proxy
+
+  # Proxy de saída do sandbox: internet liberada, destinos privados (LAN) negados.
+  # Fica na rede interna (fala com o sandbox) E numa bridge de egress (tem internet).
+  neo-workbench-proxy:
+    build:
+      context: ./docker/neo-workbench-proxy
+      dockerfile: Dockerfile
+    container_name: neo-workbench-proxy
+    restart: unless-stopped
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - workbench-net
+      - workbench-egress
+
+  neo-voice:
+    build:
+      context: ./neo-voice
+      dockerfile: Dockerfile
+    container_name: neo-voice
+    restart: unless-stopped
+    # bridge normal (neo_default): acessivel por nome (neo-voice:5002) entre os
+    # containers e publicado em :5002 pra fora. A saida p/ o IP ZeroTier do PC
+    # gamer (engines de voz) atravessa a interface zt do host via MASQUERADE do
+    # Docker — testado: container em bridge alcanca 10.47.33.237:5005.
+    ports:
+      - "127.0.0.1:5002:5002"
+    env_file:
+      - .env
+      # Fallback STT (OPENROUTER_API_KEY etc.) vem do MESMO service/.env do run
+      # nativo no Mac — o Mutagen sincroniza p/ a VPS. Opcional: nao quebra se faltar.
+      # (Sem override no `environment` abaixo, senao um valor vazio o anularia.)
+      - path: ./neo-voice/service/.env
+        required: false
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NEO_STT_PORT=5002
+      # Engine de TTS morto falha rapido (probe /health 2s + read 12s) e re-tenta
+      # menos (cooldown 30s), entao a maioria das chamadas vai direto pro Kokoro.
+      - NEO_TTS_ENGINE_TIMEOUT=12
+      - NEO_TTS_ENGINE_DOWN_COOLDOWN=30
+      # Engines do PC gamer via tunnel ZeroTier. PCGAMER_HOST vem do .env da raiz.
+      - NEO_STT_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5005
+      - NEO_TTS_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5006
+      - NEO_COQUI_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5007
+      - NEO_DIA_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5008
+      - NEO_COSYVOICE_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5009
+      - NEO_F5_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5010
+      - NEO_CHATTERBOX_ENGINE_URL=http://${PCGAMER_HOST:-192.168.4.185}:5011
+    volumes:
+      # persiste o override do fallback (ligado/desligado pelo neo-panel) entre redeploys
+      - neo-voice-state:/app/state
+
+  # Busca web self-hosted do Neo (web_search — docs/web-search-deep-research-plan.md).
+  # Só a rede interna do compose alcança (sem `ports:`); precisa de internet de
+  # saída → bridge default. Gotcha: settings.yml PRECISA de formats:[html,json].
+  searxng:
+    image: searxng/searxng:latest
+    container_name: neo-searxng
+    restart: unless-stopped
+    networks:
+      - default
+    volumes:
+      - ./docker/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+
+  # Subagente de browser do Neo (docs/browser-agent-plan.md): Chromium headless
+  # dirigido pelo browser-use, sessões/perfis persistentes em volume. Sem porta
+  # publicada — só o neo-core alcança, pela browser-net. Fica FORA da default:
+  # é a superfície de prompt-injection (lê web arbitrária), então não enxerga
+  # postgres/mongo/etc. Código do wrapper é bind-mount → editar + restart, sem
+  # rebuild.
+  neo-browser-agent:
+    build:
+      context: ./docker/neo-browser-agent
+      dockerfile: Dockerfile
+    container_name: neo-browser-agent
+    restart: unless-stopped
+    init: true
+    mem_limit: 1.5g
+    cpus: 1.5
+    pids_limit: 512
+    shm_size: 1g
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - browser-net
+    environment:
+      # Chave dedicada no .env da RAIZ (não o env_file do neo-core inteiro —
+      # o browser só recebe o que precisa).
+      - OPENROUTER_API_KEY=${NEO_BROWSER_OPENROUTER_KEY:-}
+      - NEO_BROWSER_LLM=${NEO_BROWSER_LLM:-google/gemini-2.5-flash}
+      - NEO_BROWSER_SESSION_TTL=900
+      - NEO_BROWSER_MAX_WARM=1
+      - NEO_BROWSER_TASK_TIMEOUT=570
+    volumes:
+      - ./docker/neo-browser-agent/app:/app
+      - neo-browser-profiles:/data/profiles
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5100/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  neo-workspace:
+  # Catálogo de arquivos do Neo (docs/file-store-plan.md): blobs deduplicados por
+  # sha256 + texto derivado. rw no neo-core, ro no neo-workbench.
+  neo-files:
+  neo-voice-state:
+  neo-browser-profiles:
+  pgdata:
+  pgdata-pks-test:
+  letta-pgdata:
+  mongodata:
+  ollama-data:
+  neo-core-logs:
+  neo-core-pks-test-logs:
+  baileys-auth:
+  whatsapp-session:
+  venom-tokens:
+
+networks:
+  default:
+    driver: bridge
+  # Rede do browser agent: bridge NORMAL (o browser precisa de internet, via
+  # NAT), mas só neo-core + neo-browser-agent vivem nela — o browser não
+  # alcança postgres/mongo/workbench, e ninguém de fora alcança o browser.
+  browser-net:
+    driver: bridge
+  # Rede do sandbox: `internal` = SEM rota externa (nem internet, nem LAN). Só o
+  # sandbox e o proxy vivem aqui. A saída do sandbox é exclusivamente o proxy.
+  workbench-net:
+    driver: bridge
+    internal: true
+  # Bridge de egress: só o proxy usa, para alcançar a internet. Isolada dos
+  # serviços do app (não é a `default`), então o proxy não enxerga postgres/etc.
+  workbench-egress:
+    driver: bridge
+  shared-dev-network:
+    external: true

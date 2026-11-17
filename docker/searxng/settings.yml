@@ -1,0 +1,33 @@
+# SearXNG do Neo (web_search) — docs/web-search-deep-research-plan.md §7.1
+# Instância PRIVADA: sem porta publicada no compose, só a rede interna alcança.
+use_default_settings: true
+server:
+  # Sobrescrito pela env SEARXNG_SECRET (definir no .env da raiz).
+  secret_key: "defina-SEARXNG_SECRET-no-env"
+  limiter: false # só rede interna; sem rate-limit próprio
+  public_instance: false
+search:
+  # json é OBRIGATÓRIO p/ a API (default é só html; sem isso, 403 no format=json)
+  formats:
+    - html
+    - json
+  languages:
+    - pt-BR
+    - en
+
+# Categoria 'science' do web_search / deep_research (deep-research-v2-plan.md §6):
+# é o que tira o relatório da dieta de site educacional genérico e o leva a
+# paper/dado primário. Engines desligados por default no SearXNG são ligados aqui.
+# Validar depois do deploy, de dentro do container neo-core:
+#   curl 'http://searxng:8080/search?q=industrial+revolution&categories=science&format=json'
+engines:
+  - name: arxiv
+    disabled: false
+  - name: google scholar
+    disabled: false
+  - name: semantic scholar
+    disabled: false
+  - name: crossref
+    disabled: false
+  - name: pubmed
+    disabled: false

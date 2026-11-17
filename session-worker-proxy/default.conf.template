@@ -1,0 +1,48 @@
+# Reverse proxy que expõe o session-worker da LAN para fora.
+# Alvo: 10.47.33.109:4100 — um nó da rede local, alcançado a partir da VPS pela
+# ZeroTier (mesmo caminho das engines de voz em 10.47.33.x). Um container nginx em
+# bridge chega nesse IP via MASQUERADE do host (testado com 10.47.33.237).
+#
+# Só passa quem manda o header X-Session-Token igual ao SESSION_TOKEN do .env;
+# qualquer outra coisa => 403. ${SESSION_TOKEN} é substituído no start do container
+# pelo envsubst da imagem nginx (só env vars reais são trocadas; os $vars do próprio
+# nginx sobrevivem).
+
+# Rate limit modesto só como defesa contra abuso — generoso p/ não atrapalhar o uso.
+limit_req_zone $binary_remote_addr zone=session_zone:10m rate=30r/s;
+
+# IP fixo do worker na ZeroTier. Estático, então não precisa de resolver.
+upstream session_worker {
+    server 10.47.33.109:4100;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    # Esconde a versão do nginx e mantém a superfície mínima.
+    server_tokens off;
+
+    # Uploads/streams grandes não devem ser cortados por limite de corpo.
+    client_max_body_size 0;
+
+    location / {
+        # Gate do segredo compartilhado. Faltando/errado => 403.
+        if ($http_x_session_token != "${SESSION_TOKEN}") {
+            return 403;
+        }
+
+        limit_req zone=session_zone burst=60 nodelay;
+
+        proxy_pass http://session_worker;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Sessions/jobs podem demorar; timeouts folgados.
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
