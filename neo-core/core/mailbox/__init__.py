@@ -9,7 +9,13 @@ em nome do próprio Neo e fica atrás de ``NEO_EMAIL_SEND_ENABLED`` — por isso
 tools de envio são uma lista separada (ver core/mailbox/tools.py).
 """
 
-from core.mailbox.client import MailboxError, get_message, list_inbox, send_message
+from core.mailbox.client import (
+    MailboxError,
+    get_attachment,
+    get_message,
+    list_inbox,
+    send_message,
+)
 from core.mailbox.tools import (
     EMAIL_SEND_TOOL_NAMES,
     EMAIL_SEND_TOOLS,
@@ -22,6 +28,7 @@ __all__ = [
     "MailboxError",
     "list_inbox",
     "get_message",
+    "get_attachment",
     "send_message",
     "EMAIL_TOOLS",
     "EMAIL_TOOL_NAMES",

@@ -25,6 +25,7 @@ import asyncio
 import email
 import imaplib
 import logging
+import mimetypes
 import re
 import smtplib
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ CONNECT_TIMEOUT_S = 20
 MAX_FETCH = 25
 SNIPPET_CHARS = 400
 MAX_BODY_CHARS = 4000
+#: Quantos anexos a listagem de UMA mensagem mostra (nome, tipo, tamanho).
+MAX_ATTACHMENTS_LISTED = 20
 MAX_RECIPIENTS = 5
 MAX_SUBJECT_CHARS = 200
 MAX_SEND_CHARS = 20000
@@ -63,9 +66,12 @@ class MailSummary:
     date: str
     snippet: str
     unread: bool
+    #: Nomes dos anexos. Sem isto um email que é SÓ uma foto chegava com prévia
+    #: vazia e nada mais — e o Neo concluiu que "o anexo não veio" (19b47475).
+    attachments: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "id": self.uid,
             "de": self.sender,
             "assunto": self.subject,
@@ -73,6 +79,9 @@ class MailSummary:
             "previa": self.snippet,
             "nao_lida": self.unread,
         }
+        if self.attachments:
+            out["anexos"] = list(self.attachments)
+        return out
 
 
 def _decode(raw: Any) -> str:
@@ -113,6 +122,75 @@ def _body_text(msg: email.message.Message) -> str:
     return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
+def _attachment_parts(msg: email.message.Message) -> list[email.message.Message]:
+    """As partes que são ARQUIVO (anexo ou imagem colada no corpo), em ordem.
+
+    O critério não é só ``Content-Disposition: attachment``: o Gmail manda a foto
+    arrastada para o corpo como ``inline`` dentro de um ``multipart/related``, às
+    vezes sem disposição nenhuma, só com ``Content-ID``. O que separa arquivo de
+    corpo é: tem nome, OU é ``attachment``, OU não é texto. Um ``text/plain``
+    sem nome é o corpo da mensagem (é o que ``_body_text`` lê) e fica de fora.
+    """
+    parts: list[email.message.Message] = []
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type()
+        # O email encaminhado (message/rfc822) é desdobrado pelo walk; o
+        # contêiner em si não é arquivo.
+        if ctype == "message/rfc822":
+            continue
+        disposition = (part.get_content_disposition() or "").lower()
+        has_name = bool(part.get_filename())
+        if part.get_content_maintype() == "text" and not has_name and disposition != "attachment":
+            continue
+        parts.append(part)
+    return parts
+
+
+def _attachment_name(part: email.message.Message, index: int) -> str:
+    """Nome legível do anexo; sem nome, um nome pelo tipo (``anexo-2.jpg``)."""
+    name = _decode(part.get_filename())
+    if name:
+        # Nome vem de fora: só o último componente, nunca um caminho.
+        return name.replace("\\", "/").rsplit("/", 1)[-1].strip() or f"anexo-{index}"
+    ext = mimetypes.guess_extension(part.get_content_type()) or ""
+    if ext == ".jpe":
+        ext = ".jpg"
+    return f"anexo-{index}{ext}"
+
+
+def _attachments_summary(msg: email.message.Message) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for i, part in enumerate(_attachment_parts(msg)[:MAX_ATTACHMENTS_LISTED], start=1):
+        try:
+            size = len(part.get_payload(decode=True) or b"")
+        except Exception:  # noqa: BLE001
+            size = None
+        out.append({
+            "indice": i,
+            "nome": _attachment_name(part, i),
+            "tipo": part.get_content_type(),
+            "tamanho_bytes": size,
+        })
+    return out
+
+
+def _local_time(when: datetime) -> str:
+    """``dd/mm HH:MM`` no fuso do Neo (o do usuário), não no do container.
+
+    O container roda em UTC: o email que o Daniel mandou às 23:23 de 14/11
+    aparecia como "15/11 02:23" (19b47475). O fuso padrão é o da agenda, e o
+    import é tardio porque `core.scheduler` puxa o pacote inteiro.
+    """
+    try:
+        from core.scheduler.timing import DEFAULT_TZ, get_tz
+
+        return when.astimezone(get_tz(DEFAULT_TZ)).strftime("%d/%m %H:%M")
+    except Exception:  # noqa: BLE001 — formatar hora nunca derruba a leitura
+        return when.astimezone(timezone.utc).strftime("%d/%m %H:%M UTC")
+
+
 def _connect(*, host: str, port: int, address: str, password: str) -> imaplib.IMAP4_SSL:
     try:
         conn = imaplib.IMAP4_SSL(host, port, timeout=CONNECT_TIMEOUT_S)
@@ -136,8 +214,19 @@ def _search_recent(conn: imaplib.IMAP4_SSL, since: datetime, unread_only: bool) 
 
     O SEARCH do IMAP tem granularidade de DIA (``SINCE 25-Aug-2026``), então o
     corte fino por minutos é feito depois, no header Date de cada mensagem.
+
+    **O dia pedido ao servidor é um ANTES do de ``since``.** O ``SINCE`` compara
+    com a data que o SERVIDOR dá à mensagem, no fuso DELE, e ``since`` está em UTC.
+    Sessão 19b47475 (14/11, 23:24 BRT = 02:24 UTC de 15/11): a busca de 30 min
+    virou ``SINCE 15-Nov`` e o Gmail, que datou a mensagem das 23:23 em 14/11,
+    devolveu zero — duas vezes, com o email lá. As janelas de 24 h e 7 dias
+    acharam a mesma mensagem. Toda noite, da meia-noite UTC (21h em Brasília) até
+    a virada do dia no fuso do servidor, uma janela curta ficava cega. Um dia a
+    mais custa no máximo ``MAX_FETCH`` mensagens a mais lidas, e o corte pelo
+    header descarta todas.
     """
-    criteria = [f'SINCE "{since.strftime("%d-%b-%Y")}"']
+    dia = since - timedelta(days=1)
+    criteria = [f'SINCE "{dia.strftime("%d-%b-%Y")}"']
     if unread_only:
         criteria.append("UNSEEN")
     typ, data = conn.uid("SEARCH", None, *criteria)  # type: ignore[arg-type]
@@ -174,9 +263,10 @@ def _fetch_summaries(
                 uid=uid.decode(),
                 subject=_decode(msg.get("Subject")) or "(sem assunto)",
                 sender=_decode(msg.get("From")),
-                date=when.astimezone().strftime("%d/%m %H:%M") if when else "",
+                date=_local_time(when) if when else "",
                 snippet=body[:SNIPPET_CHARS],
                 unread="\\Seen" not in flags_blob,
+                attachments=tuple(a["nome"] for a in _attachments_summary(msg)),
             )
         )
     return out
@@ -226,6 +316,43 @@ def _message_sync(
             "quando": _decode(msg.get("Date")),
             "texto": body[:MAX_BODY_CHARS],
             "truncado": len(body) > MAX_BODY_CHARS,
+            "anexos": _attachments_summary(msg),
+        }
+    finally:
+        _logout(conn)
+
+
+def _attachment_sync(
+    *, host: str, port: int, address: str, password: str, uid: str, index: int, folder: str
+) -> dict[str, Any] | None:
+    """O anexo ``index`` (1 = primeiro, a mesma ordem de ``anexos``) em bytes.
+
+    ``None`` quando a mensagem não existe; ``{"anexos": [...]}`` sem ``dados``
+    quando o índice não casa — quem chama mostra os que existem.
+    """
+    conn = _connect(host=host, port=port, address=address, password=password)
+    try:
+        typ, _ = conn.select(folder, readonly=True)
+        if typ != "OK":
+            raise MailboxError(f"não consegui abrir a pasta '{folder}'.")
+        typ, data = conn.uid("FETCH", uid.encode(), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return None
+        msg = email.message_from_bytes(data[0][1])
+        parts = _attachment_parts(msg)
+        base = {
+            "de": _decode(msg.get("From")),
+            "assunto": _decode(msg.get("Subject")) or "(sem assunto)",
+            "anexos": _attachments_summary(msg),
+        }
+        if not 1 <= index <= len(parts):
+            return base
+        part = parts[index - 1]
+        return {
+            **base,
+            "nome": _attachment_name(part, index),
+            "tipo": part.get_content_type(),
+            "dados": part.get_payload(decode=True) or b"",
         }
     finally:
         _logout(conn)
@@ -245,10 +372,21 @@ async def list_inbox(
 async def get_message(
     *, host: str, port: int, address: str, password: str, uid: str, folder: str = "INBOX"
 ) -> dict[str, Any] | None:
-    """Uma mensagem inteira (texto), pelo id que veio de :func:`list_inbox`."""
+    """Uma mensagem inteira (texto + lista de anexos), pelo id de :func:`list_inbox`."""
     return await asyncio.to_thread(
         _message_sync, host=host, port=port, address=address,
         password=password, uid=uid, folder=folder,
+    )
+
+
+async def get_attachment(
+    *, host: str, port: int, address: str, password: str, uid: str, index: int,
+    folder: str = "INBOX",
+) -> dict[str, Any] | None:
+    """Os bytes de UM anexo — ver :func:`_attachment_sync`."""
+    return await asyncio.to_thread(
+        _attachment_sync, host=host, port=port, address=address,
+        password=password, uid=uid, index=index, folder=folder,
     )
 
 
