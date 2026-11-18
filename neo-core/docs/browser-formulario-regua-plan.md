@@ -1,8 +1,8 @@
 # Formulário no navegador local: régua de produção, Enter e autocomplete — plano
 
 > Status (18/11/2026, 11:47 BRT): **F0–F5, F7, F8a, F9, F10 em produção** (§7.2–7.5).
-> E2E da F8a ✅ (119bde02). Falta: E2E dos botões do card (F10) e de uma mensagem
-> espontânea pelo painel (F2); F8b, F4-G2 e F6.
+> E2E ✅: F8a (119bde02), F10 (9e2a249a). Falta só o E2E de uma mensagem espontânea
+> pelo painel (F2); sobras em §7.6.
 > Fora: o G2 da visão ainda pergunta "deve mostrar X" no autocomplete (o aviso
 > em código cobre o modelo) e a F6. Origem: sessão `4a345d50`,
 > job `9fcb3bb6`. O pedido era preencher https://demoqa.com/automation-practice-form
@@ -397,6 +397,25 @@ Visto e não tratado: o cérebro fechou oferecendo "quer que eu clique em Submit
 num pedido que dizia "Não envie".
 
 Testes: 27 em `test_formulario_regua.py`; suíte com 4808 passando.
+
+### 7.6 Sessão 9e2a249a (job b804f200): E2E da F10 ✅ (18/11/2026)
+
+A pergunta saiu às 15:09:09 citando «Date of Birth». A conferência G1b terminou
+durante a espera (~15:09:12), e a faixa dela ficou segurada: os botões ficaram
+no card, e o Daniel clicou "Invente um valor de teste" às 15:09:14. O job seguiu
+na mesma aba até `completed` (107 s), e o chat abriu pelos campos da tela.
+
+Sobras, sem urgência:
+
+- **Trava do painel no datepicker.** Ao digitar a data, o calendário abre; o
+  modelo tentou fechar, e a trava "não feche o painel — ele É a resposta"
+  recusou. Falso positivo num calendário, contornado.
+- **Notas em português passam pelo filtro da F9** ("Data de nascimento…",
+  "State: NCR…; City: Delhi…"), porque o rótulo é "Date of Birth" / "State and
+  City".
+- **O cérebro oferece "clico em Submit?"** num pedido de "Não envie".
+- F8b, visão no autocomplete (F4-G2), constantes no `neo.toml` (F6).
+- **F2 por conta própria** (mensagem que não é resposta a pergunta) ainda sem E2E.
 
 ## 8. Teste ponta a ponta (depois de F1–F5)
 
