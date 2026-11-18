@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import posixpath
 import shutil
 import time
 import uuid
@@ -321,6 +322,31 @@ def build_claude_runner(
     return run_claude_job
 
 
+def _ficaram_no_mac(desfecho: Any, recolhidos: list[dict]) -> list[str]:
+    """Caminhos absolutos (no Mac) dos arquivos do relatório que NÃO foram recolhidos.
+
+    O `collect` do desktop só traz texto: planilha, PDF, imagem e vídeo ficam na
+    pasta da tarefa. Também entra o que passou do `_RECOLHER_MAX`.
+    """
+    cwd = str(getattr(desfecho, "cwd", "") or "").rstrip("/")
+    if desfecho.status != "completed" or not cwd:
+        return []
+    vieram = {posixpath.normpath(str(a.get("path") or "")) for a in recolhidos}
+    saida: list[str] = []
+    for bruto in desfecho.arquivos[:20]:
+        caminho = bruto.strip()
+        if caminho.startswith("/"):
+            caminho = posixpath.normpath(caminho)
+            relativo = posixpath.relpath(caminho, cwd) if caminho.startswith(cwd + "/") else caminho
+        else:
+            relativo = posixpath.normpath(caminho)
+            caminho = posixpath.join(cwd, relativo)
+        if relativo in vieram or relativo.startswith("..") or caminho in saida:
+            continue
+        saida.append(caminho)
+    return saida
+
+
 def _terminal(
     job: AgentJob, spec: dict, device_id: str, desfecho: Any, arquivos: list[dict], meta: dict
 ) -> dict:
@@ -359,6 +385,21 @@ def _terminal(
         ) + (
             ". Eles estão no catálogo, NÃO no /workspace: para ler ou mexer, "
             "file_stage(file_id=…, target='workbench') primeiro."
+        )
+    ficaram = _ficaram_no_mac(desfecho, arquivos) if str(spec.get("then") or "").strip() else []
+    if ficaram:
+        # Job 144aa240 (session-b4708de0): o recolhimento só sobe texto, o .xlsx
+        # do Claude ficou no Mac e o `then` mandava entregá-lo com file_save. Sem
+        # saber disso, o Neo entregou a PRÓPRIA planilha como "o arquivo do Claude".
+        resumo += (
+            "\n\nFicaram SÓ no Mac dele, sem cópia no catálogo (não são texto): "
+            + ", ".join(ficaram)
+            + ". Para ENTREGAR, escreva na resposta `[[FILE:<caminho>]]` com o caminho "
+            "exato acima: vira o cartão \"Mostrar no Finder\" no chat dele. Vale MESMO que "
+            "o combinado diga file_save ou botão de download: o turno da continuação roda "
+            "sem o app dele conectado e não alcança o Mac, então não tente trazer o "
+            "arquivo. Nunca entregue outro arquivo (o seu, do /workspace ou do catálogo) "
+            "no lugar de um destes."
         )
 
     meta = dict(meta)

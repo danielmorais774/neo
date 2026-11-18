@@ -590,3 +590,28 @@ def test_resumo_de_tarefa_que_nao_rodou_nao_inventa_rodada():
     t = _terminal(job, {}, "mac-1", desfecho, [], {})
     assert "nenhuma rodada chegou a rodar" in t["result_summary"]
     assert "0 rodada" not in t["result_summary"]
+
+
+def test_arquivo_binario_que_ficou_no_mac_vai_com_caminho_absoluto():
+    """Job 144aa240: o .xlsx não foi recolhido (só texto) e o Neo entregou a planilha DELE."""
+    job = SimpleNamespace(id=uuid.uuid4(), title="Claude: x", extra_metadata={})
+    desfecho = Desfecho(
+        status="completed", resumo="Planilha gerada.", session_id="s",
+        cwd="/Users/d/Neo/claude/144aa240", rodadas=1,
+        relatorio={"arquivos": ["Populacao_Area_Estados_Brasil.xlsx", "RELATORIO.md", "./gerar.py"]},
+    )
+    recolhidos = [
+        {"file_id": "f1", "path": "RELATORIO.md", "truncado": False},
+        {"file_id": "f2", "path": "gerar.py", "truncado": False},
+    ]
+    t = _terminal(job, {"then": "entregue o xlsx"}, "mac-1", desfecho, recolhidos, {})
+    resumo = t["result_summary"]
+    assert "Ficaram SÓ no Mac dele" in resumo
+    assert "/Users/d/Neo/claude/144aa240/Populacao_Area_Estados_Brasil.xlsx" in resumo
+    assert "[[FILE:<caminho>]]" in resumo
+    assert "request_user_file" not in resumo  # a continuação não alcança o Mac
+    assert "/Users/d/Neo/claude/144aa240/RELATORIO.md" not in resumo
+    assert "/Users/d/Neo/claude/144aa240/gerar.py" not in resumo
+    # sem `then` não há continuação para ler o aviso
+    t2 = _terminal(job, {}, "mac-1", desfecho, [], {})
+    assert "Ficaram SÓ no Mac" not in t2["result_summary"]

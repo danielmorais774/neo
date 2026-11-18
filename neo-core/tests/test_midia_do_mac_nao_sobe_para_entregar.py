@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 
 from core.cognitive import cognitive_tools_for
+from modules.desktop.tools import DESKTOP_TOOLS
 from modules.desktop.ai_service import ClientActuationRequested, _upload_so_para_entregar
 from shared import ToolCall
 
@@ -51,7 +52,7 @@ async def _rodar(respostas, *, no_chat: bool):
         provider=provider,
         messages=[Message(role=MessageRole.USER, content="baixa o vídeo e me manda aqui")],
         req_model=None, model_name="m", provider_name="p",
-        tools=cognitive_tools_for(uuid4()), tool_executor=_Executor({}),
+        tools=cognitive_tools_for(uuid4()) + DESKTOP_TOOLS, tool_executor=_Executor({}),
         slog=None, trace=None, arquivo_local_no_chat=no_chat,
     )
     return provider

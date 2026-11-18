@@ -304,6 +304,59 @@ def _imagens_do_sandbox_para_catalogo(
     return _IMAGEM_DO_SANDBOX.sub(_troca, texto), trocados
 
 
+_AVISO_ATUACAO_FORA_DA_MESA = (
+    "(aviso do sistema) Essa tool NÃO está disponível neste turno: ele roda sem o app "
+    "do Daniel conectado, e nada alcança o Mac dele agora. Não tente outra forma de "
+    "buscar o arquivo. Se o arquivo já está no Mac dele, entregue escrevendo na resposta "
+    "`[[FILE:<caminho absoluto>]]` (vira o cartão \"Mostrar no Finder\" quando ele abrir "
+    "a conversa); se não, diga o que ficou faltando."
+)
+
+#: `[[FILE:/workspace/…]]`: caminho do SANDBOX no marcador de arquivo local.
+_ARQUIVO_DO_SANDBOX = re.compile(r"[ \t]*\[\[\s*FILE\s*:\s*(/workspace/(?:[^\]\n|]|\](?!\]))+?)\s*(?:\|[^\]\n]*)?\]\]")
+#: `[[FILE:<file_id>]]` / `[[FILE:file:<id>]]`: id do catálogo onde o cartão
+#: espera um caminho do Mac (session-b4708de0, turnos 7 e 8). Não é caminho:
+#: o cartão sai "Não achei o arquivo". O botão de download é o do `file_save`.
+_ARQUIVO_POR_ID = re.compile(
+    r"[ \t]*\[\[\s*FILE\s*:\s*(?:file:)?\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\s*(?:\|[^\]\n]*)?\]\]"
+)
+
+
+def _arquivos_do_sandbox_sem_cartao(texto: str) -> tuple[str, list[str]]:
+    """Tira `[[FILE:/workspace/…]]` da resposta; devolve o texto e os caminhos.
+
+    O `[[FILE:]]` é o cartão "Mostrar no Finder" de um arquivo que JÁ está no
+    Mac, e o `/workspace` só existe no sandbox da VPS: o cartão sai sempre como
+    "Não achei o arquivo". A instrução proíbe e o modelo escreve assim mesmo. Nos
+    logs de produção de 17/11, 3 dos 4 marcadores reais eram do sandbox (o PDF da
+    session-0bd50471, o mp4 da 1617df09 e o xlsx da b4708de0, os três já publicados
+    com `file_save`, então o botão de download já estava na tela). Quem chama
+    publica o que ainda não estiver no catálogo, para o botão aparecer.
+    """
+    if "[[" not in (texto or ""):
+        return texto, []
+    caminhos: list[str] = []
+
+    def _tira(m: re.Match) -> str:
+        caminho = posixpath.normpath(m.group(1).strip())
+        if caminho not in caminhos:
+            caminhos.append(caminho)
+        return ""
+
+    novo = _ARQUIVO_DO_SANDBOX.sub(_tira, texto)
+    novo, por_id = _ARQUIVO_POR_ID.subn("", novo)
+    if not caminhos and not por_id:
+        return texto, []
+    return re.sub(r"\n{3,}", "\n\n", novo).strip(), caminhos
+
+
+def _ja_publicados(caminhos: list[str], arquivos: list[dict[str, Any]] | None) -> set[str]:
+    """Dos `caminhos` do sandbox, os que já estão em `arquivos` (pelo path ou pelo nome)."""
+    paths = {posixpath.normpath(str(a.get("path") or "").strip()) for a in arquivos or [] if a.get("path")}
+    nomes = {str(a.get("name") or "").strip() for a in arquivos or []}
+    return {c for c in caminhos if c in paths or posixpath.basename(c) in nomes}
+
+
 #: Extensões que o chat desenha. Um `[[IMAGE:/workspace/relatorio.pdf]]` não é
 #: imagem: publicar não faria aparecer nada, então fica como está.
 _EXTENSOES_DE_IMAGEM = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif")
@@ -6788,6 +6841,30 @@ class AIService:
                 "Marcador com caminho do sandbox trocado pelo do catálogo: "
                 + ", ".join(_imagens_trocadas[:5]),
             )
+        # `[[FILE:/workspace/…]]` é o cartão "Mostrar no Finder" apontando para o
+        # sandbox: sempre "Não achei o arquivo". Sai da resposta; o que não foi
+        # publicado é publicado agora, e o botão de download faz a entrega.
+        _antes_do_corte = full_response
+        full_response, _arquivos_sandbox = _arquivos_do_sandbox_sem_cartao(full_response)
+        if full_response != _antes_do_corte and not _arquivos_sandbox and slog:
+            slog.log_event("Cartão de arquivo por id removido", "`[[FILE:<file_id>]]` tirado da resposta.")
+        if _arquivos_sandbox:
+            _faltam = [
+                c for c in _arquivos_sandbox
+                if c not in _ja_publicados(_arquivos_sandbox, produced_files)
+            ]
+            if _faltam:
+                await self._publicar_imagens_soltas(
+                    "", produced_files, user_id=user_id, session_id=session_id,
+                    slog=slog, caminhos=_faltam,
+                )
+            if slog:
+                slog.log_event(
+                    "Cartão de arquivo do sandbox removido",
+                    "`[[FILE:]]` com caminho do sandbox tirado da resposta: "
+                    + ", ".join(_arquivos_sandbox[:5])
+                    + (f" (publicados agora: {', '.join(_faltam[:5])})" if _faltam else ""),
+                )
 
         # Safety: never leak a raw sentinel to the user (e.g. the model emitted it
         # on the final round, where clarification is disabled).
@@ -8744,6 +8821,23 @@ class AIService:
                                 "Aviso de mídia já no Mac",
                                 f"`request_user_file` de {caminho_midia} sem stage — não rodou; "
                                 "aviso para entregar com [[FILE:…]].",
+                            )
+                        continue
+                    if tc.name in _ALL_ACTUATION_TOOLS and not any(
+                        getattr(t, "name", None) == tc.name for t in tools
+                    ):
+                        # Fora da mesa e chamada pelo nome: o turno sem ninguém na
+                        # frente tira as client-side, mas o modelo chama pelo que leu
+                        # no texto. Estacionar aqui pendura o turno para sempre
+                        # (session-0bdca023: continuação do job 4a5c6069 parou num
+                        # `request_user_file` que nenhum desktop ia executar).
+                        result_lines.append(
+                            f"Tool: {tc.name}\nResult: " + _AVISO_ATUACAO_FORA_DA_MESA
+                        )
+                        if slog:
+                            slog.log_event(
+                                "Atuação fora da mesa",
+                                f"`{tc.name}` não está nas tools deste turno — não estacionou.",
                             )
                         continue
                     if tc.name in _ALL_ACTUATION_TOOLS:
@@ -11405,8 +11499,12 @@ class AIService:
         user_id: "UUID | None",
         session_id: "UUID | None",
         slog: Any = None,
+        caminhos: list[str] | None = None,
     ) -> list[str]:
         """Publica no catálogo as imagens do sandbox que a resposta mostrou sem `file_save`.
+
+        Com ``caminhos``, publica esses (qualquer extensão) em vez de procurar
+        `[[IMAGE:/workspace/…]]` no texto: é o caso do `[[FILE:/workspace/…]]`.
 
         O marcador é desenhado no Mac, que não enxerga o `/workspace`. Na
         session-6e483f5d (turno 8) o Neo escreveu `[[IMAGE:/workspace/pdf-foto/op_1.png]]`
@@ -11420,7 +11518,7 @@ class AIService:
         store = getattr(self, "file_store", None)
         if store is None:
             return []
-        soltas = _imagens_do_sandbox_soltas(texto)
+        soltas = list(caminhos) if caminhos is not None else _imagens_do_sandbox_soltas(texto)
         if not soltas:
             return []
         try:

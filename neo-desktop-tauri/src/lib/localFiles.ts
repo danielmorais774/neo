@@ -31,6 +31,16 @@ const DANGLING_SRC = String.raw`\[\[\s*FILE\s*:(?:[^\]\n]|\](?!\]))*$`;
 const DANGLING_RE = new RegExp(DANGLING_SRC, 'im');
 const DANGLING_ALL_RE = new RegExp(DANGLING_SRC, 'gim');
 
+/** Caminho do sandbox do cérebro (container na VPS), não do disco do usuário. */
+export function isSandboxPath(path: string): boolean {
+  return /^\/workspace(\/|$)/.test(path.trim());
+}
+
+/** Caminho absoluto ou `~/…`: o único formato que o cartão sabe conferir no disco. */
+export function isLocalPath(path: string): boolean {
+  return /^(\/|~\/)/.test(path.trim());
+}
+
 function parseMarkerBody(body: string): LocalFileRef | null {
   const raw = (body || '').trim();
   if (!raw) return null;
@@ -51,8 +61,16 @@ export function extractLocalFiles(content: string): ExtractedLocalFiles {
 
   const files: LocalFileRef[] = [];
   const seen = new Set<string>();
+  let removed = false;
   let text = content.replace(MARKER_RE, (_all, body: string) => {
+    removed = true;
     const ref = parseMarkerBody(body);
+    // `/workspace/…` é o sandbox da VPS: nunca existe neste disco, e o arquivo
+    // já chega pelo botão de download do catálogo. Sem cartão (seria sempre
+    // "Não achei o arquivo"); o neo-core já tira o marcador, isto cobre o
+    // histórico salvo antes disso.
+    // Idem para o que nem é caminho (o `[[FILE:<file_id>]]` da session-b4708de0).
+    if (ref && (isSandboxPath(ref.path) || !isLocalPath(ref.path))) return '';
     if (ref && !seen.has(ref.path)) {
       seen.add(ref.path);
       files.push(ref);
@@ -60,7 +78,7 @@ export function extractLocalFiles(content: string): ExtractedLocalFiles {
     return '';
   });
 
-  if (!files.length && !DANGLING_RE.test(text)) {
+  if (!removed && !DANGLING_RE.test(text)) {
     return { text: content, files: [] };
   }
 
