@@ -256,3 +256,100 @@ def test_fill_sem_sugestoes_nao_avisa():
     driver.steps = [Step("fill", {"ref": 18, "value": "Computer Science"}, True, "")]
     assert driver._aviso_de_sugestoes(_pagina_com_submit(lista_aberta=False)) == ""
     assert "pendente" not in driver._preenchidos[-1]
+
+
+# ── F7: o que o E2E 7ce2a472 mostrou (sessão 15ccd81e) ──────────────────────
+
+
+def _fim_do_7ce2a472() -> dict:
+    """O último snapshot do job 7ce2a472, nos elementos que importam."""
+    return {
+        "tela": (
+            "Student Registration Form\nName\nEmail\nGender Male Female Other\n"
+            "Mobile (10 Digits)\nDate of Birth\nSubjects Maths Computer Science\n"
+            "Hobbies Sports Reading Music\nPicture\nCurrent Address\nState and City NCR Delhi"
+        ),
+        "elements": [
+            {"ref": 2, "tag": "label", "text": "Name"},
+            {"ref": 3, "tag": "input", "type": "text", "text": "First Name", "value": "Teste"},
+            {"ref": 4, "tag": "input", "type": "text", "text": "Last Name", "value": "Neo"},
+            {"ref": 7, "tag": "input", "type": "radio", "text": "Male", "checked": True},
+            {"ref": 8, "tag": "label", "text": "Male", "checked": True, "controla": "radio[gender]"},
+            {"ref": 9, "tag": "input", "type": "radio", "text": "Female", "checked": False},
+            {"ref": 10, "tag": "label", "text": "Female", "checked": False, "controla": "radio[gender]"},
+            {"ref": 17, "tag": "label", "text": "Subjects"},
+            {"ref": 18, "tag": "div", "type": "button", "text": "Remove Maths"},
+            {"ref": 19, "tag": "div", "type": "button", "text": "Remove Computer Science"},
+            {"ref": 20, "tag": "input", "type": "text", "text": "", "value": "", "box": [0, 0, 4, 24]},
+            {"ref": 21, "tag": "label", "text": "Hobbies"},
+            {"ref": 22, "tag": "input", "type": "checkbox", "text": "1", "checked": True},
+            {"ref": 23, "tag": "label", "text": "Sports", "checked": True, "controla": "checkbox"},
+            {"ref": 24, "tag": "input", "type": "checkbox", "text": "2", "checked": True},
+            {"ref": 25, "tag": "label", "text": "Reading", "checked": True, "controla": "checkbox"},
+            {"ref": 26, "tag": "input", "type": "checkbox", "text": "3", "checked": False},
+            {"ref": 27, "tag": "label", "text": "Music", "checked": False, "controla": "checkbox"},
+            {"ref": 30, "tag": "label", "text": "Current Address"},
+            {"ref": 31, "tag": "textarea", "text": "Current Address", "value": "Rua de Teste, 123"},
+            {"ref": 32, "tag": "label", "text": "State and City"},
+            {"ref": 33, "tag": "button", "type": "submit", "text": "Submit"},
+            {"ref": 34, "tag": "div", "text": "", "controla": "text"},
+        ],
+    }
+
+
+def test_rotulos_dos_campos_do_7ce2a472():
+    estado = driver_mod._estado_dos_campos(_fim_do_7ce2a472()["elements"])
+    assert "input(checkbox)|Sports" in estado and "input(checkbox)|Reading" in estado
+    assert "input(text)|Subjects" in estado, "os chips não podem esconder o rótulo"
+    assert not any(k.endswith("|1") or k.endswith("|2") for k in estado)
+
+
+def test_campos_sem_rotulo_nao_se_fundem():
+    estado = driver_mod._estado_dos_campos([
+        {"ref": 1, "tag": "button", "text": "Submit"},
+        {"ref": 2, "tag": "input", "type": "text", "text": "", "value": "NCR"},
+        {"ref": 3, "tag": "input", "type": "text", "text": "", "value": ""},
+    ])
+    assert len(estado) == 2
+
+
+def test_bloco_do_fim_mostra_o_que_a_tela_mostra():
+    driver = BrowserLocalDriver(act=None, llm=None, model="texto", vision_model=None)
+    fim = _fim_do_7ce2a472()
+    driver._campos_com_ganho = {"x"}
+    driver._estado_final_campos = driver_mod._estado_dos_campos(fim["elements"])
+    driver._tela_final_campos = fim
+
+    bloco = driver._bloco_campos_no_fim()
+
+    assert "- Sports: marcado" in bloco and "- Reading: marcado" in bloco
+    assert "- Male: marcado" in bloco and "Female" not in bloco
+    assert "- Subjects: «Maths Computer Science»" in bloco
+    assert "- State and City: «NCR Delhi»" in bloco
+    assert "(sem rótulo)" not in bloco and "- 1: marcado" not in bloco
+    assert "Hobbies" not in bloco  # o rótulo do grupo vem pelas caixas
+
+
+@pytest.mark.asyncio
+async def test_campos_vem_antes_do_caderno_e_o_caderno_avisa_que_envelhece():
+    n = 3
+    passos = [{"action": "note", "args": {"texto": "Pergunta de teste 3: pendente"}}]
+    passos += [{"action": "fill", "args": {"ref": 2 * i + 1, "value": f"valor {i + 1}"}} for i in range(n)]
+    passos += [{"action": "done", "args": {"answer": "preenchi"}}]
+    driver = _driver_de_formulario(passos, _formulario(n), max_steps=25)
+
+    result = await driver.run("preencha o formulário de teste sem enviar")
+
+    assert result.summary.index("Campos na tela no fim") < result.summary.index("Anotações do caminho")
+    assert "DESATUALIZADAS" in result.summary
+
+
+def test_caixa_de_digitar_de_lista_ganha_dica():
+    linha = BrowserLocalDriver._element_line(
+        {"ref": 18, "tag": "input", "type": "text", "text": "", "box": [0, 0, 4, 24]}
+    )
+    assert "use `fill` direto" in linha
+    normal = BrowserLocalDriver._element_line(
+        {"ref": 3, "tag": "input", "type": "text", "text": "First Name", "box": [0, 0, 300, 38]}
+    )
+    assert "use `fill` direto" not in normal

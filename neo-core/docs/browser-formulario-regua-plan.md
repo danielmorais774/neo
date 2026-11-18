@@ -1,6 +1,7 @@
 # Formulário no navegador local: régua de produção, Enter e autocomplete — plano
 
-> Status (18/11/2026, 11:00 BRT): **F0–F5 em produção** (§7.2), falta o E2E (§8).
+> Status (18/11/2026, 11:15 BRT): **F0–F5 + F7 em produção** (§7.2, §7.3). 1º E2E ✅;
+> falta o E2E da mensagem pelo painel (F2).
 > Fora: o G2 da visão ainda pergunta "deve mostrar X" no autocomplete (o aviso
 > em código cobre o modelo) e a F6. Origem: sessão `4a345d50`,
 > job `9fcb3bb6`. O pedido era preencher https://demoqa.com/automation-practice-form
@@ -326,6 +327,31 @@ aberta continua conferindo). Suíte: 4780 → 4792 passando.
 | F3 | `_check_revisao_enter` sai sem perguntar com `type == "option"` visível ou elemento `aberto` |
 | F4 | `_aviso_de_sugestoes` no prompt depois de `fill` que abriu lista; o campo fica `pendente` na conferência até o clique numa opção. **Não feito:** pular/reformular o G2 da visão nesse campo |
 | F5 | o motivo da parada conta as ações da janela (`fill ×9, click ×2…`) e só fala de rolar/esperar se houve; resumo ganha "Campos na tela no fim" lido do último snapshot |
+
+### 7.3 Primeiro E2E (sessão 15ccd81e, job 7ce2a472) e F7 (18/11/2026)
+
+✅ `completed` em 23 passos e 96 s, com os 12 campos certos, incluindo o
+Subjects com dois chips e State/City. Nenhum "Posso enviar?". No passo 11 o
+modelo seguiu o aviso da F4 ("A lista de sugestões de Subjects está aberta com
+«Maths» em [19]. Clico nela"). **Não foi exercitado:** a mensagem pelo painel
+(F2) e o Enter (F3), porque o modelo escolheu por clique.
+
+O que o diário mostrou, consertado na F7:
+
+| Defeito | Causa | Conserto |
+|---|---|---|
+| bloco do fim com "(sem rótulo): VAZIO" no Subjects | os chips "Remove Maths" ficam entre o label e o input; o valor de verdade está nos chips | `_rotulo_do_campo` pula até 3 não-campos para achar o label; campo vazio mostra o texto da tela ao lado do rótulo (`«Maths Computer Science»`) |
+| "1: marcado", "2: marcado" | o texto do input checkbox é o `value`; o nome vem no label DEPOIS | caixa e rádio usam o label seguinte |
+| State/City ausentes do bloco | o select personalizado já escolhido sai da lista de elementos | rótulo sem campo depois dele entra com o texto da tela (`«NCR Delhi»`) |
+| inputs sem rótulo colidiam numa chave só (afeta o ganho da F1) | chave igual para todos os `input(text)\|` | sufixo `#2`, `#3` |
+| entrega com 24 notas, várias velhas ("Subjects: pendente") | o modelo anotou muito; o caderno ia antes do bloco de campos | bloco de campos ANTES do caderno, e o caderno passa a ser "Anotações do caminho — podem estar DESATUALIZADAS" |
+| 2 cliques mortos no input de 4 px, nos DOIS jobs | clicar na caixa do react-select não abre nada | dica no elemento: "caixa de digitar de uma lista: use `fill` direto" |
+
+Visto e não tratado: o modelo escolheu só o dia no datepicker, e a data de
+nascimento de teste ficou "15 Nov 2026". O pedido não fixava uma data, então
+isso é escolha do modelo, não defeito do driver.
+
+Testes: 16 em `test_formulario_regua.py`; suíte com 4797 passando.
 
 ## 8. Teste ponta a ponta (depois de F1–F5)
 

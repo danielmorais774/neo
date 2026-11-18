@@ -315,12 +315,59 @@ def _estado_dos_campos(elements: list | None) -> dict[str, tuple]:
             continue
         if el.get("panel") or el.get("aberto") is True:
             continue
-        rotulo = str(el.get("text") or "")
-        if tipo not in _MARCAVEIS and i > 0 and str(elementos[i - 1].get("tag") or "").lower() == "label":
-            rotulo = str(elementos[i - 1].get("text") or "") or rotulo
-        chave = f"{tag}({tipo})|{rotulo.strip()[:120]}"
-        out.setdefault(chave, (" ".join(str(el.get("value") or "").split()), el.get("checked")))
+        chave = f"{tag}({tipo})|{_rotulo_do_campo(elementos, i)[:120]}"
+        # Dois campos com o mesmo nome na tela (o State e o City sem rótulo
+        # próprio) não podem virar um só: o segundo ganharia o estado do primeiro.
+        base, n = chave, 2
+        while chave in out:
+            chave, n = f"{base}#{n}", n + 1
+        out[chave] = (" ".join(str(el.get("value") or "").split()), el.get("checked"))
     return out
+
+
+def _e_campo(el: dict) -> bool:
+    return str(el.get("tag") or "").lower() in _CAMPO_TAGS
+
+
+def _rotulo_do_campo(elementos: list[dict], i: int) -> str:
+    """O nome humano do campo ``i``.
+
+    * Caixa e rádio: o `<label>` que vem DEPOIS deles (o texto do próprio
+      input da caixa é o `value`, "1"/"2" — job 7ce2a472).
+    * O resto: o `<label>` de antes, pulando até 3 elementos que não são campo
+      — os chips "Remove Maths" do react-select ficam entre o "Subjects" e o
+      input. Outro campo no caminho encerra a busca: aquele label é dele.
+    """
+    el = elementos[i]
+    proprio = str(el.get("text") or "").strip()
+    if str(el.get("type") or "").lower() in _MARCAVEIS:
+        if i + 1 < len(elementos) and str(elementos[i + 1].get("tag") or "").lower() == "label":
+            return str(elementos[i + 1].get("text") or "").strip() or proprio
+        return proprio
+    for j in range(i - 1, max(-1, i - 4), -1):
+        vizinho = elementos[j]
+        if str(vizinho.get("tag") or "").lower() == "label" and not vizinho.get("controla"):
+            return str(vizinho.get("text") or "").strip() or proprio
+        if _e_campo(vizinho):
+            break
+    return proprio
+
+
+def _ao_lado_do_rotulo(tela: str, rotulo: str) -> str:
+    """O texto que a tela mostra na MESMA linha do rótulo, depois dele.
+
+    É onde a lista personalizada (react-select) mostra o que foi escolhido:
+    "Subjects Maths Computer Science", "State and City NCR Delhi". Pode ser
+    também o placeholder ("Select State"), por isso quem usa diz de onde veio.
+    """
+    alvo = " ".join(rotulo.split()).casefold()
+    if not alvo:
+        return ""
+    for linha in str(tela or "").splitlines():
+        limpa = " ".join(linha.split())
+        if limpa.casefold().startswith(alvo + " "):
+            return limpa[len(alvo):].strip()
+    return ""
 
 
 def _lista_de_sugestoes(snapshot: dict | None) -> list[dict]:
@@ -2178,6 +2225,7 @@ class BrowserLocalDriver:
         self._estado_inicial_campos: dict[str, tuple] = {}
         self._campos_com_ganho: set[str] = set()
         self._estado_final_campos: dict[str, tuple] = {}
+        self._tela_final_campos: dict = {}
         #: Rodadas seguidas paradas numa tela de login. Uma é acidente de
         #: redirect e o modelo ainda pode sair dela; duas é parede.
         self._rodadas_na_parede = 0
@@ -4340,6 +4388,16 @@ class BrowserLocalDriver:
             extra += f' [seleciona {item["controla"]}]'
         if item.get("disabled"):
             extra += " [desabilitado]"
+        # A caixa de digitar de uma lista personalizada (react-select): 4 px de
+        # largura, clicar nela não abre nada. Os dois jobs do demoqa gastaram
+        # dois cliques mortos ali antes de tentar o `fill` (9fcb3bb6, 7ce2a472).
+        caixa = item.get("box")
+        if (
+            str(tag).lower() == "input"
+            and str(item.get("type") or "text").lower() in ("text", "search", "")
+            and isinstance(caixa, list) and len(caixa) == 4 and 0 < float(caixa[2]) <= 8
+        ):
+            extra += " ⟪caixa de digitar de uma lista: use `fill` direto — clicar nela não abre nada⟫"
         # Campo de arquivo, ou o botão que o abre: clicar abre a janela do
         # SISTEMA (fora do alcance de qualquer ação). O caminho é o `upload`.
         if item.get("arquivo"):
@@ -5290,6 +5348,7 @@ class BrowserLocalDriver:
         estado = _estado_dos_campos((snapshot or {}).get("elements"))
         if estado:
             self._estado_final_campos = estado
+            self._tela_final_campos = snapshot or {}
         aba = str(self._ativa or "")
         novo = False
         for chave, atual in estado.items():
@@ -8444,8 +8503,16 @@ class BrowserLocalDriver:
             # Na ordem das questões, não na da coleta (que começa onde a aba
             # estava). Vale para o resumo, a entrega e o arquivo dos itens.
             self.notes[:] = ordenar_por_numero(self.notes)
+            # Os campos ANTES do caderno: são a verdade da página, e as notas do
+            # caminho envelhecem ("Subjects: pendente" ficou na entrega do 7ce2a472
+            # com o Subjects já preenchido).
+            campos = self._bloco_campos_no_fim()
+            if campos:
+                outcome.summary = f"{outcome.summary}\n\n{campos}".strip()
             outcome.summary = self._com_caderno(outcome.summary, outcome.status)
-            outcome.summary = self._com_campos_e_mensagens(outcome.summary)
+            pendentes = self._bloco_mensagens_pendentes()
+            if pendentes:
+                outcome.summary = f"{outcome.summary}\n\n{pendentes}".strip()
             if self.progresso:
                 # No TOPO: o caderno do servidor e o `wm_read` cortam pelo fim, e
                 # a linha do índice sai do começo do resumo.
@@ -8474,27 +8541,61 @@ class BrowserLocalDriver:
           cérebro respondeu como se ela não existisse.
         """
         partes = [summary] if summary else []
-        if self._campos_com_ganho and self._estado_final_campos:
-            linhas = []
-            for chave, (valor, marcado) in self._estado_final_campos.items():
-                tipo_e_rotulo = chave.split("|", 1)
-                rotulo = tipo_e_rotulo[1] if len(tipo_e_rotulo) > 1 else chave
-                if marcado is not None:
-                    if marcado:
-                        linhas.append(f"- {rotulo or '(sem rótulo)'}: marcado")
-                    continue
-                linhas.append(f"- {rotulo or '(sem rótulo)'}: {valor[:120] if valor else 'VAZIO'}")
-            if linhas:
-                partes.append(
-                    "Campos na tela no fim (lidos da página, não da nota):\n" + "\n".join(linhas[:40])
-                )
-        pendentes = [m for m in self.mensagens_do_daniel if m.id in self._mensagens_novas]
-        if pendentes:
-            partes.append(
-                "Mensagem do Daniel que chegou e NÃO foi atendida (a tarefa parou antes): "
-                + " / ".join(f"«{m.texto[:300]}»" for m in pendentes)
-            )
+        partes += [b for b in (self._bloco_campos_no_fim(), self._bloco_mensagens_pendentes()) if b]
         return "\n\n".join(partes).strip()
+
+    def _bloco_campos_no_fim(self) -> str:
+        """Os campos do formulário como a ÚLTIMA tela os mostrava."""
+        if not (self._campos_com_ganho and self._estado_final_campos):
+            return ""
+        tela = str(self._tela_final_campos.get("tela") or self._tela_final_campos.get("text") or "")
+        linhas: list[str] = []
+        usados: set[str] = set()
+        for chave, (valor, marcado) in self._estado_final_campos.items():
+            rotulo = chave.split("|", 1)[-1].split("#", 1)[0].strip()
+            usados.add(rotulo.casefold())
+            nome = rotulo or "(sem rótulo)"
+            if marcado is not None:
+                if marcado:
+                    linhas.append(f"- {nome}: marcado")
+                continue
+            if valor:
+                linhas.append(f"- {nome}: {valor[:120]}")
+                continue
+            # Lista personalizada: o input fica vazio e o escolhido aparece como
+            # texto ao lado do rótulo (os chips do Subjects).
+            ao_lado = _ao_lado_do_rotulo(tela, rotulo)
+            linhas.append(
+                f"- {nome}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo; o campo em si está vazio)"
+                if ao_lado else f"- {nome}: VAZIO"
+            )
+        # Rótulo sem campo depois dele: o select personalizado já escolhido some
+        # da lista de elementos (o "State and City" do 7ce2a472) e só sobra o texto.
+        elementos = [e for e in (self._tela_final_campos.get("elements") or []) if isinstance(e, dict)]
+        for i, el in enumerate(elementos):
+            if str(el.get("tag") or "").lower() != "label" or el.get("controla"):
+                continue
+            rotulo = str(el.get("text") or "").strip()
+            if not rotulo or rotulo.casefold() in usados:
+                continue
+            seguinte = elementos[i + 1] if i + 1 < len(elementos) else {}
+            if _e_campo(seguinte):
+                continue
+            ao_lado = _ao_lado_do_rotulo(tela, rotulo)
+            if ao_lado:
+                linhas.append(f"- {rotulo}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo)")
+        if not linhas:
+            return ""
+        return "Campos na tela no fim (lidos da página, não da nota):\n" + "\n".join(linhas[:40])
+
+    def _bloco_mensagens_pendentes(self) -> str:
+        pendentes = [m for m in self.mensagens_do_daniel if m.id in self._mensagens_novas]
+        if not pendentes:
+            return ""
+        return (
+            "Mensagem do Daniel que chegou e NÃO foi atendida (a tarefa parou antes): "
+            + " / ".join(f"«{m.texto[:300]}»" for m in pendentes)
+        )
 
     def _com_caderno(self, summary: str, status: str = "") -> str:
         """Cola o caderno no resumo — inclusive quando a tarefa deu errado.
@@ -8536,6 +8637,11 @@ class BrowserLocalDriver:
             if status == "completed"
             else f"O que eu TINHA coletado até parar ({len(faltando)})"
         )
+        if self._campos_com_ganho and self._estado_final_campos:
+            rotulo = (
+                f"Anotações do caminho ({len(faltando)}) — podem estar DESATUALIZADAS; "
+                "o estado do formulário é o bloco «Campos na tela no fim» acima"
+            )
         return (
             f"{summary}\n\n{rotulo} — é material bruto do que apareceu na tela, "
             f"não conclusão:\n{itens}"
