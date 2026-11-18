@@ -1,3 +1,5 @@
+<p align="center"><strong>Português</strong> · <a href="README.en.md">English</a></p>
+
 <h1 align="center">Neo</h1>
 
 <p align="center">
@@ -10,6 +12,10 @@
 
 <p align="center">
   4.701 testes em Python · 156 em Rust · em uso diário desde fevereiro de 2026
+</p>
+
+<p align="center">
+  <a href="evals/README.md"><strong>📊 Avaliações, comparativos de modelos e estudos de caso →</strong></a>
 </p>
 
 ---
@@ -108,6 +114,21 @@ Algumas medições, cada uma comparando uma coisa só. A lista completa, com mé
 | GLM-5.3-flash | 3,4 s | 11,7 s | provedor ignora o teto de raciocínio |
 | **MiniMax m3.1-flash** (em produção) | **2,5 s** | **4,2 s** | 1/30 vazio, o código repete |
 | Haiku 5.5 | 2,6 s | 4,9 s | respondeu ao usuário em 19/30 |
+
+### Estudos de caso
+
+Problemas reais de produção, cada um com o diagnóstico, a correção e o número que provou a correção:
+
+- [O modelo "flash" que pensava por 20 segundos](evals/README.md#31-o-modelo-flash-que-pensava-por-20-segundos): 11–20 s → 0,8 s por chamada
+- [Resposta vazia não é "nada a dizer"](evals/README.md#32-resposta-vazia-não-é-nada-a-dizer): classificador de 13/46 para 44/46
+- [Uma API que aceita o parâmetro e ignora](evals/README.md#33-uma-api-que-aceita-o-parâmetro-e-ignora): 9 ferramentas obrigatórias, zero chamadas
+- [O navegador que lia a mesma coisa cinco vezes](evals/README.md#34-o-navegador-que-lia-a-mesma-coisa-cinco-vezes): 27 → 13 passos, com a resposta entregue
+- [A recusa que se alimentava sozinha](evals/README.md#35-a-recusa-que-se-alimentava-sozinha): 11 → 0 recusas em 12 amostras
+- [A conversa que esquecia a própria resposta](evals/README.md#36-a-conversa-que-esquecia-a-própria-resposta): 295 de 295 trechos descartados, cinco travas
+- [A otimização que sairia mais cara](evals/README.md#37-a-otimização-que-sairia-mais-cara): medida antes e não implementada
+- [Guardas medidas nas mensagens reais](evals/README.md#38-guardas-que-leem-a-resposta-do-modelo-medidas-nas-mensagens-reais): 11 alegações que passavam batido
+
+No mesmo arquivo há também os comparativos: provedores do mesmo modelo, raciocínio ligado × desligado, quantas ferramentas mostrar ao modelo, visão × texto no navegador e os motores de voz (TTS, STT e wake word).
 
 ## O repositório
 
