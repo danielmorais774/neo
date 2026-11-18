@@ -18,6 +18,10 @@
   <a href="evals/README.md"><strong>📊 Evaluations, model comparisons and case studies (in Portuguese) →</strong></a>
 </p>
 
+<!-- MEDIA 6: link to the support demo video. MEDIA 1 (hero): assets/hero.gif
+<p align="center"><img src="assets/hero.gif" alt="Neo using the browser from a voice request" width="800"></p>
+-->
+
 ---
 
 Neo is a personal project I use every day. It takes requests by voice, chat or WhatsApp and decides what to do: answer, remember something, run a long task in a sandbox, use the browser or run a command on the Mac, always asking for approval when the action is sensitive.
@@ -170,6 +174,10 @@ cd neo-desktop-tauri/src-tauri && cargo test          # 156 tests
 ## Status
 
 In daily use. The core runs on a VPS with Docker Compose, and the Mac is the main client. Some parts are still in **shadow mode** (they log without blocking): route authentication, the context register and the v2 memory ranking. The design doc for each area, with what was measured and what is left, is in [`neo-core/docs/`](neo-core/docs) (in Portuguese).
+
+## License
+
+© 2026 Daniel Morais. The code is public for reading and evaluation, with all rights reserved ([LICENSE](LICENSE)). The [`neo-browser-local/`](neo-browser-local) folder is a fork of open-browser-use and keeps its original MIT license.
 
 ## Author
 

@@ -18,6 +18,12 @@
   <a href="evals/README.md"><strong>📊 Avaliações, comparativos de modelos e estudos de caso →</strong></a>
 </p>
 
+<!-- MÍDIA 6: link do vídeo da demo de suporte (2–3 min), ao lado do botão acima, quando estiver publicado. -->
+
+<!-- MÍDIA 1 (hero): assets/hero.gif — voz → navegador agindo com a linha do tempo → resposta falada, 10–15 s.
+<p align="center"><img src="assets/hero.gif" alt="O Neo usando o navegador a partir de um pedido por voz" width="800"></p>
+-->
+
 ---
 
 O Neo é um projeto pessoal que uso todo dia. Ele recebe pedidos por voz, chat ou WhatsApp e decide o que fazer: responder, lembrar de algo, rodar uma tarefa longa num sandbox, usar o navegador ou executar um comando no Mac, sempre com aprovação quando a ação é sensível.
@@ -32,6 +38,7 @@ O que dá trabalho num assistente assim não é chamar um modelo. É decidir **o
 - **Roda tarefas longas em segundo plano.** Jobs com sandbox Docker sem acesso à rede local, leitura delegada de PDFs, transcrição de vídeo, OCR e planilhas. Avisa quando termina.
 - **Age no Mac com aprovação.** Comandos locais passam por uma política de risco: o que é seguro roda, o que não é pede confirmação.
 - **Delega código.** Abre uma sessão do Claude Code no Mac, acompanha e traz o relatório.
+  <!-- MÍDIA 4: assets/claude-code.gif — sessão aberta, pílula "Claude · ver o processo", relatório no fim. -->
 - **E mais:** WhatsApp, agenda (cron), casa inteligente (Home Assistant), música (Spotify/YouTube) e finanças.
 
 ## Arquitetura
@@ -75,7 +82,11 @@ flowchart LR
     CORE --> LLM
 ```
 
-Todo pedido passa primeiro por um **classificador barato** que escolhe o trilho: responder, usar uma ferramenta do servidor, agir no Mac, acionar uma skill ou montar um plano. Quase tudo cai no **cérebro**, um laço de LLM com ferramentas. Tarefa longa vira **job**, que avisa quando termina. O caminho completo de um pedido está no [mapa técnico](neo-core/docs/mapa-tecnico-neo-core.md), e o do roteador, [neste diagrama](neo-core/docs/mapa-intent-router.svg).
+Todo pedido passa primeiro por um **classificador barato** que escolhe o trilho: responder, usar uma ferramenta do servidor, agir no Mac, acionar uma skill ou montar um plano. Quase tudo cai no **cérebro**, um laço de LLM com ferramentas. Tarefa longa vira **job**, que avisa quando termina. <!-- MÍDIA 5: grade 2×2 de prints — assets/desktop-plano.png, assets/notch-live.png, assets/painel-diario.png, assets/grafo-memoria.png.
+<table><tr><td><img src="assets/desktop-plano.png" alt="App do Mac executando um plano"></td><td><img src="assets/notch-live.png" alt="Notch no modo live"></td></tr><tr><td><img src="assets/painel-diario.png" alt="Diário de um turno no painel"></td><td><img src="assets/grafo-memoria.png" alt="Grafo da memória"></td></tr></table>
+-->
+
+O caminho completo de um pedido está no [mapa técnico](neo-core/docs/mapa-tecnico-neo-core.md), e o do roteador, [neste diagrama](neo-core/docs/mapa-intent-router.svg).
 
 ## Decisões de engenharia
 
@@ -84,6 +95,7 @@ Escolha que o modelo troca de um turno para o outro (para onde vai o pedido, se 
 
 **2. Texto que veio de fora não manda no assistente.**
 Cada turno registra quem pediu e o que veio de terceiros (página da web, e-mail, texto colado). Uma ação sensível pedida num turno "contaminado" é barrada por um portão em código. Um aviso no prompt não bastou: foi testado e o modelo seguia a injeção mesmo assim. → [`core/authority/`](neo-core/core/authority), [plano do portão](neo-core/docs/release-request-plan.md)
+<!-- MÍDIA 2: assets/injecao-barrada.gif — página/e-mail com instrução escondida, o Neo não obedece e pede aprovação. -->
 
 **3. Medir antes de mudar.**
 Mudança de prompt ou de modelo é medida com o request real de produção, reenviado ao mesmo modelo. Bug novo do roteador vira caso no golden set, não exemplo no prompt: exemplo custa token em toda mensagem, e caso de teste só custa no eval. → [avaliações](evals/README.md), [`scripts/eval_router.py`](neo-core/scripts/eval_router.py)
@@ -93,6 +105,7 @@ Autenticação das rotas, registro de contexto e o novo ranking da memória roda
 
 **5. Turno vivo, não turno com prazo.**
 O que derruba um turno é a falta de progresso, não o relógio. Comando lento no Mac vira tarefa em segundo plano em vez de travar a conversa, e a resposta sai em streaming, uma bolha por etapa.
+<!-- MÍDIA 3: assets/tarefa-longa.gif — pedido longo vira tarefa, a conversa segue, chega o aviso de concluído. -->
 
 **6. Latência e custo se resolvem na escolha do provedor, não só do modelo.**
 Fixar o provedor de inferência triplicou a velocidade de geração e manteve o cache de prefixo. O teto de raciocínio se ajusta por modelo com a mesma conta do timeout do TCP (média móvel + desvios, RFC 6298). → [`core/llm/teto_adaptativo.py`](neo-core/core/llm/teto_adaptativo.py)
@@ -168,6 +181,10 @@ cd neo-desktop-tauri/src-tauri && cargo test          # 156 testes
 ## Status
 
 Em uso diário. O core roda numa VPS com Docker Compose, e o Mac é o cliente principal. Algumas partes ainda estão em **modo sombra** (registram sem barrar): autenticação das rotas, registro de contexto e o ranking v2 da memória. Os planos de cada frente, com o que foi medido e o que falta, ficam em [`neo-core/docs/`](neo-core/docs).
+
+## Licença
+
+© 2026 Daniel Morais. O código está público para leitura e avaliação, com todos os direitos reservados ([LICENSE](LICENSE)). A pasta [`neo-browser-local/`](neo-browser-local) é um fork do open-browser-use e segue a licença MIT original.
 
 ## Autor
 
