@@ -1,7 +1,8 @@
 # Formulário no navegador local: régua de produção, Enter e autocomplete — plano
 
-> Status (18/11/2026, 11:38 BRT): **F0–F5, F7, F8a, F9 em produção** (§7.2–7.4).
-> Falta: E2E da mensagem pelo painel (F2) e do dado ausente (F8a); F8b, F4-G2 e F6.
+> Status (18/11/2026, 11:47 BRT): **F0–F5, F7, F8a, F9, F10 em produção** (§7.2–7.5).
+> E2E da F8a ✅ (119bde02). Falta: E2E dos botões do card (F10) e de uma mensagem
+> espontânea pelo painel (F2); F8b, F4-G2 e F6.
 > Fora: o G2 da visão ainda pergunta "deve mostrar X" no autocomplete (o aviso
 > em código cobre o modelo) e a F6. Origem: sessão `4a345d50`,
 > job `9fcb3bb6`. O pedido era preencher https://demoqa.com/automation-practice-form
@@ -373,6 +374,29 @@ liberar valor inventado sem perguntar. Antes, medir a lista de frases no corpus
 de mensagens reais. Hoje a F8a já cobre o caso com UMA pergunta.
 
 Testes: 24 em `test_formulario_regua.py`; suíte com 4805 passando.
+
+### 7.5 Sessão 119bde02 (job 9a75082a) → F10 (18/11/2026, 11:47 BRT)
+
+✅ A F8a funcionou: a data digitada virou pergunta, e o "inventa" digitado no
+painel foi entendido. O job seguiu na mesma aba até `completed`. ✅ F9: o chat
+abriu pelos campos da tela.
+
+**Os botões sumiram do card na extensão.** O desktop fecha a caixa de botões na
+próxima faixa que não seja pergunta (`browser_local.rs`, `PERGUNTAS` →
+`neoPergunta` vazio). A conferência visual G1b roda em fundo, terminou ~1,4 s
+depois da pergunta e mandou "👁 …" para a linha do tempo, levando os botões
+junto. **F10:** com uma pergunta aberta, `_banner` guarda as faixas que não são
+pergunta (`_faixas_seguradas`) e as solta no `finally` da espera. Também:
+
+- a pergunta citava o VALOR do campo («18 Nov 2026»); agora cita o rótulo
+  («Date of Birth»);
+- a nota "Mobile: …" escapava do filtro da F9, porque o rótulo é
+  "Mobile(10 Digits)". O filtro agora compara o rótulo sem o parêntese.
+
+Visto e não tratado: o cérebro fechou oferecendo "quer que eu clique em Submit?"
+num pedido que dizia "Não envie".
+
+Testes: 27 em `test_formulario_regua.py`; suíte com 4808 passando.
 
 ## 8. Teste ponta a ponta (depois de F1–F5)
 

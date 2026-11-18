@@ -2245,6 +2245,12 @@ class BrowserLocalDriver:
         #: (F8a): inventar um valor de teste, deixar em branco, ou o que ele
         #: ditou na resposta (o valor vale só para aquele campo).
         self._campos_inventar: set[str] = set()
+        #: Pergunta aberta no painel: o desktop FECHA a caixa de botões na próxima
+        #: faixa que não for pergunta (browser_local.rs, `PERGUNTAS`). A conferência
+        #: visual em fundo terminava durante a espera e levava os botões junto
+        #: (sessão 119bde02). Enquanto espera, as faixas ficam guardadas aqui.
+        self._pergunta_aberta = False
+        self._faixas_seguradas: list[tuple[str, str, str]] = []
         self._campos_em_branco: set[str] = set()
         self._campos_ditados: dict[str, str] = {}
         #: Rodadas seguidas paradas numa tela de login. Uma é acidente de
@@ -2565,6 +2571,7 @@ class BrowserLocalDriver:
         await self._banner(
             pergunta[: int(cfg.pergunta_painel_max)], kind="pergunta", detail="\n".join(opcoes)
         )
+        self._pergunta_aberta = True
         if self.on_perguntar is not None:
             try:
                 await self.on_perguntar(pergunta, list(opcoes))
@@ -2588,6 +2595,10 @@ class BrowserLocalDriver:
             chegadas = conversa.novas()
         finally:
             conversa.pergunta = None
+            self._pergunta_aberta = False
+            seguradas, self._faixas_seguradas = self._faixas_seguradas, []
+            for texto_faixa, kind_faixa, detalhe_faixa in seguradas:
+                await self._banner(texto_faixa, kind=kind_faixa, detail=detalhe_faixa)
         for mensagem in chegadas:
             # A resposta leva junto a pergunta que respondeu: no bloco de
             # mensagens ela não pode virar instrução solta.
@@ -2838,6 +2849,10 @@ class BrowserLocalDriver:
 
         Melhor esforço: nunca derruba o passo.
         """
+        if self._pergunta_aberta and kind != "pergunta":
+            self._faixas_seguradas.append((text, kind, detail))
+            del self._faixas_seguradas[:-20]
+            return
         try:
             await self._call(
                 "browser.banner",
@@ -7856,7 +7871,14 @@ class BrowserLocalDriver:
         antes (`NeedsRelease` → "falta dado seu").
         """
         rotulos = self._rotulos_do(snapshot, ref)
-        onde = f" («{rotulos[0]}»)" if rotulos else ""
+        elementos = [e for e in ((snapshot or {}).get("elements") or []) if isinstance(e, dict)]
+        idx = next((i for i, e in enumerate(elementos) if e.get("ref") == ref), None)
+        # O nome do campo, não o valor que ele mostra: a data vinha como
+        # «18 Nov 2026» porque o input se nomeia pelo próprio valor (119bde02).
+        nome_do_campo = _rotulo_do_campo(elementos, idx) if idx is not None else ""
+        if not nome_do_campo or nome_do_campo == str(elementos[idx].get("value") or "").strip():
+            nome_do_campo = next((r for r in reversed(rotulos) if r), "")
+        onde = f" («{nome_do_campo}»)" if nome_do_campo else ""
         pergunta = (
             f"A página pede {nome}{onde} e eu não tenho esse dado seu na memória. "
             "Invento um valor de teste, deixo em branco, ou você me diz o valor?"

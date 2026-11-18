@@ -490,3 +490,78 @@ async def test_dado_que_a_memoria_tem_continua_indo_para_o_card():
     with pytest.raises(NeedsRelease):
         await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
     assert driver._perguntas == []
+
+
+# ── F10: faixa de fundo não fecha a pergunta (sessão 119bde02) ──────────────
+
+
+class _ConversaQueResponde:
+    """Uma caixa de job: a resposta chega na 1ª espera; antes, a visão termina."""
+
+    def __init__(self, durante_a_espera):
+        self.pergunta = None
+        self.ditas: list[str] = []
+        self._durante = durante_a_espera
+        self._chegou = False
+
+    def tem_novas(self) -> bool:
+        return self._chegou
+
+    async def esperar(self, _s: float) -> bool:
+        await self._durante()
+        self._chegou = True
+        return True
+
+    def novas(self):
+        return [Mensagem(texto="inventa", origem="painel")]
+
+    def entregar(self, *a, **k):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_conferencia_que_termina_na_espera_nao_fecha_os_botoes():
+    driver = BrowserLocalDriver(act=None, llm=None, model="texto", vision_model=None)
+    faixas: list[tuple[str, str]] = []
+
+    async def call(acao, args):
+        if acao == "browser.banner":
+            aberta = driver._conversa.pergunta is not None
+            faixas.append((args["kind"], "COM a pergunta aberta" if aberta else "depois"))
+        return {"ok": True}
+
+    driver._call = call  # type: ignore[method-assign]
+
+    async def visao_termina():
+        await driver._banner("👁 conferido: o campo mostra Souza", kind="visto")
+
+    driver._conversa = _ConversaQueResponde(visao_termina)
+
+    respostas = await driver._perguntar("A página pede data de nascimento…", ["Invente", "Deixe em branco"])
+
+    assert [m.texto for m in respostas] == ["inventa"]
+    kinds = [k for k, _ in faixas]
+    assert kinds[0] == "pergunta"
+    # Nada que não seja pergunta entre a pergunta e a resposta: é o que o
+    # desktop lê como "a pergunta acabou" e fecha os botões.
+    assert ("visto", "depois") in faixas, faixas
+    assert ("visto", "COM a pergunta aberta") not in faixas, faixas
+    assert driver._pergunta_aberta is False
+    assert driver._faixas_seguradas == []
+
+
+@pytest.mark.asyncio
+async def test_pergunta_do_dado_ausente_cita_o_rotulo_e_nao_o_valor():
+    driver = _driver_da_data([Mensagem(texto="inventa", origem="painel")])
+    await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+    assert "«Date of Birth»" in driver._perguntas[0][0]
+    assert "18 Nov 2026" not in driver._perguntas[0][0]
+
+
+def test_nota_do_mobile_sai_quando_o_rotulo_tem_parentese():
+    from types import SimpleNamespace
+
+    from core.jobs.runner_browser_local import _itens_da_entrega
+
+    outcome = SimpleNamespace(notes=["Mobile: 11987654321"], campos=["Mobile(10 Digits): 11987654321", "Name: X"])
+    assert _itens_da_entrega(outcome) == outcome.campos

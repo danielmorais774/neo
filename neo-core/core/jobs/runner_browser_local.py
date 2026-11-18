@@ -626,9 +626,11 @@ def _itens_da_entrega(outcome: Any) -> list[str]:
     campos = [str(c) for c in getattr(outcome, "campos", None) or [] if str(c).strip()]
     if not campos:
         return notas
+    # O nome sem o parêntese: "Mobile(10 Digits)" no bloco, "Mobile:" na nota
+    # (119bde02 deixou a nota do Mobile passar).
     rotulos = {
-        r for r in (c.split(":", 1)[0].strip().casefold() for c in campos)
-        if len(r) >= 3 and r != "(sem rótulo)"
+        r for r in (c.split(":", 1)[0].split("(", 1)[0].strip().casefold() for c in campos)
+        if len(r) >= 3
     }
     resto = [n for n in notas if not any(r in n.casefold() for r in rotulos)]
     return campos + resto
