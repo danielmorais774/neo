@@ -14,6 +14,10 @@
   4.701 testes em Python · 156 em Rust · em uso diário desde fevereiro de 2026
 </p>
 
+<p align="center">
+  <a href="evals/README.md"><strong>📊 Avaliações, comparativos de modelos e estudos de caso →</strong></a>
+</p>
+
 ---
 
 O Neo é um projeto pessoal que uso todo dia. Ele recebe pedidos por voz, chat ou WhatsApp e decide o que fazer: responder, lembrar de algo, rodar uma tarefa longa num sandbox, usar o navegador ou executar um comando no Mac, sempre com aprovação quando a ação é sensível.

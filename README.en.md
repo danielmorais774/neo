@@ -14,6 +14,10 @@
   4,701 Python tests · 156 Rust tests · in daily use since February 2026
 </p>
 
+<p align="center">
+  <a href="evals/README.md"><strong>📊 Evaluations, model comparisons and case studies (in Portuguese) →</strong></a>
+</p>
+
 ---
 
 Neo is a personal project I use every day. It takes requests by voice, chat or WhatsApp and decides what to do: answer, remember something, run a long task in a sandbox, use the browser or run a command on the Mac, always asking for approval when the action is sensitive.
