@@ -3,9 +3,9 @@
 
 Mede, sem rodar navegador nem modelo, em que passo cada job PARARIA por
 "N passos seguidos sem acrescentar nada" (``_sem_ganho``) e até onde iria o
-orçamento elástico (``_teto_de_passos``), com a régua atual e com as duas que
-foram rejeitadas. Roda DENTRO do container, lendo os ``trace.md`` no lugar —
-nenhuma cópia do conteúdo das conversas sai de lá:
+orçamento elástico (``_teto_de_passos``), com a régua atual, as rejeitadas e a
+candidata. Roda DENTRO do container, lendo os ``trace.md`` no lugar — nenhuma
+cópia do conteúdo das conversas sai de lá:
 
     ssh <vps> 'docker exec -i -w /app neo-core python -' < scripts/replay_sem_ganho.py
 
@@ -17,12 +17,23 @@ Réguas:
   A      velha + nota ATUALIZADA que ganhou palavras          (rejeitada)
   B      A, se a tela do passo seguinte tem hash inédito      (rejeitada)
   C      velha + nota atualizada que ganhou palavras, depois de uma interação
-         que deu certo, com palavras inéditas na tela        (a do driver)
+         que deu certo, com palavras inéditas na tela
+  D      C + clique confirmado MARCADO com palavras inéditas  (a do driver hoje)
+  E      D + CAMPO NOVO: depois de uma interação que deu certo, um campo de
+         formulário (input/textarea/select fora de painel) aparece com estado —
+         valor ou [marcado] — diferente do PRIMEIRO estado visto para ele no
+         job; cada campo rende uma vez só. E mensagem do Daniel zera a régua.
+         (candidata — docs/browser-formulario-regua-plan.md, F0)
+  E1     só a metade do campo novo (a F1 do plano)
+  E2     só a metade da mensagem (a F2 do plano)
 
 A e B soltavam o b8dbde34, um giro real em "Carregando Questionário…":
 o modelo narrava "ainda carregando" na nota e o hash da tela mudava a cada passo.
-O simulador erra por até 1 passo nos jobs com ação recusada (a recusa não é
-cobrada no driver e o diário não a distingue).
+
+Cobrança: um passo é cobrado quando o número do cabeçalho SEGUINTE avança. É o
+que o driver faz (`step_number += 1`); ação recusada, `look` e confirmação ao
+vivo repetem o número. Até 18/11 o simulador cobrava pela ação escolhida e errava
+para mais nos jobs com recusa — no ccfee96e dizia "para@32" num job que foi a 115.
 """
 
 import glob
@@ -43,9 +54,17 @@ from core.browser_local.driver import (
 STEP = re.compile(r"^## Passo (\d+)/(\d+) · ")
 NOTE_NEW = re.compile(r"^\*\*[\d:.]+ · anotou \((\d+)\)\*\*$")
 NOTE_UPD = re.compile(r"^\*\*[\d:.]+ · atualizei a nota (\d+)\*\*$")
+MENSAGEM = re.compile(r"^\*\*[\d:.]+ · mensagem do Daniel ")
 CHOSE = re.compile(r"^- escolheu: `(\w+)`")
 PARADA = re.compile(r"Parei: (\d+) passos seguidos sem acrescentar")
-NAO_COBRA = (None, "look", "note", "find")
+NAO_COBRA = (None, "look", "note", "find", "avisar", "perguntar")
+
+#: Uma linha da lista de elementos, como `_element_line` escreve:
+#:   [3] input(text) "First Name" = "Daniel" 300×38px
+#:   [8] label "Male" [desmarcado] [seleciona radio[gender]] 35×24px
+ELEMENTO = re.compile(r'^\s+\[(\d+)\] ([\w-]+)(?:\(([^)]*)\))? "(.*?)"(?: = "(.*?)")?( .*)?$')
+CAMPO_TAGS = ("input", "textarea", "select")
+MARCAVEIS = ("radio", "checkbox")
 
 
 def _na_tela(bloco: list[str]) -> set[str]:
@@ -63,6 +82,54 @@ def _na_tela(bloco: list[str]) -> set[str]:
     return out
 
 
+def _elementos(bloco: list[str]) -> list[dict]:
+    """A lista "Elementos (N):" do bloco, uma dict por linha."""
+    out: list[dict] = []
+    dentro = False
+    for linha in bloco:
+        if linha.startswith("Elementos ("):
+            dentro = True
+            continue
+        if not dentro:
+            continue
+        if not linha.strip() or linha.startswith(">>> ") or linha.startswith("```"):
+            break
+        m = ELEMENTO.match(linha)
+        if not m:
+            continue
+        resto = m.group(6) or ""
+        out.append({
+            "ref": int(m.group(1)),
+            "tag": m.group(2),
+            "type": m.group(3) or "",
+            "text": m.group(4),
+            "value": m.group(5) or "",
+            "checked": True if "[marcado]" in resto else (False if "[desmarcado]" in resto else None),
+            "painel": "[painel:" in resto,
+        })
+    return out
+
+
+def _campos(elementos: list[dict]) -> dict[str, tuple]:
+    """Estado de cada campo de formulário da tela: chave → (valor, marcado).
+
+    A chave espelha `rotulos_do_campo`: o `<label>` logo antes do campo, senão o
+    texto do próprio campo. Rádio e caixa se nomeiam (o label deles vem DEPOIS).
+    Campo dentro de painel (o mês e o ano do datepicker) fica de fora: é peça de
+    widget passageiro, não o formulário.
+    """
+    out: dict[str, tuple] = {}
+    for i, el in enumerate(elementos):
+        if el["tag"] not in CAMPO_TAGS or el["painel"]:
+            continue
+        rotulo = el["text"]
+        if el["type"] not in MARCAVEIS and i > 0 and elementos[i - 1]["tag"] == "label":
+            rotulo = elementos[i - 1]["text"] or rotulo
+        chave = f'{el["tag"]}({el["type"]})|{rotulo}'
+        out.setdefault(chave, (el["value"], el["checked"]))
+    return out
+
+
 def _ler(path: str):
     linhas = open(path, encoding="utf-8", errors="replace").read().split("\n")
     base = 25
@@ -77,7 +144,8 @@ def _ler(path: str):
     while i < len(linhas):
         linha = linhas[i]
         if m := STEP.match(linha):
-            cur = {"n": int(m.group(1)), "hash": None, "tela": set(), "notas": [], "acao": None, "ok": False, "marcou": False}
+            cur = {"n": int(m.group(1)), "hash": None, "tela": set(), "campos": {}, "notas": [],
+                   "acao": None, "ok": False, "marcou": False, "mensagem": False}
             passos.append(cur)
         elif linha.startswith("<details><summary>página como o modelo viu"):
             j = i + 1
@@ -86,11 +154,14 @@ def _ler(path: str):
             if cur is not None:
                 cur["hash"] = hashlib.sha1("\n".join(linhas[i + 1 : j]).encode()).hexdigest()
                 cur["tela"] = _na_tela(linhas[i + 1 : j])
+                cur["campos"] = _campos(_elementos(linhas[i + 1 : j]))
             i = j
         elif cur is not None and (m := NOTE_NEW.match(linha)):
             cur["notas"].append(("nova", int(m.group(1)), linhas[i + 1] if i + 1 < len(linhas) else ""))
         elif cur is not None and (m := NOTE_UPD.match(linha)):
             cur["notas"].append(("upd", int(m.group(1)), linhas[i + 1] if i + 1 < len(linhas) else ""))
+        elif cur is not None and MENSAGEM.match(linha):
+            cur["mensagem"] = True
         elif cur is not None and (m := CHOSE.match(linha)):
             cur["acao"] = m.group(1)
         elif cur is not None and linha.startswith("- ▶ ") and "→ ok" in linha:
@@ -101,37 +172,64 @@ def _ler(path: str):
         if PARADA.search(linha) and parada_real is None and cur is not None:
             parada_real = cur["n"]
         i += 1
+    # Cobrado = o próximo cabeçalho avançou o número. O último passo não tem
+    # seguinte: cai na regra da ação.
+    for k, passo in enumerate(passos):
+        if k + 1 < len(passos):
+            passo["cobrado"] = passos[k + 1]["n"] > passo["n"]
+        else:
+            passo["cobrado"] = passo["acao"] not in NAO_COBRA
     return base, passos, estado, parada_real
 
 
 def _simular(passos: list[dict], regua: str, base: int):
-    cobrados = ultimo_ganho = ganhos = 0
+    """Devolve (passo da parada | None, teto final, ganhos de campo)."""
+    cobrados = ultimo_ganho = ganhos = ganhos_de_campo = 0
     notas: dict[int, str] = {}
     novas = cresceu = 0
     hashes: set[str] = set()
     palavras: set[str] = set()
     interagiu = marcou = False
+    primeiro_estado: dict[str, tuple] = {}
+    campos_com_ganho: set[str] = set()
     for passo in passos:
         ineditas = len(passo["tela"] - palavras)
         palavras |= passo["tela"]
         hash_novo = passo["hash"] is not None and passo["hash"] not in hashes
         if passo["hash"] is not None:
             hashes.add(passo["hash"])
+        campo_novo = False
+        for chave, estado in passo["campos"].items():
+            primeiro = primeiro_estado.setdefault(chave, estado)
+            if (
+                interagiu
+                and estado != primeiro
+                and (estado[0] or estado[1] is True)
+                and chave not in campos_com_ganho
+            ):
+                campo_novo = True
+                if regua in ("E", "E1"):
+                    campos_com_ganho.add(chave)
         ganho = novas > 0
         if regua == "A" and cresceu:
             ganho = True
         if regua == "B" and cresceu and hash_novo:
             ganho = True
-        if regua in ("C", "D") and cresceu and interagiu and ineditas >= _TELA_INEDITA_MIN:
+        if regua in ("C", "D", "E", "E1", "E2") and cresceu and interagiu and ineditas >= _TELA_INEDITA_MIN:
             ganho = True
-        if regua == "D" and marcou and ineditas >= _TELA_INEDITA_MIN:
+        if regua in ("D", "E", "E1", "E2") and marcou and ineditas >= _TELA_INEDITA_MIN:
             ganho = True
+        if regua in ("E", "E1") and campo_novo:
+            ganho = True
+            ganhos_de_campo += 1
         if ganho:
             ultimo_ganho = cobrados
             ganhos += 1
+        if regua in ("E", "E2") and passo["mensagem"]:
+            ultimo_ganho = cobrados
         novas = cresceu = 0
         if notas and cobrados - ultimo_ganho >= _SEM_GANHO_MAX:
-            return passo["n"], min(base + ganhos, base * 2)
+            return passo["n"], min(base + ganhos, base * 2), ganhos_de_campo
         for tipo, idx, texto in passo["notas"]:
             if tipo == "nova":
                 notas[idx] = texto
@@ -141,28 +239,33 @@ def _simular(passos: list[dict], regua: str, base: int):
                 if len(_fichas(texto) - _fichas(notas.get(idx, ""))) >= _NOTA_CRESCEU_MIN:
                     cresceu += 1
                 notas[idx] = texto
-        if passo["acao"] not in NAO_COBRA:
+        if passo["cobrado"]:
             cobrados += 1
         interagiu = passo["acao"] in _INTERAGE and passo["ok"]
         marcou = passo["marcou"]
-    return None, min(base + ganhos, base * 2)
+    return None, min(base + ganhos, base * 2), ganhos_de_campo
 
 
 def main() -> None:
     raiz = sys.argv[1] if len(sys.argv) > 1 else "/app/logs/browser_local"
-    reguas = ("velha", "A", "B", "C", "D")
-    print("job      | estado    | passos | base | parada real | " + " | ".join(f"{r:<11}" for r in reguas))
+    reguas = ("velha", "D", "E1", "E2", "E")
+    print(
+        "job      | estado    | passos | base | parada real | "
+        + " | ".join(f"{r:<11}" for r in reguas)
+        + " | campos(E)"
+    )
     for path in sorted(glob.glob(f"{raiz}/*/trace.md"), key=os.path.getmtime):
         base, passos, estado, parada_real = _ler(path)
         if not passos:
             continue
         colunas = []
+        campos = 0
         for regua in reguas:
-            para, teto = _simular(passos, regua, base)
+            para, teto, campos = _simular(passos, regua, base)
             colunas.append(f"{('para@' + str(para)) if para else 'segue':>7} t{teto:<3}")
         print(
             f"{path.split('/')[-2][:8]} | {estado[:9]:<9} | {len(passos):>6} | {base:>4} | "
-            f"{str(parada_real or '-'):>11} | " + " | ".join(colunas)
+            f"{str(parada_real or '-'):>11} | " + " | ".join(colunas) + f" | {campos:>9}"
         )
 
 
