@@ -282,6 +282,58 @@ _NOTA_CRESCEU_MIN = 3
 _TELA_INEDITA_MIN = 4
 _INTERAGE = frozenset({"click", "click_text", "dblclick", "fill", "select", "press"})
 
+#: CAMPO NOVO também é produção (docs/browser-formulario-regua-plan.md, F1).
+#:
+#: Preencher formulário não muda o TEXTO da tela — o valor digitado vai para a
+#: lista de elementos, não para "NA TELA AGORA" —, então as provas acima nunca
+#: fechavam e o job 9fcb3bb6 morreu no passo 18 com 8 de 10 campos certos.
+#: A prova aqui é o DEVICE: depois de uma interação que deu certo, um campo
+#: cujo estado (valor, marcado) difere do PRIMEIRO estado visto no job. Cada
+#: campo rende UMA vez — preencher de novo o mesmo campo é giro, não produção.
+#: MEDIDO no replay dos 20 diários da VPS (2026-11-18, régua E1): só o
+#: 9fcb3bb6 muda de desfecho; o giro do 1c55ba10 para no mesmo passo.
+_CAMPO_TAGS = frozenset({"input", "textarea", "select"})
+_CAMPO_TIPOS_FORA = frozenset({"hidden", "submit", "button", "reset", "image", "file"})
+_MARCAVEIS = frozenset({"radio", "checkbox"})
+
+
+def _estado_dos_campos(elements: list | None) -> dict[str, tuple]:
+    """Estado de cada campo de formulário da tela: chave → (valor, marcado).
+
+    A chave espelha `rotulos_do_campo`: o `<label>` logo antes do campo, senão o
+    texto do próprio campo (rádio e caixa se nomeiam: o label deles vem DEPOIS).
+    Fica de fora o campo dentro de painel (o mês e o ano do datepicker são peça
+    de widget passageiro) e o de lista de sugestões ABERTA: texto digitado num
+    autocomplete ainda não é valor escolhido (o Subjects do 9fcb3bb6).
+    """
+    out: dict[str, tuple] = {}
+    elementos = [e for e in (elements or []) if isinstance(e, dict)]
+    for i, el in enumerate(elementos):
+        tag = str(el.get("tag") or "").lower()
+        tipo = str(el.get("type") or "").lower()
+        if tag not in _CAMPO_TAGS or tipo in _CAMPO_TIPOS_FORA:
+            continue
+        if el.get("panel") or el.get("aberto") is True:
+            continue
+        rotulo = str(el.get("text") or "")
+        if tipo not in _MARCAVEIS and i > 0 and str(elementos[i - 1].get("tag") or "").lower() == "label":
+            rotulo = str(elementos[i - 1].get("text") or "") or rotulo
+        chave = f"{tag}({tipo})|{rotulo.strip()[:120]}"
+        out.setdefault(chave, (" ".join(str(el.get("value") or "").split()), el.get("checked")))
+    return out
+
+
+def _lista_de_sugestoes(snapshot: dict | None) -> list[dict]:
+    """As opções de uma lista ABERTA na tela (autocomplete, combobox, listbox).
+
+    É o `role="option"` que o snapshot põe em `type`. O `<select>` nativo não
+    entra: as opções dele vêm em `options`, dentro do próprio elemento.
+    """
+    return [
+        e for e in ((snapshot or {}).get("elements") or [])
+        if isinstance(e, dict) and str(e.get("type") or "").lower() == "option"
+    ]
+
 #: Palavra de TELA para a prova acima: só letras, 3+ caracteres. Número fica de
 #: fora de propósito — relógio, contador e "Pergunta 14 de 36" mudam sozinhos.
 _PALAVRA_DA_TELA = re.compile(r"[^\W\d_]{3,}")
@@ -2121,6 +2173,11 @@ class BrowserLocalDriver:
         self._interagiu = False
         self._marcou = False
         self._palavras_vistas: set[str] = set()
+        #: Campo novo é produção (`_estado_dos_campos`): o primeiro estado de
+        #: cada campo no job, os que já renderam ganho e o estado da última tela.
+        self._estado_inicial_campos: dict[str, tuple] = {}
+        self._campos_com_ganho: set[str] = set()
+        self._estado_final_campos: dict[str, tuple] = {}
         #: Rodadas seguidas paradas numa tela de login. Uma é acidente de
         #: redirect e o modelo ainda pode sair dela; duas é parede.
         self._rodadas_na_parede = 0
@@ -2271,6 +2328,12 @@ class BrowserLocalDriver:
         self.mensagens_do_daniel.append(mensagem)
         self._mensagens_novas.add(mensagem.id)
         self._bonus_mensagens += int(_conversa_ajustes().passos_por_mensagem)
+        # Mensagem nova é trabalho novo: a régua de improdutividade volta a
+        # contar daqui. Sem isto ela só ganhava orçamento, e a parada vinha na
+        # MESMA rodada — "faltou seleciona o state e uma cidade" chegou 200 ms
+        # antes de o 9fcb3bb6 morrer, e o "libere o googlevideo e baixe direto"
+        # do c1a738d6 teve um passo só (docs/browser-formulario-regua-plan.md, F2).
+        self._acting_no_ganho = self._acting_steps
         self._log("note", f"mensagem do Daniel ({mensagem.onde()})", mensagem.texto)
         # Só o tamanho no log do servidor: o texto é dele (fica no diário do job).
         logger.info(
@@ -3051,6 +3114,14 @@ class BrowserLocalDriver:
         """
         if len(self._preenchidos) < 2:
             return
+        # Com uma lista de sugestões aberta, o Enter ESCOLHE a opção, não envia.
+        # No 9fcb3bb6 a conferência perguntou "Posso enviar?" com o formulário
+        # pela metade, o "Não envie" barrou o Enter e o Subjects nunca entrou.
+        if _lista_de_sugestoes(snapshot) or any(
+            isinstance(e, dict) and e.get("aberto") is True
+            for e in ((snapshot or {}).get("elements") or [])
+        ):
+            return
         elementos = (snapshot or {}).get("elements") or []
         if not any(_ENVIO.search(str(i.get("text") or "")) for i in elementos):
             return
@@ -3598,6 +3669,29 @@ class BrowserLocalDriver:
                         "pergunta"
                     )
         return ""
+
+    def _aviso_de_sugestoes(self, snapshot: dict | None) -> str:
+        """O `fill` abriu uma lista de sugestões: o valor ainda não foi ESCOLHIDO.
+
+        Num autocomplete (react-select, combobox) o texto digitado some quando o
+        foco sai do campo. No 9fcb3bb6 a visão confirmou "Computer Science" duas
+        vezes, o modelo achou que estava feito, e o campo terminou vazio.
+        """
+        if not self.steps or self.steps[-1].action != "fill" or not self.steps[-1].ok:
+            return ""
+        opcoes = _lista_de_sugestoes(snapshot)
+        if not opcoes:
+            return ""
+        if self._preenchidos:
+            self._preenchidos[-1]["pendente"] = True
+        lista = ", ".join(
+            f"[{o.get('ref')}] «{str(o.get('text') or '')[:60]}»" for o in opcoes[:6]
+        )
+        return (
+            "ATENÇÃO: o campo que você acabou de preencher abriu uma LISTA DE SUGESTÕES "
+            f"({lista}). O texto digitado ainda NÃO é o valor — ele some quando o foco "
+            "sai do campo. Escolha a opção certa agora com `click` no número dela."
+        )
 
     def _aviso_de_grade(self, snapshot: dict | None) -> str:
         """Página com grade por marcar: o caminho é `julgar` + `marcar_grade`.
@@ -4153,6 +4247,8 @@ class BrowserLocalDriver:
         maximo = int(_conversa_ajustes().conferencia_valor_max)
         for p in self._preenchidos_da_aba():
             inicio = f"«{p['rotulo']}» → {self._valor_na_conferencia(str(p['valor']), maximo)}"
+            if p.get("pendente"):
+                inicio += " (digitado, mas a opção da lista NÃO foi escolhida)"
             if p["origem"] == "marcador":
                 linhas.append(f"{inicio} — o seu dado, só com a sua liberação")
             elif p["origem"] == "cofre":
@@ -5175,12 +5271,38 @@ class BrowserLocalDriver:
         avancou = (
             (self._nota_cresceu and self._interagiu) or self._marcou
         ) and ineditas >= _TELA_INEDITA_MIN
+        campo_novo = self._campo_novo(snapshot)
         self._nota_cresceu = self._interagiu = self._marcou = False
-        if len(self.notes) > self._notas_contadas or avancou:
+        if len(self.notes) > self._notas_contadas or avancou or campo_novo:
             self._notas_contadas = len(self.notes)
             self._acting_no_ganho = self._acting_steps
             # Produção devolve passo ao orçamento (ver `_teto_de_passos`).
             self._ganhos += 1
+
+    def _campo_novo(self, snapshot: dict | None) -> bool:
+        """Algum campo do formulário ficou preenchido agora, pela primeira vez?
+
+        Precisa de uma interação que deu certo no passo anterior (site que muda
+        um campo sozinho não conta) e de um estado DIFERENTE do primeiro visto
+        para aquele campo — é o que pega o datepicker, que já vem com a data de
+        hoje, e o clique no dia, que muda o input sem ser ele o alvo.
+        """
+        estado = _estado_dos_campos((snapshot or {}).get("elements"))
+        if estado:
+            self._estado_final_campos = estado
+        aba = str(self._ativa or "")
+        novo = False
+        for chave, atual in estado.items():
+            primeiro = self._estado_inicial_campos.setdefault(f"{aba}|{chave}", atual)
+            if (
+                self._interagiu
+                and atual != primeiro
+                and (atual[0] or atual[1] is True)
+                and f"{aba}|{chave}" not in self._campos_com_ganho
+            ):
+                self._campos_com_ganho.add(f"{aba}|{chave}")
+                novo = True
+        return novo
 
     def _teto_de_passos(self) -> int:
         """Orçamento de passos, elástico para cima e só por PRODUÇÃO.
@@ -5199,6 +5321,28 @@ class BrowserLocalDriver:
             teto = max(base, _conversa_ajustes().passos_teto)
             return min(base + extra, teto)
         return base
+
+    def _o_que_foi_tentado(self, n: int) -> str:
+        """O fim da frase de parada, contado no diário e não presumido.
+
+        A frase fixa ("rolar a página e esperar o carregamento já foram
+        tentados") veio do job 29c739d4 e virou mentira no 9fcb3bb6, que só
+        preencheu campos — e o cérebro a repetiu para o Daniel.
+        """
+        from collections import Counter
+
+        cobradas = [
+            s.action for s in self.steps
+            if s.action not in ("look", "note", "find", "avisar", "perguntar", "done")
+        ][-max(1, n):]
+        if not cobradas:
+            return "."
+        contagem = Counter(cobradas)
+        tentado = ", ".join(f"{k} ×{v}" for k, v in contagem.most_common())
+        frase = f" — nos últimos {len(cobradas)} passos: {tentado}."
+        if "scroll" in contagem and ("wait_for" in contagem or "wait" in contagem):
+            frase += " Rolar a página e esperar o carregamento já foram tentados aqui."
+        return frase
 
     def _motivo_para_parar(self) -> str:
         """Encerrar por falta de RETORNO, em vez de por fim de orçamento.
@@ -5247,8 +5391,8 @@ class BrowserLocalDriver:
             return (
                 f"Parei: {self._sem_ganho} passos seguidos sem acrescentar nada ao "
                 "que eu já tinha. Seguir ia gastar o seu navegador para entregar o "
-                "mesmo. Tentar de novo DO MESMO JEITO não muda o resultado — rolar "
-                "a página e esperar o carregamento já foram tentados aqui."
+                "mesmo. Tentar de novo DO MESMO JEITO não muda o resultado"
+                + self._o_que_foi_tentado(self._sem_ganho)
             )
         # A tela de AGORA, não o recorde histórico. `max()` sobre todas as telas
         # já vistas transformava progresso em sentença: no job 683fa0d8 o
@@ -6499,6 +6643,7 @@ class BrowserLocalDriver:
                 ),
                 self._aviso_de_palpite(task),
                 self._aviso_de_grade(snapshot),
+                self._aviso_de_sugestoes(snapshot),
                 bloco_do_cofre,
                 f"PÁGINA AGORA:\n{self._marcar_vistos(self._render(snapshot, self._panel_verdict))}",
                 # Sem olhos, dizer isso UMA vez por passo é mais barato que
@@ -7981,6 +8126,16 @@ class BrowserLocalDriver:
         if action == "press" and str(args.get("key") or "").lower() == "enter":
             self._check_revisao_enter(snapshot)
 
+        # Clique numa opção da lista de sugestões: o valor digitado foi ESCOLHIDO,
+        # e a conferência antes do envio deixa de marcá-lo como pendente.
+        if action in ("click", "dblclick") and args.get("ref") is not None:
+            alvo_opcao = next(
+                (e for e in _lista_de_sugestoes(snapshot) if e.get("ref") == args.get("ref")), None
+            )
+            if alvo_opcao is not None:
+                for p in self._preenchidos:
+                    p.pop("pendente", None)
+
         # O que o MODELO escreveu («pks:cep»), guardado antes da troca: é isto que
         # a conferência mostra, nunca o valor real que vai para a página.
         escrito = dict(args) if action == "fill" else None
@@ -8290,6 +8445,7 @@ class BrowserLocalDriver:
             # estava). Vale para o resumo, a entrega e o arquivo dos itens.
             self.notes[:] = ordenar_por_numero(self.notes)
             outcome.summary = self._com_caderno(outcome.summary, outcome.status)
+            outcome.summary = self._com_campos_e_mensagens(outcome.summary)
             if self.progresso:
                 # No TOPO: o caderno do servidor e o `wm_read` cortam pelo fim, e
                 # a linha do índice sai do começo do resumo.
@@ -8306,6 +8462,39 @@ class BrowserLocalDriver:
                 len(self.steps),
                 time.monotonic() - started,
             )
+
+    def _com_campos_e_mensagens(self, summary: str) -> str:
+        """O que a DOM diz no fim e o que o Daniel pediu sem resposta.
+
+        * **Campos na tela no fim** — quando o job mexeu num formulário. É a
+          verdade do último snapshot, não a nota do modelo: no 9fcb3bb6 a nota
+          dizia "Subjects ficou VAZIO" com o texto digitado na tela.
+        * **Mensagem que chegou e o agente não viu** — o "faltou seleciona o
+          state e uma cidade" do 9fcb3bb6 morreu entre o painel e o resumo, e o
+          cérebro respondeu como se ela não existisse.
+        """
+        partes = [summary] if summary else []
+        if self._campos_com_ganho and self._estado_final_campos:
+            linhas = []
+            for chave, (valor, marcado) in self._estado_final_campos.items():
+                tipo_e_rotulo = chave.split("|", 1)
+                rotulo = tipo_e_rotulo[1] if len(tipo_e_rotulo) > 1 else chave
+                if marcado is not None:
+                    if marcado:
+                        linhas.append(f"- {rotulo or '(sem rótulo)'}: marcado")
+                    continue
+                linhas.append(f"- {rotulo or '(sem rótulo)'}: {valor[:120] if valor else 'VAZIO'}")
+            if linhas:
+                partes.append(
+                    "Campos na tela no fim (lidos da página, não da nota):\n" + "\n".join(linhas[:40])
+                )
+        pendentes = [m for m in self.mensagens_do_daniel if m.id in self._mensagens_novas]
+        if pendentes:
+            partes.append(
+                "Mensagem do Daniel que chegou e NÃO foi atendida (a tarefa parou antes): "
+                + " / ".join(f"«{m.texto[:300]}»" for m in pendentes)
+            )
+        return "\n\n".join(partes).strip()
 
     def _com_caderno(self, summary: str, status: str = "") -> str:
         """Cola o caderno no resumo — inclusive quando a tarefa deu errado.

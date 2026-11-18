@@ -1,7 +1,8 @@
 # Formulário no navegador local: régua de produção, Enter e autocomplete — plano
 
-> Status (18/11/2026): **F0 feita** (§7: replay corrigido + régua E medida nos 20
-> diários). Driver ainda intocado; próximas: F2+F3, depois F4→F1→F5. Origem: sessão `4a345d50`,
+> Status (18/11/2026, 11:00 BRT): **F0–F5 em produção** (§7.2), falta o E2E (§8).
+> Fora: o G2 da visão ainda pergunta "deve mostrar X" no autocomplete (o aviso
+> em código cobre o modelo) e a F6. Origem: sessão `4a345d50`,
 > job `9fcb3bb6`. O pedido era preencher https://demoqa.com/automation-practice-form
 > sem enviar. O job terminou `failed` no passo 18 com 8 dos 10 campos certos na
 > tela, e uma instrução do Daniel chegou 200 ms antes da parada e foi perdida.
@@ -310,6 +311,21 @@ com `aberto is True`; a F4 cobre o resto.
 - o que não foi medido: os traces antigos de quiz e de "carregando", que não
   estão mais na VPS. Eles vivem em `test_orcamento_por_producao.py`, e esses 14
   testes têm de continuar passando na F1.
+
+### 7.2 F1–F5 no driver (18/11/2026)
+
+Tudo em `core/browser_local/driver.py`, com testes em
+`tests/browser_local/test_formulario_regua.py` (11). Contra o driver de antes,
+10 desses 11 falham; o que passa é a regressão de propósito (Enter sem lista
+aberta continua conferindo). Suíte: 4780 → 4792 passando.
+
+| Fase | O que entrou |
+|---|---|
+| F1 | `_estado_dos_campos` + `_campo_novo`: campo com estado diferente do primeiro visto, depois de interação ok, rende ganho uma vez por (aba, campo). Painel, `aberto` e `file` ficam de fora |
+| F2 | `_acolher` zera `_acting_no_ganho`; `_com_campos_e_mensagens` põe no resumo a mensagem que o agente não viu |
+| F3 | `_check_revisao_enter` sai sem perguntar com `type == "option"` visível ou elemento `aberto` |
+| F4 | `_aviso_de_sugestoes` no prompt depois de `fill` que abriu lista; o campo fica `pendente` na conferência até o clique numa opção. **Não feito:** pular/reformular o G2 da visão nesse campo |
+| F5 | o motivo da parada conta as ações da janela (`fill ×9, click ×2…`) e só fala de rolar/esperar se houve; resumo ganha "Campos na tela no fim" lido do último snapshot |
 
 ## 8. Teste ponta a ponta (depois de F1–F5)
 
