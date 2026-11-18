@@ -293,6 +293,17 @@ _INTERAGE = frozenset({"click", "click_text", "dblclick", "fill", "select", "pre
 #: MEDIDO no replay dos 20 diários da VPS (2026-11-18, régua E1): só o
 #: 9fcb3bb6 muda de desfecho; o giro do 1c55ba10 para no mesmo passo.
 _CAMPO_TAGS = frozenset({"input", "textarea", "select"})
+
+#: Resposta em TEXTO à pergunta do dado ausente (F8a), quando ele não clica no
+#: botão: "pode inventar é so para teste" (sessão 3a053c06) e afins.
+_PEDE_INVENTAR = re.compile(
+    r"\b(invent\w*|fict[ií]ci\w*|qualquer\s+(um|uma|valor|data|coisa)|dados?\s+de\s+teste|"
+    r"[ée]\s+s[óo]\s+(pra|para)\s+teste|pode\s+criar)\b",
+    re.IGNORECASE,
+)
+_PEDE_EM_BRANCO = re.compile(
+    r"\b(em\s+branco|deix[ae]\s+(vazio|sem)|pul[ae]|n[ãa]o\s+preench\w*)\b", re.IGNORECASE
+)
 _CAMPO_TIPOS_FORA = frozenset({"hidden", "submit", "button", "reset", "image", "file"})
 _MARCAVEIS = frozenset({"radio", "checkbox"})
 
@@ -1360,6 +1371,10 @@ class DriverResult:
     #: O caderno da tarefa (ver `BrowserLocalDriver.notes`). Já vem colado no
     #: `summary`; separado aqui para quem quiser tratar item a item.
     notes: list[str] = field(default_factory=list)
+    #: O formulário como a ÚLTIMA tela o mostrava, uma linha por campo
+    #: ("Subjects: «Maths Computer Science» (…)"). Vazio quando o job não
+    #: preencheu formulário. É a verdade da DOM; as notas do caminho envelhecem.
+    campos: list[str] = field(default_factory=list)
     #: O `summary` ANTES de o caderno ser colado — a linha de fecho, sozinha.
     #:
     #: Existe para a entrega poder separar o que se REDIGE do que se ENTREGA
@@ -2226,6 +2241,12 @@ class BrowserLocalDriver:
         self._campos_com_ganho: set[str] = set()
         self._estado_final_campos: dict[str, tuple] = {}
         self._tela_final_campos: dict = {}
+        #: Dado pessoal que a memória NÃO tem, decidido pelo Daniel ao vivo
+        #: (F8a): inventar um valor de teste, deixar em branco, ou o que ele
+        #: ditou na resposta (o valor vale só para aquele campo).
+        self._campos_inventar: set[str] = set()
+        self._campos_em_branco: set[str] = set()
+        self._campos_ditados: dict[str, str] = {}
         #: Rodadas seguidas paradas numa tela de login. Uma é acidente de
         #: redirect e o modelo ainda pode sair dela; duas é parede.
         self._rodadas_na_parede = 0
@@ -7824,6 +7845,53 @@ class BrowserLocalDriver:
         except Exception:  # noqa: BLE001 — evidência é luxo, a pausa não
             return []
 
+    async def _dado_ausente_ao_vivo(
+        self, args: dict, campo: str, nome: str, snapshot: dict | None, ref: Any
+    ) -> dict:
+        """Dado pessoal que a memória não tem: o DANIEL decide, com a tarefa viva.
+
+        Três saídas, e nenhuma escreve dado dele sem ele: inventar um valor de
+        teste (não é dado de ninguém), deixar em branco, ou o valor que ele mesmo
+        digitar na resposta. Sem resposta no prazo, a parada volta a ser a de
+        antes (`NeedsRelease` → "falta dado seu").
+        """
+        rotulos = self._rotulos_do(snapshot, ref)
+        onde = f" («{rotulos[0]}»)" if rotulos else ""
+        pergunta = (
+            f"A página pede {nome}{onde} e eu não tenho esse dado seu na memória. "
+            "Invento um valor de teste, deixo em branco, ou você me diz o valor?"
+        )
+        opcoes = ["Invente um valor de teste", "Deixe em branco"]
+        try:
+            respostas = await self._perguntar(pergunta, opcoes)
+        except EsperaEsgotada:
+            self._log("note", "preenchimento barrado", f"{nome} sem resposta → pedir ao Daniel")
+            raise NeedsRelease([campo], self._host_of(self._last_seen_url), rotulos) from None
+        escolha = next((m.opcao for m in respostas if getattr(m, "opcao", None) is not None), None)
+        texto = " / ".join(str(m.texto or "") for m in respostas).strip()
+        if escolha is None:
+            if _PEDE_INVENTAR.search(texto):
+                escolha = 0
+            elif _PEDE_EM_BRANCO.search(texto):
+                escolha = 1
+        if escolha == 0:
+            self._campos_inventar.add(campo)
+            self._log("note", "o Daniel decidiu", f"{nome}: inventar valor de teste")
+            return args
+        if escolha == 1:
+            self._campos_em_branco.add(campo)
+            self._log("note", "o Daniel decidiu", f"{nome}: deixar em branco")
+            raise RuntimeError(
+                f"{nome}: o Daniel mandou deixar EM BRANCO — não preencha este campo; "
+                "siga com os outros."
+            )
+        self._campos_ditados[campo] = texto
+        self._log("note", "o Daniel decidiu", f"{nome}: respondeu «{texto[:120]}»")
+        raise RuntimeError(
+            f"{nome}: o Daniel respondeu «{texto[:200]}». Se é o valor, preencha "
+            "exatamente isso; se é outra instrução, siga o que ele disse."
+        )
+
     async def _barrar_literal(
         self, args: dict, snapshot: dict | None, valor: str, url: str = ""
     ) -> dict:
@@ -7865,6 +7933,24 @@ class BrowserLocalDriver:
             return args
 
         nome = humano(campo)
+        # O que o Daniel já decidiu AO VIVO para este campo (F8a) vale até o fim.
+        if campo in self._campos_inventar:
+            return args
+        if campo in self._campos_em_branco:
+            raise RuntimeError(
+                f"{nome}: o Daniel mandou deixar EM BRANCO — não preencha este campo; "
+                "siga com os outros."
+            )
+        ditado = self._campos_ditados.get(campo)
+        if ditado is not None:
+            from core.browser_local.respondedor import comparavel
+
+            if comparavel(valor) and comparavel(valor) in comparavel(ditado):
+                return args
+            raise RuntimeError(
+                f"{nome}: preencha com o que o Daniel respondeu («{ditado[:120]}»), "
+                "exatamente — não troque por outro valor."
+            )
         tarefa = (self._finalidade or self._task_text or "").strip()
         # A finalidade que vai na FRASE é o nome canônico ("frete"), não a tarefa
         # inteira: `explicar` interpola o que receber, e despejar 400 caracteres
@@ -7902,6 +7988,19 @@ class BrowserLocalDriver:
                     f"este campo com «pks:{campo}» (o sistema troca pelo valor real). "
                     "Nunca escreva o número."
                 )
+            # A memória NÃO tem o dado: não há card a pedir (liberar o que não
+            # existe só adia a recusa), e parar matava a tarefa sem card nenhum —
+            # sessão 3a053c06, "dados de teste" parado na data de nascimento.
+            # Com a conversa viva, pergunta e SEGUE na mesma aba.
+            if self._conversa is not None:
+                try:
+                    ausente = await self._filler.disponivel(
+                        user_id=self._release_user_id, campo=campo
+                    )
+                except Exception:  # noqa: BLE001 — na dúvida, o caminho de sempre
+                    ausente = None
+                if ausente:
+                    return await self._dado_ausente_ao_vivo(args, campo, nome, snapshot, ref)
             self._log("note", "preenchimento barrado", f"{nome} sem liberação → pedir ao Daniel")
             logger.info("[release] fill barrado → pedido: campo=%s ref=%s", campo, ref)
             raise NeedsRelease(
@@ -8509,6 +8608,7 @@ class BrowserLocalDriver:
             campos = self._bloco_campos_no_fim()
             if campos:
                 outcome.summary = f"{outcome.summary}\n\n{campos}".strip()
+            outcome.campos = self._linhas_campos_no_fim()
             outcome.summary = self._com_caderno(outcome.summary, outcome.status)
             pendentes = self._bloco_mensagens_pendentes()
             if pendentes:
@@ -8544,10 +8644,26 @@ class BrowserLocalDriver:
         partes += [b for b in (self._bloco_campos_no_fim(), self._bloco_mensagens_pendentes()) if b]
         return "\n\n".join(partes).strip()
 
+    def _e_formulario(self) -> bool:
+        """O job preencheu um formulário de verdade: dois campos ou mais.
+
+        A mesma régua do `_check_revisao_enter`. Um campo só é a caixa de busca
+        ou o link colado no site de download (c1a738d6) — não vale um bloco.
+        """
+        return len(self._campos_com_ganho) >= 2 and bool(self._estado_final_campos)
+
     def _bloco_campos_no_fim(self) -> str:
         """Os campos do formulário como a ÚLTIMA tela os mostrava."""
-        if not (self._campos_com_ganho and self._estado_final_campos):
+        linhas = self._linhas_campos_no_fim()
+        if not linhas:
             return ""
+        return "Campos na tela no fim (lidos da página, não da nota):\n" + "\n".join(
+            f"- {linha}" for linha in linhas
+        )
+
+    def _linhas_campos_no_fim(self) -> list[str]:
+        if not self._e_formulario():
+            return []
         tela = str(self._tela_final_campos.get("tela") or self._tela_final_campos.get("text") or "")
         linhas: list[str] = []
         usados: set[str] = set()
@@ -8557,17 +8673,17 @@ class BrowserLocalDriver:
             nome = rotulo or "(sem rótulo)"
             if marcado is not None:
                 if marcado:
-                    linhas.append(f"- {nome}: marcado")
+                    linhas.append(f"{nome}: marcado")
                 continue
             if valor:
-                linhas.append(f"- {nome}: {valor[:120]}")
+                linhas.append(f"{nome}: {valor[:120]}")
                 continue
             # Lista personalizada: o input fica vazio e o escolhido aparece como
             # texto ao lado do rótulo (os chips do Subjects).
             ao_lado = _ao_lado_do_rotulo(tela, rotulo)
             linhas.append(
-                f"- {nome}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo; o campo em si está vazio)"
-                if ao_lado else f"- {nome}: VAZIO"
+                f"{nome}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo; o campo em si está vazio)"
+                if ao_lado else f"{nome}: VAZIO"
             )
         # Rótulo sem campo depois dele: o select personalizado já escolhido some
         # da lista de elementos (o "State and City" do 7ce2a472) e só sobra o texto.
@@ -8583,10 +8699,8 @@ class BrowserLocalDriver:
                 continue
             ao_lado = _ao_lado_do_rotulo(tela, rotulo)
             if ao_lado:
-                linhas.append(f"- {rotulo}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo)")
-        if not linhas:
-            return ""
-        return "Campos na tela no fim (lidos da página, não da nota):\n" + "\n".join(linhas[:40])
+                linhas.append(f"{rotulo}: «{ao_lado[:120]}» (texto na tela ao lado do rótulo)")
+        return linhas[:40]
 
     def _bloco_mensagens_pendentes(self) -> str:
         pendentes = [m for m in self.mensagens_do_daniel if m.id in self._mensagens_novas]
@@ -8637,7 +8751,7 @@ class BrowserLocalDriver:
             if status == "completed"
             else f"O que eu TINHA coletado até parar ({len(faltando)})"
         )
-        if self._campos_com_ganho and self._estado_final_campos:
+        if self._e_formulario():
             rotulo = (
                 f"Anotações do caminho ({len(faltando)}) — podem estar DESATUALIZADAS; "
                 "o estado do formulário é o bloco «Campos na tela no fim» acima"

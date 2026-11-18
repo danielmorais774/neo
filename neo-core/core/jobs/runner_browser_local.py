@@ -613,6 +613,27 @@ async def _pedir_liberacao(
     return saida
 
 
+def _itens_da_entrega(outcome: Any) -> list[str]:
+    """Os FATOS que vão ao chat: os campos da tela primeiro, as notas que sobram.
+
+    Formulário preenchido entregava o caderno — 13 a 24 notas do caminho, com
+    "Subjects: pendente" e "Hobbies: Sports (Music a marcar)" já velhas, quando o
+    bloco lido da página estava certo e não chegava a ele (sessões 15ccd81e e
+    3a053c06). Nota que fala de um campo do bloco sai: o bloco é a versão final
+    dela. As outras (o preço coletado, o aviso da página) ficam.
+    """
+    notas = [str(n) for n in getattr(outcome, "notes", None) or []]
+    campos = [str(c) for c in getattr(outcome, "campos", None) or [] if str(c).strip()]
+    if not campos:
+        return notas
+    rotulos = {
+        r for r in (c.split(":", 1)[0].strip().casefold() for c in campos)
+        if len(r) >= 3 and r != "(sem rótulo)"
+    }
+    resto = [n for n in notas if not any(r in n.casefold() for r in rotulos)]
+    return campos + resto
+
+
 def _estado_final(outcome: Any, pedido_liberacao: dict | None) -> str:
     """O estado do job no banco: ``completed``, ``waiting`` ou ``failed``.
 
@@ -1124,7 +1145,7 @@ def build_browser_local_runner(
         # caractere). Preço, nome de arquivo, caminho e uuid de retomada não
         # sobrevivem a uma paráfrase — e hoje passam por uma.
         fecho: list[str] = [outcome.fecho or outcome.summary]
-        itens: list[str] = list(outcome.notes)
+        itens: list[str] = _itens_da_entrega(outcome)
         summary, itens = _com_revisao(outcome, summary, itens)
         if outcome.url:
             summary += f"\n\n(a aba ficou em {outcome.url})"

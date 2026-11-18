@@ -1,7 +1,7 @@
 # Formulário no navegador local: régua de produção, Enter e autocomplete — plano
 
-> Status (18/11/2026, 11:15 BRT): **F0–F5 + F7 em produção** (§7.2, §7.3). 1º E2E ✅;
-> falta o E2E da mensagem pelo painel (F2).
+> Status (18/11/2026, 11:38 BRT): **F0–F5, F7, F8a, F9 em produção** (§7.2–7.4).
+> Falta: E2E da mensagem pelo painel (F2) e do dado ausente (F8a); F8b, F4-G2 e F6.
 > Fora: o G2 da visão ainda pergunta "deve mostrar X" no autocomplete (o aviso
 > em código cobre o modelo) e a F6. Origem: sessão `4a345d50`,
 > job `9fcb3bb6`. O pedido era preencher https://demoqa.com/automation-practice-form
@@ -352,6 +352,27 @@ nascimento de teste ficou "15 Nov 2026". O pedido não fixava uma data, então
 isso é escolha do modelo, não defeito do driver.
 
 Testes: 16 em `test_formulario_regua.py`; suíte com 4797 passando.
+
+### 7.4 Sessão 3a053c06 → F8a e F9 (18/11/2026, 11:38 BRT)
+
+**O caso:** o job d33553b6 fez `fill` "10 Jan 1995" na Date of Birth. A trava
+de dado pessoal disparou `NeedsRelease`, mas a memória não tem data de
+nascimento, então o runner a pôs em "faltando": nenhum `release_request`, nenhum
+card, job `failed` e a pergunta só como texto no chat. Depois do "pode inventar",
+o cérebro abriu um job NOVO (1153f31a) e refez tudo do zero. O bloco de campos
+saiu certo, mas o chat mostrou as 13 notas, porque o runner entregava
+`outcome.notes`.
+
+| Fase | O que entrou |
+|---|---|
+| F8a | `_dado_ausente_ao_vivo`: dado pessoal que a memória NÃO tem (`filler.disponivel`) vira pergunta viva — "Invente um valor de teste" / "Deixe em branco" / valor que ele digitar. A decisão vale para o resto do job; o valor ditado só entra naquele campo. Sem resposta no prazo → `NeedsRelease` como antes. Dado que a memória TEM continua indo para o card |
+| F9 | `DriverResult.campos` + `_itens_da_entrega` no runner: os fatos da entrega são os campos da tela, e a nota que fala de um campo do bloco sai. Nota que não é de campo (preço, aviso) fica. Bloco só com 2+ campos (`_e_formulario`, a régua do `_check_revisao_enter`) |
+
+**F8b, ainda não feita:** a frase do Daniel ("dados de teste", "pode inventar")
+liberar valor inventado sem perguntar. Antes, medir a lista de frases no corpus
+de mensagens reais. Hoje a F8a já cobre o caso com UMA pergunta.
+
+Testes: 24 em `test_formulario_regua.py`; suíte com 4805 passando.
 
 ## 8. Teste ponta a ponta (depois de F1–F5)
 

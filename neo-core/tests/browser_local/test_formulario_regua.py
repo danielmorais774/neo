@@ -316,7 +316,7 @@ def test_campos_sem_rotulo_nao_se_fundem():
 def test_bloco_do_fim_mostra_o_que_a_tela_mostra():
     driver = BrowserLocalDriver(act=None, llm=None, model="texto", vision_model=None)
     fim = _fim_do_7ce2a472()
-    driver._campos_com_ganho = {"x"}
+    driver._campos_com_ganho = {"x", "y"}
     driver._estado_final_campos = driver_mod._estado_dos_campos(fim["elements"])
     driver._tela_final_campos = fim
 
@@ -353,3 +353,140 @@ def test_caixa_de_digitar_de_lista_ganha_dica():
         {"ref": 3, "tag": "input", "type": "text", "text": "First Name", "box": [0, 0, 300, 38]}
     )
     assert "use `fill` direto" not in normal
+
+
+# ── F9: o chat recebe os campos da tela, não o caderno velho ────────────────
+
+
+def test_entrega_traz_os_campos_e_tira_as_notas_de_campo():
+    from types import SimpleNamespace
+
+    from core.jobs.runner_browser_local import _itens_da_entrega
+
+    outcome = SimpleNamespace(
+        notes=[
+            "Subjects: pendente",
+            "Hobbies: Sports e Music (Sports marcado; Music a marcar)",
+            "Formulário completo: First Name Teste, Last Name Silva",
+            "Notebook X — R$ 3.399 — loja Y",
+        ],
+        campos=["Name: Teste", "Last Name: Silva", "Subjects: «Maths» (texto na tela ao lado do rótulo)",
+                "Sports: marcado", "Music: marcado"],
+    )
+    itens = _itens_da_entrega(outcome)
+
+    assert itens[:5] == outcome.campos
+    assert "Notebook X — R$ 3.399 — loja Y" in itens, "nota que não é de campo fica"
+    assert not any("pendente" in i or "a marcar" in i for i in itens)
+
+
+def test_entrega_sem_formulario_continua_sendo_o_caderno():
+    from types import SimpleNamespace
+
+    from core.jobs.runner_browser_local import _itens_da_entrega
+
+    outcome = SimpleNamespace(notes=["a", "b"], campos=[])
+    assert _itens_da_entrega(outcome) == ["a", "b"]
+
+
+def test_um_campo_so_nao_e_formulario():
+    """O link colado no site de download (c1a738d6) não vira bloco."""
+    driver = BrowserLocalDriver(act=None, llm=None, model="texto", vision_model=None)
+    driver._campos_com_ganho = {"input(text)|Paste your video link here"}
+    driver._estado_final_campos = {"input(text)|Paste your video link here": ("https://y", None)}
+    assert driver._bloco_campos_no_fim() == ""
+    assert driver._linhas_campos_no_fim() == []
+
+
+# ── F8a: dado pessoal que a memória não tem → pergunta viva ─────────────────
+
+
+class _FillerSemData:
+    async def tem_liberacao(self, **_):
+        return False
+
+    async def disponivel(self, **_):
+        return "'data_nascimento' não está na memória"
+
+
+def _driver_da_data(respostas):
+    driver = BrowserLocalDriver(act=None, llm=None, model="texto", vision_model=None)
+    driver._filler = _FillerSemData()
+    driver._release_user_id = "u"
+    driver._conversa = object()
+    driver._last_seen_url = "https://demoqa.com/automation-practice-form"
+    perguntas = []
+
+    async def perguntar(pergunta, opcoes, **_):
+        perguntas.append((pergunta, opcoes))
+        if isinstance(respostas, Exception):
+            raise respostas
+        return respostas
+
+    driver._perguntar = perguntar  # type: ignore[method-assign]
+    driver._perguntas = perguntas  # type: ignore[attr-defined]
+    return driver
+
+
+_SNAP_DATA = {"elements": [
+    {"ref": 15, "tag": "label", "text": "Date of Birth"},
+    {"ref": 16, "tag": "input", "type": "text", "text": "18 Nov 2026", "value": "18 Nov 2026"},
+]}
+
+
+@pytest.mark.asyncio
+async def test_data_ausente_pergunta_e_inventa_quando_ele_manda():
+    driver = _driver_da_data([Mensagem(texto="pode inventar é so para teste", origem="chat")])
+    args = {"ref": 16, "value": "10 Jan 1995"}
+
+    assert await driver._barrar_literal(args, _SNAP_DATA, "10 Jan 1995") == args
+    assert "não tenho esse dado seu na memória" in driver._perguntas[0][0]
+    assert driver._perguntas[0][1] == ["Invente um valor de teste", "Deixe em branco"]
+    # A decisão vale para o resto da tarefa: não pergunta de novo.
+    assert await driver._barrar_literal(args, _SNAP_DATA, "11 Jan 1995") == args
+    assert len(driver._perguntas) == 1
+    assert driver._fills_barrados == []
+
+
+@pytest.mark.asyncio
+async def test_data_ausente_em_branco_pelo_botao():
+    driver = _driver_da_data([Mensagem(texto="Deixe em branco", origem="painel", opcao=1)])
+    with pytest.raises(RuntimeError, match="EM BRANCO"):
+        await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+    assert driver._fills_barrados == [], "deixar em branco não pode parar a tarefa"
+
+
+@pytest.mark.asyncio
+async def test_data_ausente_valor_ditado_por_ele_entra_e_so_ele():
+    driver = _driver_da_data([Mensagem(texto="usa 05 Mar 1990", origem="chat")])
+    with pytest.raises(RuntimeError, match="respondeu"):
+        await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+    ok = {"ref": 16, "value": "05 Mar 1990"}
+    assert await driver._barrar_literal(ok, _SNAP_DATA, "05 Mar 1990") == ok
+    with pytest.raises(RuntimeError, match="exatamente"):
+        await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+
+
+@pytest.mark.asyncio
+async def test_data_ausente_sem_resposta_para_como_antes():
+    from core.browser_local.driver import EsperaEsgotada, NeedsRelease
+
+    driver = _driver_da_data(EsperaEsgotada("p", []))
+    with pytest.raises(NeedsRelease):
+        await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+
+
+@pytest.mark.asyncio
+async def test_dado_que_a_memoria_tem_continua_indo_para_o_card():
+    """CPF/CEP que a memória TEM: o card de liberação, como sempre. Nada de inventar."""
+    from core.browser_local.driver import NeedsRelease
+
+    driver = _driver_da_data([Mensagem(texto="pode inventar", origem="chat")])
+
+    async def tem(**_):
+        return None
+
+    driver._filler.disponivel = tem  # type: ignore[method-assign]
+    with pytest.raises(NeedsRelease):
+        await driver._barrar_literal({"ref": 16, "value": "10 Jan 1995"}, _SNAP_DATA, "10 Jan 1995")
+    assert driver._perguntas == []
