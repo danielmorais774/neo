@@ -1371,6 +1371,81 @@ _AVISO_FIM_DAS_RODADAS = (
     "agora em texto, com o que já tem: o que ficou pronto, o que faltou e onde "
     "parou. Não chame ferramenta."
 )
+#: A mesma rodada final quando o turno vai CONTINUAR sozinho no passo seguinte
+#: (`[cerebro] continuar_no_teto`). Com o aviso de cima, na session-3b19d27a o
+#: modelo fechou com "me dá um 'vai' e eu gero a planilha": pergunta ao usuário,
+#: que o verificador de promessa não continua. Aqui o texto vira só o status do
+#: meio do caminho, e a continuação é do código. O texto desta rodada é o que o
+#: próximo passo lê (o `cycle_history` leva até `_CYCLE_REPLY_CHARS`): o que só
+#: o modelo de visão leu (a transcrição da nota) não está na nota de trabalho nem
+#: no caderno, então os DADOS têm de vir escritos aqui, compactos.
+_AVISO_FIM_DAS_RODADAS_CONTINUA = (
+    "As rodadas de ferramenta deste passo acabaram, e o trabalho segue sozinho no "
+    "próximo passo. Agora NÃO há tools. Escreva, compacto e em até 1.000 caracteres, "
+    "os dados que você já levantou e que o próximo passo vai usar (a tabela ou os "
+    "valores lidos, os caminhos no /workspace) e, numa frase, o que falta fazer. "
+    "Não pergunte nada ao usuário e não peça confirmação para continuar. Não chame "
+    "ferramenta."
+)
+#: Ordem do passo de continuação que o CÓDIGO cria quando o turno bate o teto. O
+#: começo é fixo: é por ele que o passo seguinte sabe que já é a continuação do
+#: teto (uma por pedido). Não repete o pedido original de propósito: o
+#: `cycle_history` já leva o pedido e a fala do passo anterior, e copiar o pedido
+#: aqui faria a guarda de quase-repetição do orquestrador (`order_is_near_repeat`)
+#: ler a ordem como "pede de novo o mesmo".
+_ORDEM_DO_TETO = (
+    "Terminar o pedido a partir do que já foi levantado neste turno: produzir e "
+    "entregar agora o resultado que ele pediu (arquivo com file_save, se ele pediu "
+    "arquivo), sem refazer nem reler o que o passo anterior já fez, e dizer na "
+    "resposta o que ficou incerto."
+)
+
+
+def _e_continuacao_do_teto(ordem: str | None) -> bool:
+    """Este passo já é a continuação que o teto de rodadas criou?"""
+    return (ordem or "").strip().startswith(_ORDEM_DO_TETO[:60])
+
+
+def _teto_pode_continuar(
+    arquivos: list[dict[str, Any]] | None, tool_trace: list[dict[str, Any]] | None
+) -> bool:
+    """Bater o teto daqui deixa trabalho que um passo de continuação termina?
+
+    Turno que já entregou arquivo acabou o principal. Com job aberto, quem segue
+    é o job (e o `then` dele), e um ciclo aqui correria em paralelo.
+    """
+    if arquivos:
+        return False
+    jobs, _ = _open_jobs(tool_trace)
+    return not jobs
+
+
+def _continuacao_do_teto(
+    fim_do_loop: dict[str, Any] | None,
+    *,
+    ligado: bool,
+    arquivos: list[dict[str, Any]] | None,
+    tool_trace: list[dict[str, Any]] | None,
+) -> "Handoff | None":
+    """O passo de continuação para um turno que acabou no teto de rodadas, ou None.
+
+    Decisão do código, sem LLM: o verificador de promessa lê "me dá um 'vai'"
+    como pergunta ao usuário e não continua (session-3b19d27a). Parada por
+    repetição não conta: ali o modelo está travado e continuar repetiria a trava.
+    """
+    if not ligado or not (fim_do_loop or {}).get("teto"):
+        return None
+    if not _teto_pode_continuar(arquivos, tool_trace):
+        return None
+    return Handoff(
+        target_intent=IntentType.DIRECT_RESPONSE,
+        input_text=_ORDEM_DO_TETO,
+        target_skill=None,
+        reason="teto_de_rodadas",
+        is_self=True,
+    )
+
+
 _AVISO_FIM_POR_REPETICAO = (
     "Você mandou a MESMA chamada de ferramenta {vezes} rodadas seguidas e o "
     "resultado não muda. Acabaram as rodadas de ferramenta deste turno: NÃO há "
@@ -2778,6 +2853,33 @@ _AVISO_MIDIA = {
         + _TRAZER_DO_DISCO
     ),
 }
+
+
+#: `midia` do classificador cujo aviso manda para a skill `ocr-video`.
+_MIDIA_DE_TELA = frozenset({"tela", "conteudo"})
+_EXT_IMAGEM = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif", ".bmp", ".tif", ".tiff")
+#: session-3b19d27a: "passa OCR na notinha do e-mail". O classificador não tinha
+#: como saber que o anexo era FOTO (ele ainda estava no e-mail), marcou
+#: `midia=tela`, e o aviso mandou ler a skill de vídeo: 1 rodada na skill errada e
+#: 2 de tesseract ilegível. Quem sabe o tipo é o resultado do `email_anexo` /
+#: `file_stage`, e o aviso vai colado nele, depois do aviso de vídeo.
+_AVISO_E_IMAGEM = (
+    "(aviso do sistema) Este arquivo é uma IMAGEM, não um vídeo: a skill `ocr-video` "
+    "e o tesseract não servem aqui, ignore o aviso de vídeo. Se for nota fiscal ou "
+    "cupom, siga a skill `nota-fiscal` (`skill_read`, se ela ainda não estiver "
+    "ativa). Se não for, leia a imagem inteira com `file_olhar`."
+)
+
+
+def _chegou_imagem(nome: str, resultado: Any) -> bool:
+    """O resultado desta tool trouxe uma imagem para o turno (anexo ou arquivo no sandbox)?"""
+    if nome not in ("email_anexo", "file_stage") or not isinstance(resultado, dict):
+        return False
+    mime = str(resultado.get("mime") or "").lower()
+    if mime.startswith("image/"):
+        return True
+    alvo = str(resultado.get("path") or resultado.get("name") or "").lower()
+    return alvo.endswith(_EXT_IMAGEM)
 
 
 def _aviso_midia(decision: Any, tools: list[Any]) -> str | None:
@@ -5968,6 +6070,22 @@ class AIService:
         response belongs to (for the round cap).
         """
 
+        # Teto de rodadas sem entrega → passo de continuação criado pelo código
+        # (`_continuacao_do_teto`). Só quando o turno pode encadear, nunca em
+        # música (que tem o verificador dela) e uma vez por pedido: só o passo do
+        # PEDIDO cria. Passo de handoff (inclusive a própria continuação do teto,
+        # ou uma que o cérebro escreveu) que bater o teto termina como antes; sem
+        # isso, cada passo do ciclo poderia gastar mais 32 rodadas.
+        _fim_do_loop: dict[str, Any] = {}
+        _continuar_no_teto = bool(
+            enable_handoff
+            and self.settings.pipeline_self_handoff_enabled
+            and ajustes().cerebro.continuar_no_teto
+            and decision.skill_hint != "music"
+            and "handoff_origin_message" not in (metadata or {})
+            and not _e_continuacao_do_teto(user_message)
+        )
+
         # The intent classifier already decided whether cross-session memory is useful.
         # Skip recovery when needs_memory=False (greetings, acks, phatic expressions).
         if not decision.needs_memory:
@@ -6624,8 +6742,12 @@ class AIService:
                     tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
-                    annotate_result=self._origin_annotator(user_id, session_id),
+                    annotate_result=self._anotador_do_turno(
+                        user_id, session_id, midia=getattr(decision, "midia", None)
+                    ),
                     pedido=user_message,
+                    continuar_no_teto=_continuar_no_teto,
+                    fim_do_loop=_fim_do_loop,
                 ):
                     yield _bolha
                 full_response = _run.text
@@ -6740,8 +6862,12 @@ class AIService:
                     produced_files=produced_files, tool_trace=tool_trace,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
-                    annotate_result=self._origin_annotator(user_id, session_id),
+                    annotate_result=self._anotador_do_turno(
+                        user_id, session_id, midia=getattr(decision, "midia", None)
+                    ),
                     pedido=user_message,
+                    continuar_no_teto=_continuar_no_teto,
+                    fim_do_loop=_fim_do_loop,
                 ):
                     yield _bolha
                 full_response = _run2.text
@@ -6951,6 +7077,26 @@ class AIService:
         # abaixo nunca via este caso — ela só roda quando NÃO há bloco.
         if enable_handoff and any(h.is_self for h in pipeline_handoffs):
             pipeline_handoffs = await self._continuar_depois_do_job(pipeline_handoffs, tool_trace, slog)
+
+        # Teto de rodadas sem entrega: o código cria a continuação, sem perguntar ao
+        # verificador de promessa. Com o handoff `is_self` na lista, o verificador
+        # logo abaixo nem roda (ele só age quando não há continuação).
+        if enable_handoff and not any(h.is_self for h in pipeline_handoffs):
+            _do_teto = _continuacao_do_teto(
+                _fim_do_loop,
+                ligado=_continuar_no_teto,
+                arquivos=produced_files,
+                tool_trace=tool_trace,
+            )
+            if _do_teto is not None:
+                pipeline_handoffs.append(_do_teto)
+                logger.info("[SELF-HANDOFF] teto de rodadas sem entrega — continuação criada")
+                if slog:
+                    slog.log_event(
+                        "Continuação (teto de rodadas)",
+                        "O turno bateu o teto de rodadas sem entregar arquivo nem abrir "
+                        f"job — o próximo passo termina o pedido: {_do_teto.input_text}",
+                    )
 
         # Self-continuation backstop. The prompt contract is not enough on its own:
         # on the first E2E run the instruction was in the payload verbatim and the
@@ -8224,6 +8370,8 @@ class AIService:
         annotate_result: Any = None,
         arquivo_local_no_chat: bool = False,
         pedido: str | None = None,
+        continuar_no_teto: bool = False,
+        fim_do_loop: dict[str, Any] | None = None,
     ) -> str:
         """Bounded read-tool loop for the cognitive core.
 
@@ -8257,6 +8405,14 @@ class AIService:
         O texto devolvido vai colado ao resultado da tool que o modelo lê — é por
         onde chega o aviso de que o arquivo lido é de OUTRA conversa
         (``FileLedger.nota_de_origem``). Falhar aqui nunca derruba o round.
+
+        ``continuar_no_teto``: o chamador cria um passo de continuação se o turno
+        bater o teto sem entregar (``_continuacao_do_teto``). A rodada final então
+        leva ``_AVISO_FIM_DAS_RODADAS_CONTINUA``, que pede só o status, em vez de
+        "o que faltou" (que virava "me dá um 'vai'").
+
+        ``fim_do_loop`` (in/out): recebe ``{"teto": True}`` quando a rodada final
+        sem tools veio do teto de rodadas (não da chamada repetida).
 
         ``tool_trace`` (in/out): se passado, recebe um resumo compacto (via
         ``_summarize_tool_call``) de CADA tool call bem-sucedida deste turno — não
@@ -8314,11 +8470,16 @@ class AIService:
                 # Rodada final: avisar que as tools acabaram, senão o modelo tenta
                 # chamar uma e o texto chega vazio (ver _AVISO_FIM_DAS_RODADAS).
                 aviso_final_dado = True
-                aviso_final = (
-                    _AVISO_FIM_POR_REPETICAO.format(vezes=rodadas_repetidas)
-                    if encerrar_por_repeticao
-                    else _AVISO_FIM_DAS_RODADAS
-                )
+                if encerrar_por_repeticao:
+                    aviso_final = _AVISO_FIM_POR_REPETICAO.format(vezes=rodadas_repetidas)
+                else:
+                    if fim_do_loop is not None:
+                        fim_do_loop["teto"] = True
+                    aviso_final = (
+                        _AVISO_FIM_DAS_RODADAS_CONTINUA
+                        if continuar_no_teto and _teto_pode_continuar(files_out, tool_trace)
+                        else _AVISO_FIM_DAS_RODADAS
+                    )
                 messages.append(Message(role=MessageRole.SYSTEM, content=aviso_final))
                 if slog:
                     slog.log_event(
@@ -8897,7 +9058,7 @@ class AIService:
                     if nota_extra:
                         result_lines.append(nota_extra)
                         if slog:
-                            slog.log_event("Aviso de origem", f"`{tc.name}` → {nota_extra}")
+                            slog.log_event("Aviso no resultado", f"`{tc.name}` → {nota_extra}")
                     if not tr.error and _origem_bloqueou(tc.name, tr.result):
                         result_lines.append(_aviso_origem_bloqueada(tools))
                         if slog:
@@ -11457,6 +11618,72 @@ class AIService:
             ledger = FileLedger(self.db)
             self._file_ledger_obj = ledger
         return ledger
+
+    def _anotador_do_turno(
+        self, user_id: Any, session_id: Any, *, midia: str | None = None
+    ) -> Any:
+        """Callback do laço: o que o sistema cola no resultado de uma tool.
+
+        Junta três notas, cada uma independente das outras: a de origem (o arquivo
+        lido é de OUTRA conversa, ``_origin_annotator``), a de imagem num turno que
+        o classificador marcou como vídeo de tela (``_AVISO_E_IMAGEM``, uma vez por
+        turno) e a conferência da planilha publicada pelo ``file_save``
+        (``core.files.contas``). Uma falhar nunca apaga a outra.
+        """
+        origem = self._origin_annotator(user_id, session_id)
+        imagem_avisada = False
+
+        async def anotar(nome: str, argumentos: dict[str, Any], resultado: Any) -> str | None:
+            nonlocal imagem_avisada
+            notas: list[str] = []
+            if not imagem_avisada and midia in _MIDIA_DE_TELA and _chegou_imagem(nome, resultado):
+                imagem_avisada = True
+                notas.append(_AVISO_E_IMAGEM)
+            if origem is not None:
+                try:
+                    nota = await origem(nome, argumentos, resultado)
+                except Exception as exc:  # noqa: BLE001 — anotação é extra
+                    logger.warning("[Cognitive] aviso de origem falhou: %s", exc)
+                    nota = None
+                if nota:
+                    notas.append(nota)
+            if nome == "file_save":
+                nota = await self._conferencia_da_planilha(resultado)
+                if nota:
+                    notas.append(nota)
+            return "\n\n".join(notas) or None
+
+        return anotar
+
+    async def _conferencia_da_planilha(self, resultado: Any) -> str | None:
+        """O aviso quando a planilha que o ``file_save`` acabou de publicar não fecha.
+
+        session-3b19d27a: a planilha saiu com TOTAL = SUM(F6:F13) = 207,74 ao lado de
+        "Total pago" = 213,74, e a resposta disse "Total fecha em R$ 213,74". O aviso
+        volta colado ao resultado do ``file_save``, enquanto o modelo ainda tem
+        rodadas para corrigir. Lê o blob do catálogo, que é o que o Daniel baixa.
+        Nunca levanta.
+        """
+        if not ajustes().cerebro.conferir_planilhas:
+            return None
+        if not isinstance(resultado, dict) or not resultado.get("file_id"):
+            return None
+        nome = str(resultado.get("name") or "")
+        if not nome.lower().endswith((".xlsx", ".xlsm")):
+            return None
+        store = getattr(self, "file_store", None)
+        if store is None:
+            return None
+        try:
+            from core.files.contas import conferir_planilha
+
+            entrada = await store.get(str(resultado["file_id"]))
+            if entrada is None or not getattr(entrada, "sha256", None):
+                return None
+            return await asyncio.to_thread(conferir_planilha, store.blob_path(entrada.sha256), nome)
+        except Exception as exc:  # noqa: BLE001 — conferência é extra, nunca custa o turno
+            logger.warning("[Cognitive] conferência da planilha falhou: %s", exc)
+            return None
 
     def _origin_annotator(self, user_id: Any, session_id: Any) -> Any:
         """Callback do laço: avisa quando uma tool LEU documento de outra conversa.

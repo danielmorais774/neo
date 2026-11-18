@@ -201,6 +201,14 @@ repeticao_trecho_max = 800
 # publicada com file_save: quantas o servidor publica sozinho por resposta, para
 # o chat conseguir desenhar (o Mac não enxerga o /workspace). 0 = desligado.
 imagens_publicadas_max = 6
+# Turno que bate o teto de rodadas sem ter entregado arquivo nem aberto job segue
+# sozinho num passo de continuação (uma vez por pedido), em vez de acabar
+# oferecendo o trabalho ("me dá um 'vai' e eu gero").
+continuar_no_teto = true
+# Planilha publicada com file_save passa pela conferência de contas: tabela de
+# itens (quantidade × unitário = total) e o TOTAL contra o valor pago. Se não
+# fecha, o aviso volta colado ao resultado do file_save.
+conferir_planilhas = true
 
 
 [roteador]

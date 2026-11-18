@@ -12,7 +12,7 @@ from core.files.executor import FilesExecutor
 from core.files.gc import gc_loop
 from core.files.stagers import WorkbenchStager
 from core.files.store import FileStore, FileStoreError, safe_name
-from core.files.tools import FILE_TOOL_NAMES, FILE_TOOLS
+from core.files.tools import CUPOM_TOOL_NAMES, CUPOM_TOOLS, FILE_TOOL_NAMES, FILE_TOOLS
 
 __all__ = [
     "build_file_store",
@@ -20,6 +20,8 @@ __all__ = [
     "FileStoreError",
     "FilesExecutor",
     "FILE_TOOLS",
+    "CUPOM_TOOLS",
+    "CUPOM_TOOL_NAMES",
     "FILE_TOOL_NAMES",
     "WorkbenchStager",
     "gc_loop",

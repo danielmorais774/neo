@@ -159,6 +159,8 @@ _BY_NAME: dict[str, frozenset[str]] = {
     "voice_get": frozenset(),
     "skill_list": frozenset(),
     "skill_read": frozenset(),
+    # Conta pura sobre o que o modelo já tem no contexto: não lê nem muda nada.
+    "conferir_cupom": frozenset(),
 }
 
 #: prefixo -> classes, aplicado quando o nome exato não está na tabela.

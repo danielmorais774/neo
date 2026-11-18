@@ -487,11 +487,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _file_store = None
     _files_gc_task = None
     if settings.neo_files_enabled:
-        from core.files import FILE_TOOLS, FilesExecutor, build_file_store, gc_loop
+        from core.files import CUPOM_TOOLS, FILE_TOOLS, FilesExecutor, build_file_store, gc_loop
 
         _file_store = build_file_store(db=_db, settings=settings, sandbox=_workbench_sandbox)
         _file_store.ensure_dirs()
         _tool_registry.register_many(FILE_TOOLS)
+        # conferir_cupom: gated pela skill nota-fiscal (fora do read set default).
+        _tool_registry.register_many(CUPOM_TOOLS)
         _tool_executor.register_module_executor("files", FilesExecutor(_file_store, llm=_llm_router))
         files.set_store(_file_store)
         app.state.file_store = _file_store

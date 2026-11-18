@@ -60,6 +60,8 @@ class FilesExecutor:
     async def _dispatch(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         if tool_name == "file_olhar":
             return await self._olhar(arguments)
+        if tool_name == "conferir_cupom":
+            return self._conferir_cupom(arguments)
         if tool_name == "file_list":
             return await self._list(arguments)
         if tool_name == "file_info":
@@ -187,6 +189,48 @@ class FilesExecutor:
                 "file_stage e processe no sandbox com neo_bash."
             )
         return payload
+
+    @staticmethod
+    def _conferir_cupom(arguments: dict[str, Any]) -> Any:
+        """As contas da nota transcrita, calculadas aqui (``core.files.contas``).
+
+        session-3b19d27a: a visão leu "1 × 39,99 = 33,99" e o modelo, fazendo a
+        conta de cabeça, concluiu o contrário do certo. Aqui a conta e a dedução
+        de qual leitura errou saem prontas.
+        """
+        from core.files.contas import conferir, de_dicionarios
+
+        itens, totais, problemas = de_dicionarios(
+            arguments.get("itens"),
+            {k: arguments.get(k) for k in (
+                "valor_a_pagar", "qtde_itens", "pagamentos", "troco", "descontos", "acrescimos",
+            )},
+        )
+        if not itens:
+            return {
+                "error": "bad_args",
+                "message": "passe 'itens' com o 'total' de cada linha"
+                + (f" ({'; '.join(problemas)})" if problemas else "") + ".",
+            }
+        v = conferir(itens, totais)
+        saida: dict[str, Any] = {
+            "ok": v.ok,
+            "fecha": v.fecha,
+            "todas_as_linhas_lidas": v.cobre,
+            "soma_dos_itens": str(v.soma_itens),
+            "conferencia": v.texto,
+        }
+        if v.correcoes:
+            saida["correcoes"] = [
+                {
+                    "item": (c.item + 1) if c.item >= 0 else "valor_a_pagar",
+                    "de": str(c.de), "para": str(c.para), "confianca": c.confianca,
+                }
+                for c in v.correcoes
+            ]
+        if problemas:
+            saida["ignorados"] = problemas
+        return saida
 
     async def _olhar(self, arguments: dict[str, Any]) -> Any:
         """Manda as imagens do sandbox para o modelo de visão e devolve o que ele viu.

@@ -205,3 +205,64 @@ FILE_TOOLS: list[ToolSchema] = [
 ]
 
 FILE_TOOL_NAMES = frozenset(t.name for t in FILE_TOOLS)
+
+
+#: Conferência de contas de nota/cupom (``core/files/contas.py``). NÃO entra no
+#: read set default: é destravada pela skill ``nota-fiscal`` (tool gating), então
+#: o schema só paga contexto no turno de nota. Executa no ``FilesExecutor`` (módulo
+#: ``files``) porque é conta pura: não lê banco, sandbox nem rede.
+CUPOM_TOOLS: list[ToolSchema] = [
+    ToolSchema(
+        name="conferir_cupom",
+        description=(
+            "Confere as CONTAS de uma nota fiscal/cupom que você transcreveu: "
+            "quantidade × unitário de cada linha, a soma dos itens contra o valor a "
+            "pagar, os pagamentos e a quantidade de itens. Quando não fecha, diz QUAL "
+            "leitura está errada e o valor certo. Chame ANTES de montar a planilha "
+            "ou de afirmar o total; quem faz a conta é ela, não você."
+        ),
+        module="files",
+        execution="server-side",
+        timeout=10,
+        parameters={
+            "itens": ToolParameter(
+                type="array",
+                description=(
+                    "Cada linha de item como está na nota: "
+                    "[{\"descricao\": \"VODKA 998ML\", \"qtd\": \"1\", \"unitario\": \"39,99\", "
+                    "\"total\": \"39,99\"}]. Valores em texto (\"2,168\", \"39,99\")."
+                ),
+                required=True,
+                items={
+                    "type": "object",
+                    "properties": {
+                        "codigo": {"type": "string"},
+                        "descricao": {"type": "string"},
+                        "qtd": {"type": "string"},
+                        "unitario": {"type": "string"},
+                        "total": {"type": "string"},
+                    },
+                    "required": ["total"],
+                },
+            ),
+            "valor_a_pagar": ToolParameter(
+                type="string", description="O 'Valor a pagar' / total da nota (ex.: '213,74').",
+            ),
+            "qtde_itens": ToolParameter(
+                type="integer", description="A 'Qtde. total de itens' impressa na nota.",
+            ),
+            "pagamentos": ToolParameter(
+                type="array",
+                description="Valor de cada forma de pagamento (ex.: ['150,00', '63,74']).",
+                items={"type": "string"},
+            ),
+            "troco": ToolParameter(type="string", description="Troco, se a nota mostra."),
+            "descontos": ToolParameter(
+                type="string", description="Soma das linhas de desconto, se houver (valor positivo).",
+            ),
+            "acrescimos": ToolParameter(type="string", description="Acréscimos, se houver."),
+        },
+    ),
+]
+
+CUPOM_TOOL_NAMES = frozenset(t.name for t in CUPOM_TOOLS)

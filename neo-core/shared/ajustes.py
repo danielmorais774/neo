@@ -240,6 +240,15 @@ class Cerebro(_Secao):
     #: conseguir desenhar. 0 = desligado (volta o cartão de erro). Na
     #: session-6e483f5d o recorte da notinha não apareceu por isso.
     imagens_publicadas_max: int = Field(6, ge=0, le=50)
+    #: Turno que bate o teto de rodadas SEM ter entregado arquivo nem aberto job
+    #: segue sozinho num passo de continuação, em vez de acabar oferecendo o
+    #: trabalho ("me dá um 'vai' e eu gero"). Uma vez por pedido. Na
+    #: session-3b19d27a a nota já estava lida e o Daniel precisou mandar "gera ai".
+    continuar_no_teto: bool = True
+    #: Planilha (.xlsx) publicada com `file_save` passa pela conferência de contas
+    #: (`core/files/contas.py`): tabela de itens com quantidade × unitário e o
+    #: TOTAL contra o valor pago. Se não fecha, o aviso vai colado ao resultado.
+    conferir_planilhas: bool = True
 
 
 class Roteador(_Secao):
