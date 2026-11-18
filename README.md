@@ -20,9 +20,11 @@
 
 <!-- MÍDIA 6: link do vídeo da demo de suporte (2–3 min), ao lado do botão acima, quando estiver publicado. -->
 
-<!-- MÍDIA 1 (hero): assets/hero.gif — voz → navegador agindo com a linha do tempo → resposta falada, 10–15 s.
-<p align="center"><img src="assets/hero.gif" alt="O Neo usando o navegador a partir de um pedido por voz" width="800"></p>
--->
+<p align="center">
+  <img src="assets/navegador-formulario.gif" alt="Pedido no chat do Neo: preencher um formulário no navegador sem enviar. O Neo abre a página e preenche campo por campo, com a linha do tempo e o botão PARE ao lado." width="800">
+  <br>
+  <sub>Um pedido no chat vira um job no navegador que você está olhando: o Neo preenche o formulário campo por campo, narra cada passo na linha do tempo e não clica em enviar.</sub>
+</p>
 
 ---
 
@@ -40,6 +42,17 @@ O que dá trabalho num assistente assim não é chamar um modelo. É decidir **o
 - **Delega código.** Abre uma sessão do Claude Code no Mac, acompanha e traz o relatório.
   <!-- MÍDIA 4: assets/claude-code.gif — sessão aberta, pílula "Claude · ver o processo", relatório no fim. -->
 - **E mais:** WhatsApp, agenda (cron), casa inteligente (Home Assistant), música (Spotify/YouTube) e finanças.
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/tarefas.png" alt="Janela Tarefas do Neo: lista de jobs em segundo plano com status, e o detalhe de um job com o pedido, o resultado campo por campo e o log"></td>
+    <td width="50%"><img src="assets/caderno-de-trabalho.png" alt="Janela Caderno do Neo: memória de trabalho de uma sessão, com cada passo anotado na hora e o resultado do job"></td>
+  </tr>
+  <tr>
+    <td><sub><strong>Tarefas.</strong> O que roda longe da conversa: pedido, resultado, duração e log de cada job, inclusive os que falharam.</sub></td>
+    <td><sub><strong>Caderno de trabalho.</strong> O rascunho da tarefa atual: cada passo é anotado na hora e o resultado do job entra quando ele termina.</sub></td>
+  </tr>
+</table>
 
 ## Arquitetura
 

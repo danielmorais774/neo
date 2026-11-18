@@ -18,9 +18,13 @@
   <a href="evals/README.md"><strong>📊 Evaluations, model comparisons and case studies (in Portuguese) →</strong></a>
 </p>
 
-<!-- MEDIA 6: link to the support demo video. MEDIA 1 (hero): assets/hero.gif
-<p align="center"><img src="assets/hero.gif" alt="Neo using the browser from a voice request" width="800"></p>
--->
+<!-- MEDIA 6: link to the support demo video. -->
+
+<p align="center">
+  <img src="assets/navegador-formulario.gif" alt="A request in Neo's chat to fill in a form in the browser without submitting it. Neo opens the page and fills it field by field, with the timeline and the STOP button on the side." width="800">
+  <br>
+  <sub>A chat request becomes a job in the browser you are looking at: Neo fills in the form field by field, narrates each step on the timeline and does not click submit. (UI in Portuguese.)</sub>
+</p>
 
 ---
 
@@ -39,6 +43,17 @@ The code comments and the design docs are in Portuguese.
 - **Acts on the Mac with approval.** Local commands go through a risk policy: what is safe runs, what is not asks for confirmation.
 - **Delegates code.** Opens a Claude Code session on the Mac, follows it and brings back the report.
 - **And more:** WhatsApp, scheduling (cron), smart home (Home Assistant), music (Spotify/YouTube) and personal finance.
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/tarefas.png" alt="Neo's Tasks window: a list of background jobs with their status, and one job's detail with the request, the field-by-field result and the log"></td>
+    <td width="50%"><img src="assets/caderno-de-trabalho.png" alt="Neo's Notebook window: the working memory of one session, with each step noted as it happens and the job's result"></td>
+  </tr>
+  <tr>
+    <td><sub><strong>Tasks.</strong> What runs away from the conversation: request, result, duration and log of each job, including the failed ones.</sub></td>
+    <td><sub><strong>Working notebook.</strong> The scratchpad of the current task: each step is noted as it happens, and the job's result is added when it finishes.</sub></td>
+  </tr>
+</table>
 
 ## Architecture
 
