@@ -1,10 +1,10 @@
 # Neo × Zion: o Zion na VPS, e o Neo lendo dele (fase 1) — plano
 
 **Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
-**Status:** F0–F3 feitas e verificadas (§12): desde 20/11 o Zion mora na VPS, o Claude do Mac
-fala com ele pelo WireGuard, e a porta 7077 só aceita a wg0. F4 em produção desde 20/11, com a
-consulta **desligada** no `neo.toml` (§12). Próxima: F5, que começa ligando
-`[zion] consulta_habilitada`. F6 não começou, e a cópia do spool de 18/11 se perdeu (§12, F4).
+**Status:** F0–F5 feitas e verificadas (§12), em 20/11. O Zion mora na VPS, o Claude do Mac
+fala com ele pelo WireGuard, a porta 7077 só aceita a wg0, e o Neo lê o Zion pelas tools
+`zion_overview`, `zion_search` e `zion_get`, com `[zion] consulta_habilitada = true`. F6
+(opcional) não começou, e a cópia do spool de 18/11 se perdeu: é refazer (§12, F4).
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -350,7 +350,7 @@ Cada fase só termina com a evidência da coluna da direita.
 | **F2** | Zion remoto (§5.2): token, git que vem do Mac, tradução de caminho, hooks remotos, `install --remote`, tick em laço, `git` na imagem com escrita | `npm test` verde; no Mac **sem** `client.toml`, tudo igual a hoje; hooks remotos funcionando contra um servidor HTTP local de teste, numa pasta de dados de teste |
 | **F3** | Infra na VPS e migração (§4, §6) | Uma sessão nova do Claude Code no Mac recebe o contexto vindo da VPS e grava checkpoint lá; do `neo-core`, `domain_list` responde pelo `neo-zion`; do sandbox e do `neo-core`, o `zion` com escrita não responde; o backup do Mac acompanha |
 | **F4** ✅ | neo-core: cliente, as três tools, risco e portão, `[zion]` no `neo.toml` (§7). Desenvolvido numa cópia no scratchpad, suíte inteira lá, publicação com `cmp` de 3 vias | Testes: cliente com JSON e SSE e reinicialização no 404; portão nega externo e permite agenda; tools fora da mesa com a consulta desligada; Zion fora do ar não derruba o turno |
-| **F5** | E2E (abaixo) | Os 6 itens |
+| **F5** ✅ | E2E (abaixo) | Os 6 itens |
 | **F6** (opcional) | Publicar o spool de falhas (pronto na cópia de 18/11): merge com o `ai_service.py` e o `grpc_server.py` atuais. O pull agora roda no `zion-tick` | Uma falha forçada aparece no Zion em até 5 min |
 
 **E2E da F5** (mensagens digitadas, menos de 240 caracteres):
@@ -783,4 +783,16 @@ medido; a F5 é a medida.
     reproduziu a memória fielmente. A própria pergunta ("no meu Mac" entre aspas) fez a
     guarda do navegador desviar `SERVER_TOOL`/`zion_search` para `COGNITIVE`, com a mesma
     explicação errada: a armadilha se demonstrou ao vivo.
-- **Falta o item 6** (WireGuard desligado no Mac), que depende do Daniel.
+- **Item 6 ✅ (20:39 UTC):** com o túnel `neo-vps` desligado, uma sessão nova do Claude Code
+  abriu e respondeu. O hook `session-start` desistiu em 8 s e avisou o modelo que o Zion
+  estava fora do ar; o modelo não gastou chamada e explicou a causa provável. O
+  `~/.config/zion/hook-errors.log` ganhou uma linha só (`session-start … no answer in 8000
+  ms`), porque o disjuntor (`.server-down`) segurou os hooks seguintes. O `~/.zion` não
+  reapareceu no Mac. Com o túnel religado, o Zion e o neo-core voltaram com 200. O MCP da
+  sessão ficou sem conexão (timeout de 30 s do Claude Code), sem travar a sessão; `/mcp`
+  reconecta.
+- **F5 fechada.** Itens 1–4 e 6 pelas sessões `925d4524`, `3778910b` e o log do hook; item 5
+  redefinido e travado em teste. Sobras para depois: a guarda do navegador
+  (`mem_20261120_6iu6`, medir no corpus antes); a frase em `zion_overview` dizendo que o Neo
+  só lê o Zion (ele ofereceu "alinho o Zion com essa lista"); marcar `externo` nos turnos
+  do WhatsApp e do e-mail (plano de auth).
