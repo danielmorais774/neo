@@ -1,0 +1,19 @@
+[Unit]
+Description=Vigia: avisa no Discord quem entra na VPS (SSH e WireGuard) e resume o dia
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /opt/vigia/vigia.py
+Restart=always
+RestartSec=10
+ExecReload=/bin/kill -USR1 $MAINPID
+StateDirectory=vigia
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

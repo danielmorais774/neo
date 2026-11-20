@@ -477,12 +477,15 @@ Outras saídas:
 
 | Pergunta | Fonte |
 |---|---|
-| O que aconteceu num turno | Diário da sessão `.md` no container: etapas 1–8, RAW payload de cada chamada |
+| O que aconteceu num turno | Diário da sessão `.md` no container: etapas 1–8. Desde 20/11/2026, cada mensagem do prompt vai inteira só na 1ª vez (marca `#sha`); depois vira `= #sha` ou diff (`observability/session_log_payload.py`) |
+| Payload exato de uma rodada (A/B) | `docker exec -w /app neo-core python scripts/payload_do_log.py /app/logs/session-<id>.md --listar`, depois `--interacao N --rodada K`. Lê também os diários antigos |
 | Corpo inteiro do classificador | `docker logs neo-core \| grep 'Request options'` |
 | Passo a passo de um job do navegador | `/app/logs/browser_local/<job>/trace.md` |
 | Tokens e finish por rodada | `GET /api/v1/generation?id=` do OpenRouter, pelos `x-generation-id` do app.log |
 | Folga da chave | `GET https://openrouter.ai/api/v1/key` |
 | Desktop | Log do Tauri (5 MB × 5) |
+| Desktop ou painel sem conexão com o core | Túnel WireGuard e socat no Mac: `docs/wireguard-mac-vps.md` |
+| Quem entrou na VPS; SSH recusando senha | Vigia (avisos no Discord) e SSH só com chave: `docs/vps-vigia-ssh.md` |
 
 **Testes:** cerca de 4.400 no Python e 125 no Rust. Rode com `neo-core/.venv/bin/pytest`. Evals em `scripts/eval_*.py`: roteador, portão do navegador, recall, tom e GAIA.
 
