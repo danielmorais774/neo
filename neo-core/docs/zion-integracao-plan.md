@@ -1,7 +1,8 @@
 # Neo × Zion: o Neo consulta a memória de trabalho (fase 1) — plano
 
 **Data:** 2026-11-20
-**Status:** só plano. Nada implementado.
+**Status:** F0 medida em 20/11 (§12); a réplica `zion-replica` já está de pé. F1–F5 não
+começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -140,19 +141,26 @@ sendo o deploy de lá.
 
 ## 6. Infra na VPS
 
-- **Mutagen**, criado do Mac (a sintaxe exata dos ignores é conferida na F0):
+- **Mutagen**, ✅ criado do Mac em 20/11 com este comando (padrões sem `/` valem em
+  qualquer nível; com `/` no começo, só na raiz):
   ```
-  mutagen sync create --name zion-replica --mode one-way-replica \
-    --ignore-vcs --ignore sessions --ignore transcripts --ignore .zion \
-    --ignore declined.toml --ignore recall.yaml --ignore domains/homelab \
+  mutagen sync create --name zion-replica --mode one-way-replica --ignore-vcs \
+    --ignore sessions --ignore transcripts --ignore /.zion --ignore /declined.toml \
+    --ignore /recall.yaml --ignore /domains/homelab \
     ~/.zion contabo-neo:/home/daniel/.zion-replica
   ```
   `one-way-replica` não tem conflito: o que existir do lado da VPS e não vier do Mac é
-  apagado.
+  apagado. Desfazer: `mutagen sync terminate zion-replica` e apagar a pasta na VPS.
 - **`docker-compose.yml`**: serviço `neo-zion` (build de `../zion-memory-mcp`), volume
   `/home/daniel/.zion-replica:/data:ro`, `ZION_DATA_DIR=/data`,
   `command: serve --http --read-only --host 0.0.0.0`, as travas do §3,
   `restart: unless-stopped`, rede `zion-net`.
+  - **`user: "1000:1000"`**: o Mutagen grava os arquivos da réplica com modo 0600, dono
+    `daniel` (uid 1000). Outro usuário no container não lê nada.
+  - **Imagem base `node:22-alpine`**: já está na VPS (230 MB, contra 1,64 GB da
+    `node:22`), e o disco está em 93%. O `node_modules` do Zion tem 84 MB.
+  - `healthcheck` no `/health`. Ele responde a qualquer `Host` e mostra o `data_dir` e os
+    domains, o que só é aceitável porque fica dentro da `zion-net`.
 - **Rede `zion-net`**: `driver: bridge`, `internal: true`.
 - **`neo-core`** entra na `zion-net`. Isso exige recriar o container
   (`docker compose up -d --no-deps neo-core`): uma queda curta, feita fora de turno.
@@ -166,8 +174,10 @@ então não há dependência nova nem rebuild do `neo-core`.
 
 - `initialize` com `clientInfo.name = "neo"` (o Zion deduz o agente pelo nome do
   cliente), depois `notifications/initialized` e `tools/call`;
-- aceita resposta em JSON e em SSE (o transporte do SDK pode responder dos dois jeitos;
-  qual sai é medido na F0);
+- lê a resposta em **SSE**: na F0, `initialize`, `tools/list` e `tools/call` voltaram
+  todos como `text/event-stream` (o JSON vem na última linha `data:`). Aceitar JSON
+  também, porque custa uma linha e protege contra uma troca de versão do SDK;
+- manda `Accept: application/json, text/event-stream` em toda chamada;
 - guarda o `Mcp-Session-Id`; se o servidor responder 404 (sessão perdida num restart),
   reinicializa uma vez;
 - timeout e teto de caracteres do resultado vêm do `neo.toml`;
@@ -261,8 +271,9 @@ Cada fase só termina com a evidência da coluna da direita.
 
 1. **`homelab` na réplica?** Ele tem o mapa da infra (hosts, usuários, portas). Não tem
    segredo, porque o scanner barra, mas o Neo não precisa dele para projetos.
-   **Recomendo fora.**
-2. **`sessions/` fora da réplica?** Recomendo fora (§4).
+   **Recomendo fora.** Na F0 a réplica foi criada **sem** ele; incluir = recriar a sessão
+   sem o `--ignore /domains/homelab`.
+2. **`sessions/` fora da réplica?** Recomendo fora (§4). Na F0 ficaram fora.
 3. **Nomes das tools:** `zion_projetos`, `zion_buscar`, `zion_ler`.
 
 ## 11. Depois desta fase (fase 2, outro plano)
@@ -281,4 +292,55 @@ Fica registrado aqui para não se perder:
 
 ## 12. Registro de execução
 
-(preencher a cada fase: data, o que foi medido, desvios do plano)
+### F0: medições (20/11/2026)
+
+Antes da F0, tudo o que estava pendente no `neo` foi commitado em 5 commits
+(`d980e74`..`c083eb1`, branch `formulario-regua`, sem push). O repo do Zion já estava
+limpo (`4aa136a`).
+
+**1. Réplica (Mutagen `zion-replica`, comando no §6).**
+- Chegou só o subconjunto do §4: `config.toml`, `synonyms.yaml`, `.gitignore` e os
+  domains `global`, `neo` e `zion` (neo: 160 memórias, 2 planos, 3 falhas). Não chegaram
+  `homelab`, `sessions/`, `.git`, `.zion/`, `declined.toml` nem `recall.yaml`. Total: 1,4 MB.
+- Arquivos com modo 0600, dono uid 1000 (`daniel`).
+- **Latência:** um `plan_phase_update` no Mac apareceu na VPS em ~2,3 s, contando a
+  chamada MCP e a conexão SSH da medição.
+
+**2. `zion serve --http` numa cópia da réplica** (container `node:22` descartável na
+`neo_default`, `--user 1000:1000`, `config.toml` da cópia com `host = "0.0.0.0"`).
+- Subiu em ~25 s, quase todo de `npm ci` (151 pacotes, 84 MB) e build.
+- **No boot ele grava:** `git init` com o commit `zion: init` da pasta inteira e
+  `.zion/cache`. Não mexeu em nenhum registro. Com `/data` em `:ro`, isso derrubaria o
+  boot; é o que o `--read-only` da F1 tem de pular.
+- A cópia e o container foram apagados no fim. O disco ficou como estava (5,4 GB livres,
+  93%).
+
+**3. Chamadas de dentro do `neo-core` (httpx, `docker exec`).**
+- `GET /health` com `Host: zion-f0:7077` → 200. O `/health` não confere o `Host`.
+- `initialize` com `Host: zion-f0:7077` → **403** `Invalid Host header`. Confirma o item
+  3 do §5.
+- Com `Host: localhost:7077`, todas as respostas vieram em **`text/event-stream`**
+  (`initialize`, `tools/list`, `tools/call`). `notifications/initialized` → 202.
+- `tools/list`: **18 tools**, todas as de escrita incluídas. Confirma o item 1 do §5.
+- Tempos e tamanhos (texto do resultado):
+
+  | Chamada | Caracteres | Tempo |
+  |---|---|---|
+  | `context_get {domain: neo}` | 1901 | 22 ms |
+  | `memory_search {query: "forno azul suporte", limit: 5}` | 1901 | 45 ms |
+  | `record_get {id: neo}` | 371 | 16 ms |
+  | `domain_resolve {cwd: …/neo/neo-core}` | 70 | 38 ms |
+
+  O `context_get` e o `memory_search` pararam nos mesmos 1901 caracteres: é o orçamento
+  de leitura do próprio Zion. O `max_chars = 6000` do §7.4 sobra; ele fica como teto de
+  segurança.
+- `domain_resolve` com um caminho do Mac funciona na VPS (é comparação de texto; `git`
+  volta `null`).
+
+**4. Isolamento.** Do `neo-workbench`, o nome `zion-f0` não resolve e a conexão estoura
+o tempo. Era o esperado: o sandbox está na `workbench-net` (internal). Mesmo assim, a
+`zion-net` própria continua no plano, para o `neo-zion` não ficar na `neo_default` junto
+de postgres e mongo.
+
+**O que a F0 mudou no plano:** cliente em SSE (§7.1), `user: "1000:1000"` e
+`node:22-alpine` (§6), e o comando real do Mutagen (§6).
