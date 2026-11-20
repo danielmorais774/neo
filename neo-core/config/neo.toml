@@ -209,6 +209,12 @@ continuar_no_teto = true
 # itens (quantidade × unitário = total) e o TOTAL contra o valor pago. Se não
 # fecha, o aviso volta colado ao resultado do file_save.
 conferir_planilhas = true
+# Retomada depois de uma ida ao Mac (run_command, arquivo): quantas tools do
+# SERVIDOR que já rodaram no turno (Zion, PKS, sandbox…) voltam no transcript, e
+# quantos caracteres da saída de cada uma. Sem isso o cérebro esquecia o que já
+# tinha lido e chamava de novo. 0 passos = desligado.
+retomada_servidor_passos = 8
+retomada_servidor_chars = 4000
 
 
 [roteador]
@@ -404,7 +410,7 @@ escolha_validade_s = 21600
 # Tools zion_overview, zion_search e zion_get; só leitura, pelo container
 # neo-zion (docs/zion-integracao-plan.md §7).
 # Liga as três tools. Desligada, elas somem do cérebro e do roteador.
-consulta_habilitada = false
+consulta_habilitada = true
 # Endpoint MCP do Zion só leitura, pelo nome do container na rede zion-net.
 url = "http://neo-zion:7077/mcp"
 # Prazo de cada pedido HTTP ao Zion, em segundos.

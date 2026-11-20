@@ -249,6 +249,12 @@ class Cerebro(_Secao):
     #: (`core/files/contas.py`): tabela de itens com quantidade × unitário e o
     #: TOTAL contra o valor pago. Se não fecha, o aviso vai colado ao resultado.
     conferir_planilhas: bool = True
+    #: Retomada depois de uma ida ao Mac: quantas tools do SERVIDOR (Zion, PKS,
+    #: sandbox…) que já rodaram no turno voltam no transcript, e quanto da saída
+    #: de cada uma. Sem isso a retomada esquecia o que o servidor já tinha lido e
+    #: chamava de novo (session-6166abaa: `zion_overview` 6 vezes). 0 = desligado.
+    retomada_servidor_passos: int = Field(8, ge=0, le=50)
+    retomada_servidor_chars: int = Field(4000, ge=200, le=40_000)
 
 
 class Roteador(_Secao):

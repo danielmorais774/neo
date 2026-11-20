@@ -3391,9 +3391,53 @@ def _step_tool(step: dict[str, Any] | None) -> str:
     return str((step or {}).get("command") or "").split(" ", 1)[0]
 
 
+#: `kind` do passo que é uma tool do SERVIDOR (Zion, PKS, sandbox…) rodada no
+#: turno antes de ele estacionar no cliente. Ele entra no transcript da retomada,
+#: mas não é ida ao Mac: não gasta o teto de leituras nem conta como repetição.
+_PASSO_SERVIDOR = "servidor"
+
+
+def _passo_do_servidor(step: dict[str, Any] | None) -> bool:
+    return (step or {}).get("kind") == _PASSO_SERVIDOR
+
+
+def _passos_do_cliente(steps: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Só as idas à máquina do usuário (o que os tetos e as guardas contam)."""
+    return [p for p in steps or [] if not _passo_do_servidor(p)]
+
+
+def _server_step(name: str, arguments: dict[str, Any] | None, tr: Any) -> dict[str, Any]:
+    """Uma tool do servidor que rodou neste turno, no formato de passo da retomada.
+
+    **Por que existe.** Quando o cérebro vai ao Mac (`run_command`, arquivo), o turno
+    estaciona e a retomada remonta o prompt do zero: só os passos do CLIENTE iam
+    junto. O que o servidor já tinha lido sumia. Na session-6166abaa o cérebro leu
+    o Zion, foi conferir as pastas no Mac e, na volta, não sabia que já tinha lido o
+    Zion: `zion_overview` rodou 6 vezes e o Mac foi chamado 4 (mesma família da
+    session-5efdf38d, com o sandbox).
+
+    A saída é a MESMA que o modelo leu no loop (`str(result)`), cortada no teto do
+    neo.toml já aqui: o passo fica em memória até a retomada.
+    """
+    try:
+        teto = ajustes().cerebro.retomada_servidor_chars
+    except Exception:  # noqa: BLE001 — ajuste ilegível não derruba o turno
+        teto = 4000
+    argumentos = json.dumps(arguments or {}, ensure_ascii=False, sort_keys=True)
+    erro = getattr(tr, "error", None)
+    return {
+        "kind": _PASSO_SERVIDOR,
+        "tool": name,
+        "command": f"{name} {argumentos}",
+        "ok": not erro,
+        "output": "" if erro else str(getattr(tr, "result", ""))[:teto],
+        "error": str(erro)[:500] if erro else None,
+    }
+
+
 def _actuation_counts(steps: list[dict[str, Any]] | None) -> tuple[int, int]:
     """(leituras, escritas) já gastas neste pedido."""
-    passos = steps or []
+    passos = _passos_do_cliente(steps)
     escritas = sum(1 for p in passos if _step_tool(p) in _WRITE_ACTUATION_TOOLS)
     return len(passos) - escritas, escritas
 
@@ -3447,7 +3491,8 @@ def _repeated_actuation(steps: list[dict[str, Any]] | None, command: str) -> boo
     """O MESMO comando já apareceu neste pedido? Repetir devolveria a mesma coisa."""
     chave = _actuation_key(command)
     return bool(chave) and any(
-        _actuation_key((passo or {}).get("command")) == chave for passo in steps or []
+        _actuation_key((passo or {}).get("command")) == chave
+        for passo in _passos_do_cliente(steps)
     )
 
 
@@ -3465,7 +3510,9 @@ def _near_repeated_actuation(
     cobre: set[int] = set()
     for verbo, opcoes, alvos in forma:
         achou = False
-        for i, passo in enumerate(steps or [], 1):
+        # A numeração é a do transcript da máquina (`_render_actuation_steps`),
+        # que não conta as tools do servidor.
+        for i, passo in enumerate(_passos_do_cliente(steps), 1):
             # Passo que FALHOU não respondeu nada: a saída dele é o erro. Na
             # session-94621cc8 (17/11) `open -a QuickTime\\ Player x.mp4` falhou
             # pela barra dupla, e a correção `open -a "QuickTime Player" x.mp4`
@@ -3499,7 +3546,7 @@ def _actuation_stop_text(motivo: str, steps: list[dict[str, Any]] | None) -> str
     A frase antiga jogava fora o turno inteiro: o usuário via o Neo parar sem
     saber se os quadros tinham sido gerados, e repetia o pedido do zero.
     """
-    passos = steps or []
+    passos = _passos_do_cliente(steps)
     linhas = []
     # Numeração ABSOLUTA: com o recorte, "1." era o 3º passo do turno e a lista não
     # batia com o índice que o cérebro viu (sessão 0e2fcc86 mostrou 8 de 10 idas).
@@ -3623,6 +3670,50 @@ _STEP_LINES_PREV, _STEP_CHARS_PREV = 40, 2000
 _STEP_LINES_FILE, _STEP_CHARS_FILE = 1200, 40000
 
 
+def _render_server_steps(steps: list[dict[str, Any]] | None) -> str:
+    """As tools do SERVIDOR que já rodaram neste turno, para a retomada.
+
+    Uma entrada por chamada distinta (a mesma tool com os mesmos argumentos fica
+    só com a última), e o corte guarda as mais recentes. Teto de quantidade e de
+    tamanho no `[cerebro]` do neo.toml. Ver `_server_step`.
+    """
+    servidor = [p for p in steps or [] if _passo_do_servidor(p)]
+    if not servidor:
+        return ""
+    try:
+        cfg = ajustes().cerebro
+        maximo, chars = cfg.retomada_servidor_passos, cfg.retomada_servidor_chars
+    except Exception:  # noqa: BLE001
+        maximo, chars = 8, 4000
+    if maximo <= 0:
+        return ""
+    ultimos: dict[str, dict[str, Any]] = {}
+    for passo in servidor:
+        chave = _actuation_key(passo.get("command"))
+        ultimos.pop(chave, None)  # reinsere no fim: a ordem é a da última chamada
+        ultimos[chave] = passo
+    mostrados = list(ultimos.values())[-maximo:]
+    partes = [
+        "## O que você JÁ LEU neste turno (tools do servidor)",
+        "Estas tools rodaram ANTES de você ir à máquina do usuário, e estas são as "
+        "respostas REAIS. Não chame de novo com os mesmos argumentos: use o que está "
+        "aqui. Chame de novo só se a ação na máquina do usuário pode ter mudado a "
+        "resposta.",
+        "",
+    ]
+    for passo in mostrados:
+        partes.append(f"### `{passo.get('command')}`")
+        if passo.get("ok", True):
+            saida = AIService._truncate_output(
+                str(passo.get("output") or ""), max_lines=200, max_chars=chars
+            )
+            partes.append(f"Resposta:\n```\n{saida or '(vazia)'}\n```")
+        else:
+            partes.append(f"FALHOU: {passo.get('error') or 'erro desconhecido'}")
+        partes.append("")
+    return "\n".join(partes).rstrip()
+
+
 def _render_actuation_steps(steps: list[dict[str, Any]]) -> str:
     """Transcript dos comandos que JÁ rodaram neste turno, para a retomada.
 
@@ -3645,11 +3736,14 @@ def _render_actuation_steps(steps: list[dict[str, Any]]) -> str:
     persona, invalidava o cache de prefixo a cada rodada — o mesmo cache que o pin
     de provedor foi comprar (ver `_pin_from_panel`).
     """
+    leituras_servidor = _render_server_steps(steps)
+    steps = _passos_do_cliente(steps)
     if not steps:
-        return ""
+        return leituras_servidor
     corte = max(0, len(steps) - _ACTUATION_STEPS_KEPT)
     recentes = steps[corte:]
     partes = [
+        *([leituras_servidor, ""] if leituras_servidor else []),
         "## O que você JÁ FEZ neste turno (na máquina do usuário)",
         "Você está CONTINUANDO o mesmo turno — isto não é uma mensagem nova do "
         "usuário. Os comandos abaixo já rodaram e estas são as saídas REAIS.",
@@ -6560,7 +6654,7 @@ class AIService:
                 slog.log_event(
                     "Transcrição do turno (passos já executados)",
                     "\n".join(
-                        f"{i}. `{s.get('command')}` → "
+                        f"{i}. {'(servidor) ' if _passo_do_servidor(s) else ''}`{s.get('command')}` → "
                         + ("ok" if s.get("ok", True) else f"ERRO: {s.get('error')}")
                         for i, s in enumerate(_actuation_steps or [], 1)
                     ),
@@ -6599,6 +6693,9 @@ class AIService:
         # Stream response
         produced_files: list[dict[str, Any]] = []
         tool_trace: list[dict[str, Any]] = []
+        # Tools do servidor que rodaram nesta passada, com a saída: se o turno
+        # estacionar no cliente, elas vão junto para a retomada (`_server_step`).
+        server_steps: list[dict[str, Any]] = []
         # Tools que MEXERAM no navegador do usuário neste turno (nome efetivo,
         # pós-portão, e só quando a ordem foi aceita). Nasce aqui, fora do ramo
         # `use_tools`, porque quem consome é o pós-processamento do handoff lá
@@ -6763,6 +6860,7 @@ class AIService:
                     used_tools=_used_tools,
                     produced_files=produced_files,
                     tool_trace=tool_trace,
+                    server_steps=server_steps,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
                     annotate_result=self._anotador_do_turno(
@@ -6883,6 +6981,7 @@ class AIService:
                     slog=slog, trace=trace, force_tool_first=True,
                     skill_tool_names=_skill_tool_names, used_tools=_used_tools,
                     produced_files=produced_files, tool_trace=tool_trace,
+                    server_steps=server_steps,
                     browser_actuation=browser_actuation,
                     on_step=self._step_noter(user_id, session_id, slog),
                     annotate_result=self._anotador_do_turno(
@@ -6911,7 +7010,9 @@ class AIService:
                 trace=trace,
                 slog=slog,
                 depth=_actuation_depth,
-                steps=_actuation_steps,
+                # Os passos de antes + o que o servidor leu nesta passada, na
+                # ordem em que aconteceram; o passo do cliente entra depois.
+                steps=[*(_actuation_steps or []), *server_steps],
                 midia=getattr(decision, "midia", None),
             ):
                 yield resp
@@ -8445,6 +8546,7 @@ class AIService:
         used_tools: set[str] | None = None,
         produced_files: list[dict[str, Any]] | None = None,
         tool_trace: list[dict[str, Any]] | None = None,
+        server_steps: list[dict[str, Any]] | None = None,
         browser_actuation: list[str] | None = None,
         progress: "asyncio.Queue[str] | None" = None,
         on_step: Any = None,
@@ -9158,6 +9260,10 @@ class AIService:
                                 "Download com URL sem procedência falhou — aviso para buscar "
                                 "com `web_search`: " + ", ".join(u[:120] for u in urls_de_memoria[:3]),
                             )
+                    # A retomada depois de uma ida ao Mac precisa saber o que o
+                    # servidor já leu neste turno (ver `_server_step`).
+                    if server_steps is not None:
+                        server_steps.append(_server_step(tc.name, dict(tc.arguments or {}), tr))
                     if tool_trace is not None:
                         tool_trace.append(_summarize_tool_call(tc.name, tc.arguments, tr))
                         if on_step is not None:

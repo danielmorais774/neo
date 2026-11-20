@@ -2,8 +2,9 @@
 
 **Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
 **Status:** F0–F3 feitas e verificadas (§12): desde 20/11 o Zion mora na VPS, o Claude do Mac
-fala com ele pelo WireGuard, e a porta 7077 só aceita a wg0. Próxima: F4 (as tools do Neo).
-F5–F6 não começaram.
+fala com ele pelo WireGuard, e a porta 7077 só aceita a wg0. F4 em produção desde 20/11, com a
+consulta **desligada** no `neo.toml` (§12). Próxima: F5, que começa ligando
+`[zion] consulta_habilitada`. F6 não começou, e a cópia do spool de 18/11 se perdeu (§12, F4).
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -348,7 +349,7 @@ Cada fase só termina com a evidência da coluna da direita.
 | **F1** ✅ | Zion só leitura: `--read-only`, `domain_list`, `ZION_HOST`/`ZION_ALLOWED_HOSTS`, `Dockerfile` | Feita (§12) |
 | **F2** | Zion remoto (§5.2): token, git que vem do Mac, tradução de caminho, hooks remotos, `install --remote`, tick em laço, `git` na imagem com escrita | `npm test` verde; no Mac **sem** `client.toml`, tudo igual a hoje; hooks remotos funcionando contra um servidor HTTP local de teste, numa pasta de dados de teste |
 | **F3** | Infra na VPS e migração (§4, §6) | Uma sessão nova do Claude Code no Mac recebe o contexto vindo da VPS e grava checkpoint lá; do `neo-core`, `domain_list` responde pelo `neo-zion`; do sandbox e do `neo-core`, o `zion` com escrita não responde; o backup do Mac acompanha |
-| **F4** | neo-core: cliente, as três tools, risco e portão, `[zion]` no `neo.toml` (§7). Desenvolvido numa cópia no scratchpad, suíte inteira lá, publicação com `cmp` de 3 vias | Testes: cliente com JSON e SSE e reinicialização no 404; portão nega externo e permite agenda; tools fora da mesa com a consulta desligada; Zion fora do ar não derruba o turno |
+| **F4** ✅ | neo-core: cliente, as três tools, risco e portão, `[zion]` no `neo.toml` (§7). Desenvolvido numa cópia no scratchpad, suíte inteira lá, publicação com `cmp` de 3 vias | Testes: cliente com JSON e SSE e reinicialização no 404; portão nega externo e permite agenda; tools fora da mesa com a consulta desligada; Zion fora do ar não derruba o turno |
 | **F5** | E2E (abaixo) | Os 6 itens |
 | **F6** (opcional) | Publicar o spool de falhas (pronto na cópia de 18/11): merge com o `ai_service.py` e o `grpc_server.py` atuais. O pull agora roda no `zion-tick` | Uma falha forçada aparece no Zion em até 5 min |
 
@@ -638,3 +639,118 @@ plano e fase F3) e no backup do Mac. O `~/.zion` do Mac não reapareceu. O git d
 **Pendente (fora da F3):**
 - Cosmético: o banner do `neo-zion` diz "NO TOKEN (loopback only)", que não vale para uma
   réplica só leitura numa rede interna.
+
+### F4: as tools no neo-core (20/11/2026)
+
+Desenvolvido numa cópia no scratchpad, com a suíte inteira lá, e publicado em três grupos
+importáveis depois do `cmp` base × repo (o repo não tinha mudado): `shared/ajustes.py`
+primeiro, depois o `core/zion/` novo, depois os arquivos que passam a importá-lo junto com o
+`neo.toml`. Sem turno rodando na hora (conferido no `app.log`).
+
+**O que entrou:**
+- `core/zion/cliente.py`: o cliente MCP do §7.1 (SSE e JSON, `Mcp-Session-Id`, uma
+  reinicialização no 404, `clientInfo.name = "neo"`). Erro de rede, de acesso ou de
+  protocolo vira `ZionIndisponivel`; recusa do Zion (tool que não existe, argumento
+  inválido) vira `ZionRecusou`.
+- `core/zion/tools.py`: `zion_overview` (`domain_list` ou `context_get`), `zion_search`
+  (`memory_search`) e `zion_get` (`record_get`), e o `ZionToolExecutor` com os dois contratos.
+  O executor nunca levanta: Zion fora do ar vira `{"ok": false, "error": "a memória do Zion
+  não respondeu: …"}`, e um erro do próprio Zion (`{"error": "not_found", …}`) vira
+  `ok: false` com a mensagem dele. Resultado acima de `max_chars` volta cortado, com aviso.
+- `core/authority/risk.py`: as três são `LEITURA_PRIVADA`. `gate.py`: **NEGAR com
+  `from_external`**, antes do `is_sink`; a agenda e o turno contaminado passam.
+- `[zion]` no `neo.toml` e a classe `Zion` no `ajustes.py`: `consulta_habilitada = false`,
+  `url`, `timeout_s = 8`, `max_chars = 6000`, `limite_busca = 8`.
+- `api/main.py`: registry e executor (módulo `zion`), sempre registrados.
+  `core/cognitive/read_tools.py`: as tools entram no `cognitive_tools_for` com a consulta
+  ligada.
+- `modules/desktop/ai_service.py`: rótulos de progresso das três.
+- `tests/zion/test_zion_tools.py`: 21 testes.
+
+**Desvios do plano:**
+- **A chave também esconde as tools do roteador e do SERVER_TOOL**, não só do cérebro:
+  `core.zion.visivel()` entra no `_format_tools` (`intent_router.py`) e no
+  `_server_tool_toolset` (`ai_service.py`), como a chave do Claude. Sem isso, com a consulta
+  desligada, o classificador veria as tools no catálogo e despacharia para um executor que
+  recusa. O executor recusa mesmo assim, como segunda trava.
+- **As três entraram no `_USER_SCOPED`:** elas não precisam do usuário para rodar, mas o que
+  leem é dele; turno sem dono identificado não as vê.
+- **`limite_busca`** no `[zion]` (não estava no §7.4): é o `limit` do `memory_search`, e
+  fica no código, não no modelo.
+- **A cópia do spool de falhas de 18/11 não existe mais** (o scratchpad da sessão
+  `f8a807a4` foi limpo). A seção `[zion]` nasceu do zero, e a F6 tem de refazer o spool em
+  vez de só publicá-lo.
+
+**Verificado:**
+- Suíte: na cópia, 4911 passam e 3 pulados (base: 4887 e 3); no repo, depois da
+  publicação, 4912 passam e 2 pulados.
+- **O cliente contra o `neo-zion` real**, de dentro do `neo-core` (código mandado por stdin,
+  nada gravado na VPS):
+
+  | Chamada | Tempo | Caracteres |
+  |---|---|---|
+  | `domain_list` (com o `initialize`) | 318 ms | 938 |
+  | `context_get {domain: neo}` | 40 ms | 2971 |
+  | `memory_search` (8 resultados) | 50 ms | 2755 |
+  | `record_get {id: neo}` | 32 ms | 399 |
+
+  `record_get` de um id que não existe → `{"error":"not_found",…}`; sessão forjada → 404 e
+  reinicialização; `memory_save` → `MCP error -32602: Tool memory_save not found`.
+- **As três tools pelo `ToolExecutor` de verdade** (validação, portão, `_dispatch`), no
+  container de produção, com a consulta ligada só naquele processo: as cinco chamadas
+  voltaram certas (`zion_get` de um plano: 4189 caracteres, dentro do teto). Com um principal
+  externo, o portão barrou de fato: `[authority] zion_overview BARRADA (negar,
+  modo=revelacao)`.
+- Produção: `✅ Zion wired (zion_overview/zion_search/zion_get; consulta desligada no
+  neo.toml)` no `app.log` e `/health` 200.
+
+**Para a F5:** ligar `consulta_habilitada = true` no `neo.toml` vale no turno seguinte, sem
+reiniciar. Custo: as três descriptions entram em todo turno do cérebro e no catálogo do
+roteador. O §7.5 (o roteador mandar as perguntas de projeto para o cérebro) ainda não foi
+medido; a F5 é a medida.
+
+### F5: E2E (20/11/2026, em andamento)
+
+- **Tentativa 1, com a consulta ainda desligada** (sessão `2c04329e`, item 1: "Quais projetos
+  você conhece no Zion? Me diz a pasta de cada um no meu Mac."): o classificador não via as
+  tools do Zion e mandou `CLIENT_TOOL`/`run_command` com `onde=maquina` (confiança 0,75), num
+  caminho que ele inventou: `ls ~/Neo/claude/`. A resposta listou as 9 pastas de trabalho dos
+  jobs do Claude como se fossem "projetos". Sem as tools, foi o caminho que sobrou; o "no meu
+  Mac" puxou para a máquina.
+- **19:3x UTC:** `consulta_habilitada = true` no `neo.toml`.
+- O A/B do classificador (o mesmo request, com e sem as três linhas no catálogo) ficou para
+  depois: a chave do OpenRouter, que é a de produção, tinha US$ 0,08 de folga.
+- **Tentativa 2, com a consulta ligada** (sessão `6166abaa`, mesma frase): **resposta
+  certa.** Os 4 domains vieram com as pastas e os remotes de `neo` e `zion`, e o Neo ainda
+  apontou as 9 pastas de `~/Documents/projects` que não são domain.
+  - **Roteador (§7.5):** o classificador escolheu `SERVER_TOOL`/`zion_overview` com
+    confiança 0,95. O portão do navegador (`local_browser_requested` casou "no meu Mac")
+    trocou para `COGNITIVE`, com a explicação errada de navegador. O destino é o que o
+    §7.5 queria; o motivo registrado, não.
+  - **O deslize:** 16 chamadas de LLM para uma pergunta de 2. `zion_overview` rodou 6 vezes
+    e `run_command` 4 (duas aprovações manuais). O cérebro leu o Zion, quis conferir as
+    pastas no Mac e estacionou no cliente. Na retomada, a "Transcrição do turno" só traz os
+    comandos do Mac, então ele não sabia que já tinha lido o Zion e repetia a volta. É a
+    amnésia da retomada de 08/11 (sessão `5efdf38d`), agora com tool do servidor. Falha
+    registrada no Zion (`reentry-server-tools-amnesia`).
+- **Conserto da retomada (20/11, ~19:42 UTC, em produção, sem commit):** o loop do cérebro
+  anota cada tool do servidor que rodou (`server_steps`, com a chamada e a resposta
+  cortada); se o turno estaciona no cliente, as anotações vão para os `steps` da
+  retomada, antes do passo do Mac. A retomada mostra uma seção "O que você JÁ LEU neste
+  turno (tools do servidor)", uma entrada por chamada distinta. O teto de idas ao Mac, as
+  guardas de repetição e a numeração dos passos da máquina ignoram esses passos. Tetos em
+  `[cerebro] retomada_servidor_passos = 8` e `retomada_servidor_chars = 4000`.
+  - **Rejeitado:** semear a trava de repetição do loop com as chamadas de antes da pausa,
+    para barrar a mesma chamada em código. A ida ao Mac pode mudar a resposta (um
+    `request_user_file` põe arquivo no `/workspace`, e a listagem seguinte tem de ver),
+    então a decisão de reler fica com o modelo, agora informado.
+  - Testes: `tests/test_retomada_lembra_o_servidor.py` (11). Suíte na cópia: 4922 passam.
+- **Tentativa 3, com o conserto** (sessão `925d4524`, 20:19 UTC, mesma frase): **item 1 ✅.**
+  `zion_overview` 1 vez, `run_command` 1 vez (`ls -la ~/Documents/projects`), 4 chamadas de
+  LLM (eram 16). A retomada trouxe a seção "JÁ LEU" com o Zion e a "Transcrição do turno"
+  marcou `(servidor) zion_overview {}`. Resposta certa: os 4 domains, as pastas e os remotes
+  de `neo` e `zion`, e as 9 pastas de `~/Documents/projects` que não são domain.
+  - Sobra 1: a resposta fechou oferecendo "eu alinho o Zion com essa lista", e o Neo não
+    grava no Zion (por construção, §2). É promessa que ele não cumpre.
+  - Sobra 2: o `wm_write` anotou na nota `sessao-6166abaa`, que é da sessão anterior (o
+    caderno a trouxe para o contexto). O conteúdo era o mesmo assunto.
