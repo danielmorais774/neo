@@ -247,4 +247,18 @@ Playwright headless com o Tauri simulado, versão antiga num vite à parte. Prin
 a 1100 e a 1440 px com sessões e tarefas falsas mostram as colunas, os selos, o
 cartão aberto com o fim do log e o painel de agentes.
 
+**1º E2E, prompt do email (session-0e232e1b, 20/11):** "Agentes em ação" não
+apareceu. O classificador mandou pelo trilho do servidor (`SERVER_TOOL`,
+`email_inbox`). Esse trilho manda UMA frase só, com o nome cru da tool
+(`Executando ferramenta no servidor: email_inbox...`, ai_service.py ~9683). O
+agente dele (AgentExecutor) roda sem a fila de progresso, então nenhum rótulo
+de `_TOOL_PROGRESS_LABEL` sai. A tabela casava só os rótulos do cérebro.
+Corrigido no desktop: a tabela virou tool → (agente, rótulo) e reconhece as duas
+frases que trazem o nome da tool, a do servidor e a do Mac
+(`Solicitando execução de <tool> no desktop...`). Um script confere que os
+rótulos copiados batem com o dict do core. **Limite:** no trilho do servidor o
+passo fica parado em "olhando a caixa de email" até o fim do turno. Para ele
+andar ("lendo o email"), o AgentExecutor teria que emitir progresso por passo,
+e isso é core (junto da F5).
+
 **Falta:** o roteiro do §7 no `tauri dev`, com tarefa e turno de verdade.

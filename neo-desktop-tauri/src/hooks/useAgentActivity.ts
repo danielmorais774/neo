@@ -35,11 +35,10 @@ export function useAgentActivity(): AgentActivity[] {
     const clear = () => setTurn(null);
     const stop = window.electronAPI?.onAgentEvent((event) => {
       if (event.type === 'thinking') {
-        const content = String(event.data?.content ?? '').trim();
-        const agent = agentForPhrase(content);
+        const match = agentForPhrase(String(event.data?.content ?? ''));
         // Frase que não casa (o modelo pensando, um "Processando…") não muda quem
         // está em ação: o passo anterior ainda é o último trabalho de verdade.
-        if (agent) setTurn({ agent, step: content });
+        if (match) setTurn(match);
       } else if (event.type === 'complete' || event.type === 'error') {
         clear();
       }
