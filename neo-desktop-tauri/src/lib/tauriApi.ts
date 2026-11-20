@@ -357,6 +357,9 @@ export interface ElectronAPI {
   // Sessões anteriores — a fonte é o neo-core (tabela conversation_session);
   // o desktop não mantém índice local. Rejeita se o core estiver inacessível.
   listSessions: (limit?: number) => Promise<SessionInfo[]>;
+  /** Apaga a conversa no core (sessão + mensagens). Rejeita com a frase do core
+   *  — p.ex. o 409 de "tem tarefa em andamento". A confirmação é de quem chama. */
+  deleteSession: (sessionId: string) => Promise<void>;
   // Catálogo do seletor de provider/modelo (proxy pro neo-core). O formato é
   // validado em lib/models.isModelCatalog; rejeita se o core estiver fora.
   getModelCatalog: () => Promise<unknown>;
@@ -965,6 +968,7 @@ export const electronAPI: ElectronAPI = {
 
   // Sessões anteriores (proxy pro neo-core, ver commands/mod.rs).
   listSessions: (limit?: number) => invoke<SessionInfo[]>('list_sessions', { limit }),
+  deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
   getModelCatalog: () => invoke<unknown>('get_model_catalog'),
   missionCommand: (missionId, command, editedText) =>
     invoke('mission_command', { missionId, command, editedText }),

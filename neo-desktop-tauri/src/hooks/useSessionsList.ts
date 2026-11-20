@@ -56,6 +56,14 @@ export function refreshSessions(): Promise<void> {
   return inflight;
 }
 
+/** Conversa apagada: some da lista já, sem esperar o core. Depois confere com o
+ *  core — DEPOIS de qualquer busca em voo, que pode ter saído antes do DELETE e
+ *  traria a conversa de volta. */
+export function forgetSession(sessionId: string): void {
+  emit({ ...snapshot, sessions: snapshot.sessions.filter((s) => s.session_id !== sessionId) });
+  void (inflight ?? Promise.resolve()).then(() => refreshSessions());
+}
+
 function start(): void {
   stopAgentEvents = window.electronAPI?.onAgentEvent((event) => {
     if (event.type === 'complete' || event.type === 'session_changed') void refreshSessions();

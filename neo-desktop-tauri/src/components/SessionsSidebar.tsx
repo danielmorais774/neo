@@ -50,6 +50,7 @@ export function SessionsSidebar({ open, onClose, onSelectSession }: SessionsSide
           currentSessionId={currentSessionId}
           onSelect={onSelectSession}
           onRetry={loadSessions}
+          onDeleted={() => void loadSessions()}
         />
       </aside>
     </>

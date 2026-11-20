@@ -1364,6 +1364,37 @@ pub async fn list_sessions(limit: Option<u32>) -> Result<Vec<SessionInfo>, Strin
     Ok(parsed.sessions)
 }
 
+/// Apaga uma conversa do histórico (`DELETE /desktop/session/{id}` no core, que
+/// apaga sessão + mensagens no Postgres). A confirmação é da UI. O core recusa
+/// com 409 se a conversa ainda tem tarefa aberta; a frase dele (`detail`) volta
+/// como Err para a UI mostrar como está.
+#[tauri::command]
+pub async fn delete_session(session_id: String) -> Result<(), String> {
+    // Só UUID: o id vai para dentro da URL.
+    let session_id = uuid::Uuid::parse_str(session_id.trim())
+        .map_err(|_| "id de conversa inválido".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let url = format!("{}/api/v1/desktop/session/{}", neo_core_http_url(), session_id);
+    let resp = crate::with_device_token(client.delete(url))
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao contatar o neo-core: {}", e))?;
+
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(str::to_string));
+    Err(detail.unwrap_or_else(|| format!("neo-core respondeu {}", status)))
+}
+
 /// Catálogo do seletor de provider/modelo do chat (`GET /desktop/model-catalog`).
 ///
 /// O JSON passa direto: quem conhece o formato é o front (lib/models.ts), que

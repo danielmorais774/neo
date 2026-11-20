@@ -7,7 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy import text, func
+from sqlalchemy import bindparam, text, func
 from sqlalchemy import update
 from sqlmodel import select
 
@@ -200,6 +200,73 @@ class AsyncPostgresClient:
                 ended_at=row["ended_at"],
                 extra_metadata=row["session_metadata"],
             )
+
+    async def count_open_work_for_session(self, session_id: UUID) -> dict[str, int]:
+        """Trabalho que ainda vai escrever NESTA sessão: jobs abertos e agendas ligadas.
+
+        Apagar a conversa com isso vivo faria ela voltar sozinha: o turno da
+        continuação (ou da agenda) chega com o session_id, o SessionManager não acha
+        a sessão e a recria com aquele id — uma conversa-fantasma só com a resposta.
+        """
+        from db.models.agent_job import TERMINAL_STATUSES
+
+        async with self.get_session() as db:
+            jobs = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT count(*) FROM agent_job
+                         WHERE session_id = :session_id
+                           AND status NOT IN :terminais
+                        """
+                    ).bindparams(bindparam("terminais", expanding=True)),
+                    {"session_id": session_id, "terminais": sorted(TERMINAL_STATUSES)},
+                )
+            ).scalar_one()
+            agendas = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT count(*) FROM scheduled_task
+                         WHERE session_id = :session_id AND enabled
+                        """
+                    ),
+                    {"session_id": session_id},
+                )
+            ).scalar_one()
+        return {"jobs": int(jobs or 0), "agendas": int(agendas or 0)}
+
+    async def delete_conversation_session(self, session_id: UUID) -> int | None:
+        """Apaga a conversa do banco: sessão, mensagens e chunks (busca entre sessões).
+
+        Devolve quantas mensagens saíram, ou ``None`` se a sessão não existia.
+        Apaga os filhos à mão, na mesma transação, em vez de confiar no
+        ``ON DELETE CASCADE``: a FK de prod nasceu de migration e de ``create_all``
+        em épocas diferentes, e uma FK sem cascata deixaria a mensagem órfã — ou
+        barraria o DELETE — sem ninguém ver.
+
+        Fica fora, de propósito: arquivos do catálogo, jobs encerrados e missões
+        que citam a sessão (têm vida própria) e o diário de debug em ``logs/``.
+        """
+        async with self.get_session() as db:
+            params = {"session_id": session_id}
+            await db.execute(
+                text("DELETE FROM conversation_message_chunk WHERE session_id = :session_id"),
+                params,
+            )
+            mensagens = await db.execute(
+                text("DELETE FROM conversation_message WHERE session_id = :session_id"),
+                params,
+            )
+            sessao = await db.execute(
+                text("DELETE FROM conversation_session WHERE id = :session_id"),
+                params,
+            )
+            if not sessao.rowcount:
+                await db.rollback()
+                return None
+            await db.commit()
+            return mensagens.rowcount or 0
 
     async def get_active_session(self, user_id: UUID | None = None, service: str = "neo-desktop") -> ConversationSession | None:
         """Get the most recent active session for a user/service."""

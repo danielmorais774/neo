@@ -413,6 +413,7 @@ pub fn run() {
             commands::clear_conversation_history,
             commands::save_conversation_history,
             commands::list_sessions,
+            commands::delete_session,
             commands::get_model_catalog,
             commands::mission_command,
             commands::ext_bridge_token,

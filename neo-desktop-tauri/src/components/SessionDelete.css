@@ -1,0 +1,182 @@
+/* Menu de botão direito e confirmação de "Apagar conversa" (SessionDelete.tsx).
+   Fundo opaco (--sessions-bg) como a gaveta de sessões: no Glassmorphism o
+   --modal-bg é vidro e o texto da confirmação ficaria em cima da conversa. */
+
+/* O item do botão direito fica aceso enquanto o menu dele está aberto. */
+.session-item.menu-open {
+  background: var(--control-bg-hover);
+}
+
+.session-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 180px;
+  padding: 4px;
+  border-radius: var(--modal-radius, 10px);
+  border: 1px solid var(--modal-border);
+  background: var(--sessions-bg, var(--bg-secondary));
+  box-shadow: var(--modal-shadow);
+  animation: session-menu-in 0.1s ease-out;
+}
+
+@keyframes session-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: calc(var(--modal-radius, 10px) - 4px);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-menu-item:hover,
+.session-menu-item:focus-visible {
+  outline: none;
+  background: var(--control-bg-hover);
+}
+
+.session-menu-danger {
+  color: var(--error, #ef4444);
+}
+
+.session-menu-danger:hover,
+.session-menu-danger:focus-visible {
+  background: rgba(239, 68, 68, 0.14);
+}
+
+/* ── confirmação ──────────────────────────────────────────────────────────── */
+
+.session-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.45);
+  animation: session-menu-in 0.12s ease-out;
+}
+
+.session-dialog {
+  width: 100%;
+  max-width: 380px;
+  padding: 18px 18px 14px;
+  border-radius: var(--modal-radius, 14px);
+  border: 1px solid var(--modal-border);
+  background: var(--sessions-bg, var(--bg-secondary));
+  box-shadow: var(--modal-shadow);
+  color: var(--text-primary);
+}
+
+.session-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.session-dialog-name {
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--control-bg);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-dialog-body p {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.session-dialog-error {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.4;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.session-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.session-dialog-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 15px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+}
+
+.session-dialog-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.session-dialog-cancel {
+  border: 1px solid var(--surface-border);
+  background: var(--control-bg);
+  color: var(--text-primary);
+}
+
+.session-dialog-cancel:hover:not(:disabled) {
+  background: var(--control-bg-hover);
+}
+
+.session-dialog-delete {
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.18);
+  color: #fecaca;
+}
+
+.session-dialog-delete:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+.session-dialog-actions button:focus-visible {
+  outline: 2px solid var(--accent-border-strong);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-menu,
+  .session-dialog-overlay {
+    animation: none;
+  }
+}

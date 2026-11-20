@@ -888,24 +888,51 @@ async def get_persistent_session_history(
 
 
 @router.delete("/session/{session_id}")
-async def clear_session(
+async def delete_session(
     session_id: UUID,
     http_request: Request,
     service: DesktopService = Depends(get_desktop_service),
     db: AsyncPostgresClient = Depends(get_db),
     principal: Principal = Depends(require_owner),
-) -> dict[str, str]:
-    """Limpa uma sessão (apagar é irreversível — o dono é conferido antes)."""
-    await _sessao_do_dono(db, session_id, principal, http_request)
-    deleted = service.clear_session(session_id)
+) -> dict[str, Any]:
+    """Apaga a conversa do histórico, de verdade (Conversas → botão direito → Apagar).
 
-    if not deleted:
+    Antes esta rota só limpava a cópia em memória do DesktopService: a conversa
+    voltava no próximo refresh do seletor, então nenhum botão foi ligado nela. Agora
+    apaga sessão + mensagens + chunks no Postgres. É irreversível; a confirmação é
+    do cliente, o dono é conferido aqui.
+
+    **409 com trabalho aberto na sessão** (job rodando/esperando, agenda ligada):
+    a continuação chegaria com este session_id e o SessionManager recriaria a
+    conversa com ele — ela "voltaria" com uma resposta solta. Quem pede apaga
+    depois de cancelar a tarefa.
+    """
+    sessao = await _sessao_do_dono(db, session_id, principal, http_request)
+    if sessao is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversa não encontrada")
+
+    aberto = await db.count_open_work_for_session(session_id)
+    if aberto["jobs"] or aberto["agendas"]:
+        jobs, agendas = aberto["jobs"], aberto["agendas"]
+        partes = []
+        if jobs:
+            partes.append("1 tarefa em andamento" if jobs == 1 else f"{jobs} tarefas em andamento")
+        if agendas:
+            partes.append("1 agenda ligada" if agendas == 1 else f"{agendas} agendas ligadas")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Esta conversa tem {' e '.join(partes)}. "
+                "Cancele antes de apagar, senão ela volta quando a tarefa responder."
+            ),
         )
 
-    return {"message": "Session cleared successfully"}
+    mensagens = await db.delete_conversation_session(session_id)
+    if mensagens is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversa não encontrada")
+    service.clear_session(session_id)
+    logger.info("[desktop] conversa %s apagada (%d mensagens)", session_id, mensagens)
+    return {"deleted": True, "session_id": str(session_id), "messages": mensagens}
 
 
 # Havia aqui um SEGUNDO `@router.get("/sessions")` (sessões ativas em memória).
