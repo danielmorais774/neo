@@ -1,8 +1,8 @@
 # Chat em três colunas no desktop — plano
 
-> Status (19/11/2026, noite): **F0–F4 implementadas no front, falta o E2E no
-> app real** (roteiro do §7). F5 e multimodelo continuam fora. O que saiu
-> diferente do plano está no §9. Protótipo aprovado:
+> Status (20/11/2026): **F0–F4 em produção no desktop e verificadas no app real**
+> (session-0e232e1b e session-8661abd6). F5 e multimodelo continuam fora. O que
+> saiu diferente do plano e os E2E estão no §9. Protótipo aprovado:
 > https://claude.ai/artifact/Gh1HYEzmxSBhnK84gUDKXH (artboard Main).
 > Pedido do Daniel: com a janela maximizada, conversas e histórico à esquerda,
 > o chat no centro e os agentes em segundo plano à direita. Embaixo, na coluna
@@ -278,4 +278,14 @@ e isso é core (junto da F5).
   limite, recarregar, duplo clique e teclado; e a 560×720 a tela continua
   idêntica pixel a pixel.
 
-**Falta:** o roteiro do §7 no `tauri dev`, com tarefa e turno de verdade.
+**3º E2E, tarefa longa (session-8661abd6, 20/11):** ✅ tudo como esperado. O job
+`c52d1491` (`sandbox_task`, contagem de 1 a 150) aparece "rodando" na coluna
+direita, nos filtros Ativas e Desta conversa. A conversa ganha o selo "1
+rodando", o título do centro ganha o selo "1 em segundo plano", e o Sandbox fica
+"em ação" em Agentes e canais com o título da tarefa. No banco: das 02:17:23 às
+02:19:54 UTC, exit 0. A continuação automática entrou às 02:19:54 e avisou na
+conversa.
+
+**Status:** F0–F4 verificadas no app real. A F5 (nome da tool no progresso, que
+também faria o passo andar no trilho do servidor) e o multimodelo continuam
+fora.
