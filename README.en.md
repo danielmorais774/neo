@@ -3,7 +3,7 @@
 <h1 align="center">Neo</h1>
 
 <p align="center">
-  <strong>A personal assistant that talks, remembers and acts: on the Mac, in the browser you are looking at, and on WhatsApp.</strong>
+  <strong>A personal assistant I hand work to: researching, writing, building files, remembering and acting on the Mac. By voice, chat or WhatsApp.</strong>
 </p>
 
 <p align="center">
@@ -18,9 +18,17 @@
   <a href="evals/README.md"><strong>📊 Evaluations, model comparisons and case studies (in Portuguese) →</strong></a>
 </p>
 
+<!-- MEDIA 6: link to the support demo video. -->
+
+<p align="center">
+  <img src="assets/documento-pdf.gif" alt="A request in Neo's chat to create a PDF in English about the Fifth Industrial Revolution, at most 14 pages, with an introduction, body, conclusion, references and images. Neo works in the sandbox and delivers the file with a summary of its structure; the 14-page PDF opens with a cover, figures, tables and image credits." width="800">
+  <br>
+  <sub>One request with a 14-page limit, six minutes of work in the server's sandbox (the wait is sped up in the GIF): Neo researches the sources, picks licensed images from Wikimedia Commons, builds the PDF within the limit and checks it page by page before delivering. (Interface and replies in Portuguese.)</sub>
+</p>
+
 ---
 
-Neo is a personal project I use every day. It takes requests by voice, chat or WhatsApp and decides what to do: answer, remember something, run a long task in a sandbox, use the browser or run a command on the Mac, always asking for approval when the action is sensitive.
+Neo is a personal project I use every day. It takes requests by voice, chat or WhatsApp and decides what to do: answer, remember something, run a long task in a sandbox, use the browser or run a command on the Mac, always asking for approval when the action is sensitive. Research, documents and spreadsheets run on the server; the browser is one more tool, for what can only be done in an open page, such as a form or a site you are logged into.
 
 The hard part of an assistant like this is not calling a model. It is deciding **what the model may decide on its own and what has to be code**, measuring every change, and not letting a web page take control of the assistant. This repository shows those decisions.
 
@@ -28,13 +36,31 @@ The code comments and the design docs are in Portuguese.
 
 ## What Neo does
 
-- **Talks by voice on the Mac.** Wake word ("ei Neo"), live mode with barge-in ("pare" stops it), speech-to-text (Parakeet) and text-to-speech running on a GPU in the local network, and a native "notch" in Swift showing the state.
-- **Uses the browser you are looking at.** An extension (a fork of [open-browser-use](https://github.com/iFurySt/open-browser-use)) gives Neo the tabs of your browser, with a timeline panel and a STOP button. It reads several tabs in parallel, asks when it needs you and keeps passwords in its own vault.
+- **Does the work and delivers the file.** Searches the web, writes and builds PDFs, spreadsheets and Word documents in a Docker sandbox with no access to the local network, checks the result before delivering and says what remained uncertain. Reads long PDFs with subagents, transcribes video and runs OCR.
 - **Remembers you.** A personal knowledge graph (PKS) in Postgres, semantic retrieval over past conversations (pgvector) and a working notebook for long tasks.
-- **Runs long tasks in the background.** Jobs in a Docker sandbox with no access to the local network, delegated reading of long PDFs, video transcription, OCR and spreadsheets. It reports back when done.
+- **Runs long tasks in the background.** What takes a while becomes a job: the conversation goes on and Neo reports back when it is done.
+- **Talks by voice on the Mac.** Wake word ("ei Neo"), live mode with barge-in ("pare" stops it), speech-to-text (Parakeet) and text-to-speech running on a GPU in the local network, and a native "notch" in Swift showing the state.
 - **Acts on the Mac with approval.** Local commands go through a risk policy: what is safe runs, what is not asks for confirmation.
+- **Uses the browser you are looking at, when it needs to.** An extension (a fork of [open-browser-use](https://github.com/iFurySt/open-browser-use)) gives Neo the tabs of your browser, with a timeline panel and a STOP button. It reads several tabs in parallel, asks when it needs you and keeps passwords in its own vault.
 - **Delegates code.** Opens a Claude Code session on the Mac, follows it and brings back the report.
 - **And more:** WhatsApp, scheduling (cron), smart home (Home Assistant), music (Spotify/YouTube) and personal finance.
+
+<p align="center">
+  <img src="assets/navegador-formulario.gif" alt="A request in Neo's chat to fill in a form in the browser without submitting it. Neo opens the page and fills it field by field, with the timeline and the STOP button on the side." width="800">
+  <br>
+  <sub>When a request needs an open page, it becomes a job in the browser you are looking at: Neo fills in the form field by field, narrates each step on the timeline and does not click submit. (UI in Portuguese.)</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/tarefas.png" alt="Neo's Tasks window: a list of background jobs with their status, and one job's detail with the request, the field-by-field result and the log"></td>
+    <td width="50%"><img src="assets/caderno-de-trabalho.png" alt="Neo's Notebook window: the working memory of one session, with each step noted as it happens and the job's result"></td>
+  </tr>
+  <tr>
+    <td><sub><strong>Tasks.</strong> What runs away from the conversation: request, result, duration and log of each job, including the failed ones.</sub></td>
+    <td><sub><strong>Working notebook.</strong> The scratchpad of the current task: each step is noted as it happens, and the job's result is added when it finishes.</sub></td>
+  </tr>
+</table>
 
 ## Architecture
 
@@ -170,6 +196,10 @@ cd neo-desktop-tauri/src-tauri && cargo test          # 156 tests
 ## Status
 
 In daily use. The core runs on a VPS with Docker Compose, and the Mac is the main client. Some parts are still in **shadow mode** (they log without blocking): route authentication, the context register and the v2 memory ranking. The design doc for each area, with what was measured and what is left, is in [`neo-core/docs/`](neo-core/docs) (in Portuguese).
+
+## License
+
+© 2026 Daniel Morais. The code is public for reading and evaluation, with all rights reserved ([LICENSE](LICENSE)). The [`neo-browser-local/`](neo-browser-local) folder is a fork of open-browser-use and keeps its original MIT license.
 
 ## Author
 

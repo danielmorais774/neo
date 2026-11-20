@@ -127,43 +127,6 @@ services:
       - neo-core-pks-test-logs:/app/logs
       - /var/run/docker.sock:/var/run/docker.sock
 
-  neo-letta-postgres:
-    image: pgvector/pgvector:pg15
-    container_name: neo-letta-postgres
-    restart: unless-stopped
-    profiles:
-      - letta
-    environment:
-      POSTGRES_USER: letta
-      POSTGRES_PASSWORD: ${LETTA_DB_PASSWORD:?defina LETTA_DB_PASSWORD no .env}
-      POSTGRES_DB: letta
-    ports:
-      # ABERTA NA INTERNET até 2026-09-24.
-      - "127.0.0.1:5435:5432"
-    volumes:
-      - letta-pgdata:/var/lib/postgresql/data
-      - ./docker/letta-postgres/init:/docker-entrypoint-initdb.d:ro
-
-  neo-letta:
-    image: letta/letta:latest
-    container_name: neo-letta
-    restart: unless-stopped
-    profiles:
-      - letta
-    environment:
-      - LETTA_PG_URI=postgresql://letta:${LETTA_DB_PASSWORD:?defina LETTA_DB_PASSWORD no .env}@neo-letta-postgres:5432/letta
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
-      - OLLAMA_BASE_URL=http://neo-ollama:11434/v1
-      - LETTA_UVICORN_WORKERS=1
-    ports:
-      - "127.0.0.1:8283:8283"
-    depends_on:
-      - neo-letta-postgres
-
   neo-vision:
     build:
       context: ./neo-vision
@@ -449,7 +412,6 @@ volumes:
   neo-browser-profiles:
   pgdata:
   pgdata-pks-test:
-  letta-pgdata:
   mongodata:
   ollama-data:
   neo-core-logs:
