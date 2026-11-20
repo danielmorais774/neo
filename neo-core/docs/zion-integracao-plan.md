@@ -1,9 +1,9 @@
 # Neo × Zion: o Zion na VPS, e o Neo lendo dele (fase 1) — plano
 
 **Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
-**Status:** F0–F2 feitas; F3 no ar em 20/11 (§12): o Zion mora na VPS e o Claude do Mac fala
-com ele pelo WireGuard. Falta na F3 a regra de firewall (precisa de `sudo`) e o E2E com uma
-sessão nova do Claude. F4–F6 não começaram.
+**Status:** F0–F3 feitas e verificadas (§12): desde 20/11 o Zion mora na VPS, o Claude do Mac
+fala com ele pelo WireGuard, e a porta 7077 só aceita a wg0. Próxima: F4 (as tools do Neo).
+F5–F6 não começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -627,8 +627,14 @@ falha ali nunca derrubar o Docker). `iptables -S DOCKER-USER`:
 - O painel de firewall da Contabo não serve para isso: fica fora da VPS e só vê a internet
   (a 7077 já não tem regra lá, então está fechada para fora).
 
-**Pendente na F3:**
-- **E2E:** uma sessão nova do Claude Code no Mac recebe o contexto da VPS e grava
-  checkpoint lá.
+**E2E (20/11):** uma sessão nova do Claude Code, aberta em `/Users/daniel`, fez o
+`domain_list` e o `context_get` pela VPS. O primeiro `session_checkpoint` foi recusado
+porque a home não é domain, o que é o comportamento certo. Com o checkpoint gravado no
+`neo`, a sessão **`ses_20261120_f9gk`** apareceu na VPS (18:56:31Z, goal "E2E da F3",
+plano e fase F3) e no backup do Mac. O `~/.zion` do Mac não reapareceu. O git do checkpoint
+(`2f0fcfe`) veio do último hook daquela pasta e estava certo: o commit seguinte
+(`00cf1a2`) é 20 s posterior.
+
+**Pendente (fora da F3):**
 - Cosmético: o banner do `neo-zion` diz "NO TOKEN (loopback only)", que não vale para uma
   réplica só leitura numa rede interna.
