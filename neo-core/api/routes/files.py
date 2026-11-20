@@ -197,11 +197,15 @@ async def download_file(
     blob = store.blob_path(entry.sha256)
     if not blob.exists():
         raise HTTPException(status_code=410, detail="conteúdo já removido do store")
+    # O Starlette monta o Content-Disposition: nome fora do ASCII sai como
+    # ``filename*=utf-8''...`` (RFC 5987). Escrever o cabeçalho à mão com o nome
+    # cru derrubava a rota com 500 quando o nome tinha caractere fora do latin-1
+    # (o travessão de "Revolução Industrial — Indústria 5.0.pdf", sessão 2dc79510).
     return FileResponse(
         path=str(blob),
         media_type="application/octet-stream",
         filename=entry.name,
-        headers={"Content-Disposition": f'attachment; filename="{entry.name}"'},
+        content_disposition_type="attachment",
     )
 
 
