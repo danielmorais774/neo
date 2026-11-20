@@ -6,6 +6,12 @@ import type { WindowResizeDirection } from './lib';
 import { DevicesTab } from './components/DevicesTab';
 import SettingsModal from './components/SettingsModal';
 import SessionsSidebar from './components/SessionsSidebar';
+import ConversationsPanel from './components/ConversationsPanel';
+import AgentActivityPanel from './components/AgentActivityPanel';
+import ConversationHeader from './components/ConversationHeader';
+import JobsColumn from './components/JobsColumn';
+import { useWideLayout } from './hooks/useWideLayout';
+import { readColumnOpen, storeColumnOpen } from './lib/chatPrefs';
 import { useTheme } from './themes/useTheme';
 import './App.css';
 import './index.css';
@@ -31,6 +37,45 @@ function App() {
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [rendered, setRendered] = useState(false);
   const { theme, setTheme } = useTheme();
+
+  // Chat em três colunas (neo-core/docs/desktop-chat-tres-colunas-plan.md): só na
+  // aba Chat e só com a janela larga. Abaixo de 960 px a tela é a de sempre.
+  const layout = useWideLayout();
+  const [leftOpen, setLeftOpen] = useState(() => readColumnOpen('left'));
+  const [rightOpen, setRightOpen] = useState(() => readColumnOpen('right'));
+  // Na janela média a direita abre POR CIMA do chat e não fica salva: ao mudar de
+  // largura ela fecha (ajuste no render, sem efeito — padrão do React).
+  const [rightDrawer, setRightDrawer] = useState(false);
+  const [drawerLayout, setDrawerLayout] = useState(layout);
+  if (drawerLayout !== layout) {
+    setDrawerLayout(layout);
+    setRightDrawer(false);
+  }
+  const columns = activeTab === 'chat' && layout !== 'compact';
+  const showLeft = columns && leftOpen;
+  const showRight = columns && (layout === 'wide' ? rightOpen : rightDrawer);
+
+  const toggleLeft = () => {
+    setLeftOpen(!leftOpen);
+    storeColumnOpen('left', !leftOpen);
+  };
+  const setRight = (open: boolean) => {
+    if (layout === 'wide') {
+      setRightOpen(open);
+      storeColumnOpen('right', open);
+    } else {
+      setRightDrawer(open);
+    }
+  };
+
+  useEffect(() => {
+    if (!rightDrawer) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRightDrawer(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rightDrawer]);
 
   const handleWindowDragStart = (event: React.MouseEvent<HTMLElement>) => {
     if (event.button !== 0) return;
@@ -186,27 +231,63 @@ function App() {
           </button>
         </div>
         <div className="titlebar-buttons">
-          <button
-            className="btn-new-chat-header"
-            onClick={() => window.dispatchEvent(new CustomEvent('neo-new-chat'))}
-            title="Novo chat"
-          >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-              <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-            Novo chat
-          </button>
-          <button
-            className="btn-sessions-header"
-            title="Sessões anteriores"
-            onClick={() => setSessionsOpen(!sessionsOpen)}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
-              <polyline points="3 3 3 8 8 8" />
-              <polyline points="12 7 12 12 15.5 14" />
-            </svg>
-          </button>
+          {/* Com a coluna de conversas na tela, "Novo chat" e a lista estão nela. */}
+          {!showLeft && (
+            <button
+              className="btn-new-chat-header"
+              onClick={() => window.dispatchEvent(new CustomEvent('neo-new-chat'))}
+              title="Novo chat"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              Novo chat
+            </button>
+          )}
+          {!showLeft && (
+            <button
+              className="btn-sessions-header"
+              title="Sessões anteriores"
+              onClick={() => setSessionsOpen(!sessionsOpen)}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+                <polyline points="3 3 3 8 8 8" />
+                <polyline points="12 7 12 12 15.5 14" />
+              </svg>
+            </button>
+          )}
+          {columns && (
+            <>
+              <button
+                type="button"
+                className={`btn-column-toggle${showLeft ? ' active' : ''}`}
+                onClick={toggleLeft}
+                aria-pressed={showLeft}
+                aria-label={showLeft ? 'Esconder conversas' : 'Mostrar conversas'}
+                title={showLeft ? 'Esconder conversas' : 'Mostrar conversas'}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="3" y="3" width="18" height="18" rx="2" />
+                  <line x1="9" y1="3" x2="9" y2="21" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className={`btn-column-toggle${showRight ? ' active' : ''}`}
+                onClick={() => setRight(!showRight)}
+                aria-pressed={showRight}
+                aria-label={showRight ? 'Esconder segundo plano' : 'Mostrar segundo plano'}
+                title={showRight ? 'Esconder segundo plano' : 'Mostrar segundo plano'}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="3" y="3" width="18" height="18" rx="2" />
+                  <line x1="15" y1="3" x2="15" y2="21" />
+                </svg>
+              </button>
+              <span className="titlebar-divider" aria-hidden="true" />
+            </>
+          )}
           <button
             className="btn-settings-header"
             title="Configurações"
@@ -220,8 +301,34 @@ function App() {
         </div>
       </div>
 
-      <div className="app-content">
-        {activeTab === 'chat' ? <ChatPage /> : <DevicesTab />}
+      {/* As posições dos filhos são fixas (coluna | centro | coluna, com `null`
+          no lugar da que está escondida): mostrar ou esconder uma coluna, ou
+          mudar a largura da janela, NÃO remonta o ChatPage (perderia o turno). */}
+      <div className={`app-content${columns ? ` app-content--cols layout-${layout}` : ''}`}>
+        {activeTab === 'chat' ? (
+          <>
+            {showLeft ? (
+              <aside className="side-col side-left" aria-label="Conversas e agentes em ação">
+                <ConversationsPanel />
+                <AgentActivityPanel />
+              </aside>
+            ) : null}
+            <div className={`chat-center${columns ? ' chat-center--cols' : ''}`}>
+              {columns ? <ConversationHeader onShowJobs={() => setRight(true)} /> : null}
+              <ChatPage />
+            </div>
+            {showRight ? (
+              <aside
+                className={`side-col side-right${layout === 'medium' ? ' side-drawer' : ''}`}
+                aria-label="Tarefas em segundo plano"
+              >
+                <JobsColumn onClose={layout === 'medium' ? () => setRightDrawer(false) : undefined} />
+              </aside>
+            ) : null}
+          </>
+        ) : (
+          <DevicesTab />
+        )}
       </div>
 
       <SessionsSidebar

@@ -1,0 +1,409 @@
+/* Coluna "Segundo plano" do chat largo (JobsColumn.tsx). O selo de status vem de
+   JobStatusBadge.css, o mesmo da janela Tarefas. */
+
+.bg-column {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.bg-head {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.bg-head-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bg-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.bg-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--accent);
+}
+
+.bg-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: bg-pulse 1.6s ease-in-out infinite;
+}
+
+.bg-close {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: var(--control-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.bg-close:hover {
+  background: var(--control-bg-hover);
+  color: var(--text-primary);
+}
+
+.bg-summary {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.bg-filter {
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+  background: var(--control-bg);
+}
+
+.bg-filter button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.bg-filter button:hover {
+  color: var(--text-primary);
+}
+
+.bg-filter button.selected {
+  border-color: var(--accent-border);
+  background: var(--selected-bg);
+  color: var(--text-primary);
+}
+
+.bg-filter-count {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.bg-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+}
+
+/* Na janela larga esta coluna encosta na borda direita, onde mora o
+   `.resize-handle-e` (8px, z-index 50, App.css): sem a margem, arrastar a barra
+   de rolagem viraria "redimensionar janela" (mesmo caso do Chat.css). */
+.side-right .bg-list {
+  margin-right: 8px;
+  padding-right: 2px;
+}
+
+.bg-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.bg-state code {
+  font-size: 10.5px;
+  word-break: break-word;
+}
+
+.bg-state-error {
+  color: var(--error, #ef4444);
+}
+
+.bg-card {
+  flex: none;
+  border-radius: 12px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.bg-card.expanded {
+  border-color: var(--accent-border);
+}
+
+.bg-card.waiting {
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.bg-card-head {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.bg-card-head:hover {
+  background: var(--control-bg);
+}
+
+.bg-card-head .jobs-status {
+  margin-top: 2px;
+}
+
+.bg-card-icon {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--selected-bg);
+  color: var(--accent);
+}
+
+.bg-card-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bg-card-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.bg-card-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.bg-card-preview {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding: 0 12px 10px 52px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.bg-card-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 12px 12px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12px;
+  color: #fde68a;
+}
+
+.bg-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.bg-card-log {
+  margin: 0;
+  max-height: 120px;
+  overflow: hidden;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--code-bg, rgba(0, 0, 0, 0.3));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.bg-card-origin {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.bg-card-origin-title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.bg-link {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  text-decoration: underline;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.bg-here {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--selected-bg);
+  color: var(--text-primary);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.bg-card-error {
+  font-size: 11.5px;
+  color: var(--error, #ef4444);
+}
+
+.bg-card-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.bg-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--accent-border);
+  background: var(--selected-bg);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bg-btn:hover:not(:disabled) {
+  border-color: var(--accent-border-strong);
+}
+
+.bg-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.bg-btn-danger {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: transparent;
+  color: #fca5a5;
+}
+
+.bg-btn-danger:hover:not(:disabled) {
+  border-color: rgba(248, 113, 113, 0.6);
+}
+
+.bg-btn-waiting {
+  flex: none;
+  align-self: flex-start;
+  border-color: rgba(245, 158, 11, 0.45);
+  background: transparent;
+  color: #fcd34d;
+}
+
+.bg-btn-waiting:hover:not(:disabled) {
+  border-color: rgba(245, 158, 11, 0.7);
+}
+
+.bg-foot {
+  flex: none;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.bg-btn-wide {
+  width: 100%;
+  height: 34px;
+  border-color: var(--surface-border);
+  background: var(--control-bg);
+}
+
+@keyframes bg-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bg-pulse {
+    animation: none;
+  }
+}

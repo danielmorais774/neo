@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useSessionManagement } from '../hooks/useSessionManagement';
+import { SessionsList } from './SessionsList';
 import './SessionsSidebar.css';
 
 interface SessionsSidebarProps {
@@ -42,40 +43,14 @@ export function SessionsSidebar({ open, onClose, onSelectSession }: SessionsSide
           </button>
         </div>
 
-        <div className="sessions-list">
-          {isLoading ? (
-            <div className="sessions-state">Carregando…</div>
-          ) : error ? (
-            <div className="sessions-state sessions-state-error">
-              Não foi possível carregar as sessões.
-              <button className="sessions-retry" onClick={loadSessions}>Tentar de novo</button>
-            </div>
-          ) : sessions.length === 0 ? (
-            <div className="sessions-state">Nenhuma conversa anterior</div>
-          ) : (
-            sessions.map((session) => {
-              const isCurrent = session.session_id === currentSessionId;
-              return (
-                <button
-                  key={session.session_id}
-                  type="button"
-                  className={`session-item${isCurrent ? ' current' : ''}`}
-                  onClick={() => onSelectSession(session.session_id)}
-                  title={session.title ?? undefined}
-                >
-                  <span className="session-title">
-                    {session.title || 'Conversa sem título'}
-                  </span>
-                  <span className="session-meta">
-                    {session.humanizedTime}
-                    {session.message_count > 0 && ` · ${session.message_count} msgs`}
-                    {isCurrent && ' · atual'}
-                  </span>
-                </button>
-              );
-            })
-          )}
-        </div>
+        <SessionsList
+          sessions={sessions}
+          isLoading={isLoading}
+          error={error}
+          currentSessionId={currentSessionId}
+          onSelect={onSelectSession}
+          onRetry={loadSessions}
+        />
       </aside>
     </>
   );

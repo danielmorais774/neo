@@ -11,7 +11,7 @@ export interface SessionWithHumanizedTime extends SessionInfo {
  *  ("2026-07-30T02:23:10.826889"). `new Date()` leria isso como hora LOCAL e o
  *  "há X" sairia deslocado pelo fuso (no -03 daria 3h a menos, chegando a
  *  mostrar tempo negativo em conversa recente). Daí o 'Z' explícito. */
-function parseUtc(iso: string): Date {
+export function parseUtc(iso: string): Date {
   const hasZone = /(Z|[+-]\d{2}:?\d{2})$/.test(iso);
   return new Date(hasZone ? iso : `${iso}Z`);
 }

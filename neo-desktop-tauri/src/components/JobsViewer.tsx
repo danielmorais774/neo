@@ -13,8 +13,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import type { JobDetail, JobLogs, JobSummary } from '../lib/tauriApi';
+import {
+  ACTIVE_STATUSES,
+  CANCELABLE_STATUSES,
+  formatDuration,
+  formatStamp,
+  kindLabel,
+} from '../lib/jobs';
 import { humanizeTime } from '../hooks/useSessionManagement';
 import { CopyButton } from './CodeBlock';
+import { StatusBadge } from './JobStatusBadge';
 import './WorkingMemoryViewer.css';
 import './JobsViewer.css';
 
@@ -26,71 +34,9 @@ interface JobsViewerProps {
 type LoadState = 'loading' | 'ready' | 'error';
 type Filter = 'all' | 'active';
 
-const ACTIVE_STATUSES = new Set(['queued', 'running']);
-// Cancelar vale também para a tarefa que PAROU esperando você (um card de
-// liberação, um "pode enviar"): sem isto ela ficava na lista sem saída.
-const CANCELABLE_STATUSES = new Set(['queued', 'running', 'waiting']);
 const FAST_POLL_MS = 4_000;
 const SLOW_POLL_MS = 20_000;
 const LOG_TAIL_BYTES = 16_000;
-
-const STATUS_LABEL: Record<string, string> = {
-  queued: 'na fila',
-  running: 'rodando',
-  completed: 'concluída',
-  failed: 'falhou',
-  timeout: 'estourou',
-  cancelled: 'cancelada',
-  waiting: 'esperando você',
-  continued: 'continuada',
-};
-
-const KIND_LABEL: Record<string, string> = {
-  sandbox_task: 'sandbox',
-  browser: 'navegador',
-  browser_local: 'seu navegador',
-  claude_code: 'Claude Code',
-  comando_local: 'seu computador',
-  research: 'pesquisa',
-  download_watch: 'download',
-  scheduled_prompt: 'turno agendado',
-  scheduled_tool: 'agenda',
-  scheduled_notify: 'lembrete',
-  scheduled_job: 'agenda',
-};
-
-function kindLabel(job: JobSummary): string {
-  if (job.continuation_of) return 'continuação';
-  return KIND_LABEL[job.kind] ?? job.kind;
-}
-
-function formatDuration(seconds: number | null): string {
-  if (seconds === null || seconds === undefined) return '—';
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  if (minutes < 60) return rest ? `${minutes}min ${rest}s` : `${minutes}min`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}min`;
-}
-
-/** `2026-09-13T03:47:18` (UTC, sem sufixo) → data/hora local legível. */
-function formatStamp(iso: string | null): string {
-  if (!iso) return '—';
-  const hasZone = /(Z|[+-]\d{2}:?\d{2})$/.test(iso);
-  const date = new Date(hasZone ? iso : `${iso}Z`);
-  if (Number.isNaN(date.getTime())) return '—';
-  return date.toLocaleString('pt-BR', {
-    day: '2-digit',
-    month: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-}
-
-function StatusBadge({ status }: { status: string }) {
-  return <span className={`jobs-status jobs-status-${status}`}>{STATUS_LABEL[status] ?? status}</span>;
-}
 
 export default function JobsViewer({ onClose }: JobsViewerProps) {
   const [jobs, setJobs] = useState<JobSummary[]>([]);

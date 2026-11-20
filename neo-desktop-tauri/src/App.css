@@ -887,3 +887,172 @@
   letter-spacing: 0.08em;
   color: #a78bfa;
 }
+
+/* ========================================
+   CHAT EM TRÊS COLUNAS (janela larga)
+   neo-core/docs/desktop-chat-tres-colunas-plan.md — App.tsx monta as colunas
+   só com a janela ≥ 960 px; abaixo disso nada daqui vale.
+   ======================================== */
+
+/* O centro embrulha o ChatPage sempre (para ele não remontar ao mudar de
+   largura); na janela compacta o embrulho some do layout e o chat fica
+   exatamente como era, filho direto do .app-content. */
+.chat-center {
+  display: contents;
+}
+
+.chat-center--cols {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.chat-center--cols > .chat-container {
+  min-height: 0;
+}
+
+/* Vidro dos temas continua aparecendo: só um véu escuro, não um fundo opaco. */
+.side-col {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--columns-bg, rgba(0, 0, 0, 0.14));
+}
+
+.side-left {
+  width: 280px;
+  border-right: 1px solid var(--surface-border);
+}
+
+.side-right {
+  width: 320px;
+  border-left: 1px solid var(--surface-border);
+}
+
+.layout-wide .side-left {
+  width: 300px;
+}
+
+.layout-wide .side-right {
+  width: 340px;
+}
+
+/* Janela média: o Segundo plano abre POR CIMA do chat, sem espremer a conversa.
+   Opaco aqui (mesmo fundo da gaveta de sessões), senão o texto do chat vaza. */
+.side-right.side-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  background: var(--sessions-bg, var(--modal-bg));
+  box-shadow: var(--modal-shadow);
+  animation: sideDrawerIn 0.2s ease-out;
+}
+
+@keyframes sideDrawerIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+/* Botões de mostrar/esconder coluna, na barra do topo. */
+.btn-column-toggle {
+  width: 30px;
+  height: 30px;
+  border: 1px solid transparent;
+  background: var(--control-bg, rgba(255, 255, 255, 0.05));
+  border-radius: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-column-toggle:hover {
+  background: var(--control-bg-hover, rgba(255, 255, 255, 0.1));
+  color: var(--text-primary);
+}
+
+.btn-column-toggle.active {
+  background: var(--selected-bg);
+  border-color: var(--accent-border);
+  color: var(--text-primary);
+}
+
+.titlebar-divider {
+  width: 1px;
+  height: 20px;
+  margin: 0 4px;
+  background: var(--surface-border);
+}
+
+/* Topo do centro: título da conversa aberta e o selo de tarefas dela. */
+.chat-center-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px max(20px, calc((100% - 880px) / 2));
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.chat-center-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-center-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  border: 1px solid var(--accent-border);
+  background: var(--selected-bg);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-center-chip:hover {
+  border-color: var(--accent-border-strong);
+}
+
+.chat-center-chip.waiting {
+  color: var(--warning, #f59e0b);
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.chat-center-chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-badge 1.5s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-center-chip-dot,
+  .side-right.side-drawer {
+    animation: none;
+  }
+}

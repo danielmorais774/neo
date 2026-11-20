@@ -71,3 +71,36 @@ export function readClaudeBoxOpen(): boolean {
 export function storeClaudeBoxOpen(open: boolean): void {
   write(CLAUDE_BOX_KEY, open ? 'open' : 'closed');
 }
+
+// Colunas do chat largo (App.tsx): cada uma fica aberta ou fechada como a pessoa
+// deixou, entre uma abertura do app e outra. Nascem abertas. A direita só guarda
+// a escolha da janela LARGA; na média ela abre por cima e fecha sozinha.
+export type ChatColumn = 'left' | 'right';
+
+const COLUMN_KEYS: Record<ChatColumn, string> = {
+  left: 'neo.chat.columnLeft',
+  right: 'neo.chat.columnRight',
+};
+
+export function readColumnOpen(column: ChatColumn): boolean {
+  return read(COLUMN_KEYS[column]) !== 'closed';
+}
+
+export function storeColumnOpen(column: ChatColumn, open: boolean): void {
+  write(COLUMN_KEYS[column], open ? 'open' : 'closed');
+}
+
+// Filtro da coluna "Segundo plano" (JobsColumn.tsx).
+export type JobsColumnFilter = 'open' | 'session' | 'all';
+
+const JOBS_FILTER_KEY = 'neo.chat.jobsFilter';
+const JOBS_FILTERS: JobsColumnFilter[] = ['open', 'session', 'all'];
+
+export function readJobsColumnFilter(): JobsColumnFilter {
+  const stored = read(JOBS_FILTER_KEY);
+  return JOBS_FILTERS.includes(stored as JobsColumnFilter) ? (stored as JobsColumnFilter) : 'open';
+}
+
+export function storeJobsColumnFilter(filter: JobsColumnFilter): void {
+  write(JOBS_FILTER_KEY, filter);
+}

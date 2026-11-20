@@ -1,6 +1,8 @@
 # Chat em três colunas no desktop — plano
 
-> Status (19/11/2026): só plano, nada implementado. Protótipo aprovado:
+> Status (19/11/2026, noite): **F0–F4 implementadas no front, falta o E2E no
+> app real** (roteiro do §7). F5 e multimodelo continuam fora. O que saiu
+> diferente do plano está no §9. Protótipo aprovado:
 > https://claude.ai/artifact/Gh1HYEzmxSBhnK84gUDKXH (artboard Main).
 > Pedido do Daniel: com a janela maximizada, conversas e histórico à esquerda,
 > o chat no centro e os agentes em segundo plano à direita. Embaixo, na coluna
@@ -207,3 +209,42 @@ core que não existe:
 
 Vai ter plano próprio. As fases acima não atrapalham: a seção "Modelos" entra
 no painel de baixo da coluna esquerda, acima de "Agentes em ação".
+
+## 9. Implementação (19/11/2026)
+
+Decisões confirmadas pelo Daniel: as duas larguras do §3.1 (960 e 1280 px) e o
+cartão "esperando você" só com "Ir para a conversa", sem "Enviar".
+
+**O que saiu diferente do plano:**
+- **Sem `JobsProvider`.** A consulta das tarefas é um store de módulo
+  (`hooks/useJobs.ts`) que conta quem está inscrito: com uma coluna na tela, ele
+  consulta; com nenhuma, para. Também pausa com a janela oculta e consulta de
+  novo no fim de cada turno (`complete`), quando a tarefa nova costuma nascer. Dá
+  no mesmo que a decisão 5, sem um contexto no `App`.
+- **A lista de conversas das colunas tem store próprio**
+  (`hooks/useSessionsList.ts`), lido pela coluna e pelo título do centro. A
+  gaveta continua no `useSessionManagement`, sem mudança.
+- **A conversa aberta, fora do ChatPage**, vem de `lib/activeSession.ts`. O
+  `ChatPage` ganhou um único efeito que publica o `sessionId` quando ele muda. O
+  turno não foi mexido. Abrir conversa e Novo chat pelas colunas continuam
+  disparando `neo-load-session` / `neo-new-chat`, e a conversa já aberta não é
+  reaberta, porque o handler pararia o turno.
+- **Janela média (960–1279 px):** o Segundo plano abre por cima do chat, com X e
+  Esc, e não fica salvo. Na larga, a escolha fica no `localStorage`, junto com a
+  da esquerda e o filtro da coluna (`lib/chatPrefs.ts`).
+- **O selo de status** saiu do `JobsViewer.css` para
+  `components/JobStatusBadge.{tsx,css}`. A janela Tarefas e a coluna usam o mesmo.
+- **"Agentes em ação"** também mostra a tarefa da conversa `na fila` e
+  `esperando você`, além de `rodando`. A tarefa vence a frase do turno quando as
+  duas são do mesmo agente. `comando_local` aparece como "Seu computador".
+- **A conversa nova**, que só entra na lista do core quando o 1º turno fecha,
+  aparece no topo como "Nova conversa", destacada.
+
+**Verificado (sem o app real):** `tsc -b` limpo. O lint não tem erro nos
+arquivos novos (o total caiu de 54 para 50, todos antigos). A 560×720 a tela é
+idêntica pixel a pixel à do commit anterior, com e sem a gaveta aberta:
+Playwright headless com o Tauri simulado, versão antiga num vite à parte. Prints
+a 1100 e a 1440 px com sessões e tarefas falsas mostram as colunas, os selos, o
+cartão aberto com o fim do log e o painel de agentes.
+
+**Falta:** o roteiro do §7 no `tauri dev`, com tarefa e turno de verdade.

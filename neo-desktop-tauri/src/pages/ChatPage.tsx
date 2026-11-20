@@ -13,6 +13,7 @@ import {
   useWakeEnabled
 } from '../hooks';
 import type { VoiceInputMeta } from '../hooks/useLiveMode';
+import { setActiveSession } from '../lib/activeSession';
 import {
   HistoryService,
   CommandService,
@@ -62,6 +63,11 @@ export const ChatPage = () => {
         /* sem id, a faixa só não aparece */
       });
   }, []);
+  // As colunas do chat largo moram fora daqui (App.tsx) e leem a conversa aberta
+  // de lib/activeSession; só publica, não muda nada do turno.
+  useEffect(() => {
+    setActiveSession(sessionId);
+  }, [sessionId]);
 
   // Hook para carregar histórico e configurar startup
   const loadHistory = useCallback(async () => {

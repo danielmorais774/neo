@@ -121,6 +121,20 @@
   animation: none;
 }
 
+/* Chat largo (App.tsx, colunas): mensagens e campo numa faixa de até 880 px no
+   centro. O recuo vai no PADDING (que em % conta a largura do .chat-container),
+   não numa caixa interna, para a barra de rolagem continuar na borda da coluna.
+   Na janela compacta nada disto vale: o .chat-center--cols só existe com colunas. */
+.chat-center--cols .messages-container {
+  padding-left: max(16px, calc((100% - 880px) / 2));
+  padding-right: max(4px, calc((100% - 880px) / 2));
+}
+
+.chat-center--cols .input-container {
+  padding-left: max(16px, calc((100% - 880px) / 2));
+  padding-right: max(16px, calc((100% - 880px) / 2));
+}
+
 /* Mais larga que a global (6px): aqui a barra é alvo de arrasto, não só
    indicador. A cor do thumb fica com as regras globais/de tema (index.css,
    styles/themes.css) — sobrescrever aqui empataria em especificidade com os
