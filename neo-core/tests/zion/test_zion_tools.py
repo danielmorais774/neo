@@ -355,3 +355,13 @@ def test_main_registra_as_tools_e_o_executor_juntos():
     fonte = (Path(__file__).resolve().parents[2] / "api" / "main.py").read_text(encoding="utf-8")
     assert "_tool_registry.register_many(ZION_TOOLS)" in fonte
     assert '_tool_executor.register_module_executor("zion", ZionToolExecutor())' in fonte
+
+
+def test_contato_do_whatsapp_nao_tem_as_tools_do_zion():
+    """Item 5 do E2E (§8). Hoje nenhum caminho marca o turno como `externo`
+    (`principal_from_metadata` só lê o que alguém declarar). Quem protege é a mesa
+    do pipeline de missão do WhatsApp, que só tem as tools dele; o portão
+    (`from_external` → NEGAR) é a segunda trava, para quando a marcação existir."""
+    from core.skills.whatsapp_messaging.tools import WHATSAPP_MESSAGING_TOOLS
+
+    assert not ({t.name for t in WHATSAPP_MESSAGING_TOOLS} & ZION_TOOL_NAMES)

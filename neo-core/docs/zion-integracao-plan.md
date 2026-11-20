@@ -754,3 +754,17 @@ medido; a F5 é a medida.
     grava no Zion (por construção, §2). É promessa que ele não cumpre.
   - Sobra 2: o `wm_write` anotou na nota `sessao-6166abaa`, que é da sessão anterior (o
     caderno a trouxe para o contexto). O conteúdo era o mesmo assunto.
+- **Commits (20/11):** `2a06a5e` (F4, com a consulta desligada) e `2ff3e1a` (conserto da
+  retomada, consulta ligada, este registro).
+- **Item 4, no nível da tool ✅ (20:23 UTC):** o Claude Code do Mac salvou
+  `mem_20261120_6iu6` (a armadilha da guarda do navegador) às 20:23:00; às 20:23:18 a
+  `zion_search` do Neo, pelo `ToolExecutor` no container de produção, já o trazia em
+  primeiro lugar (213 ms), e o `zion_get` o abriu. Falta a mesma pergunta pelo chat.
+- **Item 5 não dá para fazer como foi escrito.** Nenhum caminho marca hoje um turno como
+  `externo`: o `principal_from_metadata` só lê o que alguém declarar no metadata, e nem o
+  WhatsApp nem o leitor de e-mail declaram. Uma mensagem de contato no WhatsApp só roda o
+  pipeline de missão (`api/routes/whatsapp.py` → `WhatsAppMessagingPipeline`), cuja mesa
+  tem apenas `WHATSAPP_MESSAGING_TOOLS`. Ou seja, hoje quem protege o Zion de um contato é
+  a mesa, por construção. A regra do portão (`from_external` → NEGAR) é a segunda trava,
+  para quando a marcação existir (plano de auth, Principal em sombra). Travado em
+  `test_contato_do_whatsapp_nao_tem_as_tools_do_zion`.
