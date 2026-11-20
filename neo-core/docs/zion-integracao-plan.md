@@ -1,8 +1,8 @@
 # Neo × Zion: o Neo consulta a memória de trabalho (fase 1) — plano
 
 **Data:** 2026-11-20
-**Status:** F0 medida em 20/11 (§12); a réplica `zion-replica` já está de pé. F1–F5 não
-começaram.
+**Status:** F0 medida e F1 feita em 20/11 (§12). A réplica `zion-replica` está de pé, e o
+modo só leitura do Zion está no commit `6e0a9d8` do `zion-memory-mcp`. F2–F5 não começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -106,7 +106,7 @@ projeto e pasta mudam pouco), e uma parte da memória passa a existir na VPS (§
 | `config.toml`, `synonyms.yaml` | `domains/*/sessions/` (checkpoints: o resumo do trabalho de cada conversa) |
 | `domains/*/domain.md` | `domains/*/transcripts/` |
 | `domains/*/memories/`, `plans/`, `tasks/`, `failures/` | `.zion/` (lock e cache), `.git/` |
-| | `declined.toml`, `recall.yaml` |
+| | `declined.yaml`, `recall.yaml` |
 | | `domains/homelab/` (**decisão em aberto**, §10) |
 
 - As `sessions/` ficam fora por causa da regra de não deixar conteúdo das conversas na
@@ -121,7 +121,7 @@ projeto e pasta mudam pouco), e uma parte da memória passa a existir na VPS (§
    - registra só as tools de leitura: `domain_list` (nova), `domain_resolve`,
      `context_get`, `memory_search`, `record_get` e `record_related`;
    - não chama `init()`, não pega lock, não faz commit;
-   - o diretório interno (`.zion/`) vai para um diretório temporário;
+   - não cria o diretório interno (`.zion/`): fora do lock, nada o usa (conferido na F1);
    - defesa em profundidade: no modo só leitura, o `Store` levanta erro em qualquer
      escrita, mesmo que alguém registre uma tool de escrita por engano.
 2. **`domain_list`**: tool nova, de leitura, sobre o `domainList()` que a CLI já usa,
@@ -145,8 +145,8 @@ sendo o deploy de lá.
   qualquer nível; com `/` no começo, só na raiz):
   ```
   mutagen sync create --name zion-replica --mode one-way-replica --ignore-vcs \
-    --ignore sessions --ignore transcripts --ignore /.zion --ignore /declined.toml \
-    --ignore /recall.yaml --ignore /domains/homelab \
+    --ignore sessions --ignore transcripts --ignore /.zion --ignore /declined.yaml \
+    --ignore /declined.toml --ignore /recall.yaml --ignore /domains/homelab \
     ~/.zion contabo-neo:/home/daniel/.zion-replica
   ```
   `one-way-replica` não tem conflito: o que existir do lado da VPS e não vier do Mac é
@@ -344,3 +344,50 @@ de postgres e mongo.
 
 **O que a F0 mudou no plano:** cliente em SSE (§7.1), `user: "1000:1000"` e
 `node:22-alpine` (§6), e o comando real do Mutagen (§6).
+
+### F1: modo só leitura no Zion (20/11/2026)
+
+Commit `6e0a9d8` no `zion-memory-mcp`. Desenvolvido numa cópia no scratchpad, porque lá
+o `npm test` compila o `dist/`, que é o deploy no Mac. Copiado de volta depois de conferir
+que o repo não tinha mudado desde a cópia.
+
+**O que entrou:**
+- `zion serve --http --read-only` (ou `ZION_READ_ONLY=1`): registra só as 6 tools de
+  leitura; o `init()` não grava; o `Store` recusa escrita no `lock()` e nos `save*`
+  (erro `read_only`), mesmo se alguém registrar uma tool de escrita por engano;
+- `ZION_HOST` e `--host`; `ZION_ALLOWED_HOSTS` (ou `[server] allowed_hosts`) somam nomes ao
+  `allowedHosts`, e a proteção contra DNS rebinding continua ligada;
+- `domain_list`, com `repos: [{name, path, remote}]`. A CLI `zion domains` passou a
+  mostrar o mesmo formato;
+- `/health` com `read_only`;
+- `Dockerfile` (`node:22-alpine`, multi-stage, usuário `node`) e `.dockerignore`;
+- `tests/readOnly.test.ts` (5 testes) e a seção §8.1 no `docs/design.md` do Zion.
+
+**Desvio do plano:** o diretório interno não foi para um temporário. Fora do lock, nada o
+usa, então no modo só leitura ele simplesmente não é criado.
+
+**Correção na réplica:** o Zion grava as pastas recusadas em `declined.yaml`, não em
+`declined.toml` (o design estava errado). A sessão `zion-replica` foi recriada com
+`--ignore /declined.yaml`. O arquivo ainda não existia no Mac, então nada vazou.
+
+**Verificado:**
+- Suíte do Zion: 70 de 71. A falha é o `CT-CON-05`, um snapshot que depende de dois
+  registros caírem no mesmo segundo. Ele já falhava antes da F1 (1 em 4 rodadas isoladas,
+  quase sempre com a suíte inteira) e foi registrado como falha no Zion.
+- **Dados reais no Mac:** cópia do `~/.zion` igual à réplica, sem permissão de escrita, e
+  `serve --read-only` na porta 7099 (o servidor do launchd ficou intocado):
+  - `Host: neo-zion:7099` → 200, outro nome → 403;
+  - 6 tools; `memory_save` → `Tool memory_save not found`;
+  - `domain_list` com as pastas de `neo` e `zion`;
+  - nenhum arquivo criado nem alterado (181 antes e depois).
+- **Imagem na VPS:** contexto com modo 0600, como o Mutagen grava, e build ok (266 MB, dos
+  quais 230 MB são da base que já estava lá). Container com `--read-only`, `tmpfs /tmp`,
+  `--cap-drop ALL`, `no-new-privileges`, 256 MB, a réplica real em `:ro` e
+  `ZION_ALLOWED_HOSTS=zion-f1:7077`:
+  - healthcheck `healthy`; roda como `node` (uid 1000); a CLI de dentro funciona;
+  - de dentro do `neo-core`, pelo nome `zion-f1:7077` sem forjar `Host` → 200;
+  - 6 tools; `record_update` → `Tool record_update not found`.
+  - Container, imagem e arquivos de teste apagados depois (disco: 92%, 5,8 GB livres).
+- **Mac em modo normal:** `zion doctor` e `zion domains` pelo shim funcionam. As sessões
+  novas do Claude Code já usam o `dist/` novo. O servidor HTTP do launchd continua com o
+  código antigo até reiniciar; não reiniciei para não derrubar as sessões abertas.
