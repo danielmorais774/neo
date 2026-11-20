@@ -30,6 +30,12 @@ O `socat` existe porque os clientes têm `127.0.0.1:8000` fixo em uns 20 lugares
 | 50051 | neo-core gRPC | desktop |
 | 5434 | neo-postgres | `psql`, `db/seeds.py`, scripts |
 
+**Zion (desde 20/11):** o Claude Code e os hooks do Mac falam direto com
+`http://10.66.66.1:7077` (container `zion`), sem socat e com token Bearer
+(`~/.config/zion/token` no Mac e na VPS). A porta só é publicada no IP do `wg0`, e um drop-in
+do Docker (`/etc/systemd/system/docker.service.d/zion-7077.conf`) barra no `DOCKER-USER` o
+que não entra pela `wg0`. Ver `zion-integracao-plan.md`.
+
 Fora do túnel:
 - **pontuax-redis** (6379): é de outro projeto e usa o ZeroTier.
 - **neo-voice**: o desktop e o painel usam o da LAN (`192.168.4.210:5002`), não o da VPS.

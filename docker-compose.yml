@@ -30,10 +30,12 @@ services:
       - "127.0.0.1:8000:8000"
       - "127.0.0.1:50051:50051"
     # default (todos os serviços) + browser-net (só p/ falar com o
-    # neo-browser-agent — docs/browser-agent-plan.md §6).
+    # neo-browser-agent — docs/browser-agent-plan.md §6) + zion-net (só p/ ler o
+    # Zion pelo neo-zion — docs/zion-integracao-plan.md §6).
     networks:
       - default
       - browser-net
+      - zion-net
     depends_on:
       - neo-postgres
       - neo-mongo
@@ -403,6 +405,99 @@ services:
       retries: 3
       start_period: 30s
 
+  # ── Zion: a memória de trabalho dos agentes (docs/zion-integracao-plan.md §6) ──
+  # A fonte é /home/daniel/.zion (repo git). Dois processos na mesma pasta:
+  #   zion      grava; o Claude Code do Mac chega pelo WireGuard (a porta só é
+  #             publicada no docker-compose.override.yml, em 10.66.66.1) e com token.
+  #   neo-zion  só leitura, para o neo-core, numa rede interna que só tem os dois.
+  #             O Neo não tem caminho de escrita no Zion: o Zion entra no começo de
+  #             toda sessão do Claude, e uma gravação feita num turno que leu e-mail
+  #             viraria injeção permanente.
+  # As imagens não se reconstroem sozinhas: mudou o zion-memory-mcp, rode
+  # `docker compose build zion neo-zion && docker compose up -d zion zion-tick neo-zion`.
+  zion:
+    build:
+      context: ../zion-memory-mcp
+      target: writer
+    image: zion:writer
+    container_name: zion
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    environment:
+      - ZION_DATA_DIR=/data
+      - ZION_TOKEN_FILE=/run/zion/token
+      - ZION_ALLOWED_HOSTS=10.66.66.1:7077
+      # Os .md dos planos que o Claude do Mac aponta são lidos pela cópia do Mutagen.
+      - ZION_PATH_MAP=/Users/daniel/Documents/projects=/projects
+    volumes:
+      - /home/daniel/.zion:/data
+      - /home/daniel/.config/zion/token:/run/zion/token:ro
+      - /home/daniel/Documents/projects:/projects:ro
+    networks:
+      - zion-pub
+
+  # Pull do spool de falhas do neo-core + jardineiro (sem LLM), a cada 5 min. Divide
+  # a pasta com o `zion` pelo lock entre processos do próprio Zion.
+  zion-tick:
+    build:
+      context: ../zion-memory-mcp
+      target: writer
+    image: zion:writer
+    container_name: zion-tick
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    command: ["node", "dist/cli.js", "tick", "--loop", "300"]
+    # O healthcheck da imagem chama a porta 7077, que o tick não abre.
+    healthcheck:
+      disable: true
+    environment:
+      - ZION_DATA_DIR=/data
+    volumes:
+      - /home/daniel/.zion:/data
+      - ./neo-core/.zion-spool:/neo-spool:ro
+    # Lê arquivos locais; o jardineiro está sem LLM ([garden] model vazio).
+    network_mode: none
+
+  neo-zion:
+    build:
+      context: ../zion-memory-mcp
+      target: reader
+    image: zion:reader
+    container_name: neo-zion
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    environment:
+      - ZION_DATA_DIR=/data
+      - ZION_ALLOWED_HOSTS=neo-zion:7077
+    volumes:
+      - /home/daniel/.zion:/data:ro
+    networks:
+      - zion-net
+
 volumes:
   neo-workspace:
   # Catálogo de arquivos do Neo (docs/file-store-plan.md): blobs deduplicados por
@@ -436,6 +531,15 @@ networks:
   # Bridge de egress: só o proxy usa, para alcançar a internet. Isolada dos
   # serviços do app (não é a `default`), então o proxy não enxerga postgres/etc.
   workbench-egress:
+    driver: bridge
+  # Zion só leitura ↔ neo-core. `internal`: sem rota externa, e só os dois vivem
+  # aqui (o sandbox e o navegador não alcançam o Zion).
+  zion-net:
+    driver: bridge
+    internal: true
+  # Rede do `zion` (com escrita). Não é a `default`: nenhum serviço do app fala com
+  # ele; quem chega é o Mac, pela porta publicada no IP do WireGuard.
+  zion-pub:
     driver: bridge
   shared-dev-network:
     external: true

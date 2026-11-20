@@ -1,8 +1,9 @@
 # Neo × Zion: o Zion na VPS, e o Neo lendo dele (fase 1) — plano
 
 **Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
-**Status:** F0, F1 e F2 feitas (§12). F2 = commit `23035b1` do `zion-memory-mcp`. A réplica
-`zion-replica` da F0 era o desenho anterior e sai na migração (§4). F3–F6 não começaram.
+**Status:** F0–F2 feitas; F3 no ar em 20/11 (§12): o Zion mora na VPS e o Claude do Mac fala
+com ele pelo WireGuard. Falta na F3 a regra de firewall (precisa de `sudo`) e o E2E com uma
+sessão nova do Claude. F4–F6 não começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -257,9 +258,12 @@ gravar e o `Store` recusando escrita; `ZION_HOST`; `ZION_ALLOWED_HOSTS`; `domain
     recriar o container (uma queda curta, feita fora de turno).
 - **`docker-compose.override.yml`** (fora do git): `zion` com
   `ports: ["10.66.66.1:7077:7077"]`.
-- **Firewall:** no `PostUp` do `wg0.conf`, ao lado da regra `raw` que já existe:
-  `iptables -I DOCKER-USER -p tcp --dport 7077 ! -i wg0 -j DROP`. O `DOCKER-USER` vê o
-  pacote depois do DNAT, então a porta é a do container.
+- **Firewall:** `iptables -I DOCKER-USER -p tcp --dport 7077 ! -i wg0 -j DROP`. O
+  `DOCKER-USER` vê o pacote depois do DNAT, então a porta é a do container. Fica num
+  drop-in do Docker (`/etc/systemd/system/docker.service.d/zion-7077.conf`,
+  `ExecStartPost`), **não** no `PostUp` do `wg0.conf`: o Docker sobe depois do
+  WireGuard (`after-wg.conf`), então no `PostUp` a chain `DOCKER-USER` ainda não existe,
+  o comando falha e o `wg-quick` derrubaria o túnel no boot.
 - **Token:** gerado na VPS (`openssl rand -hex 32`) e copiado para o Mac em
   `~/.config/zion/token` (0600). Nunca vai para git, memória, log nem conversa.
 - **Mutagen:** encerrar o `zion-replica` e criar o `zion-backup` (§4).
@@ -572,3 +576,51 @@ a dica de `git diff` no modo review; `client.toml` e `zion install claude-code -
   como antes, e o `zion doctor` funciona. O `dist/` novo já é o dos hooks do Mac.
 - **Codex:** fora desta fase; o binário dele no Mac dá `ENOENT`.
 
+### F3: infra na VPS e migração (20/11/2026)
+
+**Feito, na ordem do §4:**
+1. Pré-checagem: só esta sessão do Claude estava aberta (`~/.claude/sessions`, pid 3886); a
+   7077 do Mac estava livre (o reboot matou o `npm run dev`); a extensão do Codex no VS
+   Code (pid 2950) não tinha `zion serve` aberto. Checkpoint gravado antes da cópia.
+2. `zion uninstall launchd` (o tick do Mac; `bootout` sozinho voltaria no próximo login) e
+   `zion uninstall codex` (o Codex ainda era stdio local e dividiria a memória na próxima
+   conversa; reinstalar com `--remote` quando o Codex for configurado para HTTP).
+3. Mutagen `zion-replica` encerrado e `~/.zion-replica` apagado na VPS.
+4. `rsync -a --exclude /.zion/ ~/.zion/ contabo-neo:/home/daniel/.zion/`: mesmo HEAD
+   (`0d75cc9`) e 748 arquivos dos dois lados, dono `daniel`, 6 MB.
+5. Token de 256 bits gerado na VPS (`~/.config/zion/token`, 0600) e copiado para o Mac
+   (mesmo hash). `[neo_pull] spool_path = "/neo-spool/failures.jsonl"` no `config.toml` da
+   VPS; `neo-core/.zion-spool` criado como `daniel` (o Docker criaria como root).
+6. `docker-compose.yml`: `zion` (alvo `writer`, rede `zion-pub`), `zion-tick` (mesma
+   imagem, `tick --loop 300`, `network_mode: none`, healthcheck desligado), `neo-zion`
+   (alvo `reader`, `zion-net`), redes `zion-net` (internal) e `zion-pub`, e a `zion-net` no
+   `neo-core`. Override: `zion` em `10.66.66.1:7077`.
+7. `docker compose build zion neo-zion` (285 MB e 266 MB) e `up -d zion zion-tick neo-zion`.
+   O `neo-core` entrou na `zion-net` com `docker network connect`, **sem reiniciar**; o
+   compose já o põe na rede da próxima vez que o recriar.
+8. Mac: `zion install claude-code --remote http://10.66.66.1:7077 --token-file
+   ~/.config/zion/token` → `claude mcp get zion`: `Type: http`, `✔ Connected`.
+9. `kill` no `zion serve` local desta sessão, `~/.zion` → `~/.zion.antes-da-vps-20261120`,
+   e Mutagen `zion-backup` (VPS → Mac, `one-way-replica`, `--no-ignore-vcs`,
+   `--ignore /.zion`) em `~/.zion-backup`: mesmo HEAD (`bd980fd`) e 751 arquivos dos dois
+   lados. Os 3 a mais são do jardineiro, que rodou no primeiro tick, e do `config.toml`.
+
+**Verificado:**
+- `zion` e `neo-zion` `healthy`; `ss -tln`: 7077 só em `10.66.66.1`.
+- Mac → `10.66.66.1:7077`: `/health` sem token `{"name":"zion","ok":true}`; com token, os 4
+  domains e 178 memórias; `initialize` sem token → 401.
+- `neo-core` → `neo-zion`: só as 6 tools de leitura; `domain_list` com os 4 domains. O
+  `neo-core` não resolve os nomes `zion` nem `zion-tick`.
+- `neo-workbench`: não resolve `neo-zion`; `10.66.66.1:7077` pelo proxy → 403.
+- Hook real pelo Mac (`zion hook session-start`, com o `client.toml`): o contexto do domain
+  `neo` veio da VPS em **661 ms** de ponta a ponta. O `~/.zion` não reapareceu.
+- `zion-tick`: primeira rodada `neo_pull: no_spool`, jardineiro sem LLM.
+
+**Pendente na F3:**
+- **Regra de firewall** (precisa de `sudo` na VPS). Hoje o `neo-core` (e qualquer container)
+  ainda alcança `10.66.66.1:7077` pelo IP do host: o `/health` mínimo responde, e o resto
+  pede token. A regra fecha isso.
+- **E2E:** uma sessão nova do Claude Code no Mac recebe o contexto da VPS e grava
+  checkpoint lá.
+- Cosmético: o banner do `neo-zion` diz "NO TOKEN (loopback only)", que não vale para uma
+  réplica só leitura numa rede interna.
