@@ -3,7 +3,7 @@
 <h1 align="center">Neo</h1>
 
 <p align="center">
-  <strong>Um assistente pessoal que conversa, lembra e age: no Mac, no navegador que você está olhando e no WhatsApp.</strong>
+  <strong>Um assistente pessoal a quem eu delego trabalho: pesquisar, escrever, montar arquivos, lembrar e agir no Mac. Por voz, chat ou WhatsApp.</strong>
 </p>
 
 <p align="center">
@@ -21,27 +21,34 @@
 <!-- MÍDIA 6: link do vídeo da demo de suporte (2–3 min), ao lado do botão acima, quando estiver publicado. -->
 
 <p align="center">
-  <img src="assets/navegador-formulario.gif" alt="Pedido no chat do Neo: preencher um formulário no navegador sem enviar. O Neo abre a página e preenche campo por campo, com a linha do tempo e o botão PARE ao lado." width="800">
+  <img src="assets/documento-pdf.gif" alt="Pedido no chat do Neo: criar um PDF em inglês sobre a Quinta Revolução Industrial, com no máximo 14 páginas, introdução, desenvolvimento, conclusão, referências e imagens. O Neo trabalha no sandbox e entrega o arquivo com um resumo da estrutura; o PDF de 14 páginas abre com capa, figuras, tabelas e créditos das imagens." width="800">
   <br>
-  <sub>Um pedido no chat vira um job no navegador que você está olhando: o Neo preenche o formulário campo por campo, narra cada passo na linha do tempo e não clica em enviar.</sub>
+  <sub>Um pedido com limite de 14 páginas, seis minutos de trabalho no sandbox do servidor (a espera foi acelerada no GIF): o Neo pesquisa as fontes, escolhe imagens com licença no Wikimedia Commons, monta o PDF dentro do limite e confere página por página antes de entregar.</sub>
 </p>
 
 ---
 
-O Neo é um projeto pessoal que uso todo dia. Ele recebe pedidos por voz, chat ou WhatsApp e decide o que fazer: responder, lembrar de algo, rodar uma tarefa longa num sandbox, usar o navegador ou executar um comando no Mac, sempre com aprovação quando a ação é sensível.
+O Neo é um projeto pessoal que uso todo dia. Ele recebe pedidos por voz, chat ou WhatsApp e decide o que fazer: responder, lembrar de algo, rodar uma tarefa longa num sandbox, usar o navegador ou executar um comando no Mac, sempre com aprovação quando a ação é sensível. Pesquisa, documentos e planilhas rodam no servidor; o navegador é uma ferramenta a mais, para o que só dá para fazer numa página aberta, como um formulário ou um site em que você está logado.
 
 O que dá trabalho num assistente assim não é chamar um modelo. É decidir **o que o modelo pode decidir sozinho e o que tem que ser código**, medir cada mudança e não deixar uma página da web mandar no assistente. Este repositório mostra essas decisões.
 
 ## O que o Neo faz
 
-- **Conversa por voz no Mac.** Wake word ("ei Neo"), modo live com interrupção por "pare", STT (Parakeet) e TTS rodando numa GPU da rede local, e um "notch" nativo em Swift mostrando o estado.
-- **Usa o navegador que você está olhando.** Uma extensão (fork do [open-browser-use](https://github.com/iFurySt/open-browser-use)) dá ao Neo as abas do seu navegador, com painel da linha do tempo e botão PARE. Ele lê várias abas em paralelo, pergunta quando precisa de você e guarda senhas num cofre próprio.
+- **Faz o trabalho e entrega o arquivo.** Pesquisa na web, escreve e monta PDFs, planilhas e documentos Word num sandbox Docker sem acesso à rede local, confere o resultado antes de entregar e diz o que ficou incerto. Lê PDFs longos com subagentes, transcreve vídeo e faz OCR.
 - **Lembra de você.** Grafo de conhecimento pessoal (PKS) no Postgres, recuperação semântica das conversas (pgvector) e um caderno de trabalho para tarefas longas.
-- **Roda tarefas longas em segundo plano.** Jobs com sandbox Docker sem acesso à rede local, leitura delegada de PDFs, transcrição de vídeo, OCR e planilhas. Avisa quando termina.
+- **Roda tarefas longas em segundo plano.** O que demora vira job: a conversa segue e o Neo avisa quando termina.
+- **Conversa por voz no Mac.** Wake word ("ei Neo"), modo live com interrupção por "pare", STT (Parakeet) e TTS rodando numa GPU da rede local, e um "notch" nativo em Swift mostrando o estado.
 - **Age no Mac com aprovação.** Comandos locais passam por uma política de risco: o que é seguro roda, o que não é pede confirmação.
+- **Usa o navegador que você está olhando, quando precisa.** Uma extensão (fork do [open-browser-use](https://github.com/iFurySt/open-browser-use)) dá ao Neo as abas do seu navegador, com painel da linha do tempo e botão PARE. Ele lê várias abas em paralelo, pergunta quando precisa de você e guarda senhas num cofre próprio.
 - **Delega código.** Abre uma sessão do Claude Code no Mac, acompanha e traz o relatório.
   <!-- MÍDIA 4: assets/claude-code.gif — sessão aberta, pílula "Claude · ver o processo", relatório no fim. -->
 - **E mais:** WhatsApp, agenda (cron), casa inteligente (Home Assistant), música (Spotify/YouTube) e finanças.
+
+<p align="center">
+  <img src="assets/navegador-formulario.gif" alt="Pedido no chat do Neo: preencher um formulário no navegador sem enviar. O Neo abre a página e preenche campo por campo, com a linha do tempo e o botão PARE ao lado." width="800">
+  <br>
+  <sub>Quando o pedido precisa de uma página aberta, ele vira um job no navegador que você está olhando: o Neo preenche o formulário campo por campo, narra cada passo na linha do tempo e não clica em enviar.</sub>
+</p>
 
 <table>
   <tr>
