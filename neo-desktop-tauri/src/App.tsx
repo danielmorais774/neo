@@ -10,6 +10,7 @@ import ConversationsPanel from './components/ConversationsPanel';
 import AgentActivityPanel from './components/AgentActivityPanel';
 import ConversationHeader from './components/ConversationHeader';
 import JobsColumn from './components/JobsColumn';
+import { ColumnSplit, SideColumn } from './components/ChatColumns';
 import { useWideLayout } from './hooks/useWideLayout';
 import { readColumnOpen, storeColumnOpen } from './lib/chatPrefs';
 import { useTheme } from './themes/useTheme';
@@ -308,22 +309,27 @@ function App() {
         {activeTab === 'chat' ? (
           <>
             {showLeft ? (
-              <aside className="side-col side-left" aria-label="Conversas e agentes em ação">
-                <ConversationsPanel />
-                <AgentActivityPanel />
-              </aside>
+              <SideColumn
+                side="left"
+                defaultWidth={layout === 'wide' ? 300 : 280}
+                ariaLabel="Conversas e agentes da sessão"
+              >
+                <ColumnSplit top={<ConversationsPanel />} bottom={<AgentActivityPanel />} />
+              </SideColumn>
             ) : null}
             <div className={`chat-center${columns ? ' chat-center--cols' : ''}`}>
               {columns ? <ConversationHeader onShowJobs={() => setRight(true)} /> : null}
               <ChatPage />
             </div>
             {showRight ? (
-              <aside
-                className={`side-col side-right${layout === 'medium' ? ' side-drawer' : ''}`}
-                aria-label="Tarefas em segundo plano"
+              <SideColumn
+                side="right"
+                defaultWidth={layout === 'wide' ? 340 : 320}
+                ariaLabel="Tarefas em segundo plano"
+                className={layout === 'medium' ? 'side-drawer' : undefined}
               >
                 <JobsColumn onClose={layout === 'medium' ? () => setRightDrawer(false) : undefined} />
-              </aside>
+              </SideColumn>
             ) : null}
           </>
         ) : (

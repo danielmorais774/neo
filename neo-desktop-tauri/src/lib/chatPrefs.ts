@@ -35,6 +35,14 @@ function write(key: string, value: string): void {
   }
 }
 
+function remove(key: string): void {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    /* idem */
+  }
+}
+
 export function readStoredProvider(): string {
   return read(PROVIDER_KEY) ?? '';
 }
@@ -88,6 +96,27 @@ export function readColumnOpen(column: ChatColumn): boolean {
 
 export function storeColumnOpen(column: ChatColumn, open: boolean): void {
   write(COLUMN_KEYS[column], open ? 'open' : 'closed');
+}
+
+// Tamanhos arrastáveis do chat largo (ResizeHandle.tsx): largura de cada coluna e
+// altura da seção "Agentes e canais". Sem valor salvo (ou depois do duplo clique
+// na barra) vale o padrão da largura da janela.
+const PANE_SIZE_KEYS = {
+  left: 'neo.chat.columnLeftWidth',
+  right: 'neo.chat.columnRightWidth',
+  sessionPanel: 'neo.chat.sessionPanelHeight',
+} as const;
+
+export type ChatPane = keyof typeof PANE_SIZE_KEYS;
+
+export function readPaneSize(pane: ChatPane): number | null {
+  const stored = Number(read(PANE_SIZE_KEYS[pane]) ?? Number.NaN);
+  return Number.isFinite(stored) && stored > 0 ? stored : null;
+}
+
+export function storePaneSize(pane: ChatPane, px: number | null): void {
+  if (px === null) remove(PANE_SIZE_KEYS[pane]);
+  else write(PANE_SIZE_KEYS[pane], String(Math.round(px)));
 }
 
 // Filtro da coluna "Segundo plano" (JobsColumn.tsx).

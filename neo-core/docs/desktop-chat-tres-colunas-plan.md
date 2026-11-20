@@ -261,4 +261,21 @@ passo fica parado em "olhando a caixa de email" até o fim do turno. Para ele
 andar ("lendo o email"), o AgentExecutor teria que emitir progresso por passo,
 e isso é core (junto da F5).
 
+**2º E2E (20/11):** o Email apareceu. Pedidos do Daniel em seguida, já feitos:
+- **A seção de baixo fica sempre na tela** ("Agentes e canais"). Quem está em
+  ação aparece primeiro. Depois vem quem já trabalhou nesta conversa: os agentes
+  que o turno usou desde que o app abriu, com selo "feito", e as tarefas da
+  conversa que terminaram, com o status delas. Sem ninguém, a seção mostra um
+  aviso. O histórico dos turnos fica só na memória do app (o core não guarda
+  quem trabalhou), então some ao fechar; o das tarefas vem do core.
+- **Tamanhos por arraste** (`components/ResizeHandle.tsx` e
+  `components/ChatColumns.tsx`): largura de cada coluna (esquerda 240–440 px,
+  direita 280–480 px) e a divisória entre Conversas e Agentes e canais (mínimo
+  de 180 px em cima e 110 px embaixo). Fica salvo no `localStorage`. Duplo
+  clique volta ao padrão, e as setas, Home e End ajustam pelo teclado. Cada
+  moldura é dona do próprio tamanho: arrastar não re-renderiza o App nem o
+  ChatPage, que só sofre o reflow da largura. Conferido no headless: arraste,
+  limite, recarregar, duplo clique e teclado; e a 560×720 a tela continua
+  idêntica pixel a pixel.
+
 **Falta:** o roteiro do §7 no `tauri dev`, com tarefa e turno de verdade.
