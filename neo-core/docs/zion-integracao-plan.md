@@ -768,3 +768,19 @@ medido; a F5 é a medida.
   a mesa, por construção. A regra do portão (`from_external` → NEGAR) é a segunda trava,
   para quando a marcação existir (plano de auth, Principal em sombra). Travado em
   `test_contato_do_whatsapp_nao_tem_as_tools_do_zion`.
+- **Itens 2, 3 e 4 pelo chat** (sessão `3778910b`, 20:29–20:31 UTC, uma interação cada):
+  - **Item 2 ✅** ("O que o Zion sabe do projeto neo? Tem falha aberta?"): o classificador
+    foi direto para `SERVER_TOOL`/`zion_overview {domain: neo}` (0,9), e o agente abriu a
+    falha com `zion_get`. A resposta citou `fai_20261120_8wwx` com o estado real (conserto
+    em produção sem commit), as 7 regras, os 2 planos e as sessões; nada inventado. 9,3 s.
+  - **Item 3 ✅, com ressalva** ("Onde fica o projeto zion no meu Mac?"): resposta certa
+    (`/Users/daniel/Documents/projects/zion-memory-mcp`, remote e branch), conferida com 1
+    `run_command`. O caminho veio do índice do caderno (a nota da conversa `6166abaa`), não
+    de uma consulta nova ao Zion; o classificador tinha sugerido `zion_overview {domain:
+    zion}`. Fonte certa na origem, mas de segunda mão.
+  - **Item 4 ✅** ("O que o Zion tem sobre a guarda do navegador que confunde 'no meu
+    Mac'?"): `zion_search` 2 vezes e `zion_get` em `mem_20261120_6iu6`; a resposta
+    reproduziu a memória fielmente. A própria pergunta ("no meu Mac" entre aspas) fez a
+    guarda do navegador desviar `SERVER_TOOL`/`zion_search` para `COGNITIVE`, com a mesma
+    explicação errada: a armadilha se demonstrou ao vivo.
+- **Falta o item 6** (WireGuard desligado no Mac), que depende do Daniel.
