@@ -9,6 +9,7 @@ Meta, Mistral, etc.) com fallback automático e roteamento por preço/disponibil
 """
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -53,6 +54,34 @@ def _provedores_ignorados() -> tuple[str, ...]:
         return tuple(p for p in ajustes().openrouter.provedores_ignorados if p)
     except Exception:  # noqa: BLE001 — ajuste ilegível não derruba a chamada
         return ()
+
+
+_UPSTREAM_DE = re.compile(r"Upstream error from ([^:]+):")
+
+
+def provedor_que_falhou(exc: BaseException | None) -> str | None:
+    """O provedor que o OpenRouter culpou por um erro de upstream, pelo nome.
+
+    Vem no ``metadata.provider_name`` do erro quando o SDK guarda o corpo, e
+    sempre no texto ("Upstream error from DigitalOcean: …"). Anda pela cadeia
+    de ``__cause__`` porque o ``LLMProviderError`` que chega ao loop embrulha o
+    ``APIError`` original duas vezes. O nome de exibição serve direto em
+    ``provider.ignore`` (conferido em 20/11/2026: ``only: ["DigitalOcean"]``
+    roteou para lá, e um nome desconhecido no ``ignore`` não dá erro).
+    """
+    for _ in range(6):
+        if exc is None:
+            return None
+        body = getattr(exc, "body", None)
+        meta = body.get("metadata") if isinstance(body, dict) else None
+        nome = meta.get("provider_name") if isinstance(meta, dict) else None
+        if isinstance(nome, str) and nome.strip():
+            return nome.strip()
+        m = _UPSTREAM_DE.search(str(exc))
+        if m:
+            return m.group(1).strip()
+        exc = exc.__cause__ or exc.__context__
+    return None
 
 
 def _exige_raciocinio(model: str) -> bool:
@@ -175,15 +204,19 @@ class OpenRouterProvider(OpenAIProvider):
         return bare
 
     @staticmethod
-    def _apply_provider_ignore(kwargs: dict[str, Any]) -> None:
+    def _apply_provider_ignore(kwargs: dict[str, Any], extras: Any = ()) -> None:
         """Tira do roteamento os provedores de ``[openrouter] provedores_ignorados``.
 
         Vai em ``provider.ignore``: o gateway segue escolhendo entre todos os
         outros, nada fica fixado. Roda DEPOIS de ``_split_provider_pin``: chamada
         com provedor fixado (``order``/``only``) já escolheu e fica como está. Um
         ``ignore`` que o chamador já mandou é somado, não trocado.
+
+        ``extras`` são provedores a evitar só nesta chamada: o que acabou de
+        falhar no meio da resposta (``evitar_provedores``, ver
+        ``AIService._cognitive_round``).
         """
-        ignorar = _provedores_ignorados()
+        ignorar = _provedores_ignorados() + tuple(p for p in (extras or ()) if p)
         if not ignorar:
             return
         extra = dict(kwargs.get("extra_body") or {})
@@ -325,8 +358,9 @@ class OpenRouterProvider(OpenAIProvider):
     ):
         """Completion via OpenRouter (usa mesma lógica da OpenAI)."""
         teto = kwargs.pop("teto_raciocinio", None)
+        evitar = kwargs.pop("evitar_provedores", None)
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_provider_ignore(kwargs)
+        self._apply_provider_ignore(kwargs, evitar)
         self._apply_reasoning_pref(kwargs, model, teto)
         try:
             return await super().complete(
@@ -386,8 +420,9 @@ class OpenRouterProvider(OpenAIProvider):
     ):
         """Streaming via OpenRouter."""
         teto = kwargs.pop("teto_raciocinio", None)
+        evitar = kwargs.pop("evitar_provedores", None)
         model = self._split_provider_pin(model or self.DEFAULT_MODEL, kwargs)
-        self._apply_provider_ignore(kwargs)
+        self._apply_provider_ignore(kwargs, evitar)
         self._apply_reasoning_pref(kwargs, model, teto)
         # Até 3 voltas: uma para tirar o desligamento de raciocínio que o modelo
         # recusa, uma para afrouxar o pin lotado — cada conserto vale uma vez só.

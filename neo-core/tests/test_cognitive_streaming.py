@@ -14,8 +14,9 @@ import asyncio
 
 import pytest
 
+from core.llm.openrouter_provider import OpenRouterProvider
 from modules.desktop.ai_service import AIService, _progress_label
-from shared import StreamChunk, StreamEventType
+from shared import LLMProviderError, StreamChunk, StreamEventType
 
 
 class _S:
@@ -160,15 +161,55 @@ async def test_stream_que_morre_antes_do_primeiro_chunk_cai_no_bufferizado():
 
 
 @pytest.mark.asyncio
-async def test_stream_que_ja_emitiu_texto_propaga_em_vez_de_repetir():
-    """Refazer depois de ter mandado texto duplicaria a resposta na tela."""
+async def test_stream_que_morre_no_meio_refaz_bufferizado_uma_vez():
+    """session-435a6701: o provedor abortou a rodada final no meio da resposta.
+
+    Antes isso propagava ("refazer duplicaria na tela") e o turno virava "Não
+    consegui responder agora", com o resumo pronto no caderno. O texto parcial
+    só estava na bolha de progresso, que o desktop substitui: refazer é seguro.
+    """
     provider = _StreamProvider([_tok("comecei a responder"), _tok("...")], falha_em=1)
-    with pytest.raises(RuntimeError):
-        await _svc()._cognitive_round(
-            provider=provider, messages=[], tools=None, req_model="m",
-            max_tokens=100, extra={}, progress=None,
+    fila: asyncio.Queue = asyncio.Queue()
+    resp, _ = await _svc()._cognitive_round(
+        provider=provider, messages=[], tools=None, req_model="m",
+        max_tokens=100, extra={}, progress=fila,
+    )
+    assert resp.get_content() == "resposta bufferizada"
+    assert len(provider.complete_kwargs) == 1
+    # Provider que não é o OpenRouter não recebe o kwarg (iria parar na API).
+    assert "evitar_provedores" not in provider.complete_kwargs[0]
+    linhas = []
+    while not fila.empty():
+        linhas.append(str(fila.get_nowait()))
+    assert linhas[-1].startswith("O provedor travou no meio da resposta")
+
+
+class _OpenRouterQueTrava(OpenRouterProvider):
+    """OpenRouter de mentira: streama um pedaço e morre como o DigitalOcean morreu."""
+
+    def __init__(self):
+        self.complete_kwargs = []
+
+    async def stream_complete(self, **kwargs):
+        yield _tok("Resumo das notícias de hoje: ")
+        raise LLMProviderError(
+            "Erro no streaming OpenRouter: Upstream error from DigitalOcean: "
+            "The model is repeating the same chunk = _css_css_css_css."
         )
-    assert provider.complete_kwargs == []
+
+    async def complete(self, **kwargs):
+        self.complete_kwargs.append(kwargs)
+        return await _StreamProvider([]).complete()
+
+
+@pytest.mark.asyncio
+async def test_refazer_no_openrouter_evita_o_provedor_que_travou():
+    provider = _OpenRouterQueTrava()
+    await _svc()._cognitive_round(
+        provider=provider, messages=[], tools=None, req_model="minimax/minimax-m3.1-flash",
+        max_tokens=100, extra={}, progress=None,
+    )
+    assert provider.complete_kwargs[0]["evitar_provedores"] == ["DigitalOcean"]
 
 
 @pytest.mark.asyncio

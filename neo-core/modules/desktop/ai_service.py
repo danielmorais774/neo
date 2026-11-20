@@ -44,6 +44,7 @@ from core.authority import (
 from core.claude_code.balao import tarefas_do_balao
 from core.liveness import touch_progress
 from core.llm.router import LLMRouter, provider_for_model
+from core.llm.openrouter_provider import OpenRouterProvider, provedor_que_falhou
 from core.pks import PKSService
 from core.cognitive import CognitiveReadExecutor, cognitive_tools_for
 from core.pipeline.handoff_parser import extract_handoffs
@@ -8319,7 +8320,9 @@ class AIService:
           rebaixamento;
         * stream que morre ANTES do primeiro chunk cai para o bufferizado, que
           tem a escada;
-        * stream que já emitiu texto propaga o erro: refazer duplicaria na tela.
+        * stream que morre DEPOIS também cai para o bufferizado, uma vez, sem o
+          provedor que falhou. O texto parcial só estava na bolha de progresso,
+          que é substituída, então refazer não duplica nada na tela.
 
         O pin de provedor já é relaxado dentro do `OpenRouterProvider.stream_complete`.
         """
@@ -8389,12 +8392,31 @@ class AIService:
                     (time.monotonic() - t0) * 1000,
                 )
             except Exception as e:  # noqa: BLE001 — a queda é o ponto do bloco
-                if partes:
-                    raise
-                logger.warning(
-                    "[Cognitive] stream falhou antes do primeiro chunk (%s) — "
-                    "refazendo bufferizado, que tem a escada de 429", e,
-                )
+                if not partes:
+                    logger.warning(
+                        "[Cognitive] stream falhou antes do primeiro chunk (%s) — "
+                        "refazendo bufferizado, que tem a escada de 429", e,
+                    )
+                else:
+                    # Morreu NO MEIO. Refazer aqui não duplica nada: o texto
+                    # parcial só foi para a bolha de progresso, que o desktop
+                    # SUBSTITUI a cada evento (useAgentEvents, case 'thinking');
+                    # a resposta de verdade sai do retorno desta função. Sem
+                    # isto, a session-435a6701 perdeu a rodada final inteira
+                    # para um "The model is repeating the same chunk" do
+                    # DigitalOcean, com o resumo pronto no caderno.
+                    culpado = provedor_que_falhou(e)
+                    logger.warning(
+                        "[Cognitive] stream morreu depois de %d chars (%s) — refazendo "
+                        "a rodada bufferizada%s",
+                        sum(len(p) for p in partes), e,
+                        f" sem o provedor {culpado!r}" if culpado else "",
+                    )
+                    if culpado and isinstance(provider, OpenRouterProvider):
+                        comum = {**comum, "evitar_provedores": [culpado]}
+                    await self._emit_progress(
+                        progress, "O provedor travou no meio da resposta — refazendo"
+                    )
 
         resp = await provider.complete(messages=messages, tools=tools, **comum, **extra)
         return resp, (time.monotonic() - t0) * 1000
