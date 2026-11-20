@@ -397,3 +397,20 @@ penalidades = [
 quadros_timeout_s = 60
 # Por quanto tempo o vídeo escolhido pode ser baixado sem comparar de novo.
 escolha_validade_s = 21600
+
+[zion]
+# A consulta do Neo ao Zion, a memória de TRABALHO do Daniel: os projetos, a pasta
+# de cada um no Mac e o que os agentes (Claude Code, Codex) sabem de cada um.
+# Tools zion_overview, zion_search e zion_get; só leitura, pelo container
+# neo-zion (docs/zion-integracao-plan.md §7).
+# Liga as três tools. Desligada, elas somem do cérebro e do roteador.
+consulta_habilitada = false
+# Endpoint MCP do Zion só leitura, pelo nome do container na rede zion-net.
+url = "http://neo-zion:7077/mcp"
+# Prazo de cada pedido HTTP ao Zion, em segundos.
+timeout_s = 8.0
+# Teto de caracteres do resultado que volta ao cérebro (o Zion já resume em
+# ~1900; isto é a rede de segurança).
+max_chars = 6000
+# Quantos registros uma zion_search traz.
+limite_busca = 8

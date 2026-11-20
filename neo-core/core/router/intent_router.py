@@ -1381,6 +1381,7 @@ class IntentRouter:
         (Workstream A — see docs/intent-routing-redesign.md).
         """
         from core.claude_code import chave
+        from core.zion import visivel as zion_visivel
 
         tools = [
             t
@@ -1390,6 +1391,8 @@ class IntentRouter:
             and t.name not in _BRAIN_ONLY_CLIENT_TOOLS
             # chave do Claude desligada no painel: o classificador nem as vê
             and (t.name not in chave.TOOLS or chave.ligado())
+            # consulta ao Zion desligada no neo.toml: idem
+            and zion_visivel(t.name)
         ]
         if not tools:
             return ""

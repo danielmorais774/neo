@@ -2127,6 +2127,9 @@ _TOOL_PROGRESS_LABEL: dict[str, str] = {
     "claude_reply": "falando com o Claude Code",
     "claude_sessoes": "olhando as sessões do Claude no Mac",
     "claude_enviar": "mandando o pedido para a sessão do Claude",
+    "zion_overview": "abrindo a memória de trabalho (Zion)",
+    "zion_search": "procurando na memória de trabalho (Zion)",
+    "zion_get": "abrindo o registro do Zion",
     "service_request": "chamando o serviço externo",
 }
 
@@ -7999,6 +8002,7 @@ class AIService:
         from modules.release.tools import RELEASE_TOOLS
 
         from core.claude_code import chave
+        from core.zion import visivel as zion_visivel
 
         visiveis = [
             t
@@ -8007,6 +8011,8 @@ class AIService:
             and (t.name != "pks_reveal" or escolhida == "pks_reveal")
             # Chave do Claude desligada no painel: as tools dele somem daqui também.
             and (t.name not in chave.TOOLS or self._claude_code_available())
+            # Consulta ao Zion desligada no neo.toml: idem.
+            and zion_visivel(t.name)
         ]
         nomes = {t.name for t in visiveis}
         return visiveis + [t for t in RELEASE_TOOLS if t.name not in nomes]

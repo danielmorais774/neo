@@ -457,6 +457,28 @@ class Video(_Secao):
     escolha_validade_s: int = Field(21600, ge=60, le=604_800)
 
 
+class Zion(_Secao):
+    """A consulta do Neo ao Zion, a memória de trabalho do Daniel.
+
+    Ver docs/zion-integracao-plan.md §7. O neo-core fala com o ``neo-zion`` (só
+    leitura, rede ``zion-net``); as tools são ``zion_overview``, ``zion_search``
+    e ``zion_get``.
+    """
+
+    #: Liga as três tools. Desligada, elas somem do cérebro e do roteador, e o
+    #: executor recusa. Vale no turno seguinte, sem reiniciar.
+    consulta_habilitada: bool = False
+    #: Endpoint MCP do Zion só leitura, pelo nome do container na ``zion-net``.
+    url: str = "http://neo-zion:7077/mcp"
+    #: Prazo de cada pedido HTTP ao Zion, em segundos.
+    timeout_s: float = Field(8.0, gt=0, le=60)
+    #: Teto de caracteres do resultado que volta ao cérebro. O próprio Zion já
+    #: resume (~1900 caracteres medidos na F0); isto é a rede de segurança.
+    max_chars: int = Field(6000, ge=500, le=50_000)
+    #: Quantos registros uma ``zion_search`` traz.
+    limite_busca: int = Field(8, ge=1, le=30)
+
+
 class Ajustes(_Secao):
     teto_adaptativo: AprendizadoDoTeto = AprendizadoDoTeto()
     navegador: Navegador = Navegador()
@@ -470,6 +492,7 @@ class Ajustes(_Secao):
     grpc: Grpc = Grpc()
     transcricao: Transcricao = Transcricao()
     video: Video = Video()
+    zion: Zion = Zion()
 
 
 def caminho() -> Path:

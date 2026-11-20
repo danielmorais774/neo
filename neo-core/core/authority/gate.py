@@ -30,6 +30,7 @@ from typing import Any
 from core.authority.risk import ATUACAO, REVELACAO, classes_of, is_sink, known
 from core.authority.sinks import Destination, covers, destination_of
 from core.authority.turn import TurnAuthority, current_authority
+from core.zion.tools import ZION_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +243,17 @@ def evaluate(
         return GateDecision(
             NEGAR,
             "as sessões do Claude do Daniel só aparecem para ele, num pedido dele",
+            nome,
+        )
+
+    # O Zion é o mapa do trabalho do Daniel: projetos, pastas e máquinas, falhas
+    # abertas. Um contato do WhatsApp ou o remetente de um e-mail não leem isso
+    # (docs/zion-integracao-plan.md §7.3). A agenda pode: o cron de suporte da
+    # fase 2 precisa achar o projeto do chamado. Também vem antes do `is_sink`.
+    if nome in ZION_TOOL_NAMES and authority.from_external:
+        return GateDecision(
+            NEGAR,
+            "a memória de trabalho do Daniel (Zion) só abre para ele e para a agenda dele",
             nome,
         )
 

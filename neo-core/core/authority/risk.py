@@ -70,6 +70,13 @@ _BY_NAME: dict[str, frozenset[str]] = {
     # sessão respondeu); entregar um pedido faz um agente agir na máquina dele.
     "claude_sessoes": frozenset({_L}),
     "claude_enviar": frozenset({_A}),
+    # Zion, a memória de TRABALHO do Daniel (projetos, pastas do Mac, decisões,
+    # falhas). Escrita pelos agentes dele e por ele, com o scanner de segredo do
+    # Zion na gravação: não é texto de terceiro, então não contamina o turno.
+    # O portão nega para quem é de fora (gate.py). Só leitura, por construção.
+    "zion_overview": frozenset({_L}),
+    "zion_search": frozenset({_L}),
+    "zion_get": frozenset({_L}),
     "file_read": frozenset({_F, _L}),
     # A fala transcrita de um vídeo de terceiro é texto de terceiro (injection
     # falada). O áudio vai ao Groq, mas o destino é fixo e escolhido pelo dono no

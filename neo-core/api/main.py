@@ -198,6 +198,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _nomes = "/".join(t.name for t in _email_tools)
         print(f"✅ Cofre wired (vault_list + {_nomes})")
 
+    # Memória de trabalho do Daniel (Zion, docs/zion-integracao-plan.md §7).
+    # Registry e executor sempre juntos, sempre registrados: quem decide se as
+    # tools aparecem é o `[zion] consulta_habilitada` do neo.toml, lido a cada
+    # turno (vale sem reiniciar). Desligada, o roteador, o SERVER_TOOL e o
+    # cérebro não as veem (`core.zion.visivel`), e o executor recusa.
+    from core.zion import ZION_TOOLS, ZionToolExecutor, consulta_ligada
+
+    _tool_registry.register_many(ZION_TOOLS)
+    _tool_executor.register_module_executor("zion", ZionToolExecutor())
+    print(
+        "✅ Zion wired (zion_overview/zion_search/zion_get; consulta "
+        f"{'ligada' if consulta_ligada() else 'desligada no neo.toml'})"
+    )
+
     # Service Gateway (docs/service-gateway-dsl-plan.md): HTTP arbitrário para
     # serviços cadastrados (HA, GitHub, …) sem o LLM ver credencial. Registry
     # (db + seed das envs), política deny>confirm>allow, broker env://.

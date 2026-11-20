@@ -41,6 +41,7 @@ from modules.voice.tools import VOICE_TOOLS
 from modules.weather.tools import WEATHER_TOOLS
 from modules.web_search.tools import WEB_SEARCH_TOOLS
 from modules.working_memory.tools import WORKING_MEMORY_TOOL_NAMES, WORKING_MEMORY_TOOLS
+from core.zion import ZION_TOOL_NAMES
 from shared import ToolCall, ToolResult, ToolSchema
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,9 @@ _USER_SCOPED = frozenset(
     | DATASET_TOOL_NAMES
     | EVENT_TOOL_NAMES
     | RELEASE_TOOL_NAMES
+    # Não precisam do usuário para rodar, mas o que leem é dele: turno sem dono
+    # identificado não abre a memória de trabalho.
+    | ZION_TOOL_NAMES
 )
 
 _SKILLS_LIBRARY_TOOL_NAMES = frozenset(t.name for t in SKILLS_LIBRARY_TOOLS)
@@ -238,6 +242,14 @@ def cognitive_tools_for(user_id: UUID | None) -> list[ToolSchema]:
 
         have = {t.name for t in tools}
         tools += [t for t in TOOL_INDEX_TOOLS if t.name not in have]
+    # Memória de trabalho do Daniel (Zion, docs/zion-integracao-plan.md §7).
+    # Liga e desliga pelo `[zion] consulta_habilitada` do neo.toml, a cada turno.
+    # Despacho pelo executor global (módulo "zion"), como web_search.
+    from core.zion import ZION_TOOLS, consulta_ligada
+
+    if consulta_ligada():
+        have = {t.name for t in tools}
+        tools += [t for t in ZION_TOOLS if t.name not in have]
     if user_id is None:
         tools = [t for t in tools if t.name not in _USER_SCOPED]
     return tools
