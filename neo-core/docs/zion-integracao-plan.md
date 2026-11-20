@@ -1,13 +1,14 @@
-# Neo × Zion: o Neo consulta a memória de trabalho (fase 1) — plano
+# Neo × Zion: o Zion na VPS, e o Neo lendo dele (fase 1) — plano
 
-**Data:** 2026-11-20
-**Status:** F0 medida e F1 feita em 20/11 (§12). A réplica `zion-replica` está de pé, e o
-modo só leitura do Zion está no commit `6e0a9d8` do `zion-memory-mcp`. F2–F5 não começaram.
+**Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
+**Status:** F0 e F1 feitas (§12). A réplica `zion-replica` da F0 era o desenho anterior e sai
+na migração (§4). F2–F6 não começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
 **Depende de:** o Zion (`~/Documents/projects/zion-memory-mcp`, design em
-`docs/design.md` de lá) e o portão de autoridade (`core/authority/`).
+`docs/design.md` de lá), o WireGuard Mac↔VPS (`docs/wireguard-mac-vps.md`) e o portão de
+autoridade (`core/authority/`).
 
 ---
 
@@ -17,153 +18,233 @@ O Daniel quer que o Neo consulte o Zion: quais projetos existem, em que pasta do
 cada um mora, e o que os agentes já sabem de cada um (regras, decisões, falhas
 abertas). Isso é o alicerce da fase 2: o Neo só consegue chamar o Claude "na pasta do
 projeto" se souber onde ela fica. Ele pediu que a ligação seja **pela própria VPS**,
-sem depender do Mac no caminho, e em fases separadas, com esta integração primeiro.
+em fases separadas, com esta integração primeiro.
+
+**Revisão de 20/11, depois da F1:** o Daniel decidiu levar o Zion **inteiro** para a VPS.
+Passa a existir um Zion só: o Claude Code e o Codex do Mac falam com ele pelo
+WireGuard, e o neo-core lê dele lá mesmo.
 
 ## 1. Onde as coisas estão hoje (medido em 20/11)
 
-- **O Zion roda no Mac, não na VPS.** O `zion serve --http` sobe pelo launchd em
-  `127.0.0.1:7077/mcp`, e os dados ficam em `~/.zion` (repo git próprio). Na VPS não
-  há processo do Zion nem `~/.zion`. Só o **código** do repo chega lá, porque a sessão
-  `contabo-projects` do Mutagen copia `~/Documents/projects` inteiro.
+- **O Zion roda no Mac, um processo por sessão.** O Claude Code e o Codex sobem cada um o
+  seu `zion serve` por **stdio** (`claude mcp get zion` e `~/.codex/config.toml`: comando
+  `~/.local/bin/zion serve`). Esses processos leem e gravam direto em `~/.zion` (repo git),
+  com um lock entre processos. O launchd só roda o `zion tick` a cada 5 min (pull do
+  spool do Neo e jardineiro). O `zion serve --http` que escuta na 7077 do Mac é um
+  `npm run dev` esquecido, não faz parte da instalação. Na VPS só chega o código, pela
+  sessão `contabo-projects` do Mutagen.
 - **O domain já é o cadastro de projeto.** O `domain.md` guarda
   `repos: [{name, path, remote}]`, e o `domain_resolve(cwd, git_remote)` acha o domain
   pela pasta ou pelo remote. Hoje existem 4: `global`, `homelab`, `neo` e `zion`.
-- **Não há tool MCP para listar os domains.** Existe `ZionService.domainList()`, que só
-  a CLI usa (`zion domains`).
-- **As leituras não gravam.** `contextGet`, `memorySearch` e `recordGet` não chamam
-  lock, escrita nem commit (conferido no `src/service.ts`).
-- **Subir o servidor grava.** O `startHttp` chama `service.init()`, que pega o lock, cria
-  `.zion/cache`, garante o repo git e faz commit. Com a pasta montada só para leitura, ele
-  morreria no boot.
-- **O servidor HTTP só aceita `localhost`.** O transporte liga a proteção contra DNS
-  rebinding, e o `allowedHosts` tem só `127.0.0.1`/`localhost`. Uma chamada a
-  `http://neo-zion:7077` seria recusada. O host de escuta vem do `config.toml`
-  (`127.0.0.1`), e não há flag `--host` na CLI (só `--port`).
-- **Plano com caminho do Mac:** o `planProgress` só compara o `.md` de origem quando o
-  arquivo existe (`existsSync`). Na VPS o caminho não existe, e o campo vira `null`, sem
-  alarme falso.
+- **Os hooks do Claude Code rodam no Mac.** `zion hook session-start|pre-compact|stop|session-end`
+  lê o transcript local (só para ver quais arquivos foram editados), acha o domain pelo
+  `cwd` e grava checkpoint mecânico.
+- **O servidor lê o disco e o git de quem chama.** Isso acontece em:
+  - `domain_resolve` e `domain_create`: `realpath` e `git remote`;
+  - `session_start` e `session_checkpoint`: o estado do git no `cwd`;
+  - `session_resume`: o drift do git e, no modo review, os arquivos mudados entre dois
+    commits;
+  - `plan_save`: lê o `.md` pelo caminho e guarda o sha.
+
+  Hoje funciona porque servidor e cliente estão no mesmo Mac. Com o servidor na VPS, os
+  caminhos do Mac não existem lá: o Mutagen leva os projetos para `/home/daniel/...`, e
+  sem `.git`.
+- **A F1 resolveu o lado da leitura** (§12): `serve --read-only`, `ZION_HOST`,
+  `ZION_ALLOWED_HOSTS`, `domain_list` e o `Dockerfile`.
+- **O proxy do sandbox barra os IPs internos.** A lista negra do tinyproxy cobre `10.x`,
+  `127.x`, `172.16–31.x` e o IP público da VPS. Medido: do `neo-workbench`,
+  `10.66.66.1:8000` dá 403. A limitação conhecida é um nome público que resolva para um
+  IP interno (DNS rebinding).
 - **Lado do Neo:** o `httpx` já está no `pyproject.toml`; não há cliente MCP nem tool do
   Zion. A única ponte Neo → Zion é o **spool de falhas** (§11 do design do Zion), que
   está pronta numa cópia de 18/11 (sessão `f8a807a4`, `scratchpad/dev/neo-core`) e **não
   foi publicada**. Essa cópia já cria a seção `[zion]` no `neo.toml` e a classe `Zion` no
   `shared/ajustes.py`.
 
-## 2. Decisão: réplica só de leitura na VPS
+## 2. Decisão (20/11): o Zion mora na VPS
 
-| | Réplica só de leitura na VPS (**escolhida**) | Mover o Zion para a VPS | O Neo chama o Zion do Mac (WireGuard ou desktop) |
+A fonte da verdade passa a ser `/home/daniel/.zion` na VPS. **Dois processos** leem a
+mesma pasta:
+
+| Processo | Quem usa | Onde escuta | Grava |
 |---|---|---|---|
-| Fonte da verdade | Mac, como hoje | VPS | Mac |
-| Claude Code e Codex | não mudam | passam a falar com a VPS pelo WireGuard; os hooks (que hoje escrevem direto em `~/.zion`) precisam virar cliente HTTP | não mudam |
-| Neo lê com o Mac desligado | sim (último estado) | sim | não |
-| Neo lê no turno da agenda | sim | sim | só pelo desktop, e só com ele aberto |
-| O Neo consegue gravar no Zion | **não, por construção** | sim, se não travar | sim, se não travar |
-| Porta nova | nenhuma | a do Zion no WireGuard | a do Mac no WireGuard (ou nenhuma, pelo desktop) |
+| `zion` | Claude Code e Codex do Mac (pelo `zion proxy` e pelos hooks), e o `zion tick` | `10.66.66.1:7077`, só pelo WireGuard, com token | sim |
+| `neo-zion` | neo-core | rede `zion-net` (internal), sem porta publicada | **não** (`--read-only`, pasta montada `:ro`) |
 
-**Por que a réplica:**
-1. É a ligação "pela própria VPS" que o Daniel pediu, sem mexer no que já funciona no
-   Mac.
-2. **O Neo não pode gravar no Zion.** O Zion entra no começo de toda sessão do Claude
-   Code (hook `SessionStart`). Se o Neo gravasse num turno que leu um e-mail, uma injeção
-   viraria instrução permanente para todas as sessões do Claude do Daniel. Com a réplica,
-   não existe caminho de escrita: não é regra de prompt nem lista de tools, é a
-   arquitetura. A única escrita do Neo continua sendo o spool de falhas, com formato fixo,
-   que o `zion pull` do Mac valida.
+**Por que dois processos e não um só com permissão por token:**
+1. O `neo-zion` é a F1 pronta, sem código novo.
+2. **O Neo continua sem caminho de escrita, por construção.** Ele não alcança o `zion`
+   (outra rede) e não tem o token. O Zion entra no começo de toda sessão do Claude Code;
+   se o Neo gravasse num turno que leu um e-mail, uma injeção viraria instrução
+   permanente para todos os agentes.
 
-**Custo:** com o Mac desligado, a réplica fica parada no último estado (o que é aceitável:
-projeto e pasta mudam pouco), e uma parte da memória passa a existir na VPS (§4).
+**O que muda em relação ao desenho da réplica:**
+- A VPS passa a ser a fonte, e o Mac fica com uma cópia de backup (Mutagen VPS → Mac).
+- `sessions/` e `homelab` passam a morar na VPS. Isso é consequência da decisão dele e
+  tira as perguntas 1 e 2 do §10 anterior. Os checkpoints são o resumo do trabalho, não a
+  conversa. O transcript continua fora do Zion (design §12 de lá).
+
+**Custos:**
+- **Mac sem WireGuard** (sem internet, VPS fora do ar): o Claude Code trabalha sem Zion.
+  Os hooks desistem em até 2 s para não atrasar a sessão. Há uma opção de cair para uma
+  leitura local do backup (§10).
+- **Latência:** ~170 ms de ida e volta por chamada (ping do WireGuard, Brasil–Europa). Um
+  hook faz de 1 a 4 chamadas.
+- **Trabalho no Zion:** o cliente remoto (§5.2) é a maior parte desta revisão.
 
 ## 3. Arquitetura
 
 ```
- Mac                                         VPS (contabo-neo)
- ~/.zion  (fonte; Claude Code, Codex,        /home/daniel/.zion-replica
-           hooks e zion tick, como hoje)              │  montado :ro em /data
-     │                                                ▼
-     └── Mutagen "zion-replica" ──────────►  neo-zion (container)
-         one-way-replica, Mac → VPS            zion serve --http --read-only
-         (só o subconjunto do §4)              0.0.0.0:7077, sem porta publicada
-                                                      ▲
-                                                      │ rede zion-net (internal)
-                                                      │
-                                              neo-core (entra na zion-net)
-                                                core/zion/cliente.py (httpx, MCP)
-                                                tools zion_projetos / zion_buscar / zion_ler
+ Mac                                                VPS (contabo-neo)
+ Claude Code / Codex                                /home/daniel/.zion   (fonte, repo git)
+   ├─ zion proxy (stdio, um por sessão) ──┐               │ rw                 │ :ro
+   │   preenche o que só o Mac vê:        │               ▼                    ▼
+   │   git, realpath, conteúdo do plano   ├─ WireGuard ─► zion               neo-zion
+   └─ zion hook <evento> ─────────────────┘   10.66.66.1:7077               serve --http --read-only
+       lê o transcript e o git no Mac          serve --http, token          rede zion-net (internal)
+                                               só entra pela wg0                  ▲
+ ~/.zion-backup ◄── Mutagen one-way, VPS → Mac   zion-tick (5 min)                │
+                    (com .git)                   lê o spool do neo-core        neo-core
 ```
 
-- **`zion-net`** é `internal: true` e só tem o `neo-zion` e o `neo-core`. O sandbox
-  (`workbench-net`), o proxy dele e o navegador (`browser-net`) não alcançam o Zion.
-- **Nenhuma porta publicada**, nem em `127.0.0.1` do host.
-- O container roda com `read_only: true`, `/data` montado `:ro`, `tmpfs` em `/tmp`,
-  `cap_drop: ALL`, `no-new-privileges` e limite de memória.
-- O código do Zion chega à VPS pelo `contabo-projects`, mas **a imagem não se reconstrói
-  sozinha**: mudou o Zion de um jeito que importa para a leitura, tem de rebuildar o
-  `neo-zion`.
+- **`zion` (com escrita):**
+  - publicado só em `10.66.66.1:7077`, no `docker-compose.override.yml`, como o neo-core
+    e o postgres;
+  - uma regra no `DOCKER-USER` faz a porta 7077 aceitar só o que entra pela `wg0`. Isso
+    barra as redes do Docker (sandbox, navegador) e a `eth0`;
+  - token Bearer obrigatório;
+  - `10.66.66.1:7077` entra no `allowedHosts`, com a proteção contra DNS rebinding
+    ligada;
+  - a imagem com escrita precisa de `git`, que o Zion usa para o histórico (o `alpine`
+    não traz).
+- **`neo-zion` (só leitura):** a F1, montando `/home/daniel/.zion:/data:ro`.
+- **`zion-tick`:** a mesma imagem do `zion`, em laço de 5 min. Lê o spool do Neo direto
+  da pasta do neo-core na VPS (montada `:ro`), sem passar pelo Mutagen. O servidor e o
+  tick dividem a pasta pelo lock entre processos que o Zion já tem.
+- Os três containers rodam como uid 1000, o dono dos arquivos.
 
-## 4. O que vai para a VPS
+## 4. Migração dos dados
 
-| Entra | Fica no Mac |
-|---|---|
-| `config.toml`, `synonyms.yaml` | `domains/*/sessions/` (checkpoints: o resumo do trabalho de cada conversa) |
-| `domains/*/domain.md` | `domains/*/transcripts/` |
-| `domains/*/memories/`, `plans/`, `tasks/`, `failures/` | `.zion/` (lock e cache), `.git/` |
-| | `declined.yaml`, `recall.yaml` |
-| | `domains/homelab/` (**decisão em aberto**, §10) |
+**O cuidado:** cada sessão aberta do Claude Code e do Codex tem o seu `zion serve` por
+stdio gravando em `~/.zion`. Uma sessão que continuar aberta depois da troca segue
+gravando no Mac, e o que ela gravar se perde.
 
-- As `sessions/` ficam fora por causa da regra de não deixar conteúdo das conversas na
-  VPS: os checkpoints são o resumo do que cada sessão fez. O Neo não precisa deles.
-  Efeito: o `context_get` da réplica vem sem a seção de sessões, e o resto (regras,
-  planos, falhas, tarefas) vem igual.
-- O `global` entra porque o `context_get` de qualquer domain soma as regras do `global`.
+1. **Parar os escritores do Mac:**
+   - fechar todas as sessões do Claude Code e do Codex, menos a que faz a migração;
+   - desligar o `zion tick`: `launchctl bootout gui/$UID/dev.zion.memory.tick`;
+   - matar o `npm run dev` da 7077.
+2. **Tirar a réplica:** encerrar o Mutagen `zion-replica` e apagar `~/.zion-replica` na
+   VPS.
+3. **Copiar:** `rsync -a` do `~/.zion` inteiro (com `.git`, sem `.zion/`) para
+   `/home/daniel/.zion` na VPS. Conferir o mesmo `git rev-parse HEAD` e a mesma contagem
+   de arquivos.
+4. **Subir na VPS:** `zion`, `zion-tick` e `neo-zion`. Conferir o `/health` e uma busca
+   pelos dois lados.
+5. **Trocar o Mac:**
+   - `zion install claude-code --remote …` e `zion install codex --remote …`. O comando
+     do MCP vira `zion proxy`;
+   - os hooks passam a ler a URL e o caminho do token de `~/.config/zion/client.toml`
+     (modo 0600).
+6. **Guardar o antigo e ligar o backup:**
+   - `~/.zion` vira `~/.zion.antes-da-vps-20261120`, sem apagar nada;
+   - criar o Mutagen `zion-backup` (VPS → Mac, `one-way-replica`, com `.git`) em
+     `~/.zion-backup`.
+7. **Conferir com uma sessão nova do Claude Code:** o contexto do Zion tem de chegar no
+   `SessionStart`, e um checkpoint tem de aparecer na VPS.
+
+- A sessão que faz a migração **não grava mais no Zion depois do passo 5**: o
+  `zion serve` dela ainda é o local.
+- Se `~/.zion` reaparecer no Mac depois da troca, alguma sessão ficou aberta e gravou
+  nele.
+- **Desfazer:** voltar o `claude mcp` e o Codex para `zion serve` (stdio local), copiar
+  `/home/daniel/.zion` de volta para `~/.zion` e religar o `zion tick`.
 
 ## 5. Mudanças no Zion (repo `zion-memory-mcp`)
 
-1. **`zion serve --http --read-only`**
-   - registra só as tools de leitura: `domain_list` (nova), `domain_resolve`,
-     `context_get`, `memory_search`, `record_get` e `record_related`;
-   - não chama `init()`, não pega lock, não faz commit;
-   - não cria o diretório interno (`.zion/`): fora do lock, nada o usa (conferido na F1);
-   - defesa em profundidade: no modo só leitura, o `Store` levanta erro em qualquer
-     escrita, mesmo que alguém registre uma tool de escrita por engano.
-2. **`domain_list`**: tool nova, de leitura, sobre o `domainList()` que a CLI já usa,
-   devolvendo também o `remote` de cada repo.
-3. **Host:** `--host` na CLI (ou `ZION_HOST`), e `ZION_ALLOWED_HOSTS` para somar
-   `neo-zion:7077` ao `allowedHosts`. A proteção contra DNS rebinding continua ligada.
-4. **`Dockerfile`**: Node 22 slim, `npm ci`, `npm run build`, usuário não-root,
-   `HEALTHCHECK` no `/health` que o servidor já tem.
-5. **Testes (vitest):**
-   - no modo só leitura, as tools de escrita não existem;
-   - com a pasta de dados sem permissão de escrita, o servidor sobe e responde;
-   - `domain_list` devolve slug, nome, descrição, pastas e remote;
-   - o `allowedHosts` aceita o host configurado e recusa outro.
+### 5.1 ✅ F1: modo só leitura
 
-No Mac nada muda: o modo só leitura é desligado por padrão, e o `npm run build` continua
-sendo o deploy de lá.
+`serve --read-only` (ou `ZION_READ_ONLY=1`) com só as 6 tools de leitura, `init()` sem
+gravar e o `Store` recusando escrita; `ZION_HOST`; `ZION_ALLOWED_HOSTS`; `domain_list`;
+`Dockerfile`. Commit `6e0a9d8`, detalhes no §12.
+
+### 5.2 F2: Zion remoto
+
+1. **Token no HTTP.**
+   - `ZION_TOKEN_FILE` (ou `[server] token_file`). Com token configurado, `/mcp` e
+     `/hooks` exigem `Authorization: Bearer <token>`, comparado em tempo constante.
+   - Sem token, fica o comportamento de hoje, que só serve em loopback.
+   - Com token, o `/health` sem autenticação responde só `{"name":"zion","ok":true}`.
+2. **O cliente manda o que só ele vê.** Um campo opcional `client` nas tools que hoje leem
+   o disco de quem chama:
+   - `domain_resolve` e `domain_create`: o `realpath` e o `git remote` de cada pasta;
+   - `session_start` e `session_checkpoint`: o estado do git do `cwd` (branch, head,
+     arquivos sujos, remote);
+   - `session_resume`: o git atual do `cwd`. No modo review, o proxy calcula os arquivos
+     mudados entre `base_sha` e `head_sha` depois da resposta;
+   - `plan_save`: o conteúdo do `.md` e o sha. O `source_path` continua guardado como
+     referência.
+
+   A regra fica no código:
+   - se o caminho existe no servidor, ele mesmo calcula (é o modo local de hoje);
+   - se não existe, usa o `client`;
+   - sem nenhum dos dois, o `git` fica `null`, como já acontece fora de um repo.
+3. **`zion proxy`**: servidor MCP por stdio no Mac que repassa ao Zion remoto (SDK:
+   `Client` + `StreamableHTTPClientTransport`, com o token).
+   - Lista as tools do remoto e preenche o `client` de cada chamada (item 2).
+   - Se o remoto não responder dentro do timeout, devolve um erro legível ("o Zion remoto
+     está fora do ar") em vez de travar a sessão.
+4. **Hooks remotos.** Com o `client.toml` presente, `zion hook <evento>` não abre pasta de
+   dados nenhuma:
+   - lê o transcript e o git no Mac;
+   - manda um resumo (`cwd`, `session_id`, `git`, `edits: [{path, at}]`) para
+     `POST /hooks/<evento>` no servidor, que roda a mesma lógica de hoje (`runHook`)
+     sobre esse resumo;
+   - o transcript nunca sai do Mac, só a lista de arquivos editados e a hora de cada
+     edição;
+   - timeout de 2 s. Se falhar, loga em `~/.zion-client/hook-errors.log` e não bloqueia o
+     Claude.
+5. **`zion install claude-code|codex --remote <url>`**:
+   - grava o `client.toml` (URL e caminho do token);
+   - troca o comando do MCP para `zion proxy`;
+   - mantém os hooks.
+
+   O `zion install launchd` deixa de ser usado no Mac, porque o tick vai para a VPS.
+6. **Tick em laço:** `zion tick --loop 300`. O `spool_path` do `[neo_pull]` aponta para o
+   spool montado.
+7. **`git` na imagem com escrita:** um estágio do `Dockerfile` com `apk add git` (a imagem
+   do `neo-zion` continua sem).
+8. **Testes:**
+   - token: sem, errado e certo;
+   - o `client` é usado quando o caminho não existe e ignorado quando existe;
+   - `zion proxy` contra um servidor HTTP de teste, inclusive com o servidor fora do ar;
+   - o hook remoto produz o mesmo checkpoint que o local, com o mesmo transcript de
+     exemplo.
 
 ## 6. Infra na VPS
 
-- **Mutagen**, ✅ criado do Mac em 20/11 com este comando (padrões sem `/` valem em
-  qualquer nível; com `/` no começo, só na raiz):
-  ```
-  mutagen sync create --name zion-replica --mode one-way-replica --ignore-vcs \
-    --ignore sessions --ignore transcripts --ignore /.zion --ignore /declined.yaml \
-    --ignore /declined.toml --ignore /recall.yaml --ignore /domains/homelab \
-    ~/.zion contabo-neo:/home/daniel/.zion-replica
-  ```
-  `one-way-replica` não tem conflito: o que existir do lado da VPS e não vier do Mac é
-  apagado. Desfazer: `mutagen sync terminate zion-replica` e apagar a pasta na VPS.
-- **`docker-compose.yml`**: serviço `neo-zion` (build de `../zion-memory-mcp`), volume
-  `/home/daniel/.zion-replica:/data:ro`, `ZION_DATA_DIR=/data`,
-  `command: serve --http --read-only --host 0.0.0.0`, as travas do §3,
-  `restart: unless-stopped`, rede `zion-net`.
-  - **`user: "1000:1000"`**: o Mutagen grava os arquivos da réplica com modo 0600, dono
-    `daniel` (uid 1000). Outro usuário no container não lê nada.
-  - **Imagem base `node:22-alpine`**: já está na VPS (230 MB, contra 1,64 GB da
-    `node:22`), e o disco está em 93%. O `node_modules` do Zion tem 84 MB.
-  - `healthcheck` no `/health`. Ele responde a qualquer `Host` e mostra o `data_dir` e os
-    domains, o que só é aceitável porque fica dentro da `zion-net`.
-- **Rede `zion-net`**: `driver: bridge`, `internal: true`.
-- **`neo-core`** entra na `zion-net`. Isso exige recriar o container
-  (`docker compose up -d --no-deps neo-core`): uma queda curta, feita fora de turno.
+- **`docker-compose.yml` do neo:**
+  - **`zion`**: build de `../zion-memory-mcp` (estágio com `git`);
+    - volume `/home/daniel/.zion:/data` (com escrita);
+    - token em `/home/daniel/.config/zion/token` (0600), montado só para leitura;
+    - `ZION_TOKEN_FILE` e `ZION_ALLOWED_HOSTS=10.66.66.1:7077`;
+    - `user: "1000:1000"`, `read_only`, `tmpfs /tmp`, `cap_drop: ALL`,
+      `no-new-privileges`, 256 MB, `restart: unless-stopped`;
+    - rede própria `zion-pub`, que não é a `default` nem a `zion-net`.
+  - **`zion-tick`**: a mesma imagem, `command: tick --loop 300`, a mesma pasta com
+    escrita e `./neo-core/.zion-spool:/neo-spool:ro`.
+  - **`neo-zion`**: como na F1, com `/home/daniel/.zion:/data:ro`,
+    `ZION_ALLOWED_HOSTS=neo-zion:7077` e a rede `zion-net`.
+  - **Rede `zion-net`**: `internal: true`. O **`neo-core`** entra nela, o que exige
+    recriar o container (uma queda curta, feita fora de turno).
+- **`docker-compose.override.yml`** (fora do git): `zion` com
+  `ports: ["10.66.66.1:7077:7077"]`.
+- **Firewall:** no `PostUp` do `wg0.conf`, ao lado da regra `raw` que já existe:
+  `iptables -I DOCKER-USER -p tcp --dport 7077 ! -i wg0 -j DROP`. O `DOCKER-USER` vê o
+  pacote depois do DNAT, então a porta é a do container.
+- **Token:** gerado na VPS (`openssl rand -hex 32`) e copiado para o Mac em
+  `~/.config/zion/token` (0600). Nunca vai para git, memória, log nem conversa.
+- **Mutagen:** encerrar o `zion-replica` e criar o `zion-backup` (§4).
+- **Imagem base:** `node:22-alpine`, que já está na VPS. O disco estava em 92%.
 
 ## 7. Lado do Neo (neo-core)
 
@@ -240,41 +321,51 @@ Cada fase só termina com a evidência da coluna da direita.
 
 | Fase | O quê | Pronta quando |
 |---|---|---|
-| **F0** | Medições, sem código: (1) Mutagen `one-way-replica` com os ignores: o que chega e quanto demora uma gravação do Mac até a VPS; (2) um `zion serve --http` num container Node na VPS lendo uma **cópia** da réplica: o que ele tenta gravar; (3) de dentro do `neo-core`, `initialize` + `tools/call` por `curl`: resposta em JSON ou SSE, e o `Host` recusado; (4) tamanho do `context_get neo` e de um `memory_search` (o `zion budget-check` já mede) | Números anotados no §12 |
-| **F1** | Zion: `--read-only`, `domain_list`, `--host`/`ZION_ALLOWED_HOSTS`, `Dockerfile`, testes do §5 | `npm test` passa; no Mac, o `zion serve` de sempre continua igual (o Claude Code abre sessão e grava checkpoint) |
-| **F2** | Infra: sessão `zion-replica`, `neo-zion` no compose, rede `zion-net`, `neo-core` na rede | Do `neo-core`, `tools/call domain_list` responde; do `neo-workbench`, `neo-zion` não resolve nem conecta; uma memória salva no Mac aparece na réplica |
-| **F3** | neo-core: cliente, as três tools, risco e portão, `[zion]` no `neo.toml`. Desenvolvido numa cópia no scratchpad, suíte inteira lá, publicação com `cmp` de 3 vias | Testes: cliente com JSON e SSE e reinicialização no 404; portão nega externo e permite agenda; tools fora da mesa com a consulta desligada; Zion fora do ar não derruba o turno |
-| **F4** | E2E pelo chat | Ver abaixo |
-| **F5** (opcional) | Publicar o spool de falhas (pronto na cópia de 18/11): precisa de merge com o `ai_service.py` e o `grpc_server.py` atuais | Uma falha forçada aparece no Zion do Mac depois do `zion tick` |
+| **F0** ✅ | Medições do desenho da réplica (§12) | Números no §12 |
+| **F1** ✅ | Zion só leitura: `--read-only`, `domain_list`, `ZION_HOST`/`ZION_ALLOWED_HOSTS`, `Dockerfile` | Feita (§12) |
+| **F2** | Zion remoto (§5.2): token, `client`, `zion proxy`, hooks remotos, `install --remote`, tick em laço, `git` na imagem com escrita | `npm test` verde; no Mac **sem** `client.toml`, tudo igual a hoje; proxy e hooks funcionando contra um servidor HTTP local de teste, numa pasta de dados de teste |
+| **F3** | Infra na VPS e migração (§4, §6) | Uma sessão nova do Claude Code no Mac recebe o contexto vindo da VPS e grava checkpoint lá; do `neo-core`, `domain_list` responde pelo `neo-zion`; do sandbox e do `neo-core`, o `zion` com escrita não responde; o backup do Mac acompanha |
+| **F4** | neo-core: cliente, as três tools, risco e portão, `[zion]` no `neo.toml` (§7). Desenvolvido numa cópia no scratchpad, suíte inteira lá, publicação com `cmp` de 3 vias | Testes: cliente com JSON e SSE e reinicialização no 404; portão nega externo e permite agenda; tools fora da mesa com a consulta desligada; Zion fora do ar não derruba o turno |
+| **F5** | E2E (abaixo) | Os 6 itens |
+| **F6** (opcional) | Publicar o spool de falhas (pronto na cópia de 18/11): merge com o `ai_service.py` e o `grpc_server.py` atuais. O pull agora roda no `zion-tick` | Uma falha forçada aparece no Zion em até 5 min |
 
-**E2E da F4** (mensagens digitadas, menos de 240 caracteres):
+**E2E da F5** (mensagens digitadas, menos de 240 caracteres):
 1. "Quais projetos você conhece no Zion?" → lista com `neo` e `zion`, com as pastas.
 2. "O que o Zion sabe do projeto neo? Tem falha aberta?" → cita a falha aberta e as
    regras, sem inventar.
 3. "Onde fica o projeto zion no meu Mac?" → `/Users/daniel/Documents/projects/zion-memory-mcp`.
-4. Uma memória nova salva no Mac (pelo Claude Code) aparece numa busca do Neo em menos
-   de um minuto.
+4. Uma memória salva pelo Claude Code no Mac aparece numa busca do Neo na hora (agora é a
+   mesma pasta).
 5. Pelo WhatsApp, um contato perguntando dos projetos → o portão nega (conferir no
    diário).
+6. Com o WireGuard desligado no Mac, uma sessão nova do Claude Code abre sem travar, e o
+   hook registra a falha no log.
 
 ## 9. Riscos
 
 | Risco | O que fazer |
 |---|---|
-| Mac desligado | A réplica fica no último estado; é aceitável para projeto e pasta. Se um dia precisar saber a idade da réplica, a `domain_list` devolve o `updated_at` |
-| Imagem do `neo-zion` velha depois de mudar o Zion | Rebuild do `neo-zion` faz parte do "deploy" de qualquer mudança no formato dos registros |
+| VPS ou WireGuard fora do ar | O Claude trabalha sem Zion; os hooks desistem em 2 s. Fallback local é a decisão 2 do §10 |
+| Token vazado | Quem estiver no WireGuard grava no Zion. Trocar: arquivo novo na VPS, reiniciar o `zion`, copiar para o Mac |
+| Sessão do Claude que ficou aberta na migração | Grava no `~/.zion` local e se perde. Passo 1 do §4; `~/.zion` reaparecendo no Mac é o sinal |
+| Dois escritores (`zion` e `zion-tick`) | O lock entre processos do Zion já cobre (design §8 de lá) |
+| Imagem velha depois de mudar o Zion | Rebuild de `zion`, `zion-tick` e `neo-zion` faz parte do deploy de qualquer mudança no Zion. O `npm run build` do Mac deixa de ser o deploy do servidor; continua sendo o do `zion proxy` e dos hooks |
+| Disco da VPS (92%) | Os dados do Zion têm ~2 MB mais o `.git`; o `git` na imagem soma ~15 MB |
 | Texto ruim numa memória vira instrução para o Neo | Aceito: o Zion é escrito pelos agentes do Daniel e por ele. O Neo não grava, então não há laço de auto-alimentação |
-| Custo em tokens | `max_chars`; o `context_get` já é resumido (~1–2k tokens) |
-| A mesma memória em dois lugares (nativa do Claude e Zion) | Fora do escopo; a decisão de desligar a nativa continua com o Daniel |
+| Custo em tokens no Neo | `max_chars`; o `context_get` já é resumido (~1–2k tokens) |
 
 ## 10. Decisões em aberto (do Daniel)
 
-1. **`homelab` na réplica?** Ele tem o mapa da infra (hosts, usuários, portas). Não tem
-   segredo, porque o scanner barra, mas o Neo não precisa dele para projetos.
-   **Recomendo fora.** Na F0 a réplica foi criada **sem** ele; incluir = recriar a sessão
-   sem o `--ignore /domains/homelab`.
-2. **`sessions/` fora da réplica?** Recomendo fora (§4). Na F0 ficaram fora.
-3. **Nomes das tools:** `zion_projetos`, `zion_buscar`, `zion_ler`.
+1. **O que o Neo vê.** Com tudo na VPS, o `neo-zion` vê também o `homelab` e os
+   checkpoints das sessões. **Recomendo deixar ver tudo:** é o assistente dele, e o
+   portão já barra quem é de fora. A alternativa é um filtro no modo só leitura que
+   esconda domains escolhidos.
+2. **Fallback com o Mac offline.** O `zion proxy` lê o `~/.zion-backup` em modo só leitura
+   quando o remoto não responde. **Recomendo, mas depois da F3.** A F2 sai sem isso.
+3. **Aviso de "o `.md` do plano mudou desde o upload"** no `context_get`: no remoto o
+   servidor não enxerga o arquivo. **Recomendo o proxy recalcular** para os planos do
+   domain. A alternativa é o aviso sumir.
+4. **Nomes das tools do Neo:** `zion_projetos`, `zion_buscar`, `zion_ler`.
 
 ## 11. Depois desta fase (fase 2, outro plano)
 
@@ -285,9 +376,9 @@ Fica registrado aqui para não se perder:
   **uma vez** em `~/Neo/projetos/<nome>` (fora de `~/Documents/projects`, que o Mutagen
   copia para a VPS), com o repo vindo do Daniel ou do `gh repo list` dele, **nunca do
   e-mail**;
-- **a escrita do Neo no Zion** (cadastrar projeto) não pode passar pela réplica. Vai por
-  um spool de pedidos que o `zion pull` aplica no Mac, ou pelo desktop, sempre num turno
-  limpo do Daniel;
+- **a escrita do Neo no Zion** (cadastrar projeto) não passa pelo `neo-zion`, que é só
+  leitura. Vai por um caminho próprio, decidido na fase 2 (ex.: um token do Neo que só
+  pode `domain_create`, usado só depois do "sim" do Daniel num turno limpo);
 - worktree por chamado, papel analista só de leitura, tabela de chamados, revisor.
 
 ## 12. Registro de execução
@@ -391,3 +482,24 @@ usa, então no modo só leitura ele simplesmente não é criado.
 - **Mac em modo normal:** `zion doctor` e `zion domains` pelo shim funcionam. As sessões
   novas do Claude Code já usam o `dist/` novo. O servidor HTTP do launchd continua com o
   código antigo até reiniciar; não reiniciei para não derrubar as sessões abertas.
+
+### Revisão do desenho (20/11/2026, depois da F1)
+
+O Daniel decidiu levar o Zion inteiro para a VPS, com o Claude Code do Mac falando com
+ele pelo WireGuard (§0, §2). O levantamento que mudou o plano:
+- `claude mcp get zion` e `~/.codex/config.toml`: os dois usam **stdio**
+  (`~/.local/bin/zion serve`), um processo por sessão, gravando direto em `~/.zion`. O
+  launchd só tem o `dev.zion.memory.tick`. O `serve --http` da 7077 é um `npm run dev`
+  (`node --watch … dist/cli.js serve --http --port 7077`).
+- `src/service.ts`: `realpath`/`inspectRepo` em `domainResolve`, `domainCreate`,
+  `domainDecline`, `sessionStart`, `sessionCheckpoint`, `sessionResume` (e
+  `changedFiles` no modo review), e leitura do arquivo em `planSave`. Daí o campo
+  `client` e o `zion proxy` do §5.2.
+- `src/hooks.ts`: os hooks leem o transcript local (`scanTranscript`) e chamam o serviço
+  direto. Daí o `POST /hooks/<evento>` com o resumo feito no Mac.
+- Do `neo-workbench`, `http://10.66.66.1:8000/health` e `http://172.17.0.1:8000/health`
+  dão 403 no proxy (a lista negra cobre `10.x` e `172.16–31.x`).
+
+O que continua valendo do desenho anterior: o modo só leitura (F1) vira o `neo-zion`, e o
+lado do Neo (§7) não muda. O que sai: a réplica `zion-replica` (Mac → VPS), que é
+encerrada no passo 2 da migração.
