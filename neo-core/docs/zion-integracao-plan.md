@@ -616,10 +616,18 @@ a dica de `git diff` no modo review; `client.toml` e `zion install claude-code -
   `neo` veio da VPS em **661 ms** de ponta a ponta. O `~/.zion` não reapareceu.
 - `zion-tick`: primeira rodada `neo_pull: no_spool`, jardineiro sem LLM.
 
+**Regra de firewall (20/11, aplicada como root pela chave SSH; o `daniel` não tem sudo sem
+senha):** `~/zion-firewall.sh` na VPS põe a regra no `DOCKER-USER` e grava o drop-in
+`/etc/systemd/system/docker.service.d/zion-7077.conf` (`ExecStartPost=-…`; o `-` faz uma
+falha ali nunca derrubar o Docker). `iptables -S DOCKER-USER`:
+`-A DOCKER-USER ! -i wg0 -p tcp -m tcp --dport 7077 -j DROP`. Conferido depois:
+- Mac → `10.66.66.1:7077` (pela wg0): 200;
+- `neo-core` → `10.66.66.1:7077`: `ConnectTimeout`; `neo-core` → `neo-zion`: 200;
+- `neo-browser-agent` → `10.66.66.1:7077`: `URLError`.
+- O painel de firewall da Contabo não serve para isso: fica fora da VPS e só vê a internet
+  (a 7077 já não tem regra lá, então está fechada para fora).
+
 **Pendente na F3:**
-- **Regra de firewall** (precisa de `sudo` na VPS). Hoje o `neo-core` (e qualquer container)
-  ainda alcança `10.66.66.1:7077` pelo IP do host: o `/health` mínimo responde, e o resto
-  pede token. A regra fecha isso.
 - **E2E:** uma sessão nova do Claude Code no Mac recebe o contexto da VPS e grava
   checkpoint lá.
 - Cosmético: o banner do `neo-zion` diz "NO TOKEN (loopback only)", que não vale para uma
