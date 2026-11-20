@@ -274,9 +274,9 @@ function Chat({
             <p>Seu assistente pessoal de IA para automação do sistema.</p>
             <p className="welcome-subtitle">Agora com execução em ciclos - vou tentar até conseguir!</p>
             <div className="suggestions">
-              <button onClick={() => { onSendMessage('Crie uma chave SSH no meu computador'); inputRef.current?.focus(); }}>
+              {/* <button onClick={() => { onSendMessage('Crie uma chave SSH no meu computador'); inputRef.current?.focus(); }}>
                 🔐 Criar chave SSH
-              </button>
+              </button> */}
               <button onClick={() => { onSendMessage('Mostre informações do sistema'); inputRef.current?.focus(); }}>
                 💻 Info do Sistema
               </button>

@@ -13,6 +13,8 @@
 // `<...>` que o modelo esquece — o token `[[…]]` também é a convenção que o
 // resto do sistema já usa ([[VOICE:…]], [[HANDOFF:…]]).
 
+import { codeLookup } from './codeSpans';
+
 export interface InlineImageRef {
   /** Conteúdo cru do marcador: caminho local, `file:<file_id>` ou URL http(s). */
   source: string;
@@ -40,13 +42,17 @@ const MARKER_RE = /\[\[\s*IMAGE\s*:\s*([^\]]*?)\s*\]\]/gi;
 // texto também, senão o usuário lê meio caminho de arquivo na bolha.
 const DANGLING_RE = /\[\[\s*IMAGE\s*:[^\]]*$/i;
 
+// Origem que é molde, não arquivo: `file:<file_id>`, `<caminho>` — o modelo
+// citando a instrução. Sai do texto, mas não vira cartão (seria sempre 404).
+const PLACEHOLDER_RE = /[<>]/;
+
 function parseMarkerBody(body: string): InlineImageRef | null {
   const raw = (body || '').trim();
   if (!raw) return null;
   const pipe = raw.indexOf('|');
   const source = (pipe >= 0 ? raw.slice(0, pipe) : raw).trim().replace(/^["']|["']$/g, '');
   const caption = pipe >= 0 ? raw.slice(pipe + 1).trim() : '';
-  if (!source) return null;
+  if (!source || PLACEHOLDER_RE.test(source)) return null;
   return {
     source,
     caption: caption || undefined,
@@ -63,9 +69,15 @@ function parseMarkerBody(body: string): InlineImageRef | null {
 export function extractInlineImages(content: string): ExtractedInlineImages {
   if (!content || !content.includes('[[')) return { text: content, images: [] };
 
+  // Marcador que começa dentro de código (`inline` ou bloco) é citação, não
+  // pedido de imagem: fica no texto como o modelo escreveu (ver lib/codeSpans.ts).
+  const inCode = codeLookup(content);
   const images: InlineImageRef[] = [];
   const seen = new Set<string>();
-  let text = content.replace(MARKER_RE, (_all, body: string) => {
+  let removed = false;
+  let text = content.replace(MARKER_RE, (all: string, body: string, offset: number) => {
+    if (inCode(offset)) return all;
+    removed = true;
     const ref = parseMarkerBody(body);
     if (ref && !seen.has(ref.source)) {
       seen.add(ref.source);
@@ -74,11 +86,18 @@ export function extractInlineImages(content: string): ExtractedInlineImages {
     return '';
   });
 
-  if (!images.length && !DANGLING_RE.test(text)) {
+  const inCodeNow = removed ? codeLookup(text) : inCode;
+  let dangling = false;
+  text = text.replace(DANGLING_RE, (all: string, offset: number) => {
+    if (inCodeNow(offset)) return all;
+    dangling = true;
+    return '';
+  });
+
+  if (!removed && !dangling) {
     return { text: content, images: [] };
   }
 
-  text = text.replace(DANGLING_RE, '');
   // Não deixa o buraco do marcador virar linha vazia/parágrafo solto.
   text = text
     .split('\n')

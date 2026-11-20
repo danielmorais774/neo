@@ -6,6 +6,8 @@
 // SANDBOX para a máquina; este aponta um arquivo que JÁ ESTÁ nela (o vídeo do
 // YouTube baixado pelo yt-dlp do Mac, session-3ed86282). Legenda opcional após `|`.
 
+import { codeLookup } from './codeSpans';
+
 export interface LocalFileRef {
   /** Caminho absoluto (ou `~/…`) no disco do usuário. */
   path: string;
@@ -27,9 +29,7 @@ export interface ExtractedLocalFiles {
 // linha em vez de engolir o resto da resposta.
 const BODY = String.raw`((?:[^\]\n]|\](?!\]))*?)`;
 const MARKER_RE = new RegExp(String.raw`\[\[\s*FILE\s*:\s*` + BODY + String.raw`\s*\]\]`, 'gi');
-const DANGLING_SRC = String.raw`\[\[\s*FILE\s*:(?:[^\]\n]|\](?!\]))*$`;
-const DANGLING_RE = new RegExp(DANGLING_SRC, 'im');
-const DANGLING_ALL_RE = new RegExp(DANGLING_SRC, 'gim');
+const DANGLING_RE = /\[\[\s*FILE\s*:(?:[^\]\n]|\](?!\]))*$/gim;
 
 /** Caminho do sandbox do cérebro (container na VPS), não do disco do usuário. */
 export function isSandboxPath(path: string): boolean {
@@ -59,10 +59,14 @@ function parseMarkerBody(body: string): LocalFileRef | null {
 export function extractLocalFiles(content: string): ExtractedLocalFiles {
   if (!content || !content.includes('[[')) return { text: content, files: [] };
 
+  // Marcador que começa dentro de código (`inline` ou bloco) é citação: fica no
+  // texto como o modelo escreveu (ver lib/codeSpans.ts).
+  const inCode = codeLookup(content);
   const files: LocalFileRef[] = [];
   const seen = new Set<string>();
   let removed = false;
-  let text = content.replace(MARKER_RE, (_all, body: string) => {
+  let text = content.replace(MARKER_RE, (all: string, body: string, offset: number) => {
+    if (inCode(offset)) return all;
     removed = true;
     const ref = parseMarkerBody(body);
     // `/workspace/…` é o sandbox da VPS: nunca existe neste disco, e o arquivo
@@ -78,11 +82,18 @@ export function extractLocalFiles(content: string): ExtractedLocalFiles {
     return '';
   });
 
-  if (!removed && !DANGLING_RE.test(text)) {
+  const inCodeNow = removed ? codeLookup(text) : inCode;
+  let dangling = false;
+  text = text.replace(DANGLING_RE, (all: string, offset: number) => {
+    if (inCodeNow(offset)) return all;
+    dangling = true;
+    return '';
+  });
+
+  if (!removed && !dangling) {
     return { text: content, files: [] };
   }
 
-  text = text.replace(DANGLING_ALL_RE, '');
   text = text
     .split('\n')
     .map((line) => line.replace(/[ \t]+$/, ''))
