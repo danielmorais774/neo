@@ -1,8 +1,8 @@
 # Neo × Zion: o Zion na VPS, e o Neo lendo dele (fase 1) — plano
 
 **Data:** 2026-11-20. Revisto no mesmo dia, depois da F1: o Zion inteiro vai para a VPS (§2).
-**Status:** F0 e F1 feitas (§12). A réplica `zion-replica` da F0 era o desenho anterior e sai
-na migração (§4). F2–F6 não começaram.
+**Status:** F0, F1 e F2 feitas (§12). F2 = commit `23035b1` do `zion-memory-mcp`. A réplica
+`zion-replica` da F0 era o desenho anterior e sai na migração (§4). F3–F6 não começaram.
 **Fase 1 de 2.** A fase 2 (chamado de suporte → o Neo acha o projeto → chama o Claude
 na pasta dele → plano → aprovação → PR) é outro plano, escrito depois desta fase
 funcionar. Contexto da fase 2: `docs/demo-suporte-ponta-a-ponta.md`.
@@ -204,13 +204,16 @@ gravar e o `Store` recusando escrita; `ZION_HOST`; `ZION_ALLOWED_HOSTS`; `domain
    dados nenhuma:
    - lê o transcript e o git no Mac;
    - manda um resumo (o payload do hook sem o caminho do transcript, mais
-     `zion_edits: {files: [{path, last_at, untimed}], last_edit_at}` e `zion_git`) para
-     `POST /hooks/<evento>` no servidor, que roda a mesma lógica de hoje sobre esse resumo;
-   - o transcript nunca sai do Mac, só os arquivos editados e a hora da última edição de
-     cada um;
-   - timeout de 2 s. Se falhar, loga em `~/.config/zion/hook-errors.log` e não bloqueia o
-     Claude. No início da sessão, avisa o modelo que o Zion está fora do ar, para ele não
-     gastar chamadas.
+     `zion_edits: {events: [{path, at}], last_edit_at}` e `zion_git`) para
+     `POST /hooks/<evento>` no servidor, que roda a mesma lógica de hoje sobre esse resumo.
+     As edições vão em ordem, e uma sequência de edições seguidas do mesmo arquivo fica só
+     com a primeira e a última: isso dá exatamente a mesma resposta que ler o transcript;
+   - o transcript nunca sai do Mac, só os arquivos editados e a hora de cada edição;
+   - timeout de 8 s (o servidor leva 0,4–1,3 s com os dados reais, mais ~0,35 s de rede).
+     Se falhar, loga em `~/.config/zion/hook-errors.log` e não bloqueia o Claude; os hooks
+     de turno pulam o servidor por 2 min (disjuntor), para uma VPS fora do ar custar um
+     timeout e não um por turno. O `session-start` sempre tenta e, se falhar, avisa o
+     modelo que o Zion está fora do ar, para ele não gastar chamadas.
 5. **`zion install claude-code --remote <url>`**:
    - grava o `~/.config/zion/client.toml` (URL e caminho do token, modo 0600);
    - registra o MCP por HTTP com o header do token;
@@ -243,8 +246,11 @@ gravar e o `Store` recusando escrita; `ZION_HOST`; `ZION_ALLOWED_HOSTS`; `domain
     - `user: "1000:1000"`, `read_only`, `tmpfs /tmp`, `cap_drop: ALL`,
       `no-new-privileges`, 256 MB, `restart: unless-stopped`;
     - rede própria `zion-pub`, que não é a `default` nem a `zion-net`.
-  - **`zion-tick`**: a mesma imagem, `command: tick --loop 300`, a mesma pasta com
-    escrita e `./neo-core/.zion-spool:/neo-spool:ro`.
+  - **`zion-tick`**: a mesma imagem (`target: writer`), `command: tick --loop 300`, a mesma
+    pasta com escrita e `./neo-core/.zion-spool:/neo-spool:ro`. **`healthcheck: disable`**:
+    o healthcheck da imagem chama a porta 7077, que o tick não abre.
+  - **Imagem:** `build: {context: ../zion-memory-mcp, target: writer}` para `zion` e
+    `zion-tick`; `target: reader` (o padrão) para o `neo-zion`.
   - **`neo-zion`**: como na F1, com `/home/daniel/.zion:/data:ro`,
     `ZION_ALLOWED_HOSTS=neo-zion:7077` e a rede `zion-net`.
   - **Rede `zion-net`**: `internal: true`. O **`neo-core`** entra nela, o que exige
@@ -513,3 +519,56 @@ ele pelo WireGuard (§0, §2). O levantamento que mudou o plano:
 O que continua valendo do desenho anterior: o modo só leitura (F1) vira o `neo-zion`, e o
 lado do Neo (§7) não muda. O que sai: a réplica `zion-replica` (Mac → VPS), que é
 encerrada no passo 2 da migração.
+
+### F2: Zion remoto (20/11/2026)
+
+Commit `23035b1` no `zion-memory-mcp` (design §8.2 de lá). Desenvolvido numa cópia no
+scratchpad e copiado de volta depois de conferir que o repo não tinha mudado.
+
+**O que entrou:** token Bearer (`ZION_TOKEN_FILE`); `POST /hooks/<evento>` com o resumo
+das edições e o git; o último git visto de cada pasta (`gitOf`), usado quando o caminho
+não existe no servidor; o preenchimento do remote que falta; `ZION_PATH_MAP` só para `.md`;
+a dica de `git diff` no modo review; `client.toml` e `zion install claude-code --remote`;
+`tick --loop`; os alvos `writer` e `reader` no `Dockerfile`.
+
+**Desvios do plano:**
+- **O resumo das edições mudou de forma.** A primeira versão ia por arquivo (última hora de
+  cada um). Comparando com a leitura antiga, a ordem dos "arquivos novos desde o
+  checkpoint" podia sair diferente. Passou a ser a sequência de edições, com as repetições
+  seguidas do mesmo arquivo reduzidas à primeira e à última, o que preserva a ordem. Uma
+  edição sem horário nunca é descartada, porque conta sempre como nova.
+- **O timeout subiu de 2 s para 8 s, e entrou o disjuntor de 2 min.** No teste com os
+  dados reais, o servidor levou 2,1 s no primeiro `session-start`, e o hook declarou o
+  Zion fora do ar. Medido depois: o hook **local de hoje** já leva 2,9 s no `session-start`
+  e 1,4 s no `stop` (0,5 s só para subir o node). O caro é o `context_get` (0,6–1,3 s).
+- `/hooks` ganhou a mesma regra de `Host` do `/mcp` e só aceita JSON. Sem token, no modo
+  local, uma página no navegador poderia mandar um POST "simples" para lá.
+
+**Verificado:**
+- Suíte do Zion: **83 de 83** (12 testes novos em `tests/remote.test.ts`, incluindo a
+  paridade do resumo com a leitura antiga do transcript para 19 marcas de checkpoint, e a
+  paridade dos 4 hooks remotos com os locais).
+- **Dados reais no Mac:** servidor com token numa cópia do `~/.zion` (porta 7098) e o hook
+  pela CLI com um `client.toml` de teste:
+
+  | Hook | Remoto (ponta a ponta) | Só o servidor | Local de hoje |
+  |---|---|---|---|
+  | `session-start` | 1,3 s | 0,5 s | 2,9 s |
+  | `stop` | 1,0 s | 0,4 s | 1,4 s |
+  | `session-end` | 1,2 s | 0,6 s | — |
+
+  O contexto veio completo, e a sessão foi gravada com branch e commit.
+- **Imagens na VPS** (contexto com modo 0600): `writer` 285 MB, `reader` 266 MB. O `writer`
+  rodou numa cópia dos dados com `--read-only`, `--cap-drop ALL`, token e
+  `ZION_ALLOWED_HOSTS`, e foi chamado de dentro do `neo-core`:
+  - `/health` sem token → `{"name":"zion","ok":true}`; `initialize` sem token → 401;
+  - com token: 19 tools; `memory_save` gravou e virou commit no git dos dados (uid 1000,
+    `git` da imagem);
+  - hooks `session-start`, `stop` e `session-end` com um caminho do Mac que não existe na
+    VPS: a sessão saiu com o **git mandado pelo "Mac"** (branch `formulario-regua`,
+    commit `b2676f3`) e os arquivos editados vindos do resumo.
+  - Container, imagens e arquivos de teste apagados (disco: 92%, 5,8 GB livres).
+- **Mac em modo local:** sem `~/.config/zion`, o `zion hook session-start` local responde
+  como antes, e o `zion doctor` funciona. O `dist/` novo já é o dos hooks do Mac.
+- **Codex:** fora desta fase; o binário dele no Mac dá `ENOENT`.
+
