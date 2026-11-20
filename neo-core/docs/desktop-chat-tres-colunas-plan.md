@@ -286,6 +286,36 @@ rodando", o título do centro ganha o selo "1 em segundo plano", e o Sandbox fic
 02:19:54 UTC, exit 0. A continuação automática entrou às 02:19:54 e avisou na
 conversa.
 
-**Status:** F0–F4 verificadas no app real. A F5 (nome da tool no progresso, que
-também faria o passo andar no trilho do servidor) e o multimodelo continuam
-fora.
+**Status:** F0–F4 verificadas no app real.
+
+### F5 em produção (20/11/2026)
+- **Proto:** campo `AgentThinking.tool_name = 3`, vazio quando a linha não vem de
+  tool. O stub Python (`neo-core/neo_desktop_pb2.py`) foi regenerado com o
+  `grpc_tools` do `.venv`, mesma versão do gerador de antes (6.31.1). O Rust não
+  usa a saída do `build.rs`: ele inclui `src-tauri/src/grpc_gen/neo_desktop.rs`,
+  que é cópia dela. Proto mudou → compilar e copiar o
+  `target/debug/build/neo-desktop-*/out/neo.desktop.rs` novo para lá. As duas
+  cópias do `.proto` (`proto/` e `neo-core/proto/`) têm que ficar iguais.
+- **Core:** a linha de progresso virou `_ProgressLine`, um `str` com
+  `tool_name`. Quem só lê texto não muda. `_emit_progress(…, tool_name=)` nos dois
+  anúncios do loop cognitivo (START do stream e execução). O drenador virou
+  `_progress_until_done` e põe a tool em `metadata["tool_name"]`. O gRPC e o SSE
+  (`toolName`) repassam.
+- **Trilho do servidor:** o `AgentExecutor.execute` ganhou
+  `on_tool_calls` (chamado com as tools de cada rodada, antes de rodarem; falha
+  ali é só log). O `_handle_server_tool` roda o agente como task e escoa a fila
+  como o cognitivo. Agora cada passo chega com rótulo e tool: "olhando a caixa
+  de email" → "lendo o email". O Stop fecha o generator e cancela o agente (teste
+  conferido por mutação). A 1ª linha do trilho e a do CLIENT_TOOL também levam a
+  tool.
+- **Desktop:** `matchProgress(toolName, frase)` usa a tool quando ela vem.
+  Sem ela (core antigo, ou texto do modelo), casa a frase como antes.
+- **Verificado:** 11 testes novos (`tests/test_progresso_com_tool.py`); suíte do
+  core com 4821 passando; `cargo test --lib` com 138; 8 casos do
+  `matchProgress`. Publicação em dois passos (stub primeiro, código depois), um
+  reload cada, `neo-core` saudável. O app reiniciou com o binário novo às 02:37
+  UTC.
+- **Falta:** E2E com o prompt do email para ver o passo andar no trilho do
+  servidor.
+
+O multimodelo continua fora.

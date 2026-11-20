@@ -8,6 +8,7 @@ It uses IntentRouter to classify messages and dispatches to the correct handler:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import posixpath
@@ -2215,6 +2216,24 @@ _TOOL_CALL_EVENTS = (
 #: Campos que, quando existem nos argumentos, dizem em QUE a tool está mexendo.
 #: Ordem = prioridade; o primeiro que aparecer vira o complemento do rótulo.
 _PROGRESS_ARG_HINTS = ("name", "file_name", "path", "query", "task", "topic", "url", "title")
+
+
+class _ProgressLine(str):
+    """Uma linha da bolha de progresso, com a tool que ela anuncia.
+
+    `str` de propósito: a bolha e quem só lê o texto continuam lendo um texto. O
+    `tool_name` vai junto até o desktop (``AgentThinking.tool_name``), para o
+    painel "Agentes e canais" saber QUEM está trabalhando sem casar a frase
+    (docs/desktop-chat-tres-colunas-plan.md, F5). Vazio quando a linha não vem de
+    tool nenhuma (o texto do modelo sendo escrito).
+    """
+
+    tool_name: str
+
+    def __new__(cls, text: str, tool_name: str = "") -> "_ProgressLine":
+        line = super().__new__(cls, text)
+        line.tool_name = tool_name
+        return line
 
 
 def _progress_label(name: str, arguments: dict[str, Any] | None) -> str:
@@ -8187,29 +8206,13 @@ class AIService:
         )
         task = asyncio.create_task(self._run_cognitive_tool_loop(progress=fila, **loop_kwargs))
         try:
-            while True:
-                proxima = asyncio.ensure_future(fila.get())
-                done, _ = await asyncio.wait({proxima, task}, return_when=asyncio.FIRST_COMPLETED)
-                if proxima in done:
-                    yield AIServiceResponse(
-                        intent=IntentType.DIRECT_RESPONSE,
-                        session_id=session_id,
-                        message=f"{CYCLE_PROGRESS_MARKER}{proxima.result()}",
-                        is_final=False,
-                    )
-                    continue
-                # O loop terminou (ou explodiu). Escoa o que sobrou na fila antes
-                # de sair: a última linha costuma ser o fim do texto, e perdê-la
-                # faria a bolha "voltar" para um estado mais antigo.
-                proxima.cancel()
-                while not fila.empty():
-                    yield AIServiceResponse(
-                        intent=IntentType.DIRECT_RESPONSE,
-                        session_id=session_id,
-                        message=f"{CYCLE_PROGRESS_MARKER}{fila.get_nowait()}",
-                        is_final=False,
-                    )
-                break
+            async with contextlib.aclosing(
+                self._progress_until_done(
+                    fila, task, session_id=session_id, intent=IntentType.DIRECT_RESPONSE
+                )
+            ) as bolhas:
+                async for bolha in bolhas:
+                    yield bolha
             saida.text = await task
         finally:
             # Cliente apertou Stop, ou o consumidor fechou o generator: sem isto a
@@ -8218,7 +8221,55 @@ class AIService:
                 task.cancel()
 
     @staticmethod
-    async def _emit_progress(progress: "asyncio.Queue[str] | None", text: str) -> None:
+    async def _progress_until_done(
+        fila: "asyncio.Queue[str]",
+        task: "asyncio.Task[Any]",
+        *,
+        session_id: UUID,
+        intent: IntentType,
+    ) -> AsyncIterator["AIServiceResponse"]:
+        """Converte em bolha cada linha que ``task`` põe na fila, até ela acabar.
+
+        Serve aos dois loops que trabalham longe do generator: o cognitivo e o
+        agente do SERVER_TOOL. Quem chama lê o resultado com ``await task`` depois
+        (a exceção da task sobe por ali). A linha leva a tool que anuncia em
+        ``metadata["tool_name"]`` (ver `_ProgressLine`).
+        """
+
+        def _bolha(linha: str) -> "AIServiceResponse":
+            tool_name = getattr(linha, "tool_name", "")
+            return AIServiceResponse(
+                intent=intent,
+                session_id=session_id,
+                message=f"{CYCLE_PROGRESS_MARKER}{linha}",
+                is_final=False,
+                metadata={"tool_name": tool_name} if tool_name else None,
+            )
+
+        try:
+            while True:
+                proxima = asyncio.ensure_future(fila.get())
+                done, _ = await asyncio.wait({proxima, task}, return_when=asyncio.FIRST_COMPLETED)
+                if proxima in done:
+                    yield _bolha(proxima.result())
+                    continue
+                # O loop terminou (ou explodiu). Escoa o que sobrou na fila antes
+                # de sair: a última linha costuma ser o fim do texto, e perdê-la
+                # faria a bolha "voltar" para um estado mais antigo.
+                proxima.cancel()
+                while not fila.empty():
+                    yield _bolha(fila.get_nowait())
+                break
+        finally:
+            # Mesmo motivo do `finally` de quem chama: generator fechado no meio
+            # não pode deixar a task rodando.
+            if not task.done():
+                task.cancel()
+
+    @staticmethod
+    async def _emit_progress(
+        progress: "asyncio.Queue[str] | None", text: str, tool_name: str = ""
+    ) -> None:
         """Empurra uma linha de progresso para a bolha do desktop (best-effort).
 
         Fila sem limite e `put_nowait`: progresso NUNCA pode segurar o turno. Se
@@ -8233,7 +8284,7 @@ class AIService:
         if progress is None or not (text or "").strip():
             return
         try:
-            progress.put_nowait(text.strip())
+            progress.put_nowait(_ProgressLine(text.strip(), tool_name))
         except Exception:  # noqa: BLE001 — bolha nunca derruba o turno
             pass
 
@@ -8315,7 +8366,9 @@ class AIService:
                         # "rodando no sandbox" enquanto o modelo ainda escreve o
                         # script de 1.500 chars que vai rodar lá.
                         await self._emit_progress(
-                            progress, _progress_label(chunk.tool_name or "", None)
+                            progress,
+                            _progress_label(chunk.tool_name or "", None),
+                            tool_name=chunk.tool_name or "",
                         )
                     elif chunk.event == StreamEventType.DONE:
                         finish = chunk.finish_reason
@@ -9027,7 +9080,9 @@ class AIService:
                     # Agora com o argumento em mãos a bolha pode dizer em QUE ele
                     # está mexendo — e cobre a espera da tool, que num `neo_bash`
                     # pesado é o pedaço do turno que o stream não alcança.
-                    await self._emit_progress(progress, _progress_label(tc.name, tc.arguments))
+                    await self._emit_progress(
+                        progress, _progress_label(tc.name, tc.arguments), tool_name=tc.name
+                    )
                     urls_de_memoria = _urls_de_memoria(tc.name, tc.arguments)
                     tr = await tool_executor.execute_tool_call(tc)
                     nota_extra: str | None = None
@@ -9682,6 +9737,7 @@ class AIService:
             session_id=session_id,
             message=f"Executando ferramenta no servidor: {decision.tool_name or 'agent'}...",
             is_final=False,
+            metadata={"tool_name": decision.tool_name} if decision.tool_name else None,
         )
 
         t0 = time.monotonic()
@@ -9825,19 +9881,51 @@ class AIService:
             ):
                 brain_provider = brain_model = None
 
-            # Use AgentExecutor for multi-step tool execution
-            result = await self.agent.execute(
-                task=task,
-                session_id=session_id,
-                memory=memory,
-                provider=brain_provider,
-                model=brain_model,
-                tool_executor=ctx_executor,
-                # Sem isto o agente enxerga o registry INTEIRO, gated incluso —
-                # ver `_server_tool_toolset`.
-                available_tools=self._server_tool_toolset(decision.tool_name),
-                force_tool_first=True,
+            # Use AgentExecutor for multi-step tool execution.
+            #
+            # Roda como task para o progresso de cada passo chegar ao desktop
+            # enquanto o agente trabalha: antes este trilho mandava UMA linha
+            # ("Executando ferramenta no servidor: …") e mais nada até a resposta
+            # (session-0e232e1b). Cada rodada de tools vira uma linha com o rótulo
+            # e a tool, como no loop cognitivo.
+            fila_progresso: asyncio.Queue[str] = asyncio.Queue()
+
+            async def _anuncia_passo(chamadas: list[Any]) -> None:
+                for chamada in chamadas:
+                    await self._emit_progress(
+                        fila_progresso,
+                        _progress_label(chamada.name, chamada.arguments),
+                        tool_name=chamada.name,
+                    )
+
+            agente = asyncio.create_task(
+                self.agent.execute(
+                    task=task,
+                    session_id=session_id,
+                    memory=memory,
+                    provider=brain_provider,
+                    model=brain_model,
+                    tool_executor=ctx_executor,
+                    # Sem isto o agente enxerga o registry INTEIRO, gated incluso —
+                    # ver `_server_tool_toolset`.
+                    available_tools=self._server_tool_toolset(decision.tool_name),
+                    force_tool_first=True,
+                    on_tool_calls=_anuncia_passo,
+                )
             )
+            try:
+                async with contextlib.aclosing(
+                    self._progress_until_done(
+                        fila_progresso, agente, session_id=session_id, intent=IntentType.SERVER_TOOL
+                    )
+                ) as bolhas:
+                    async for bolha in bolhas:
+                        yield bolha
+                result = await agente
+            finally:
+                # Stop do usuário fecha este generator: o agente não segue sozinho.
+                if not agente.done():
+                    agente.cancel()
 
             final_text = result.get("final_response", "Tarefa concluída.")
             iterations = result.get("iterations", 1)
@@ -11306,6 +11394,7 @@ class AIService:
                 session_id=session_id,
                 message=f"Solicitando execução de {tool_name} no desktop...",
                 is_final=False,
+                metadata={"tool_name": tool_name} if tool_name else None,
             )
 
             yield AIServiceResponse(

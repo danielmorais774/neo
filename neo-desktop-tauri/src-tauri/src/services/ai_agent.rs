@@ -979,6 +979,10 @@ impl GrpcClient {
                         "content": body,
                         "iteration": t.iteration,
                         "cycle": is_cycle,
+                        // Tool que a linha anuncia (vazio quando não é de tool):
+                        // o painel "Agentes e canais" lê daqui em vez de casar a
+                        // frase (docs/desktop-chat-tres-colunas-plan.md, F5).
+                        "toolName": t.tool_name,
                     }),
                     timestamp,
                 }

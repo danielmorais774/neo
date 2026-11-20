@@ -120,6 +120,11 @@ message CoreMessage {
 message AgentThinking {
   string message = 1;
   int32 iteration = 2;
+  // Tool que esta linha de progresso anuncia (`email_inbox`, `neo_bash`…); vazio
+  // quando a linha não vem de uma tool (o texto do modelo, um "Continuando…").
+  // O desktop usa para saber QUEM está trabalhando sem casar a frase
+  // (docs/desktop-chat-tres-colunas-plan.md, F5). Campo novo: cliente antigo ignora.
+  string tool_name = 3;
 }
 
 message ToolRequest {

@@ -744,13 +744,15 @@ class NeoDesktopServicer(neo_desktop_pb2_grpc.NeoDesktopServiceServicer):
                 ),
             )
 
-        # Thinking / intermediate
+        # Thinking / intermediate. `tool_name` diz de qual tool é a linha (vazio
+        # quando não é de nenhuma): o painel "Agentes e canais" do desktop lê daí.
         if resp.message and not resp.is_final:
             return neo_desktop_pb2.CoreMessage(
                 session_id=sid,
                 thinking=neo_desktop_pb2.AgentThinking(
                     message=resp.message,
                     iteration=resp.iterations,
+                    tool_name=str((resp.metadata or {}).get("tool_name") or ""),
                 ),
             )
 

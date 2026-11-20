@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from core.agent.context_compactor import ContextCompactor
@@ -133,6 +133,7 @@ class AgentExecutor:
         tool_executor: Any = None,
         available_tools: list["ToolSchema"] | None = None,
         force_tool_first: bool = False,
+        on_tool_calls: Callable[[list[ToolCall]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Executa uma task com resiliência (double-loop).
 
@@ -156,6 +157,10 @@ class AgentExecutor:
                 escolheu `browser_local_task`, montou os argumentos completos, e
                 o agente respondeu prosa em 1 iteração. Nenhum job foi criado, e
                 o usuário só descobriu 9 minutos depois, perguntando.
+            on_tool_calls: chamado com as tools de cada rodada ANTES de rodarem.
+                É por onde quem chama mostra o progresso (o desktop: "olhando a
+                caixa de email" e quem está trabalhando). Falha aqui é só log —
+                progresso nunca derruba o agente.
         Returns:
             Dict com status, final_response, steps, iterations, metadata.
         """
@@ -185,6 +190,7 @@ class AgentExecutor:
                         force_tool_first=force_tool_first,
                         steps_sink=passos,
                         watch=watch,
+                        on_tool_calls=on_tool_calls,
                     ),
                     watch,
                 )
@@ -372,6 +378,7 @@ class AgentExecutor:
         force_tool_first: bool = False,
         steps_sink: list[AgentStep] | None = None,
         watch: _StallWatch | None = None,
+        on_tool_calls: Callable[[list[ToolCall]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Loop interno: LLM → Tools → LLM com detecção de loops.
 
@@ -526,6 +533,11 @@ class AgentExecutor:
                     tool_calls=tool_calls,
                 )
                 watch.touch("rodando " + ", ".join(tc.name for tc in tool_calls))
+                if on_tool_calls is not None:
+                    try:
+                        await on_tool_calls(tool_calls)
+                    except Exception as exc:  # noqa: BLE001 — progresso nunca derruba o agente
+                        logger.warning("Aviso de progresso do agente falhou: %s", exc)
                 step.tool_results = await self._execute_tools(tool_calls, executor=tool_executor)
                 steps.append(step)
                 watch.touch("tools concluídas")

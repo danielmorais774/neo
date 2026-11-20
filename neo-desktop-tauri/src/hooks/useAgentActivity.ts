@@ -14,7 +14,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   AGENT_FOR_JOB_KIND,
   AGENT_NAME,
-  agentForPhrase,
+  matchProgress,
   type AgentId,
   type PhraseMatch,
 } from '../lib/agentActivity';
@@ -61,7 +61,7 @@ export function useAgentActivity(): AgentActivity[] {
     const clear = () => setTurn(null);
     const stop = window.electronAPI?.onAgentEvent((event) => {
       if (event.type === 'thinking') {
-        const match = agentForPhrase(String(event.data?.content ?? ''));
+        const match = matchProgress(String(event.data?.toolName ?? ''), String(event.data?.content ?? ''));
         // Frase que não casa (o modelo pensando, um "Processando…") não muda quem
         // está em ação: o passo anterior ainda é o último trabalho de verdade.
         if (!match) return;

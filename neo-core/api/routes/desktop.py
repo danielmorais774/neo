@@ -578,6 +578,8 @@ async def _stream_ai_events(
                         "content": resp.message[len(CYCLE_PROGRESS_MARKER):] if is_cycle else resp.message,
                         "iteration": resp.iterations,
                         "cycle": is_cycle,
+                        # Mesmo campo do `AgentThinking.tool_name` no gRPC.
+                        "toolName": str((resp.metadata or {}).get("tool_name") or ""),
                     },
                 )
     except Exception:

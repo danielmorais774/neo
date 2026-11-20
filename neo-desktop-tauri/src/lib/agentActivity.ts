@@ -131,6 +131,23 @@ export function agentForPhrase(text: string): PhraseMatch | null {
   return null;
 }
 
+/**
+ * O evento `thinking` inteiro → quem está trabalhando. Com `toolName` (F5: o core
+ * diz a tool de cada linha de progresso), a tool decide e a frase vira só o passo
+ * mostrado; sem ele (core antigo, ou linha que não é de tool), cai na frase.
+ */
+export function matchProgress(toolName: string, text: string): PhraseMatch | null {
+  const name = toolName.trim();
+  if (!name) return agentForPhrase(text);
+  const tool = TOOLS[name];
+  // Tool que não é "alguém trabalhando" (clima, memória, skill): ninguém novo.
+  if (!tool) return null;
+  const phrase = text.trim();
+  // As frases com o nome cru da tool não são para gente: mostra o rótulo.
+  const raw = !phrase || SERVER_TOOL_RE.test(phrase) || CLIENT_TOOL_RE.test(phrase);
+  return { agent: tool[0], step: raw ? tool[1] : phrase };
+}
+
 /** Tipo de tarefa em background → agente. Tipos que não são "alguém
  *  trabalhando" (agenda, lembrete, vigia de download) ficam de fora. */
 export const AGENT_FOR_JOB_KIND: Record<string, AgentId> = {

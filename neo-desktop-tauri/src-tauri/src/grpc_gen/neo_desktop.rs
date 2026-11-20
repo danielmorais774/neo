@@ -152,6 +152,12 @@ pub struct AgentThinking {
     pub message: ::prost::alloc::string::String,
     #[prost(int32, tag = "2")]
     pub iteration: i32,
+    /// Tool que esta linha de progresso anuncia (`email_inbox`, `neo_bash`…); vazio
+    /// quando a linha não vem de uma tool (o texto do modelo, um "Continuando…").
+    /// O desktop usa para saber QUEM está trabalhando sem casar a frase
+    /// (docs/desktop-chat-tres-colunas-plan.md, F5). Campo novo: cliente antigo ignora.
+    #[prost(string, tag = "3")]
+    pub tool_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ToolRequest {
