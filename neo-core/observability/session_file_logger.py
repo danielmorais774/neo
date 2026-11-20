@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from observability import session_log_payload as fmt
+
 logger = logging.getLogger(__name__)
 
 # Resolve logs directory: /app/logs inside Docker, fallback to neo-core/logs locally
@@ -106,6 +108,7 @@ class SessionFileLogger:
         self._interaction += 1
         self._interaction_start = datetime.now(timezone.utc)
         self._step_timings: list[tuple[str, float]] = []
+        self._rodada = 0
         self._write(
             f"## Interação {self._interaction}\n\n"
             f"**⏱ Request recebida:** `{self._interaction_start.strftime('%H:%M:%S.%f')[:-3]} UTC`  "
@@ -235,8 +238,8 @@ class SessionFileLogger:
     ) -> None:
         """O que foi enviado ao modelo — INCLUSIVE a mesa de tools.
 
-        O payload abaixo se anuncia como "completo" e durante muito tempo não
-        era: `tools` e `tool_choice` ficavam de fora. A pergunta que o diário
+        O antigo bloco "RAW payload" se anunciava como "completo" e durante
+        muito tempo não era: `tools` e `tool_choice` ficavam de fora. A pergunta que o diário
         então não respondia é a primeira de qualquer investigação de "por que
         ele não chamou X?" — se X estava na mesa. Nas sessões 0cd866a1 e
         e0905aae só deu para afirmar que `browser_local_task` estava disponível
@@ -245,26 +248,47 @@ class SessionFileLogger:
         `tool_choice` entra pelo mesmo motivo, do outro lado: um round com
         `required` explica uma chamada de tool que de outro jeito pareceria
         iniciativa do modelo.
+
+        Cada mensagem vai inteira só na 1ª vez que aparece no arquivo; depois
+        vira uma linha ``= #sha`` (formato e medição em
+        ``observability/session_log_payload.py``). O antigo bloco "⚡ RAW
+        payload" saiu: repetia as mensagens logo abaixo dele, e
+        ``scripts/payload_do_log.py`` remonta o mesmo JSON a partir delas.
         """
-        self._write(f"### 6. LLM Request — {stage}\n\n")
-        self._write(f"- **Provider:** {provider}\n")
-        self._write(f"- **Model:** {model}\n")
+        self._esquecer_se_o_arquivo_mudou()
+        self._rodada = getattr(self, "_rodada", 0) + 1
+        onde = f"Interação {self._interaction}, rodada {self._rodada}"
+        partes: list[str] = [f"### 6. LLM Request — {stage} (rodada {self._rodada})\n\n"]
+        partes.append(f"- **Provider:** {provider}\n")
+        partes.append(f"- **Model:** {model}\n")
         if temperature is not None:
-            self._write(f"- **Temperature:** {temperature}\n")
-        self._write(f"- **Total mensagens:** {len(messages)}\n")
+            partes.append(f"- **Temperature:** {temperature}\n")
+        partes.append(f"- **Total mensagens:** {len(messages)}\n")
         nomes = [
             str(getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else t))
             for t in (tools or [])
         ]
-        self._write(f"- **Tools na mesa ({len(nomes)}):** ")
-        self._write(", ".join(f"`{n}`" for n in nomes) + "\n" if nomes else "_nenhuma_\n")
+        if not nomes:
+            partes.append("- **Tools na mesa (0):** _nenhuma_\n")
+        else:
+            marca = fmt.sha("\n".join(nomes))
+            if marca in self._tools_vistas:
+                partes.append(
+                    f"- **Tools na mesa ({len(nomes)}):** = #{marca} "
+                    f"(iguais às da {self._tools_vistas[marca]})\n"
+                )
+            else:
+                self._tools_vistas[marca] = onde
+                partes.append(
+                    f"- **Tools na mesa ({len(nomes)}):** "
+                    + ", ".join(f"`{n}`" for n in nomes)
+                    + f" · #{marca}\n"
+                )
         if tool_choice:
-            self._write(f"- **tool_choice:** `{tool_choice}`\n")
-        self._write("\n")
+            partes.append(f"- **tool_choice:** `{fmt.json_compacto(tool_choice)}`\n")
+        partes.append("\n")
 
-        # Build the raw payload list for JSON dump
-        raw_messages: list[dict] = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             if hasattr(msg, "role"):
                 role = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
                 content = msg.content or ""
@@ -274,32 +298,62 @@ class SessionFileLogger:
             else:
                 role = "?"
                 content = str(msg)
-            raw_messages.append({"role": role, "content": content})
+            partes.append(self._bloco_da_mensagem(i, str(role), str(content), f"{onde}, [{i}]"))
 
-        # Raw JSON payload (full — as sent to the API)
-        raw_payload: dict = {"model": model, "messages": raw_messages}
-        if temperature is not None:
-            raw_payload["temperature"] = temperature
-        raw_payload["stream"] = True
-        # Só os NOMES: o schema inteiro de 40 tools infla o diário em centenas de
-        # KB por round e não responde nada que o nome não responda.
-        if nomes:
-            raw_payload["tools"] = nomes
-        if tool_choice:
-            raw_payload["tool_choice"] = tool_choice
-        self._write(
-            f"<details>\n<summary>⚡ RAW payload completo (JSON)</summary>\n\n"
-            f"```json\n{_safe_json(raw_payload)}\n```\n\n</details>\n\n"
-        )
+        self._write("".join(partes))
+        self._marcar_tamanho()
 
-        # Individual message details
-        for i, (msg, raw) in enumerate(zip(messages, raw_messages)):
-            role = raw["role"]
-            content = raw["content"]
-            self._write(
-                f"<details>\n<summary>Mensagem [{i}] — {role} ({len(content)} chars)</summary>\n\n"
-                f"```\n{content}\n```\n\n</details>\n\n"
-            )
+    # ── dedup das mensagens (ver observability/session_log_payload.py) ──
+
+    def _bloco_da_mensagem(self, i: int, role: str, content: str, onde: str) -> str:
+        if len(content) < fmt.MIN_DEDUP:
+            return fmt.bloco_inteiro(i, role, content)
+        marca = fmt.sha(content)
+        if marca in self._msgs_vistas:
+            return fmt.linha_referencia(i, role, content, marca, self._msgs_vistas[marca])
+        self._msgs_vistas[marca] = onde
+        if role != "system":
+            return fmt.bloco_inteiro(i, role, content, marca)
+        # System muda aos pedaços entre rodadas (caderno, PKS, hora): a versão
+        # anterior é a do mesmo bloco, reconhecido pela 1ª linha.
+        chave = content.split("\n", 1)[0][:80]
+        anterior = self._ultimo_system.get(chave)
+        self._ultimo_system[chave] = (marca, content)
+        if anterior is not None:
+            diff = fmt.fazer_diff(anterior[1], content)
+            if diff is not None:
+                return fmt.bloco_diff(
+                    i, role, content, marca, anterior[0], diff, self._msgs_vistas[anterior[0]]
+                )
+        return fmt.bloco_inteiro(i, role, content, marca)
+
+    def _esquecer_se_o_arquivo_mudou(self) -> None:
+        """Arquivo apagado ou encolhido: as marcas antigas não estão mais nele.
+
+        Uma referência só vale se o original estiver no MESMO arquivo. Se alguém
+        limpou o diário com o processo de pé, a próxima rodada volta a gravar
+        tudo inteiro em vez de apontar para o vazio.
+        """
+        if not hasattr(self, "_msgs_vistas"):
+            self._msgs_vistas: dict[str, str] = {}
+            self._tools_vistas: dict[str, str] = {}
+            self._ultimo_system: dict[str, tuple[str, str]] = {}
+            self._tamanho_visto = 0
+        try:
+            tamanho = self._path.stat().st_size
+        except OSError:
+            tamanho = -1
+        if tamanho < self._tamanho_visto:
+            self._msgs_vistas.clear()
+            self._tools_vistas.clear()
+            self._ultimo_system.clear()
+            self._tamanho_visto = 0
+
+    def _marcar_tamanho(self) -> None:
+        try:
+            self._tamanho_visto = self._path.stat().st_size
+        except OSError:
+            self._tamanho_visto = 0
 
     def log_llm_response(
         self,
